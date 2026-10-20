@@ -1,0 +1,11 @@
+.omc/
+graft/
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-wal
+*.db-shm
+.env
+target/
+dist/
