@@ -154,7 +154,7 @@ CREATE TABLE api_tokens (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, scope TE
 ### inventory.db (Vigie-owned; written by `pipeline`, except collectors/batches by `ingest`)
 ```sql
 CREATE TABLE devices (
-  id TEXT PRIMARY KEY,                -- UUIDv4; one per unmatched MAC until a human merges
+  id TEXT PRIMARY KEY,                -- UUIDv4; one per unmatched MAC until a rule or human attaches it to another device
   first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
   inferred_type TEXT,                 -- phone|tv|iot|camera|laptop|console|unknown
   inferred_confidence REAL,
