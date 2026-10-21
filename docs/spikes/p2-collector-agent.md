@@ -199,8 +199,9 @@ for a write racing the drain, which cannot be tested deterministically).
 
 ### Mutation run for the review fixes
 
-63 hand-rolled single-edit mutants, `cargo test` after each (the table of mutants lives in the commit message history
-of this branch; the harness was a throwaway script). First pass: 52 killed, 9 survived, 2 did not compile. The tests
+63 hand-rolled single-edit mutants, `cargo test` after each (a throwaway script, not committed; mutants cover
+the xid taint, per-MAC quota and caps, eviction counters, script symlink/owner/mode checks, clock gating, key checks, duplicate
+handling, urgent eviction, RNG, `PinnedTransport` and the byte-cap reserves). First pass: 52 killed, 9 survived, 2 did not compile. The tests
 added for the survivors (taint stickiness independent of the ACK check, reserve and spool-accounting assertions,
 `allow_identity_push`) kill all but two: removing the `FlushPlan::Probe` early return and removing the
 `allow_identity_push` call in `main.rs` still pass, because that wiring lives in the binary and has no unit test
