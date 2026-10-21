@@ -70,9 +70,22 @@ the neighbor table.
      flows that will be counted again if they return. The snapshot says so:
      `"table_pressure":true` and `"recounted_flows":N` (stubs dropped this sample, an upper bound
      on flows that may be recounted). A flow evicted as a tombstone also returns as new (same as a
-     flow forgotten after 3 absences). A stub can mis-attribute when a dead flow's tuple is reused
-     by a new flow with larger counters before its stub is dropped (the new flow's first delta is
-     under-reported); stubs are not aged out because that would bring the recount back.
+     flow forgotten after 3 absences), but the helper remembers a 64-bit hash of it (bounded by the
+     same stub cap) and, when it does return, counts it in `recounted_flows` and raises
+     `table_pressure` (a dump racing churn can hold more entries than `nf_conntrack_max`).
+     **Stubs age out** after `--stub-ttl-samples` samples (default 30; the same TTL applies to the
+     tombstone memory), so a new flow reusing a long-dead flow's tuple is a new flow and gets no
+     bogus delta from the old stub. Inside the TTL a tuple reused with larger counters is still
+     under-reported on its first delta; a shorter TTL trades that for recounting a long-absent
+     live flow.
+   - **The table is also capped during a sample.** New flow keys are refused once the table holds
+     `max_flows + max(max_flows / 3, 16)` entries (the 16 only matters for tiny explicit caps).
+     Refused keys are counted in `"dropped_new_keys"` and raise `table_pressure`; flows already
+     tracked keep exact totals, the refused ones contribute nothing. This bounds memory with the
+     size of the dump (a runtime-raised `nf_conntrack_max` or a huge table) instead of letting it
+     grow with the input; before this fix 65536 live flows cost 48 MB RSS and 1M about 150 MB as
+     root (reviewer measurement). Test: a dump of 5 x `max_flows` distinct flows stays within the
+     ceiling, sets the flag and keeps tracked totals exact.
    - **`nf_conntrack_max` is enforced, fail closed.** At startup the daemon reads
      `/proc/sys/net/netfilter/nf_conntrack_max` (override: `--conntrack-max-file`). Without
      `--max-flows` the cap is derived from it (3 x; refused above 3 x 65536 so the memory cost is
@@ -106,7 +119,7 @@ the neighbor table.
    - Flows whose original source is external (port-forwards, router-originated) are emitted
      too; the agent decides what to drop.
 3. **Serve**: one JSON line per interval to the connected reader, example:
-   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"acct_off":false,"folded":0,"evicted":0,"recounted_flows":0,"table_pressure":false,"records":[{"src":"192.168.8.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
+   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"acct_off":false,"folded":0,"evicted":0,"recounted_flows":0,"dropped_new_keys":0,"table_pressure":false,"records":[{"src":"192.168.8.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
    `ts` comes from the router clock (no RTC): the agent should stamp by its own sane clock and use
    `seq` for ordering.
    - **One reader at a time.** A new connection never cuts a line already in flight: it waits
@@ -241,7 +254,7 @@ so the `lchown` vs `chown` mutant is **not verified**.
   1 RSS). `cargo clippy -p vigie-conntrack --all-targets -- -D warnings` and `cargo fmt --check`
   clean. Not run as root (see above): the chown and lchown-swap tests print `SKIPPED` here, and
   FAIL with `VIGIE_ROOT_TESTS=1`.
-- Release build `aarch64-unknown-linux-musl` (rust-lld): **414.6 KiB** (424552 bytes), static.
+- Release build `aarch64-unknown-linux-musl` (rust-lld): **417.6 KiB** (427592 bytes), static.
   Not run (no emulator); only built.
 - Memory (x86_64 static musl release, `/usr/bin/time -v` max RSS, 3 runs each; generated tables,
   not committed):
@@ -252,8 +265,14 @@ so the `lchown` vs `chown` mutant is **not verified**.
   - Daemon, three rotating tables of 16384 distinct sources (49152 tracked = live + tombstones,
     the default cap under full churn): **VmHWM 12.7 MB**, VmRSS 9.2 MB. The default cap therefore
     trades up to ~13 MB peak under attacker-shaped churn for correct byte counts. A full stub
-    table (32768 stubs, 48 B + table overhead, about 3 MB) comes on top only when live flows are
-    evicted; that case was **not measured**.
+    table is NOT free: the reviewer measured the full stub-table state at **30 MB RSS / 38 MB
+    HWM** with 81920-flow samples (including about 7 MB of harness input) and **48 MB RSS** with
+    `nf_conntrack_max` raised 4x; the earlier "about 3 MB" figure was an unmeasured estimate and
+    is withdrawn. That state is **OFF-CONTRACT**: it is only reachable with an explicit, small
+    `--max-flows` or a runtime increase of `nf_conntrack_max`, and it is always flagged by
+    `table_pressure`. Note the Rust `HashMap` never shrinks its capacity after the peak, so RSS
+    stays at the high-water mark until the process restarts. The in-sample ceiling above bounds
+    how far one oversized dump can push it (not re-measured after the change).
   - `tests/rss.rs` (glibc debug build, 16384 sources) still holds: growth over idle <= 7 MB.
 - Items 1-5 review fixes, test order: the churn repro (`churn_does_not_recount_...`, 1.37 GB
   reported against ~200 kB true), the tombstone-first, stub-reset and stub-overflow tests and the
@@ -272,6 +291,15 @@ so the `lchown` vs `chown` mutant is **not verified**.
   - **Survived: `lchown` -> `chown`** (needs a root run with a distinct gid; not verified, see
     above). **Survived: `check_root_needs_uid` not called from `main`** (only observable as root;
     the function itself is tested).
+- Mutation check, final-review round (hand-applied, whole suite each):
+  - Killed: in-sample ceiling removed / `>` instead of `>=` / slack dropped; dropped keys not
+    counted / not reported / counter never reset / pressure not raised by drops; stub key by
+    sport only; stub TTL `<=`, never expires, stamp never set, ignored in main, default 31, flag
+    lower bound 0; tombstone memory not expired / recount not noted / not added to
+    `recounted_flows` / eviction not remembered / not capped / counter never reset; uid bound
+    removed, 999, 1001, `--allow-shared-uid` ignored, shared list removed.
+  - **Survived: tombstone memory not cleared on return** (`remove` -> `get`): it can only double
+    flag a flow that returns twice inside the TTL; no test covers it.
 - Previous round (kept for the record):
   - Mutation check (hand-applied mutants, each run against the whole suite):
   - Killed: delta, reset (never; reply.packets only), eviction (disabled; keeps oldest), other-cap K
