@@ -86,8 +86,20 @@ class ConntrackSummary(_Strict):
 
 
 class Sighting(_Strict):
+    """An mDNS/SSDP announcement the collector attributed to a MAC.
+
+    UNAUTHENTICATED HINT: multicast source addresses are spoofable on the LAN, and the
+    collector maps the claimed source IP to a MAC through the router's neighbor table, so any
+    LAN host can cause a sighting to be attributed to another device's MAC. Use sightings to
+    suggest a device type or name, never as proof of identity. The collector bounds them
+    (64 per MAC and 1024 per window; refusals are counted in `truncated.sightings_dropped`).
+    """
+
     mac: Mac
-    kind: Literal["mdns", "ssdp"]
+    kind: Annotated[
+        Literal["mdns", "ssdp"],
+        Field(description="Protocol the announcement arrived on; it is the only provenance tag."),
+    ]
     name: Name | None = None
     service: Name | None = None
     ua: Name | None = None
@@ -99,6 +111,25 @@ class Health(_Strict):
     spool_batches: Count | None = None
     uptime_s: Count | None = None
 
+
+_TRUNCATED_DOC = (
+    "Counters of what the collector dropped or could not attribute in this window, plus one "
+    "bitmask; at most 16 keys, each [a-z_]{1,32} with a non-negative integer. The set of keys "
+    "is open. Units: keys naming a section (leases, neigh, dns, sightings, conntrack) count "
+    "ROWS removed from that section to fit the 256 KB batch; conntrack_lost counts folded "
+    "summary rows that were dropped outright; *_dropped and *_quota_dropped count rows refused "
+    "by a window cap; dns_out_of_window counts DNS rows outside the window; ct_errors, "
+    "ct_recounted, ct_dropped_keys and mcast_* count EVENTS (read errors, flows that may be "
+    "counted again, refused new flow keys, multicast packets); ct_unmapped_bytes counts BYTES "
+    "(up + down) of conntrack sources with no MAC; ct_unmapped_flows counts FLOWS of those "
+    "sources, summed over the window's snapshots (a flow seen in two snapshots counts twice). "
+    "source_flags is a BITMASK, not a count: 1 = conntrack helper table pressure, 2 = kernel "
+    "byte accounting is off (nf_conntrack_acct), 4 = conntrack socket down or silent, "
+    "8 = multicast socket could not be bound or joined. When more than 16 keys would be "
+    "needed, ct_unmapped_flows is merged first, then the smallest counts, and their SUM is "
+    "reported as truncated_other (a count of mixed units, only meaningful as 'something else "
+    "was lost'); source_flags is always kept verbatim."
+)
 
 TruncatedMap = Annotated[
     dict[Annotated[str, StringConstraints(pattern=r"^[a-z_]{1,32}$")], Count],
@@ -115,7 +146,7 @@ class Batch(_Strict):
     window_start: EpochSeconds
     window_end: EpochSeconds
     sent_ts: EpochSeconds
-    truncated: TruncatedMap = {}
+    truncated: Annotated[TruncatedMap, Field(description=_TRUNCATED_DOC)] = {}
     dropped_batches: Count = 0
     leases: Annotated[list[Lease], Field(max_length=1000)] = []
     neigh: Annotated[list[Neighbor], Field(max_length=2000)] = []
