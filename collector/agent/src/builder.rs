@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use crate::model::*;
 
 pub const BATCH_CAP: usize = 256 * 1024;
+/// The ingest server's request body limit (`MAX_BODY_BYTES` in server `config.py`, 512 KiB). The
+/// agent stays at half of it; `BATCH_CAP` must never exceed this.
+pub const SERVER_MAX_BODY: usize = 512 * 1024;
 /// Most of the cap the identity group (leases, neigh, sightings) may use.
 pub const IDENTITY_BUDGET: usize = 96 * 1024;
 /// Conntrack is guaranteed this much (or what it needs, if less) before DNS may use the rest.
