@@ -97,7 +97,7 @@ group-readable by `vigie`. That is why the log may be owned by uid 0 or by the u
 start with the checks in "Re-review fixes" (item 8). Also unverified:
 busybox `stat -c %u/%a`, `mktemp` with a path template and `install` on GL.iNet (they work with the host busybox).
 
-**Floods.** `Window` caps DNS rows (10,000 per window) and sightings (4,096 distinct), with a per-MAC DNS quota of
+**Floods.** `Window` caps DNS rows (10,000 per window) and sightings (4,096 distinct, and at most 1,024 new ones admitted per window; see Sightings below), with a per-MAC DNS quota of
 1,024 rows per window, so one chatty device cannot crowd out the others. The correlator caps pending queries per
 client IP (256 between two polls) so a flood within one 2 s poll cannot evict other clients' queries, and counts
 global evictions. Everything dropped is reported in the batch `truncated` map: `dns_quota_dropped`,
@@ -279,11 +279,36 @@ bounded channels (4 snapshots, 256 packets; a full queue drops the newest and co
 - **Where conditions go**: the schema's `health` is closed (4 fields) and `truncated` is the only free-form slot
   (<= 16 keys, `[a-z_]{1,32}`). Used: `source_flags` bitmask (1 table_pressure, 2 acct_off, 4 conntrack socket
   down, 8 multicast bind failed), counters `ct_recounted`, `ct_dropped_keys`, `ct_errors` (reader errors + queue drops),
-  `ct_unmapped_bytes`, `mcast_unmapped`, `mcast_dropped`; the per-device quota reuses `sightings_dropped`.
+  `ct_unmapped_bytes`, `ct_unmapped_flows`, `mcast_unmapped`, `mcast_dropped`; the per-device quota and the
+  per-window admission rate reuse `sightings_dropped`. `ct_unmapped_flows` sums the `flows` gauge of unmapped
+  records over the window's snapshots (a flow seen in two snapshots counts twice; with one snapshot per 60 s window it
+  is the flow count). Key priority when the map would exceed 16 keys: `source_flags` verbatim; then
+  `ct_unmapped_flows` yields first (it only accompanies `ct_unmapped_bytes`), then the smallest counts, summed into
+  `truncated_other`. Units of every key are in the `truncated` description of `api/batch.schema.json`.
   `new_flows`, packets, `folded`, `evicted`, `skipped_lines` have no slot and are not reported. The builder now caps
   `truncated` at 16 keys (largest counts keep a key, the rest are summed into `truncated_other`, `source_flags`
   is exempt): without it the 15 existing keys plus these would make the server reject the whole batch.
-- **Quotas**: sightings 64 distinct per MAC per window (new), 4096 per window (existing).
+- **Quotas / Sightings**: 64 distinct per MAC per window, 1,024 newly admitted per window across all MACs
+  (`SIGHTINGS_ADMIT_PER_WINDOW`, a compile-time constant), 4,096 held (existing hard cap). Sightings are
+  **unauthenticated hints**: multicast source addresses are spoofable, so a LAN host can make sightings appear under
+  another device's MAC (up to the 64-per-MAC quota, which also crowds out that device's real sightings for the
+  window) and, across many spoofed addresses, consume the 1,024 admission budget so later real announcements in
+  that window are dropped (counted in `sightings_dropped`). Already admitted sightings are never evicted. The
+  batch schema has no provenance field, so `kind` (`mdns`/`ssdp`) is the only tag; the server and its API must treat
+  sightings as hints for a name or device type, never as identity (stated in `api/batch.schema.json`). Devices
+  re-announce periodically, so a dropped sighting normally reappears in a later window.
+- **IP to MAC freshness**: the table is read (a) every 10 s, (b) immediately for a new device's lease, (c) on any
+  lease whose (IP, MAC) pairing differs from the current table (IP unknown or held by another MAC), and (d) once per
+  helper snapshot before it is attributed, so an address that moved from MAC A to MAC B is billed to B and an
+  address not yet in the table is learned in the same pump. (c) and (d) are limited to one read per second
+  (`REFRESH_MIN_S`); a read by any path counts. **Residual window:** attribution is per snapshot, not per flow:
+  the helper reports one record per source IP for its whole interval (60 s by default), so if an IP changes owner
+  mid-interval, that interval's bytes for the address go entirely to the owner seen at snapshot time (at worst one
+  helper interval of the address's traffic is misattributed, ~60 s). Beyond that the kernel neighbor entry itself
+  can stay stale until ARP/NDP traffic updates it (up to its gc time, minutes) and no refresh helps; DNS and multicast
+  attribution use the table as of the last read (<= 10 s old, or 1 s after a lease change), and a lease-less IP change
+  (static IPs, ARP-only) is seen at the next 10 s read. A hostile LAN can trigger at most one extra `ip neigh` read
+  per second.
 - **Shutdown**: std cannot install a signal handler without `unsafe`; SIGTERM takes the default action. State is RAM
   only by design, so nothing is lost that a clean stop would have saved.
 - **Config**: new optional keys `conntrack_socket` (default `/tmp/vigie/conntrack.sock`), `lan_addr` (192.168.8.1),
