@@ -156,7 +156,10 @@ mod tests {
     #[test]
     fn first_duplicate_header_wins() {
         let m = "NOTIFY * HTTP/1.1\r\nSERVER: first\r\nSERVER: second\r\n\r\n";
-        assert_eq!(parse(m.as_bytes()).unwrap().server.as_deref(), Some("first"));
+        assert_eq!(
+            parse(m.as_bytes()).unwrap().server.as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
