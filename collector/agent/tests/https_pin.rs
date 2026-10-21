@@ -341,3 +341,97 @@ fn handshake_with_a_malformed_certificate_fails_cleanly() {
         "{e:?}"
     );
 }
+
+/// Runs `openssl s_server -tls1_2 <extra>` for `id` and returns the result and duration of a post
+/// to it, or None when openssl is unavailable.
+fn post_to_openssl_tls12(
+    id: &Ident,
+    extra: &[&str],
+) -> Option<(Result<u16, TransportError>, Duration)> {
+    let dir = std::env::temp_dir().join(format!(
+        "vigie-ems-{}-{}",
+        std::process::id(),
+        extra.join("")
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("c.der"), &id.cert).unwrap();
+    std::fs::write(dir.join("k.der"), id.key.serialize_der()).unwrap();
+    let d = dir.display().to_string();
+    let converted = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "openssl x509 -inform der -in {d}/c.der -out {d}/c.pem && openssl pkey -inform der -in {d}/k.der -out {d}/k.pem"
+        ))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let child = converted.then(|| {
+        std::process::Command::new("openssl")
+            .args(["s_server", "-accept", &port.to_string(), "-tls1_2"])
+            .args([
+                "-cert",
+                &format!("{d}/c.pem"),
+                "-key",
+                &format!("{d}/k.pem"),
+            ])
+            .args(["-www", "-quiet"])
+            .args(extra)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    });
+    let out = match child {
+        Some(Ok(mut child)) => {
+            std::thread::sleep(Duration::from_millis(500));
+            let out = child.try_wait().unwrap().is_none().then(|| {
+                let url = format!("https://127.0.0.1:{port}/v1/batch");
+                let pt = PinnedTransport::new(&url, &[id.pin_hex()]).unwrap();
+                let mut t = HttpsTransport::new(pt)
+                    .unwrap()
+                    .with_timeout(Duration::from_secs(2));
+                let start = std::time::Instant::now();
+                let r = t.post(&headers(), b"{}").map(|r| r.status);
+                (r, start.elapsed())
+            });
+            let _ = child.kill();
+            let _ = child.wait();
+            out
+        }
+        _ => None,
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn tls12_without_extended_master_secret_is_refused() {
+    let cfg = vigie_agent::tls_pin::client_config(&[[7u8; 32]]).unwrap();
+    assert!(
+        cfg.require_ems,
+        "TLS 1.2 must require the extended master secret"
+    );
+
+    let id = Ident::new();
+    // Control: with EMS the handshake completes, then openssl's `-www` mode sits waiting for a
+    // GET it never gets, so the post runs into its 2 s deadline. A refused handshake is an
+    // immediate error instead.
+    let Some((control, took)) = post_to_openssl_tls12(&id, &[]) else {
+        eprintln!("openssl unavailable: skipped");
+        return;
+    };
+    assert!(
+        control.is_err() && took >= Duration::from_secs(1),
+        "control: {control:?} {took:?}"
+    );
+
+    let (no_ems, took) = post_to_openssl_tls12(&id, &["-no_ems"]).unwrap();
+    assert!(no_ems.is_err());
+    assert!(
+        took < Duration::from_secs(1),
+        "handshake without EMS was not refused promptly: {no_ems:?} after {took:?}"
+    );
+}

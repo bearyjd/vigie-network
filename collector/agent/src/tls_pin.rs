@@ -108,5 +108,8 @@ pub fn client_config(pins: &[Pin]) -> Result<ClientConfig, Error> {
         .with_no_client_auth();
     // One request per connection: a session cache would only cost RAM.
     cfg.resumption = Resumption::disabled();
+    // TLS 1.2 only: refuse a server that does not do the extended master secret (RFC 7627), which
+    // closes the triple-handshake class of attacks. TLS 1.3 always has the equivalent.
+    cfg.require_ems = true;
     Ok(cfg)
 }
