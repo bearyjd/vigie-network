@@ -59,7 +59,7 @@ ensure)
 		(umask 077 && set -C && : >"$LOG") 2>/dev/null || true
 		[ -f "$LOG" ] && [ ! -L "$LOG" ] && chown "$VIGIE_OWNER" "$LOG"
 	fi
-	require_file "$LOG" "$VIGIE_LOG_ALLOWED_UIDS"
+	require_file "$LOG" "$(log_allowed_uids)"
 	[ -f "$LOG" ] || refuse "$LOG could not be created"
 	chmod 0640 "$LOG" || exit 1
 	require_file "$FILE" "$VIGIE_TRUSTED_UID"

@@ -1,4 +1,5 @@
 use std::fs;
+mod common;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -324,6 +325,7 @@ fn watchdog_script_rotates_only_above_the_limit() {
             .env("VIGIE_LOG_MAX_BYTES", limit)
             .env("VIGIE_SIGNAL_CMD", "true")
             .envs(trust_env())
+            .envs(common::fake_dnsmasq_env())
             .status()
             .unwrap()
             .code()

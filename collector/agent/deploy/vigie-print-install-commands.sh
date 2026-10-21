@@ -72,7 +72,7 @@ id vigie    # expect uid=${UID_N} gid=${GID_N}
 # 2. install the files (binary, scripts, init, config) under root ownership
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie
 # install -m 0755 vigie-collector /usr/bin/vigie-collector
-# install -m 0755 vigie-lib.sh vigie-dnsmasq-dropin.sh vigie-log-watchdog.sh /usr/libexec/vigie/
+# install -m 0755 vigie-lib.sh vigie-dnsmasq-dropin.sh vigie-log-watchdog.sh vigie-run.sh /usr/libexec/vigie/
 # install -m 0755 vigie-collector.init /etc/init.d/vigie-collector
 # install -m 0644 collector.conf.example /etc/vigie/collector.conf   # then edit it
 

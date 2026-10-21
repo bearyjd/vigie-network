@@ -2,6 +2,7 @@
 //! root on the router; tests run unprivileged and reach the trust anchors only through the
 //! `VIGIE_TEST=1` hooks, which production ignores.
 
+mod common;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -213,6 +214,7 @@ fn watchdog(log: &Path, max: &str, signal: &str) -> Output {
         .env("VIGIE_LOG_FILE", log)
         .env("VIGIE_LOG_MAX_BYTES", max)
         .env("VIGIE_SIGNAL_CMD", signal)
+        .envs(common::fake_dnsmasq_env())
         .output()
         .unwrap()
 }

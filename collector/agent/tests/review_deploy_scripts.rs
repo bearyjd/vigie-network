@@ -3,6 +3,7 @@
 //! `root:vigie` in production) is overridden through env hooks that an attacker cannot reach
 //! (cron/procd start the scripts with a clean environment).
 
+mod common;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ fn sh(name: &str, args: &[&str], envs: &[(&str, String)]) -> Output {
         .env("VIGIE_TRUSTED_UID", uid.to_string())
         .env("VIGIE_OWNER", format!("{uid}:{gid}"))
         .env("VIGIE_LOG_ALLOWED_UIDS", uid.to_string());
+    c.envs(common::fake_dnsmasq_env());
     for (k, v) in envs {
         c.env(k, v);
     }
@@ -273,13 +275,7 @@ fn watchdog_refuses_untrusted_directory_and_foreign_owned_log() {
     let o = watchdog(&log, "1", &[("VIGIE_TRUSTED_UID", (uid + 1).to_string())]);
     assert!(!o.status.success());
     assert_eq!(fs::metadata(&log).unwrap().len(), 100);
-    let o = watchdog(
-        &log,
-        "1",
-        &[("VIGIE_LOG_ALLOWED_UIDS", (uid + 1).to_string())],
-    );
-    assert!(!o.status.success(), "log owned by a non-allowed uid");
-    assert_eq!(fs::metadata(&log).unwrap().len(), 100);
+    // A log owned by a non-allowed uid is covered in review4_deploy.rs (stat stub).
     let o = watchdog(&log, "1", &[]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(
@@ -297,6 +293,7 @@ fn all_scripts_parse() {
         "vigie-dnsmasq-dropin.sh",
         "vigie-log-watchdog.sh",
         "vigie-lib.sh",
+        "vigie-run.sh",
         "vigie-collector.init",
         "vigie-print-install-commands.sh",
     ] {
