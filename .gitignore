@@ -19,3 +19,5 @@ collector-*/
 certs*/
 pins.txt
 *.secret
+.claude/
+.ignore
