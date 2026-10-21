@@ -232,3 +232,26 @@ fn urls_without_https_or_with_userinfo_cannot_become_a_transport() {
         );
     }
 }
+
+#[test]
+fn absurd_content_lengths_are_refused_without_panicking() {
+    // usize::MAX overflows `body_start + content_length` (debug panic); usize::MAX - 3 wraps past
+    // the cap in release and used to slice-panic (panic=abort kills the agent).
+    for declared in [
+        usize::MAX.to_string(),
+        (usize::MAX - 3).to_string(),
+        (usize::MAX - 100).to_string(),
+        (CAP + 1).to_string(),
+        "18446744073709551616".to_string(), // does not fit u64
+    ] {
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n{{}}");
+        let script: Script = Box::new(move |c| {
+            let _ = c.write_all(raw.as_bytes());
+            let _ = c.flush();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let (r, _, took) = post_with(script, Duration::from_secs(5), b"{}");
+        assert!(r.is_err(), "Content-Length {declared} accepted");
+        assert!(took < Duration::from_secs(2), "{declared}: {took:?}");
+    }
+}

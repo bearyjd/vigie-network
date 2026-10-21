@@ -170,10 +170,11 @@ fn read_reply<R: Read>(r: &mut R) -> Result<HttpReply, String> {
             }
         }
         if let Some(h) = &head {
-            let total = h.body_start + h.content_length;
-            if total > MAX_RESPONSE_BYTES {
-                return Err("response exceeds 64 KiB".into());
-            }
+            let total = h
+                .body_start
+                .checked_add(h.content_length)
+                .filter(|t| *t <= MAX_RESPONSE_BYTES)
+                .ok_or("response exceeds 64 KiB")?;
             if buf.len() >= total {
                 return Ok(HttpReply {
                     status: h.status,
@@ -213,11 +214,13 @@ fn parse_head(raw: &[u8], body_start: usize) -> Result<Head, String> {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err("invalid Content-Length".into());
                 }
-                content_length = Some(
-                    value
-                        .parse::<usize>()
-                        .map_err(|_| "invalid Content-Length")?,
-                );
+                let n = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Content-Length")?;
+                if n > MAX_RESPONSE_BYTES {
+                    return Err("Content-Length exceeds 64 KiB".into());
+                }
+                content_length = Some(n);
             }
             "date" if date.is_none() => date = parse_imf_fixdate(value),
             _ => {}
