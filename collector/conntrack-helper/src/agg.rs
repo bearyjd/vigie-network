@@ -1098,6 +1098,8 @@ mod tests {
             "tracked flows are counted exactly"
         );
         assert_eq!(a.tracked(), 100);
+        let s = a.ingest(&[]);
+        assert_eq!(s.dropped_new_keys, 0, "per sample");
     }
 
     #[test]
@@ -1114,6 +1116,37 @@ mod tests {
         let s = a.finish();
         assert_eq!(s.dropped_new_keys, 0);
         assert!(!s.table_pressure);
+    }
+
+    #[test]
+    fn a_long_gone_tombstone_evicted_flow_is_not_flagged_when_it_returns() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 3,
+            max_stubs: 10,
+            stub_ttl_samples: 2,
+            ..cfg(true)
+        });
+        let f = |p: u16| flow("10.0.0.1", "1.1.1.1", p, 443, 1000, 1000);
+        a.ingest(&[f(1), f(2), f(3)]);
+        a.ingest(&[f(1), f(2), f(4)]); // flow 3 evicted as a tombstone
+        a.ingest(&[f(1), f(2), f(4)]);
+        a.ingest(&[f(1), f(2), f(4)]);
+        let s = a.ingest(&[f(1), f(2), f(3), f(4)]);
+        assert!(!s.table_pressure && s.recounted_flows == 0);
+    }
+
+    #[test]
+    fn memory_of_evicted_tombstones_is_bounded_by_max_stubs() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 2,
+            max_stubs: 1,
+            ..cfg(true)
+        });
+        let f = |p: u16| flow("10.0.0.1", "1.1.1.1", p, 443, 1000, 1000);
+        a.ingest(&[f(1), f(2)]);
+        a.ingest(&[f(3), f(4)]); // f1 and f2 are tombstones and both get evicted
+        let s = a.ingest(&[f(1), f(2), f(3), f(4)]);
+        assert!(s.recounted_flows <= 1, "{}", s.recounted_flows);
     }
 
     #[test]
