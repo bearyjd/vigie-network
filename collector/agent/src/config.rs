@@ -4,9 +4,9 @@
 //! `pin2` must not silently disable a pin). The key file must be a regular file (no symlink),
 //! owned by the running user, with no group/other permissions (mode 0600 or 0400).
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const MAX_KEY_FILE_BYTES: usize = 1024;
@@ -47,6 +47,8 @@ pub enum KeyError {
     NotRegularFile,
     BadMode(u32),
     WrongOwner,
+    BadDirMode(u32),
+    WrongDirOwner,
     TooShort,
     TooLarge,
     NotHex,
@@ -64,6 +66,13 @@ impl std::fmt::Display for KeyError {
                 "key file mode {m:o} grants group/other access; need 0600"
             ),
             Self::WrongOwner => f.write_str("key file is not owned by the collector user"),
+            Self::BadDirMode(m) => write!(
+                f,
+                "key directory mode {m:o} is writable by group/other (or not private)"
+            ),
+            Self::WrongDirOwner => {
+                f.write_str("key directory is not owned by root or the collector")
+            }
             Self::TooShort => write!(f, "key shorter than {MIN_KEY_BYTES} bytes"),
             Self::TooLarge => write!(f, "key file larger than {MAX_KEY_FILE_BYTES} bytes"),
             Self::NotHex => f.write_str("key file must hold hex text"),
@@ -180,6 +189,29 @@ pub fn check_key_meta(mode: u32, file_uid: u32, euid: u32, regular: bool) -> Res
     Ok(())
 }
 
+/// The directory holding the key must be a real directory that only root or the agent can
+/// change: no group/other write bit (a sticky /tmp-style directory does not count as private).
+/// `mode` is the raw st_mode.
+pub fn check_dir_meta(mode: u32, uid: u32, euid: u32, is_dir: bool) -> Result<(), KeyError> {
+    if !is_dir {
+        return Err(KeyError::NotRegularFile);
+    }
+    if mode & 0o022 != 0 {
+        return Err(KeyError::BadDirMode(mode & 0o7777));
+    }
+    if uid != 0 && uid != euid {
+        return Err(KeyError::WrongDirOwner);
+    }
+    Ok(())
+}
+
+/// Overwrite secret bytes in place. `black_box` keeps the optimizer from treating the stores as
+/// dead; without `unsafe` (volatile writes) this is best effort, not a guarantee.
+pub fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    std::hint::black_box(&*buf);
+}
+
 /// Hex text (whitespace around it ignored) of at least 32 bytes.
 pub fn parse_key_hex(text: &str) -> Result<Vec<u8>, KeyError> {
     if text.len() > MAX_KEY_FILE_BYTES {
@@ -211,18 +243,55 @@ fn current_euid() -> Result<u32, KeyError> {
         .ok_or_else(|| KeyError::Io("cannot determine effective uid".into()))
 }
 
+/// `O_NOFOLLOW` per architecture (std exposes no constant and the agent has no libc dependency).
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+))]
+const O_NOFOLLOW: i32 = 0x8000;
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+)))]
+const O_NOFOLLOW: i32 = 0x20000;
+
+/// Reads the key. Every check runs on the opened descriptor (no check-then-open race): the open
+/// refuses a symlink, then `fstat` gives type, mode and owner of the file actually read. The
+/// parent directory must not be writable by group/other.
 pub fn load_key(path: &Path) -> Result<Vec<u8>, KeyError> {
-    let link_meta = fs::symlink_metadata(path).map_err(|e| KeyError::Io(e.to_string()))?;
+    let io = |e: std::io::Error| KeyError::Io(e.to_string());
     let euid = current_euid()?;
-    check_key_meta(
-        link_meta.mode(),
-        link_meta.uid(),
-        euid,
-        link_meta.file_type().is_file(),
-    )?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = fs::symlink_metadata(parent).map_err(io)?;
+    check_dir_meta(dir.mode(), dir.uid(), euid, dir.file_type().is_dir())?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        // ELOOP (40 on Linux) is what O_NOFOLLOW reports for a symlink.
+        .map_err(|e| match e.raw_os_error() {
+            Some(40) => KeyError::NotRegularFile,
+            _ => io(e),
+        })?;
+    let meta = file.metadata().map_err(io)?;
+    check_key_meta(meta.mode(), meta.uid(), euid, meta.file_type().is_file())?;
     let mut buf = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(MAX_KEY_FILE_BYTES as u64 + 1).read_to_end(&mut buf))
-        .map_err(|e| KeyError::Io(e.to_string()))?;
-    parse_key_hex(&String::from_utf8(buf).map_err(|_| KeyError::NotHex)?)
+    let read = file
+        .take(MAX_KEY_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf);
+    let parsed = read
+        .map_err(io)
+        .and_then(|_| std::str::from_utf8(&buf).map_err(|_| KeyError::NotHex))
+        .and_then(parse_key_hex);
+    wipe(&mut buf);
+    parsed
 }

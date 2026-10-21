@@ -123,6 +123,7 @@ fn tmpdir() -> PathBuf {
 #[test]
 fn load_key_checks_the_real_file() {
     let d = tmpdir();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap(); // not umask-dependent
     let k = d.join("key");
     fs::write(&k, format!("{}\n", "ab".repeat(32))).unwrap();
     fs::set_permissions(&k, fs::Permissions::from_mode(0o644)).unwrap();

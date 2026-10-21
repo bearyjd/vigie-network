@@ -69,6 +69,13 @@ pub enum Tick {
     Retry { status: Option<u16>, delay_s: u64 },
 }
 
+/// Wipes the HMAC key when the engine goes away.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        crate::config::wipe(&mut self.key);
+    }
+}
+
 pub struct Engine {
     pub spool: Spool,
     pub backoff: Backoff,

@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
-use vigie_agent::config::{load_key, parse_config, Config};
+use vigie_agent::config::{load_key, parse_config, wipe, Config};
 use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
 use vigie_agent::dropin::{check_dropin, QuietDetector, DROPIN_PATH, LOG_DIR};
 use vigie_agent::ids;
@@ -249,7 +249,7 @@ fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let (cfg, key) = match load(&args) {
+    let (cfg, mut key) = match load(&args) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("vigie-collector: {e}");
@@ -257,6 +257,7 @@ fn main() -> ExitCode {
         }
     };
     if args.check_only {
+        wipe(&mut key);
         println!("config and key ok");
         return ExitCode::SUCCESS;
     }
