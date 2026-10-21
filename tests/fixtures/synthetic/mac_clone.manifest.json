@@ -1,0 +1,258 @@
+{
+ "seed": 1,
+ "profile": "mac_clone",
+ "start": 1791990000,
+ "window_s": 60,
+ "windows": 6,
+ "collector_id": "rtr-1",
+ "key_id": "k1",
+ "boot_id": "boot-a",
+ "roll_interval_s": null,
+ "devices": [
+  {
+   "device_id": "dev-01",
+   "true_type": "phone_ios",
+   "role": "benign",
+   "hostname": "Daves-iPhone",
+   "mdns_name": "Daves iPhone",
+   "opt55": [
+    1,
+    121,
+    3,
+    6,
+    15,
+    119,
+    252
+   ],
+   "opt60": null,
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "aa:76:7d:f6:4b:ab",
+     "ip": "192.168.8.100",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-02",
+   "true_type": "phone_android",
+   "role": "benign",
+   "hostname": "Pixel-9",
+   "mdns_name": "Pixel 9",
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    26,
+    28,
+    51,
+    58,
+    59,
+    43
+   ],
+   "opt60": "android-dhcp-14",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "7e:56:b8:45:35:d1",
+     "ip": "192.168.8.101",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-03",
+   "true_type": "smart_tv",
+   "role": "benign",
+   "hostname": "LivingRoom-TV-A7FC",
+   "mdns_name": "Living Room TV",
+   "opt55": [
+    1,
+    3,
+    6,
+    12,
+    15,
+    28,
+    42
+   ],
+   "opt60": "udhcp 1.30.1",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "24:0e:61:42:b6:81",
+     "ip": "192.168.8.102",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-04",
+   "true_type": "ip_camera",
+   "role": "benign",
+   "hostname": "ipcam-25FB",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    12,
+    15,
+    28
+   ],
+   "opt60": "udhcp 1.19.4",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "48:e5:50:67:27:2a",
+     "ip": "192.168.8.103",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-05",
+   "true_type": "thermostat",
+   "role": "benign",
+   "hostname": "thermostat-DC3B",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    15
+   ],
+   "opt60": "udhcpc 1.22.1",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "8c:ce:bc:b2:d0:b5",
+     "ip": "192.168.8.104",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-06",
+   "true_type": "laptop",
+   "role": "benign",
+   "hostname": "DESKTOP-5A69",
+   "mdns_name": "desktop-5A69",
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    31,
+    33,
+    43,
+    44,
+    46,
+    47,
+    119,
+    121,
+    249,
+    252
+   ],
+   "opt60": "MSFT 5.0",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "28:b2:0f:3c:fb:c0",
+     "ip": "192.168.8.105",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-07",
+   "true_type": "game_console",
+   "role": "benign",
+   "hostname": "PS5-EABA",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    28,
+    33
+   ],
+   "opt60": "dhcpcd-5.5.6",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "08:a1:e1:41:b0:18",
+     "ip": "192.168.8.106",
+     "from_ts": 1791990000,
+     "to_ts": 1791990360
+    }
+   ]
+  },
+  {
+   "device_id": "dev-08",
+   "true_type": "laptop",
+   "role": "attacker",
+   "hostname": "DESKTOP-ECBA",
+   "mdns_name": "desktop-ECBA",
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    31,
+    33,
+    43,
+    44,
+    46,
+    47,
+    119,
+    121,
+    249,
+    252
+   ],
+   "opt60": "MSFT 5.0",
+   "impersonates": "dev-04",
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "48:e5:50:67:27:2a",
+     "ip": "192.168.8.108",
+     "from_ts": 1791990180,
+     "to_ts": 1791990360
+    }
+   ]
+  }
+ ],
+ "anomalies": [
+  {
+   "kind": "mac_clone",
+   "mac": "48:e5:50:67:27:2a",
+   "attacker": "dev-08",
+   "victim": "dev-04",
+   "from_ts": 1791990180
+  }
+ ]
+}
