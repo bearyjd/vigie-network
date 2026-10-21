@@ -1,5 +1,6 @@
 """vigie-api: the app principal's HTTP surface (PRP section 6)."""
 
+import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -26,6 +27,7 @@ SuggestionState = Literal["pending", "accepted", "rejected", "expired"]
 DeviceId = Annotated[str, Path(min_length=1, max_length=64)]
 Limit = Annotated[int, Query(ge=1, le=500)]
 VERSION = "0.1.0"
+LOG = logging.getLogger("vigie_api")
 
 
 class DevicePatch(BaseModel):
@@ -79,6 +81,11 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
         code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "error")
         return JSONResponse(error_envelope(code, str(exc.detail)), status_code=exc.status_code)
+
+    @app.exception_handler(sqlite3.Error)
+    async def _storage_error(request: Request, exc: sqlite3.Error) -> JSONResponse:
+        LOG.error("storage error on %s %s: %r", request.method, request.url.path, exc)
+        return JSONResponse(error_envelope("internal_error", "internal error"), status_code=500)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:

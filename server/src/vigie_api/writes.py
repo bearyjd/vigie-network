@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from typing import Any
@@ -13,17 +14,21 @@ from vigie_api.errors import ApiError
 FIELDS = ("name", "owner", "type", "group_id")
 
 
+_IF_MATCH_RE = re.compile(r'(?:"([0-9]{1,12})"|([0-9]{1,12}))')
+
+
 def parse_if_match(header: str | None) -> int:
-    """`If-Match: "<n>"` (quotes and W/ optional). Required: 428 when absent."""
+    """`If-Match: "<n>"` or bare `<n>` (RFC 9110 strong tag). Required: 428 when absent.
+
+    Weak tags (`W/`), lists, `*` and malformed quoting are rejected: a weak validator must never
+    satisfy a write precondition.
+    """
     if header is None or not header.strip():
         raise ApiError(428, "precondition_required", "If-Match (override version) is required")
-    text = header.strip()
-    if text.startswith("W/"):
-        text = text[2:]
-    text = text.strip('"')
-    if not text.isdigit() or len(text) > 12:
-        raise ApiError(400, "invalid_if_match", "If-Match must be an override version number")
-    return int(text)
+    match = _IF_MATCH_RE.fullmatch(header)
+    if match is None:
+        raise ApiError(400, "invalid_if_match", "If-Match must be one override version number")
+    return int(match.group(1) or match.group(2))
 
 
 def etag(version: int) -> str:
@@ -64,10 +69,11 @@ def patch_override(
     now_iso: str,
 ) -> dict[str, Any]:
     """Apply `changes` (None clears a field) iff the override version still matches."""
-    _check_target(inv, ov, device_id)
-    _validate(ov, changes)
     ov.execute("BEGIN IMMEDIATE")
     try:
+        # inside the write lock: a merge or group change cannot land between check and write
+        _check_target(inv, ov, device_id)
+        _validate(ov, changes)
         current = _current_version(ov, device_id)
         if current != expected_version:
             raise ApiError(

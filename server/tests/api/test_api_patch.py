@@ -37,7 +37,7 @@ def test_first_patch_creates_override_version_1_and_bumps_after(env: Env) -> Non
     assert env.get("/devices/d1").headers["etag"] == '"2"'
 
 
-@pytest.mark.parametrize("header", ["1", '"1"', 'W/"1"'])
+@pytest.mark.parametrize("header", ["1", '"1"'])
 def test_if_match_forms_accepted(env: Env, header: str) -> None:
     env.device("d1")
     env.patch("/devices/d1", {"name": "A"}, "0")
