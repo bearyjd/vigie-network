@@ -6,12 +6,16 @@ overrides.db is read-write for this process only. inventory.db is opened read-on
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
+import stat
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import quote
 
 BUSY_TIMEOUT_MS = 5000
+LOG = logging.getLogger("vigie_api")
 
 # Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
 OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
@@ -70,6 +74,17 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "INSERT INTO groups (id, name, auto_inherit) VALUES ('guest', 'Guest', 1)",
         "INSERT INTO groups (id, name, auto_inherit) VALUES ('quarantine', 'Quarantine', 0)",
     ),
+    (
+        # revoked: NOT NULL DEFAULT 0. A legacy NULL (never written by this code) fails closed.
+        """CREATE TABLE api_tokens_new (
+          id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, scope TEXT NOT NULL,
+          revoked INTEGER NOT NULL DEFAULT 0
+        )""",
+        "INSERT INTO api_tokens_new SELECT id, token_hash, scope,"
+        " CASE WHEN revoked IS NULL THEN 1 ELSE revoked END FROM api_tokens",
+        "DROP TABLE api_tokens",
+        "ALTER TABLE api_tokens_new RENAME TO api_tokens",
+    ),
 )
 
 
@@ -92,8 +107,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _secure_file(path: Path) -> None:
+    """Create the file 0600 up front (WAL/SHM siblings inherit its mode) and tighten an old one."""
+    os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        try:
+            path.chmod(0o600)
+        except OSError as exc:
+            LOG.warning("cannot restrict %s to 0600: %s", path, exc)
+
+
 def open_overrides(path: Path) -> sqlite3.Connection:
-    """Open (creating and migrating if needed) the read-write overrides.db."""
+    """Open (creating and migrating if needed) the read-write overrides.db (mode 0600)."""
+    _secure_file(path)
     conn = sqlite3.connect(
         path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None, check_same_thread=False
     )

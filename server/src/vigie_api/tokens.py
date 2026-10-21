@@ -7,6 +7,7 @@ import hmac
 import re
 import secrets
 import sqlite3
+import uuid
 from dataclasses import dataclass
 
 SCOPE_APP = "app"
@@ -57,6 +58,16 @@ def verify_token(conn: sqlite3.Connection, presented: str) -> Principal | None:
         ).fetchone()
     stored = row["token_hash"] if row else _DUMMY_HASH
     equal = hmac.compare_digest(stored.encode(), _hash(presented).encode())
-    if row is None or not equal or row["revoked"] or row["scope"] != SCOPE_APP:
+    if row is None or not equal or row["revoked"] != 0 or row["scope"] != SCOPE_APP:
         return None
     return Principal(token_id=row["id"], scope=row["scope"])
+
+
+def audit(
+    conn: sqlite3.Connection, principal: str, action: str, token_id: str, now_iso: str
+) -> None:
+    """Record a token lifecycle event. Never carries token material, only the id."""
+    conn.execute(
+        "INSERT INTO audit_log (id, ts, principal, action, target) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), now_iso, principal, action, token_id),
+    )

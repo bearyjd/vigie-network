@@ -9,6 +9,7 @@ import argparse
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import uvicorn
@@ -17,9 +18,11 @@ from vigie_api import tokens
 from vigie_api.app import create_app
 from vigie_api.config import Settings
 from vigie_api.schema import open_overrides
+from vigie_ingest.db import iso_utc
 
 DEFAULT_LIMIT_CONCURRENCY = 64
 DEFAULT_KEEPALIVE_S = 5
+CLI_PRINCIPAL = "cli"
 
 
 def _serve_parser() -> argparse.ArgumentParser:
@@ -52,9 +55,13 @@ def _tokens_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args_list = sys.argv[1:] if argv is None else argv
-    if args_list[:1] == ["tokens"]:
-        return _tokens_main(args_list[1:])
-    return _serve_main(args_list)
+    previous = os.umask(0o077)  # everything this process creates (overrides.db + WAL) is private
+    try:
+        if args_list[:1] == ["tokens"]:
+            return _tokens_main(args_list[1:])
+        return _serve_main(args_list)
+    finally:
+        os.umask(previous)
 
 
 def _serve_main(argv: list[str]) -> int:
@@ -85,23 +92,49 @@ def _tokens_main(argv: list[str]) -> int:
     conn = open_overrides(data_dir / "overrides.db")
     try:
         if args.command == "create":
-            try:
-                token_id, token = tokens.create_token(conn, args.token_id)
-            except ValueError as exc:
-                print(f"vigie-api: {exc}", file=sys.stderr)
-                return 2
-            except sqlite3.IntegrityError:
-                print("vigie-api: a token with that id already exists", file=sys.stderr)
-                return 2
-            print(f"token id: {token_id}", file=sys.stderr)
-            print(token)
-            return 0
-        if not tokens.revoke_token(conn, args.token_id):
-            print("vigie-api: no such token id", file=sys.stderr)
-            return 1
-        return 0
+            return _create_token(conn, args.token_id)
+        return _revoke_token(conn, args.token_id)
     finally:
         conn.close()
+
+
+def _create_token(conn: sqlite3.Connection, label: str | None) -> int:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        token_id, token = tokens.create_token(conn, label)
+        tokens.audit(conn, CLI_PRINCIPAL, "token.create", token_id, iso_utc(time.time()))
+        conn.execute("COMMIT")
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        conn.execute("ROLLBACK")
+        reason = (
+            "a token with that id already exists"
+            if isinstance(exc, sqlite3.IntegrityError)
+            else str(exc)
+        )
+        print(f"vigie-api: {reason}", file=sys.stderr)
+        return 2
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    print(f"token id: {token_id}", file=sys.stderr)
+    print(token)
+    return 0
+
+
+def _revoke_token(conn: sqlite3.Connection, token_id: str) -> int:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        revoked = tokens.revoke_token(conn, token_id)
+        if revoked:
+            tokens.audit(conn, CLI_PRINCIPAL, "token.revoke", token_id, iso_utc(time.time()))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    if not revoked:
+        print("vigie-api: no such token id", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _refuse(reason: str) -> int:
