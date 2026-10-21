@@ -110,9 +110,16 @@ fn response_without_content_length_is_refused() {
 
 #[test]
 fn oversized_responses_are_refused() {
-    // Declared too big: refused without reading it all.
+    // Declared too big: refused as soon as the head is read, not after the deadline.
     let declared = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", CAP + 1);
-    assert!(post(respond(declared.into_bytes())).is_err());
+    let script: Script = Box::new(move |c| {
+        let _ = c.write_all(declared.as_bytes());
+        let _ = c.flush();
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    let (r, _, took) = post_with(script, Duration::from_secs(10), b"{}");
+    assert!(r.is_err());
+    assert!(took < Duration::from_secs(2), "{took:?}");
 
     // Honest length, just over the cap in total (headers count).
     let body = vec![b'x'; CAP];
