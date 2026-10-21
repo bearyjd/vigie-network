@@ -9,6 +9,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from vigie_ingest.keeper import Keeper
 from vigie_pipeline.config import TRANSIENT_WINDOW_DEFAULT_S, PipelineConfig
 from vigie_pipeline.logs import configure_logging, log
 from vigie_pipeline.processor import run_once
@@ -69,8 +70,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             log(logger, logging.ERROR, "run_failed", error=str(exc))
             return 1
         return 0
+    held = Keeper()
     try:
         while True:
+            # Keep inventory.db attached for the api's read-only mount; retried every tick until
+            # ingest has created the file (never created from here).
+            held.hold(config.inventory_path)
             try:
                 run_once(config)
             except (sqlite3.Error, ShardReadError) as exc:  # log, retry next tick
@@ -79,3 +84,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         log(logger, logging.INFO, "stopped")
         return 0
+    finally:
+        held.close()

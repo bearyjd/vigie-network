@@ -29,6 +29,7 @@ from vigie_ingest.db import (
     shard_name,
     utc_day,
 )
+from vigie_ingest.keeper import hold_active
 from vigie_ingest.models import Batch
 
 Rejection = Literal["duplicate", "bad_ts", "seq_regression"]
@@ -174,6 +175,7 @@ def _after_shard_commit() -> None:
 
 def _write_shard(data_dir: Path, day: date, tables: ShardRows, batch: Batch) -> None:
     ensure_shard(data_dir, day, LOCKED_BUSY_TIMEOUT_MS)
+    hold_active(data_dir / shard_name(day))  # keeps -wal/-shm for the pipeline's read-only mount
     conn = _connect_locked(data_dir / shard_name(day))
     try:
         with immediate(conn):

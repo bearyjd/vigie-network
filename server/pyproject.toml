@@ -48,5 +48,6 @@ select = ["E", "F", "I", "B", "UP", "S"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106"]
+"tests/ro_wal_harness.py" = ["S603", "S101"]  # runs bubblewrap and our own interpreter
 "tests/api/*" = ["S101", "S105", "S106", "F811"]
 "tests/pipeline/*" = ["S101", "S105", "S106", "F811"]  # the `data` fixture is imported

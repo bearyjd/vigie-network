@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 from ro_wal_harness import bwrap_usable, read_ro, start_writer
 
-pytestmark = pytest.mark.skipif(not bwrap_usable(), reason="bubblewrap read-only mounts unavailable")
+pytestmark = pytest.mark.skipif(
+    not bwrap_usable(), reason="bubblewrap read-only mounts unavailable"
+)
 
 
 def test_reader_works_while_a_writer_holds_a_connection(tmp_path: Path) -> None:
@@ -36,7 +38,9 @@ def test_reader_fails_closed_after_a_clean_close(tmp_path: Path) -> None:
     assert not (tmp_path / "x.db-shm").exists()  # a clean close removes the sidecars
     result = read_ro(db)
     assert result["ok"] == 0 and result["errors"] == 1
-    assert "unable to open" in str(result["first_error"]) or "readonly" in str(result["first_error"])
+    assert "unable to open" in str(result["first_error"]) or "readonly" in str(
+        result["first_error"]
+    )
 
 
 def test_reader_after_a_killed_writer_is_recorded(tmp_path: Path) -> None:
@@ -78,3 +82,45 @@ def test_plain_chmod_directory_is_not_a_read_only_mount(tmp_path: Path) -> None:
         tmp_path.chmod(0o700)
         writer.kill()
         writer.wait()
+
+
+_PIPELINE_READER = """
+import sys
+sys.path.insert(0, sys.argv[2])
+from pathlib import Path
+from vigie_pipeline.overrides import open_overrides_ro
+print("CONNECTED" if open_overrides_ro(Path(sys.argv[1])) is not None else "NO-LINKS")
+"""
+
+
+def _open_overrides_ro_from_ro_mount(db: Path) -> str:
+    import shutil
+    import subprocess
+    import sys
+
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    cmd = [
+        shutil.which("bwrap") or "bwrap",
+        "--ro-bind", "/", "/",
+        "--ro-bind", str(db.parent), str(db.parent),
+        "--dev", "/dev", "--proc", "/proc",
+        sys.executable, "-I", "-c", _PIPELINE_READER, str(db), src,
+    ]  # fmt: skip
+    done = subprocess.run(cmd, capture_output=True, text=True, check=True)  # noqa: S603
+    return done.stdout.strip()
+
+
+def test_pipeline_reader_with_a_keeper_connects_and_without_one_trusts_nothing(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "overrides.db"
+    writer = start_writer(db, "hold")
+    try:
+        assert _open_overrides_ro_from_ro_mount(db) == "CONNECTED"
+    finally:
+        writer.kill()
+        writer.wait()
+    clean = tmp_path / "clean" / "overrides.db"
+    clean.parent.mkdir()
+    start_writer(clean, "close").wait(timeout=10)
+    assert _open_overrides_ro_from_ro_mount(clean) == "NO-LINKS"

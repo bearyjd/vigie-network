@@ -9,6 +9,7 @@ from pathlib import Path
 
 from vigie_ingest.config import SHARD_RETENTION_MAX_DAYS, Settings
 from vigie_ingest.db import SHARD_LOCK, SHARD_RE, iso_utc, open_inventory
+from vigie_ingest.keeper import release_active
 
 log = logging.getLogger("vigie.ingest.retention")
 _SIDECARS = ("-wal", "-shm")
@@ -39,6 +40,7 @@ def _unlink_old(data_dir: Path, cutoff: date, removed: list[str]) -> None:
         except ValueError:
             continue
         if day < cutoff:
+            release_active(entry)  # close our keeper connection before the file goes
             entry.unlink()
             for suffix in _SIDECARS:
                 Path(f"{entry}{suffix}").unlink(missing_ok=True)

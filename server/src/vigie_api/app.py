@@ -1,9 +1,10 @@
 """vigie-api: the app principal's HTTP surface (PRP section 6)."""
 
+import contextlib
 import logging
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
@@ -34,6 +35,7 @@ from vigie_api.models import (
 from vigie_api.ratelimit import FailureLimiter
 from vigie_api.schema import open_inventory_ro, open_overrides
 from vigie_ingest.db import iso_utc
+from vigie_ingest.keeper import Keeper
 from vigie_ingest.ratelimit import RateLimiter
 
 DeviceId = Annotated[str, Path(min_length=1, max_length=64)]
@@ -76,7 +78,17 @@ def _bearer(authorization: str | None) -> str:
 
 
 def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> FastAPI:
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        held = Keeper()  # keeps overrides.db's -wal/-shm so the pipeline's read-only mount works
+        held.hold(settings.overrides_path)
+        try:
+            yield
+        finally:
+            held.close()
+
     app = FastAPI(
+        lifespan=lifespan,
         title="Vigie API",
         version=VERSION,
         summary="App-principal API for the Vigie network device inventory.",
