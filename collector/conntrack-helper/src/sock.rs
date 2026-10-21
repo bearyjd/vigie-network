@@ -126,6 +126,8 @@ pub enum Step {
     Bound,
     /// Identity re-checked; the next call is the chmod.
     BeforeChmod,
+    /// chmod done; the identity re-check guarding the lchown comes next.
+    AfterChmod,
     /// Identity re-checked; the next call is the lchown.
     BeforeChown,
     /// Staged socket verified; the identity re-check guarding the rename comes next.
@@ -175,6 +177,7 @@ fn stage_and_install(
     recheck_same(&staged, id)?;
     hook(Step::BeforeChmod, &staged);
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+    hook(Step::AfterChmod, &staged);
     if uid.is_some() || gid.is_some() {
         recheck_same(&staged, id)?;
         hook(Step::BeforeChown, &staged);
@@ -424,6 +427,29 @@ mod tests {
         current_ids().unwrap().0 == 0
     }
 
+    /// `VIGIE_ROOT_TESTS=1 sudo -E cargo test -p vigie-conntrack`: the privileged lane, where a
+    /// test that cannot run FAILS instead of skipping.
+    fn root_lane() -> bool {
+        std::env::var("VIGIE_ROOT_TESTS").is_ok_and(|v| v == "1")
+    }
+
+    /// Non-root fallback for tests that need to chown: skip loudly, or fail in the root lane.
+    fn skip_chown_test(what: &str) {
+        assert!(!is_root(), "root must always be able to chown");
+        assert!(
+            !root_lane(),
+            "VIGIE_ROOT_TESTS=1 but {what} cannot run: not root (run the suite as root)"
+        );
+        eprintln!("SKIPPED {what}: not root and no usable supplementary group");
+    }
+
+    #[test]
+    fn root_lane_runs_as_root() {
+        if root_lane() {
+            assert!(is_root(), "VIGIE_ROOT_TESTS=1 requires root (uid 0)");
+        }
+    }
+
     /// A gid different from `uid` we can chown to: any gid as root, otherwise a supplementary
     /// group of this user. None (non-root only) means the caller must skip, loudly.
     fn distinct_gid(uid: u32) -> Option<u32> {
@@ -449,7 +475,7 @@ mod tests {
         assert!(check_dir_for(&d, &[uid + 1]).is_err());
         assert!(check_dir_for(&d, &[]).is_err());
         let Some(g) = distinct_gid(uid) else {
-            eprintln!("SKIPPED uid!=gid owner check: no group distinct from the uid is usable");
+            skip_chown_test("uid!=gid owner check");
             return;
         };
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
@@ -507,8 +533,7 @@ mod tests {
     fn bind_chowns_socket_to_requested_group() {
         let (uid, _) = current_ids().unwrap();
         let Some(other) = distinct_gid(uid) else {
-            assert!(!is_root(), "root must always be able to chown");
-            eprintln!("SKIPPED chown test: not root and no usable supplementary group");
+            skip_chown_test("chown test");
             return;
         };
         let d = tmpdir("chown");
@@ -555,8 +580,7 @@ mod tests {
     fn symlink_swapped_in_before_lchown_is_never_followed() {
         let (uid, _) = current_ids().unwrap();
         let Some(other) = distinct_gid(uid) else {
-            assert!(!is_root(), "root must always be able to chown");
-            eprintln!("SKIPPED lchown swap test: not root and no usable supplementary group");
+            skip_chown_test("lchown swap test");
             return;
         };
         let d = tmpdir("swapchown");
@@ -599,8 +623,10 @@ mod tests {
         let d = tmpdir("swapinstall");
         let (uid, _) = current_ids().unwrap();
         let mut imposter = None;
+        let mut seen = Vec::new();
         let sock = d.join("c.sock");
         let e = bind_secure_with(&sock, None, None, &[uid], &mut |st, staged| {
+            seen.push(st);
             if st == Step::BeforeInstall {
                 imposter = Some(swap_in_socket(staged));
             }
@@ -609,9 +635,36 @@ mod tests {
         assert!(imposter.is_some(), "hook never ran");
         assert!(e.to_string().contains("replaced"), "{e}");
         assert!(
+            !seen.contains(&Step::BeforeRename),
+            "the pre-install re-check must stop it before the rename: {seen:?}"
+        );
+        assert!(
             fs::symlink_metadata(&sock).is_err(),
             "imposter was installed"
         );
+    }
+
+    #[test]
+    fn socket_replaced_before_chown_is_refused_before_the_lchown() {
+        let d = tmpdir("swappre");
+        let (uid, _) = current_ids().unwrap();
+        let mut imposter = None;
+        let mut seen = Vec::new();
+        // our own uid: lchown(uid, none) is permitted without privileges, so the branch runs
+        let e = bind_secure_with(&d.join("c.sock"), Some(uid), None, &[uid], &mut |st, p| {
+            seen.push(st);
+            if st == Step::AfterChmod {
+                imposter = Some(swap_in_socket(p));
+            }
+        })
+        .unwrap_err();
+        assert!(imposter.is_some(), "hook never ran");
+        assert!(e.to_string().contains("replaced"), "{e}");
+        assert!(
+            !seen.contains(&Step::BeforeChown),
+            "the pre-chown re-check must stop it before the lchown: {seen:?}"
+        );
+        assert!(fs::symlink_metadata(d.join("c.sock")).is_err());
     }
 
     #[test]

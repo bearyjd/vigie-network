@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vigie_conntrack::agg::{AggConfig, Aggregator, Snapshot};
-use vigie_conntrack::cli::{parse_args, Opts, USAGE};
+use vigie_conntrack::cli::{check_root_needs_uid, parse_args, Opts, USAGE};
 use vigie_conntrack::json::{snapshot_json, Meta};
 use vigie_conntrack::lan::default_lan;
 use vigie_conntrack::limits::{recheck_due, recheck_pressure, resolve_max_flows, stub_cap, CtMax};
@@ -89,13 +89,7 @@ fn check_table_limit(opts: &Opts) -> Result<(usize, bool), String> {
 
 fn run_daemon(opts: &Opts) -> Result<(), String> {
     let (euid, _) = current_ids().map_err(|e| format!("cannot determine own uid: {e}"))?;
-    if euid == 0 && opts.uid.is_none() {
-        return Err(
-            "running as root requires --uid (and --gid) of the unprivileged agent, \
-                    otherwise the agent could not connect to the socket"
-                .to_string(),
-        );
-    }
+    check_root_needs_uid(euid, opts.uid)?;
     let (max_flows, mut pressure) = check_table_limit(opts)?;
     let listener = bind_secure(&opts.socket, opts.uid, opts.gid)
         .map_err(|e| format!("socket {}: {e}", opts.socket.display()))?;

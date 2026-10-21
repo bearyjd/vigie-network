@@ -136,6 +136,18 @@ fn check_uid(o: &Opts) -> Result<(), String> {
     }
 }
 
+/// Root must name the unprivileged agent's uid, or the agent could not connect to the socket.
+pub fn check_root_needs_uid(euid: u32, uid: Option<u32>) -> Result<(), String> {
+    if euid == 0 && uid.is_none() {
+        return Err(
+            "running as root requires --uid (and --gid) of the unprivileged agent, \
+                    otherwise the agent could not connect to the socket"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +232,18 @@ mod tests {
         assert!(p(&["--uid", "65533"]).is_ok());
         assert!(p(&["--uid", "1"]).is_ok());
         assert!(p(&[]).is_ok());
+    }
+
+    #[test]
+    fn root_requires_an_explicit_uid() {
+        let e = check_root_needs_uid(0, None).unwrap_err();
+        assert!(e.contains("--uid"), "{e}");
+        assert!(check_root_needs_uid(0, Some(20001)).is_ok());
+        assert!(
+            check_root_needs_uid(1000, None).is_ok(),
+            "non-root needs no --uid"
+        );
+        assert!(check_root_needs_uid(1000, Some(20001)).is_ok());
     }
 
     #[test]
