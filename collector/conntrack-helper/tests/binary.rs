@@ -217,7 +217,7 @@ fn daemon_refuses_a_kernel_table_larger_than_max_flows() {
 
 #[test]
 fn shared_uids_are_refused_without_the_explicit_flag() {
-    for uid in ["0", "65534"] {
+    for uid in ["0", "999", "65534"] {
         let out = Command::new(BIN)
             .args(["--once", "--uid", uid, "--file", &fixture("ipv6.txt")])
             .output()

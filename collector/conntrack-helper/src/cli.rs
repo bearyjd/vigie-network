@@ -12,6 +12,8 @@ pub const MAX_TOP_N: usize = 2048;
 pub const MAX_K: usize = 2048;
 /// uids that other services commonly share; a dedicated one is required unless overridden.
 pub const SHARED_UIDS: [u32; 2] = [0, 65534];
+/// Below this are system uids (daemons, root-adjacent accounts); not a dedicated agent user.
+pub const MIN_DEDICATED_UID: u32 = 1000;
 
 pub const USAGE: &str =
     "usage: vigie-conntrack [--once] [--file PATH] [--socket PATH] [--interval SECS]\n\
@@ -26,7 +28,8 @@ pub const USAGE: &str =
   --max-flows defaults to 3 x nf_conntrack_max; the daemon refuses to start when that file is
   unreadable or the cap is below 3 x it, unless --max-flows is given explicitly (then a lower
   cap only warns loudly and sets table_pressure)
-  --uid must be a dedicated user; 0 and 65534 (nobody) need --allow-shared-uid";
+  --uid must be a dedicated user with uid >= 1000; 0, 65534 (nobody) and system uids below
+  1000 need --allow-shared-uid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opts {
@@ -129,8 +132,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
 /// The dedicated-uid rule, applied after parsing: see the shared-uid section of the doc.
 fn check_uid(o: &Opts) -> Result<(), String> {
     match o.uid {
-        Some(u) if SHARED_UIDS.contains(&u) && !o.allow_shared_uid => Err(format!(
-            "--uid {u} is shared with other services; use a dedicated uid or pass --allow-shared-uid"
+        Some(u) if (SHARED_UIDS.contains(&u) || u < MIN_DEDICATED_UID) && !o.allow_shared_uid => Err(format!(
+            "--uid {u} is a system or shared uid; use a dedicated uid >= {MIN_DEDICATED_UID} or pass --allow-shared-uid"
         )),
         _ => Ok(()),
     }
@@ -221,16 +224,17 @@ mod tests {
     }
 
     #[test]
-    fn shared_uids_are_refused_unless_explicitly_allowed() {
-        for uid in ["0", "65534"] {
+    fn shared_and_low_uids_are_refused_unless_explicitly_allowed() {
+        for uid in ["0", "1", "999", "65534"] {
             let e = p(&["--uid", uid]).unwrap_err();
             assert!(e.contains("--allow-shared-uid"), "{e}");
             let o = p(&["--uid", uid, "--allow-shared-uid"]).unwrap();
             assert!(o.allow_shared_uid);
             assert_eq!(o.uid, uid.parse().ok());
         }
-        assert!(p(&["--uid", "65533"]).is_ok());
-        assert!(p(&["--uid", "1"]).is_ok());
+        for uid in ["1000", "20001", "65533"] {
+            assert!(p(&["--uid", uid]).is_ok(), "uid {uid}");
+        }
         assert!(p(&[]).is_ok());
     }
 

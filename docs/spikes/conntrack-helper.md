@@ -135,8 +135,9 @@ the neighbor table.
   Residual: `chmod` and `rename` are path based (std has no `fchmodat(NOFOLLOW)`), so a swap in
   the microseconds between the re-check and the call is only detectable afterwards; the staging
   directory is `0700` root-owned, so only root-equivalent code could race it.
-- **Dedicated uid.** The helper refuses `--uid 0` and `--uid 65534` (nobody) unless
-  `--allow-shared-uid` is given. A uid shared with other services means every one of them can
+- **Dedicated uid.** The helper refuses `--uid 0`, `--uid 65534` (nobody) and any system
+  uid below 1000 unless `--allow-shared-uid` is given, so a low system uid cannot be chosen by
+  mistake. A uid shared with other services means every one of them can
   read conntrack data (who talks to whom). Use a dedicated `vigie` user for the agent.
 - As root without `--uid` it refuses to start (the agent could not connect); the rule is the
   pure function `cli::check_root_needs_uid`, unit tested.
