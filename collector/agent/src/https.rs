@@ -7,8 +7,8 @@
 //! truncated by an attacker, and the server always sends a length).
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -90,9 +90,13 @@ impl HttpsTransport {
 
     fn connect(&self, end: Instant) -> Result<TcpStream, TransportError> {
         let t = &self.target;
-        let addrs = (bare_host(t.host()), t.port())
-            .to_socket_addrs()
-            .map_err(|e| err("resolve", e))?;
+        let (host, port) = (bare_host(t.host()).to_string(), t.port());
+        let addrs = resolve_within(end, move || {
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        })
+        .map_err(|e| err("resolve", e))?;
         let mut last = TransportError("no address".into());
         for addr in addrs {
             let left = remaining(end).map_err(|e| err("connect", e))?;
@@ -102,6 +106,26 @@ impl HttpsTransport {
             }
         }
         Err(last)
+    }
+}
+
+/// Runs the (blocking, not interruptible) resolver and gives up when `end` passes. It
+/// does the lookup on a short-lived thread. On timeout the helper thread is left to finish on its
+/// own: it holds nothing but the host name, and the C resolver bounds its own run time.
+fn resolve_within<F>(end: Instant, lookup: F) -> io::Result<Vec<SocketAddr>>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let wait = remaining(end)?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("vigie-resolve".into())
+        .spawn(move || {
+            let _ = tx.send(lookup());
+        })?;
+    match rx.recv_timeout(wait) {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "deadline exceeded")),
     }
 }
 
@@ -310,6 +334,32 @@ mod tests {
         let mut fits = format!("HTTP/1.1 200 OK\r\nContent-Length: {ok_len}\r\n\r\n").into_bytes();
         fits.extend(std::iter::repeat_n(b'x', ok_len));
         assert_eq!(reply(&fits).unwrap().body.len(), ok_len);
+    }
+
+    #[test]
+    fn a_stuck_resolver_is_cut_off_by_the_deadline() {
+        let start = Instant::now();
+        let r = resolve_within(start + Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        });
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_quick_resolver_result_and_error_pass_through() {
+        let end = Instant::now() + Duration::from_secs(5);
+        let a: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(resolve_within(end, move || Ok(vec![a])).unwrap(), vec![a]);
+        let e = resolve_within(end, || Err(io::Error::other("nxdomain"))).unwrap_err();
+        assert!(e.to_string().contains("nxdomain"));
+        let past = Instant::now();
+        assert!(resolve_within(past, || Ok(Vec::new())).is_err());
     }
 
     #[test]
