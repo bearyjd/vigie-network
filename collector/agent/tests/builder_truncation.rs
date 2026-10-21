@@ -226,3 +226,42 @@ fn conntrack_keeps_its_reserve_when_dns_floods() {
     // At least 48 KiB worth of verbatim conntrack rows survive (rows are ~130 bytes each).
     assert!(s.matches(r#""dst_port":"#).count() > 300);
 }
+
+#[test]
+fn a_surviving_verbatim_other_row_is_merged_with_the_folded_bucket() {
+    let m = mac_n(1);
+    let mut rows = Vec::new();
+    // The MAC's own accumulator `other` row is huge, so it stays verbatim in the top-k.
+    rows.push(ConntrackSummary {
+        mac: m.clone(),
+        dst_ip: None,
+        dst_port: None,
+        proto: Proto::Other,
+        bytes_up: 1_000_000,
+        bytes_down: 1_000_000,
+        flows: 7,
+    });
+    // Enough small detail rows of the same MAC to force folding.
+    for i in 0..6000u32 {
+        let mut r = ct(&m, (i % 60_000) as u16, 1);
+        r.dst_ip = Some(format!("198.51.{}.{}", (i >> 8) & 255, i & 255));
+        rows.push(r);
+    }
+    let total_bytes: u64 = rows.iter().map(|r| r.total_bytes()).sum();
+    let total_flows: u64 = rows.iter().map(|r| r.flows).sum();
+    let input = Sections {
+        conntrack: rows,
+        ..Sections::default()
+    };
+    let b = build(&meta(), input, &Health::default(), BATCH_CAP);
+    let v: serde_json::Value = serde_json::from_str(&body(&b)).unwrap();
+    let ct_rows = v["conntrack"].as_array().unwrap();
+    let others = ct_rows
+        .iter()
+        .filter(|r| r["dst_ip"].is_null() && r["mac"] == m.as_str())
+        .count();
+    assert_eq!(others, 1, "one other row per MAC, not two");
+    let sum = |k: &str| ct_rows.iter().map(|r| r[k].as_u64().unwrap()).sum::<u64>();
+    assert_eq!(sum("bytes_up") + sum("bytes_down"), total_bytes);
+    assert_eq!(sum("flows"), total_flows);
+}

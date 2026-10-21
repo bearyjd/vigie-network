@@ -6,7 +6,7 @@
 //! identity records that re-attach a rolled MAC. Budgets are filled in that order; the
 //! identity group is capped so a lease/mDNS flood cannot starve DNS and conntrack either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model::*;
 
@@ -106,10 +106,22 @@ fn fold_after(sorted: &[ConntrackSummary], k: usize) -> Vec<ConntrackSummary> {
         b.2 = b.2.saturating_add(r.flows);
     }
     let mut out: Vec<ConntrackSummary> = sorted[..k].to_vec();
-    out.extend(
-        buckets
-            .into_iter()
-            .map(|(mac, (up, down, flows))| ConntrackSummary {
+    // A surviving verbatim `other` row of a MAC absorbs that MAC's bucket: one row per MAC.
+    let verbatim_other: HashMap<&str, usize> = sorted[..k]
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.dst_ip.is_none() && r.dst_port.is_none() && r.proto == Proto::Other)
+        .map(|(i, r)| (r.mac.as_str(), i))
+        .collect();
+    for (mac, (up, down, flows)) in buckets {
+        match verbatim_other.get(mac) {
+            Some(&i) => {
+                let r = &mut out[i];
+                r.bytes_up = r.bytes_up.saturating_add(up);
+                r.bytes_down = r.bytes_down.saturating_add(down);
+                r.flows = r.flows.saturating_add(flows);
+            }
+            None => out.push(ConntrackSummary {
                 mac: mac.to_string(),
                 dst_ip: None,
                 dst_port: None,
@@ -118,7 +130,8 @@ fn fold_after(sorted: &[ConntrackSummary], k: usize) -> Vec<ConntrackSummary> {
                 bytes_down: down,
                 flows,
             }),
-    );
+        }
+    }
     out
 }
 
