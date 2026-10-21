@@ -1,0 +1,120 @@
+"""overrides.db schema (PRP section 5) and connection factories.
+
+overrides.db is read-write for this process only. inventory.db is opened read-only
+(`mode=ro` URI plus `query_only`), so a write through it is structurally impossible.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Sequence
+from pathlib import Path
+from urllib.parse import quote
+
+BUSY_TIMEOUT_MS = 5000
+
+# Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
+OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
+    (
+        """CREATE TABLE groups (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          enforcement_ref TEXT,
+          auto_inherit INTEGER NOT NULL DEFAULT 0
+        )""",
+        """CREATE TABLE device_overrides (
+          device_id TEXT PRIMARY KEY,
+          name TEXT, owner TEXT, type TEXT,
+          group_id TEXT REFERENCES groups(id),
+          version INTEGER NOT NULL DEFAULT 1,
+          updated_at TEXT NOT NULL, updated_by TEXT NOT NULL
+        )""",
+        """CREATE TRIGGER no_override_delete BEFORE DELETE ON device_overrides
+          BEGIN SELECT RAISE(ABORT, 'overrides are cleared by nulling fields, never deleted');
+          END""",
+        """CREATE TABLE identity_links (
+          from_device TEXT PRIMARY KEY,
+          into_device TEXT NOT NULL,
+          merge_id TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+          CHECK (from_device <> into_device)
+        )""",
+        """CREATE TABLE identity_rules (
+          id TEXT PRIMARY KEY, device_id TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+          expires_at TEXT, revoked_at TEXT
+        )""",
+        """CREATE TABLE identity_merges (
+          id TEXT PRIMARY KEY, ts TEXT NOT NULL, from_device TEXT NOT NULL,
+          into_device TEXT NOT NULL,
+          prior_overrides TEXT NOT NULL,
+          suggestion_id TEXT, decided_by TEXT NOT NULL, undone_at TEXT
+        )""",
+        """CREATE TABLE suggestion_decisions (
+          suggestion_id TEXT PRIMARY KEY,
+          state TEXT NOT NULL CHECK (state IN ('accepted','rejected')),
+          decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, applied TEXT
+        )""",
+        """CREATE TABLE audit_log (
+          id TEXT PRIMARY KEY, ts TEXT NOT NULL, principal TEXT NOT NULL,
+          action TEXT NOT NULL, target TEXT, detail TEXT
+        )""",
+        "CREATE INDEX idx_audit_ts ON audit_log(ts, id)",
+        """CREATE TABLE api_tokens (
+          id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, scope TEXT NOT NULL,
+          revoked INTEGER DEFAULT 0
+        )""",
+        "INSERT INTO groups (id, name, auto_inherit) VALUES ('trusted', 'Trusted', 0)",
+        "INSERT INTO groups (id, name, auto_inherit) VALUES ('kids', 'Kids', 0)",
+        "INSERT INTO groups (id, name, auto_inherit) VALUES ('iot', 'IoT', 1)",
+        "INSERT INTO groups (id, name, auto_inherit) VALUES ('guest', 'Guest', 1)",
+        "INSERT INTO groups (id, name, auto_inherit) VALUES ('quarantine', 'Quarantine', 0)",
+    ),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current > len(OVERRIDES_MIGRATIONS):
+        raise RuntimeError(f"overrides schema v{current} is newer than this build")
+    for index in range(current, len(OVERRIDES_MIGRATIONS)):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            seen = conn.execute("PRAGMA user_version").fetchone()[0]
+            if seen == index:  # another process may have migrated while we waited
+                for statement in OVERRIDES_MIGRATIONS[index]:
+                    conn.execute(statement)
+                conn.execute(f"PRAGMA user_version={index + 1}")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+
+def open_overrides(path: Path) -> sqlite3.Connection:
+    """Open (creating and migrating if needed) the read-write overrides.db."""
+    conn = sqlite3.connect(
+        path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None, check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    _migrate(conn)
+    return conn
+
+
+def open_inventory_ro(path: Path) -> sqlite3.Connection | None:
+    """Open inventory.db read-only; None when it does not exist (never created from here)."""
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(
+        f"file:{quote(str(path.resolve()))}?mode=ro",
+        uri=True,
+        timeout=BUSY_TIMEOUT_MS / 1000,
+        check_same_thread=False,
+        isolation_level=None,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn

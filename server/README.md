@@ -151,3 +151,37 @@ the `batches` row stay.
 
 Retention: raw shards deleted after `VIGIE_SHARD_RETENTION_DAYS` (default 7, max 30); `batches`
 rows older than 7 days purged. Maintenance runs at startup and hourly.
+
+## App API (`vigie_api`)
+
+The app principal's HTTP surface (PRP section 6), separate process and port from ingest.
+Contract: `../api/openapi.yaml` (OpenAPI 3.1, emitted as JSON, which is valid YAML; a test fails
+on drift). Regenerate with `uv run python -m vigie_api.openapi_export`.
+
+```sh
+export VIGIE_DATA_DIR=/var/lib/vigie      # inventory.db (opened read-only) + overrides.db (rw)
+uv run python -m vigie_api tokens create --id control-app   # prints the token once, stores SHA-256
+uv run python -m vigie_api tokens revoke control-app
+uv run python -m vigie_api --host <LAN-IP> --port 8444 --tls-cert ... --tls-key ...
+```
+
+TLS is required (`--insecure-dev` / `VIGIE_INSECURE_DEV=1` for development only). No CORS.
+`Authorization: Bearer vgt_<id>.<secret>`; every auth failure is the same 401. Limits:
+`VIGIE_API_RATE_LIMIT` per `VIGIE_API_RATE_WINDOW_S` per token (failed auth is limited per source
+address), `VIGIE_API_MAX_BODY_BYTES` (default 16 KiB, 413).
+
+Envelope: `{ok, data, error:{code,message}|null, page:{next_cursor}|null}`. Implemented:
+`GET /devices` (filters `type`, `group` (`unassigned` for none), `identity_state`, `status`,
+`updated_since`; transient hidden unless `include_transient=1` or `status=transient`),
+`GET /devices/{id}`, `GET /macs/{mac}`, `PATCH /devices/{id}`, `GET /events`, `GET /suggestions`,
+`GET /healthz`. Not yet: accept/reject/merge/undo, identity rules, SSE, metrics.
+
+`PATCH` needs `If-Match: "<override version>"` (428 if absent, 412 on mismatch with the current
+`ETag`); a device with no override has version 0 and the first write creates version 1. Only the
+fields present in the body change; `null` clears one. Aliases (merged devices) return the
+canonical device with `merged_into` on reads and 409 on PATCH. `group_id` comes only from
+`device_overrides`; inferred data never assigns a group. `/events` is oldest-first and
+`page.next_cursor` is the resume point (pass it as `since`).
+
+Overrides are loaded whole per list request (home-scale: hundreds of devices); revisit before
+use on a large network.

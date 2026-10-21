@@ -1,0 +1,62 @@
+"""Generate api/openapi.yaml (OpenAPI 3.1) from the app.
+
+Usage: python -m vigie_api.openapi_export [path]
+
+The document is emitted as sorted-key, 2-space-indented JSON: valid YAML 1.2, deterministic,
+and needs no YAML dependency.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+from vigie_api.app import create_app
+from vigie_api.config import Settings
+
+DEFAULT_PATH = Path(__file__).resolve().parents[3] / "api" / "openapi.yaml"
+
+
+def render() -> str:
+    with tempfile.TemporaryDirectory() as scratch:
+        app = create_app(Settings(data_dir=Path(scratch)))
+        spec = app.openapi()
+    spec["servers"] = [{"url": "/", "description": "TLS-terminated app API"}]
+    spec.setdefault("components", {}).setdefault("securitySchemes", {})["bearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "App token from `python -m vigie_api tokens create`.",
+    }
+    for path, item in spec["paths"].items():
+        if path == "/healthz":
+            continue
+        for method, operation in item.items():
+            operation["security"] = [{"bearer": []}]
+            operation["responses"].setdefault("401", {"description": "Unauthorized (uniform)"})
+            operation["responses"].setdefault("429", {"description": "Rate limited"})
+            if method == "patch":
+                _document_if_match(operation)
+    return json.dumps(spec, indent=2, sort_keys=True) + "\n"
+
+
+def _document_if_match(operation: dict) -> None:
+    for param in operation["parameters"]:
+        if param["name"] == "if-match":
+            param["required"] = True
+            param["description"] = (
+                "Override version from the last ETag (0 when the device has no override yet)."
+            )
+    operation["responses"]["412"] = {"description": "If-Match does not match; current ETag sent"}
+    operation["responses"]["428"] = {"description": "If-Match header missing"}
+
+
+def main(argv: list[str]) -> int:
+    target = Path(argv[1]) if len(argv) > 1 else DEFAULT_PATH
+    target.write_text(render(), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
