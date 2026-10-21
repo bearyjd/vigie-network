@@ -147,9 +147,15 @@ impl Agent {
     fn poll_log(&mut self, now: u64) {
         match self.tail.poll() {
             Ok(lines) => {
-                for ev in lines.iter().filter_map(|l| parse_line(l)) {
-                    self.dns.feed(&ev, now);
-                    self.on_dhcp(&ev);
+                for line in &lines {
+                    match parse_line(line) {
+                        Some(ev) => {
+                            self.dns.feed(&ev, now);
+                            self.on_dhcp(&ev);
+                        }
+                        // Anything unparsed sits between packet lines: no attaching across it.
+                        None => self.dhcp.break_context(),
+                    }
                 }
             }
             Err(e) => eprintln!("dnsmasq log: {e}"),

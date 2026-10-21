@@ -35,9 +35,17 @@ pub enum LogEvent {
         client_ip: String,
         ip: String,
     },
+    /// `DHCPREQUEST` or (`discover`) `DHCPDISCOVER`: opens an attach context for its MAC.
     DhcpRequest {
         id: String,
         mac: String,
+        discover: bool,
+    },
+    /// Any other DHCP packet line. `poison`: it has no MAC we can trust for this serial
+    /// (INFORM, RELEASE, DECLINE, NAK), so the serial's entry is tainted.
+    DhcpBoundary {
+        id: String,
+        poison: bool,
     },
     DhcpOptions {
         id: String,
@@ -138,13 +146,26 @@ fn parse_dhcp(id: &str, rest: &str) -> Option<LogEvent> {
         return Some(LogEvent::DhcpRequest {
             id,
             mac: toks[2].into(),
+            discover: false,
         });
     }
     if first.starts_with("DHCPDISCOVER(") && toks.len() >= 2 {
         return Some(LogEvent::DhcpRequest {
             id,
             mac: toks[1].into(),
+            discover: true,
         });
+    }
+    for (verb, poison) in [
+        ("DHCPINFORM(", true),
+        ("DHCPRELEASE(", true),
+        ("DHCPDECLINE(", true),
+        ("DHCPNAK(", true),
+        ("DHCPOFFER(", false),
+    ] {
+        if first.starts_with(verb) {
+            return Some(LogEvent::DhcpBoundary { id, poison });
+        }
     }
     if first.starts_with("DHCPACK(") && toks.len() >= 3 {
         let name = (toks.len() > 3).then(|| toks[3..].join(" "));
@@ -162,7 +183,7 @@ fn parse_dhcp(id: &str, rest: &str) -> Option<LogEvent> {
 struct DhcpPartial {
     /// MAC of the `DHCPREQUEST`/`DHCPDISCOVER` that opened this entry (normalized).
     mac: Option<String>,
-    /// Two different MACs (or data without a request) shared this serial: nothing here can be
+    /// Two different MACs (or a MAC-less verb) shared this serial: nothing here can be
     /// attributed to the ACKed MAC, so no fingerprint fields are emitted.
     tainted: bool,
     opt55: Vec<u8>,
@@ -170,11 +191,27 @@ struct DhcpPartial {
     name: Option<String>,
 }
 
-/// Joins the per-transaction DHCP lines (by serial) into one lease on `DHCPACK`.
+/// The packet line that the option/vendor/name lines now being read belong to.
+#[derive(Debug)]
+struct Context {
+    id: String,
+    mac: Option<String>,
+    /// An options line has already been attached in this context (later ones extend it; the
+    /// first one replaces what an earlier packet of the same transaction left).
+    opts_started: bool,
+}
+
+/// Joins the per-transaction DHCP lines into one lease on `DHCPACK`.
+///
+/// The serial (xid) is chosen by the client, so it proves nothing. The log is therefore read as
+/// a sequential stream: a fingerprint line is attached only to the packet line directly before
+/// it (same serial, nothing in between). Every other line, including every DHCP verb we do not
+/// build leases from, ends that context; INFORM/RELEASE/DECLINE/NAK also poison the serial.
 #[derive(Debug, Default)]
 pub struct DhcpAssembler {
     partial: HashMap<String, DhcpPartial>,
     order: VecDeque<String>,
+    ctx: Option<Context>,
 }
 
 impl DhcpAssembler {
@@ -190,45 +227,74 @@ impl DhcpAssembler {
         self.partial.entry(id.to_string()).or_default()
     }
 
+    /// A log line that is not one of ours (unparsed, or DNS) ends the attach context.
+    pub fn break_context(&mut self) {
+        self.ctx = None;
+    }
+
+    /// The entry a fingerprint line may be attached to, or `None` (and the context is dropped
+    /// when the line does not directly continue it).
+    fn attach_target(&mut self, id: &str) -> Option<(&mut DhcpPartial, &mut bool)> {
+        if self.ctx.as_ref()?.id != id {
+            self.ctx = None;
+            return None;
+        }
+        let c = self.ctx.as_mut()?;
+        let p = self.partial.get_mut(id)?;
+        (!p.tainted && p.mac == c.mac).then_some((p, &mut c.opts_started))
+    }
+
     pub fn feed(&mut self, ev: &LogEvent) -> Option<Lease> {
         match ev {
-            LogEvent::DhcpRequest { id, mac } => {
+            LogEvent::DhcpRequest { id, mac, discover } => {
                 let mac = crate::mac::normalize(mac);
                 let p = self.entry(id);
-                // The serial is attacker-chosen: a second MAC on it, or fingerprint lines that
-                // came before any request, poison the entry for good.
-                let foreign = match (&p.mac, &mac) {
-                    (Some(old), new) => Some(old) != new.as_ref(),
-                    (None, _) => p.has_fingerprint(),
-                };
+                // The serial is attacker-chosen: a second MAC on it poisons the entry for good.
+                let foreign =
+                    matches!((&p.mac, &mac), (Some(old), new) if Some(old) != new.as_ref());
                 if foreign || mac.is_none() {
                     p.taint();
+                } else if *discover {
+                    p.clear_fingerprint();
                 }
                 if p.mac.is_none() {
-                    p.mac = mac;
+                    p.mac = mac.clone();
                 }
+                self.ctx = Some(Context {
+                    id: id.clone(),
+                    mac,
+                    opts_started: false,
+                });
             }
             // dnsmasq may split a long list over several lines (assumed); accumulate.
             LogEvent::DhcpOptions { id, opt55 } => {
-                let p = self.entry(id);
-                if !p.tainted {
+                if let Some((p, started)) = self.attach_target(id) {
+                    if !*started {
+                        p.opt55.clear();
+                        *started = true;
+                    }
                     p.opt55.extend(opt55.iter().copied());
                     p.opt55.truncate(MAX_OPT55);
                 }
             }
             LogEvent::DhcpVendor { id, class } => {
-                let p = self.entry(id);
-                if !p.tainted {
+                if let Some((p, _)) = self.attach_target(id) {
                     p.class = Some(class.clone());
                 }
             }
             LogEvent::DhcpName { id, name } => {
-                let p = self.entry(id);
-                if !p.tainted {
+                if let Some((p, _)) = self.attach_target(id) {
                     p.name = Some(name.clone());
                 }
             }
+            LogEvent::DhcpBoundary { id, poison } => {
+                self.ctx = None;
+                if *poison {
+                    self.entry(id).taint();
+                }
+            }
             LogEvent::DhcpAck { id, mac, ip, name } => {
+                self.ctx = None;
                 let mut p = self.partial.remove(id).unwrap_or_default();
                 self.order.retain(|o| o != id);
                 if p.mac.is_none() || p.mac != crate::mac::normalize(mac) {
@@ -237,21 +303,21 @@ impl DhcpAssembler {
                 let host = name.as_deref().or(p.name.as_deref());
                 return Lease::new(mac, ip, host, &p.opt55, p.class.as_deref());
             }
-            LogEvent::Query { .. } | LogEvent::Answer { .. } => {}
+            LogEvent::Query { .. } | LogEvent::Answer { .. } => self.ctx = None,
         }
         None
     }
 }
 
 impl DhcpPartial {
-    fn has_fingerprint(&self) -> bool {
-        !self.opt55.is_empty() || self.class.is_some() || self.name.is_some()
-    }
-    fn taint(&mut self) {
-        self.tainted = true;
+    fn clear_fingerprint(&mut self) {
         self.opt55.clear();
         self.class = None;
         self.name = None;
+    }
+    fn taint(&mut self) {
+        self.tainted = true;
+        self.clear_fingerprint();
     }
 }
 
