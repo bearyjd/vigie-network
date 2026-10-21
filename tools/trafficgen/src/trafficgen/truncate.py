@@ -81,9 +81,14 @@ def apply_cap(batch: Batch, cap_bytes: int) -> Batch:
         if encoded_size(out) <= cap_bytes:
             return out
     flows = out["conntrack"]
-    keep = _largest_fitting(
-        len(flows), lambda n: encoded_size({**out, "conntrack": _fold(flows, n)}) <= cap_bytes
-    )
-    out["truncated"]["conntrack"] = len(flows) - keep
-    out["conntrack"] = _fold(flows, keep)
-    return out
+
+    def with_keep(n: int) -> Batch:
+        # Include the truncated counter: it is part of the encoded size.
+        counters = {**out["truncated"], "conntrack": len(flows) - n}
+        return {**out, "truncated": counters, "conntrack": _fold(flows, n)}
+
+    keep = _largest_fitting(len(flows), lambda n: encoded_size(with_keep(n)) <= cap_bytes)
+    # Size is not strictly monotone in keep (digit counts of the folded totals change).
+    while keep > 0 and encoded_size(with_keep(keep)) > cap_bytes:
+        keep -= 1
+    return with_keep(keep)

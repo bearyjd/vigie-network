@@ -12,6 +12,7 @@ PRP_BATCH_CAP_BYTES = 256 * 1024  # PRP section 4: collector batch cap
 WINDOW_S = 60
 DEFAULT_START = 1_791_990_000  # 15:00 UTC, minute-aligned: phones are "awake"
 MAX_DNS_SKEW_S = 300
+GRACE_S = 600  # PRP section 8: overlap veto grace window (default 10 min)
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,7 @@ import pytest
 from conftest import FIXTURES
 
 from trafficgen import PROFILES
+from trafficgen.cli import FIXTURE_FILE_BUDGET_BYTES, FIXTURE_SPECS, FIXTURE_TOTAL_BUDGET_BYTES
 from trafficgen.generator import emissions_to_jsonl, load_emissions
 
 
@@ -27,7 +28,7 @@ def test_replay_outcomes(gen, ingest):
         200,
         {"duplicate": True},
     )
-    assert results["replay_resigned_ts"].status == 401
+    assert results["replay_header_ts_bumped"].status == 401
 
 
 def test_out_of_order_and_stale_rejections(gen, ingest):
@@ -54,7 +55,13 @@ def test_wrong_key_is_401(gen, ingest):
 
 @pytest.mark.parametrize("path", sorted(FIXTURES.glob("*.jsonl")), ids=lambda p: p.stem)
 def test_committed_fixtures_replay_and_stay_small(ingest, path):
-    assert path.stat().st_size < 200_000
+    assert path.stat().st_size < FIXTURE_FILE_BUDGET_BYTES
     ems = load_emissions(path)
     assert all(r.ok for r in ingest.replay(ems))
     assert emissions_to_jsonl(ems) == path.read_text()
+
+
+def test_fixture_set_is_complete_and_within_total_budget():
+    files = sorted(FIXTURES.glob("*.jsonl"))
+    assert {p.stem for p in files} == set(FIXTURE_SPECS)
+    assert sum(p.stat().st_size for p in files) < FIXTURE_TOTAL_BUDGET_BYTES

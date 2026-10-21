@@ -19,6 +19,10 @@ from .roster import PROFILES
 from .tls import PIN_RE, TlsError
 from .transport import http_post, run
 
+# Fixture size budget (enforced by tests): each file stays small, the whole set stays reviewable.
+FIXTURE_FILE_BUDGET_BYTES = 200_000
+FIXTURE_TOTAL_BUDGET_BYTES = 650_000  # measured 613 KB of .jsonl for 15 fixtures
+
 # Committed fixtures under tests/fixtures/synthetic/ are regenerated from exactly these.
 FIXTURE_SPECS: dict[str, dict[str, Any]] = {
     "baseline": {"profile": "baseline", "kwargs": {"seed": 1, "windows": 5}},
@@ -27,13 +31,35 @@ FIXTURE_SPECS: dict[str, dict[str, Any]] = {
         "kwargs": {"seed": 1, "windows": 12, "roll_interval_s": 180},
     },
     "hostname_spoof": {"profile": "hostname_spoof", "kwargs": {"seed": 1, "windows": 6}},
+    "hostname_spoof_full_fingerprint": {
+        "profile": "hostname_spoof",
+        "kwargs": {"seed": 1, "windows": 6, "variant": "full_fingerprint"},
+    },
     "mac_clone": {"profile": "mac_clone", "kwargs": {"seed": 1, "windows": 6}},
+    "mac_clone_same_fingerprint": {
+        "profile": "mac_clone",
+        "kwargs": {"seed": 1, "windows": 6, "variant": "same_fingerprint"},
+    },
+    # 26 windows: the second device joins at window 8 and the first lingers 14 min (> 10 min grace).
+    "rolling_overlap_veto": {
+        "profile": "rolling_overlap_veto",
+        "kwargs": {"seed": 1, "windows": 26},
+    },
+    # 24 windows: the attacker is on the LAN for the last 12, longer than the 10 min grace.
+    "rolling_fingerprint_copy_away": {
+        "profile": "rolling_fingerprint_copy",
+        "kwargs": {"seed": 1, "windows": 24, "variant": "victim_away"},
+    },
+    "rolling_fingerprint_copy_present": {
+        "profile": "rolling_fingerprint_copy",
+        "kwargs": {"seed": 1, "windows": 24, "variant": "victim_present"},
+    },
     "ip_flap": {"profile": "ip_flap", "kwargs": {"seed": 1, "windows": 8}},
     "doh_user": {"profile": "doh_user", "kwargs": {"seed": 1, "windows": 5}},
     "replay": {"profile": "replay", "kwargs": {"seed": 1, "windows": 4}},
     "out_of_order": {"profile": "out_of_order", "kwargs": {"seed": 1, "windows": 5}},
     "stale_ts": {"profile": "stale_ts", "kwargs": {"seed": 1, "windows": 4}},
-    # 256 KB would exceed the 200 KB fixture budget, so the committed flood uses a 64 KB cap.
+    # A 256 KB cap would break the per-file budget below, so the committed flood uses a 64 KB cap.
     "flood": {"profile": "flood", "kwargs": {"seed": 1, "windows": 4, "batch_cap_bytes": 64_000}},
 }
 

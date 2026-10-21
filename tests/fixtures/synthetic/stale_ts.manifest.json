@@ -8,6 +8,8 @@
  "key_id": "k1",
  "boot_id": "boot-a",
  "roll_interval_s": null,
+ "variant": null,
+ "note": "A batch whose sent_ts is an hour old is refused with 400 sent_ts_out_of_range.",
  "devices": [
   {
    "device_id": "dev-01",
@@ -33,7 +35,9 @@
      "mac": "aa:76:7d:f6:4b:ab",
      "ip": "192.168.8.100",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -64,7 +68,9 @@
      "mac": "7e:56:b8:45:35:d1",
      "ip": "192.168.8.101",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -89,10 +95,12 @@
    "rolling": false,
    "macs": [
     {
-     "mac": "24:0e:61:42:b6:81",
+     "mac": "00:00:5e:00:53:66",
      "ip": "192.168.8.102",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -100,7 +108,7 @@
    "device_id": "dev-04",
    "true_type": "ip_camera",
    "role": "benign",
-   "hostname": "ipcam-25FB",
+   "hostname": "ipcam-24EC",
    "mdns_name": null,
    "opt55": [
     1,
@@ -116,10 +124,12 @@
    "rolling": false,
    "macs": [
     {
-     "mac": "48:e5:50:67:27:2a",
+     "mac": "00:00:5e:00:53:67",
      "ip": "192.168.8.103",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -127,7 +137,7 @@
    "device_id": "dev-05",
    "true_type": "thermostat",
    "role": "benign",
-   "hostname": "thermostat-DC3B",
+   "hostname": "thermostat-0E45",
    "mdns_name": null,
    "opt55": [
     1,
@@ -141,10 +151,12 @@
    "rolling": false,
    "macs": [
     {
-     "mac": "8c:ce:bc:b2:d0:b5",
+     "mac": "00:00:5e:00:53:68",
      "ip": "192.168.8.104",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -152,8 +164,8 @@
    "device_id": "dev-06",
    "true_type": "laptop",
    "role": "benign",
-   "hostname": "DESKTOP-5A69",
-   "mdns_name": "desktop-5A69",
+   "hostname": "DESKTOP-6199",
+   "mdns_name": "desktop-6199",
    "opt55": [
     1,
     3,
@@ -176,10 +188,12 @@
    "rolling": false,
    "macs": [
     {
-     "mac": "28:b2:0f:3c:fb:c0",
+     "mac": "00:00:5e:00:53:69",
      "ip": "192.168.8.105",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   },
@@ -187,7 +201,7 @@
    "device_id": "dev-07",
    "true_type": "game_console",
    "role": "benign",
-   "hostname": "PS5-EABA",
+   "hostname": "PS5-4235",
    "mdns_name": null,
    "opt55": [
     1,
@@ -203,10 +217,12 @@
    "rolling": false,
    "macs": [
     {
-     "mac": "08:a1:e1:41:b0:18",
+     "mac": "00:00:5e:00:53:6a",
      "ip": "192.168.8.106",
      "from_ts": 1791990000,
-     "to_ts": 1791990240
+     "to_ts": 1791990240,
+     "overlap_s": 0,
+     "active_until": 1791990240
     }
    ]
   }

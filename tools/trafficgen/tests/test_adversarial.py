@@ -79,7 +79,7 @@ def test_replay_stream(gen):
     sc = gen("replay", 2, 8)
     ems = sc.emissions
     dup = [e for e in ems if e.label == "replay_identical"]
-    tamper = [e for e in ems if e.label == "replay_resigned_ts"]
+    tamper = [e for e in ems if e.label == "replay_header_ts_bumped"]
     assert len(dup) == 1 and len(tamper) == 1
     orig = next(
         e
@@ -136,3 +136,13 @@ def test_flood_with_small_cap_still_orders(gen):
     sc = gen("flood", 2, 6, batch_cap_bytes=60_000)
     flood = max(sc.emissions, key=lambda e: len(e.batch["truncated"]))
     assert len(json.dumps(flood.batch, separators=(",", ":")).encode()) <= 60_000
+
+
+def test_cap_is_respected_for_every_cap_even_when_size_is_not_monotone(gen):
+    from trafficgen.truncate import apply_cap, encoded_size
+
+    raw = gen("flood", 2, 6, batch_cap_bytes=10**9)
+    batch = max(raw.emissions, key=lambda e: len(e.batch["conntrack"])).batch
+    assert len(batch["conntrack"]) > 5000
+    for cap in range(60_000, 70_000, 331):
+        assert encoded_size(apply_cap(batch, cap)) <= cap, cap

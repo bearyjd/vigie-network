@@ -1,0 +1,425 @@
+{
+ "seed": 1,
+ "profile": "rolling_overlap_veto",
+ "start": 1791990000,
+ "window_s": 60,
+ "windows": 26,
+ "collector_id": "rtr-1",
+ "key_id": "k1",
+ "boot_id": "boot-a",
+ "roll_interval_s": null,
+ "variant": null,
+ "note": "PRP section 8 overlap veto with a 10 min grace window. Case legit_rolling: a rolling phone briefly holds two MACs (overlap shorter than grace; same device). Case sustained_two_devices: two devices with the same signature are both active for longer than the grace window; the newer MAC must be detached to its own device.",
+ "grace_s": 600,
+ "devices": [
+  {
+   "device_id": "dev-01",
+   "true_type": "phone_ios",
+   "role": "benign",
+   "hostname": "Daves-iPhone",
+   "mdns_name": "Daves iPhone",
+   "opt55": [
+    1,
+    121,
+    3,
+    6,
+    15,
+    119,
+    252
+   ],
+   "opt60": null,
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "aa:76:7d:f6:4b:ab",
+     "ip": "192.168.8.100",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-02",
+   "true_type": "phone_android",
+   "role": "benign",
+   "hostname": "Pixel-9",
+   "mdns_name": "Pixel 9",
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    26,
+    28,
+    51,
+    58,
+    59,
+    43
+   ],
+   "opt60": "android-dhcp-14",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "7e:56:b8:45:35:d1",
+     "ip": "192.168.8.101",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-03",
+   "true_type": "smart_tv",
+   "role": "benign",
+   "hostname": "LivingRoom-TV-A7FC",
+   "mdns_name": "Living Room TV",
+   "opt55": [
+    1,
+    3,
+    6,
+    12,
+    15,
+    28,
+    42
+   ],
+   "opt60": "udhcp 1.30.1",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "00:00:5e:00:53:66",
+     "ip": "192.168.8.102",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-04",
+   "true_type": "ip_camera",
+   "role": "benign",
+   "hostname": "ipcam-24EC",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    12,
+    15,
+    28
+   ],
+   "opt60": "udhcp 1.19.4",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "00:00:5e:00:53:67",
+     "ip": "192.168.8.103",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-05",
+   "true_type": "thermostat",
+   "role": "benign",
+   "hostname": "thermostat-0E45",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    15
+   ],
+   "opt60": "udhcpc 1.22.1",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "00:00:5e:00:53:68",
+     "ip": "192.168.8.104",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-06",
+   "true_type": "laptop",
+   "role": "benign",
+   "hostname": "DESKTOP-6199",
+   "mdns_name": "desktop-6199",
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    31,
+    33,
+    43,
+    44,
+    46,
+    47,
+    119,
+    121,
+    249,
+    252
+   ],
+   "opt60": "MSFT 5.0",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "00:00:5e:00:53:69",
+     "ip": "192.168.8.105",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-07",
+   "true_type": "game_console",
+   "role": "benign",
+   "hostname": "PS5-4235",
+   "mdns_name": null,
+   "opt55": [
+    1,
+    3,
+    6,
+    15,
+    28,
+    33
+   ],
+   "opt60": "dhcpcd-5.5.6",
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "00:00:5e:00:53:6a",
+     "ip": "192.168.8.106",
+     "from_ts": 1791990000,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-08",
+   "true_type": "phone_ios",
+   "role": "benign",
+   "hostname": "Daves-iPhone-roller",
+   "mdns_name": "Daves iPhone roller",
+   "opt55": [
+    1,
+    121,
+    3,
+    6,
+    15,
+    119,
+    252
+   ],
+   "opt60": null,
+   "impersonates": null,
+   "doh": false,
+   "rolling": true,
+   "macs": [
+    {
+     "mac": "96:31:59:c2:52:a8",
+     "ip": "192.168.8.108",
+     "from_ts": 1791990000,
+     "to_ts": 1791990300,
+     "overlap_s": 180,
+     "active_until": 1791990480
+    },
+    {
+     "mac": "7e:66:cc:90:ea:be",
+     "ip": "192.168.8.109",
+     "from_ts": 1791990300,
+     "to_ts": 1791990600,
+     "overlap_s": 180,
+     "active_until": 1791990780
+    },
+    {
+     "mac": "4e:59:0a:19:fe:70",
+     "ip": "192.168.8.110",
+     "from_ts": 1791990600,
+     "to_ts": 1791990900,
+     "overlap_s": 180,
+     "active_until": 1791991080
+    },
+    {
+     "mac": "be:69:39:b8:bf:1b",
+     "ip": "192.168.8.111",
+     "from_ts": 1791990900,
+     "to_ts": 1791991200,
+     "overlap_s": 180,
+     "active_until": 1791991380
+    },
+    {
+     "mac": "ca:1a:8b:0f:6e:37",
+     "ip": "192.168.8.112",
+     "from_ts": 1791991200,
+     "to_ts": 1791991500,
+     "overlap_s": 180,
+     "active_until": 1791991680
+    },
+    {
+     "mac": "66:dd:e2:9f:d9:e2",
+     "ip": "192.168.8.113",
+     "from_ts": 1791991500,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  },
+  {
+   "device_id": "dev-09",
+   "true_type": "phone_ios",
+   "role": "benign",
+   "hostname": "Bobs-iPhone",
+   "mdns_name": "Bobs iPhone",
+   "opt55": [
+    1,
+    121,
+    3,
+    6,
+    15,
+    119,
+    252
+   ],
+   "opt60": null,
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "12:6b:ef:2e:28:8f",
+     "ip": "192.168.8.114",
+     "from_ts": 1791990000,
+     "to_ts": 1791990480,
+     "overlap_s": 840,
+     "active_until": 1791991320
+    }
+   ]
+  },
+  {
+   "device_id": "dev-10",
+   "true_type": "phone_ios",
+   "role": "benign",
+   "hostname": "Bobs-iPhone",
+   "mdns_name": "Bobs iPhone",
+   "opt55": [
+    1,
+    121,
+    3,
+    6,
+    15,
+    119,
+    252
+   ],
+   "opt60": null,
+   "impersonates": null,
+   "doh": false,
+   "rolling": false,
+   "macs": [
+    {
+     "mac": "ba:2e:a0:72:08:29",
+     "ip": "192.168.8.115",
+     "from_ts": 1791990480,
+     "to_ts": 1791991560,
+     "overlap_s": 0,
+     "active_until": 1791991560
+    }
+   ]
+  }
+ ],
+ "anomalies": [
+  {
+   "kind": "overlap",
+   "case": "legit_rolling",
+   "device": "dev-08",
+   "overlap_s": 180,
+   "grace_s": 600,
+   "within_grace": true,
+   "expected_verdict": "same_device",
+   "transitions": [
+    {
+     "old_mac": "96:31:59:c2:52:a8",
+     "new_mac": "7e:66:cc:90:ea:be",
+     "new_from_ts": 1791990300,
+     "old_active_until": 1791990480,
+     "overlap_s": 180
+    },
+    {
+     "old_mac": "7e:66:cc:90:ea:be",
+     "new_mac": "4e:59:0a:19:fe:70",
+     "new_from_ts": 1791990600,
+     "old_active_until": 1791990780,
+     "overlap_s": 180
+    },
+    {
+     "old_mac": "4e:59:0a:19:fe:70",
+     "new_mac": "be:69:39:b8:bf:1b",
+     "new_from_ts": 1791990900,
+     "old_active_until": 1791991080,
+     "overlap_s": 180
+    },
+    {
+     "old_mac": "be:69:39:b8:bf:1b",
+     "new_mac": "ca:1a:8b:0f:6e:37",
+     "new_from_ts": 1791991200,
+     "old_active_until": 1791991380,
+     "overlap_s": 180
+    },
+    {
+     "old_mac": "ca:1a:8b:0f:6e:37",
+     "new_mac": "66:dd:e2:9f:d9:e2",
+     "new_from_ts": 1791991500,
+     "old_active_until": 1791991560,
+     "overlap_s": 60
+    }
+   ]
+  },
+  {
+   "kind": "overlap",
+   "case": "sustained_two_devices",
+   "devices": [
+    "dev-09",
+    "dev-10"
+   ],
+   "old_mac": "12:6b:ef:2e:28:8f",
+   "new_mac": "ba:2e:a0:72:08:29",
+   "new_from_ts": 1791990480,
+   "old_active_until": 1791991320,
+   "overlap_s": 840,
+   "grace_s": 600,
+   "within_grace": false,
+   "expected_verdict": "two_devices"
+  }
+ ]
+}

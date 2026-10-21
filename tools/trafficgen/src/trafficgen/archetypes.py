@@ -1,6 +1,7 @@
 """Device archetypes: static fingerprint plus a per-window traffic behavior.
 
-All names, OUIs and cloud hostnames are synthetic (reserved .example domains).
+All names, addresses and MACs are reserved/documentation values: .example domains,
+RFC 5737 IPv4 ranges and the RFC 7042 documentation MAC range.
 """
 
 from __future__ import annotations
@@ -17,16 +18,16 @@ FlowEvent = tuple[str, int, str, int, int, int]
 # (kind, name, service, ua)
 SightingEvent = tuple[str, str | None, str | None, str | None]
 
-_PUBLIC_FIRST_OCTETS = (23, 34, 35, 52, 54, 104, 142, 151, 185)
-DOH_RESOLVERS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+# RFC 5737 documentation networks: the only "public" destinations the generator ever emits.
+DOC_NETS = ("192.0.2", "198.51.100", "203.0.113")
+# Stand-ins for public DoH resolvers (documentation addresses); named in the doh_user manifest.
+DOH_RESOLVERS = ("192.0.2.53", "198.51.100.53", "203.0.113.53")
 
 
 def ip_for(name: str) -> str:
-    """Stable fake public IPv4 for a hostname."""
+    """Stable fake public IPv4 (RFC 5737 documentation range) for a hostname."""
     h = hashlib.sha256(name.encode()).digest()
-    return (
-        f"{_PUBLIC_FIRST_OCTETS[h[0] % len(_PUBLIC_FIRST_OCTETS)]}.{h[1]}.{h[2]}.{1 + h[3] % 254}"
-    )
+    return f"{DOC_NETS[h[0] % len(DOC_NETS)]}.{1 + h[1] % 254}"
 
 
 @dataclass(frozen=True)

@@ -8,9 +8,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .archetypes import Ctx, ip_for
+from .archetypes import DOH_RESOLVERS, Ctx, ip_for
+from .devices import Device
 from .model import (
     DEFAULT_START,
+    GRACE_S,
     PRP_BATCH_CAP_BYTES,
     WINDOW_S,
     Emission,
@@ -18,7 +20,8 @@ from .model import (
     emissions_to_jsonl,
     shift_batch,
 )
-from .roster import PROFILES, Device, build_roster
+from .notes import NOTES
+from .roster import PROFILES, build_roster, resolve_variant
 from .truncate import apply_cap
 
 __all__ = ["emissions_to_jsonl", "generate", "load_emissions"]
@@ -49,10 +52,7 @@ def _window(
     dns: list[dict[str, Any]] = []
     sightings: list[dict[str, Any]] = []
     conntrack: dict[tuple[str, str, int, str], list[int]] = {}
-    for dev in devices:
-        span = dev.span_at(ws)
-        if span is None:
-            continue
+    for dev, span in ((d, s) for d in devices for s in d.spans_at(ws)):
         new_span = span.from_ts == ws
         act = dev.behavior(
             Ctx(rngs[dev.device_id], widx, (ws // 3600) % 24, new_span, dev.mdns_name)
@@ -69,6 +69,8 @@ def _window(
             )
             neigh.append({"ip": span.ip, "mac": span.mac, "family": "inet"})
             neigh.append({"ip": _link_local(span.mac), "mac": span.mac, "family": "inet6"})
+        elif dev.heartbeat:  # deterministic presence while MACs overlap
+            neigh.append({"ip": span.ip, "mac": span.mac, "family": "inet"})
         for off, qname, qtype in act.dns:
             dns.append(
                 {
@@ -140,7 +142,7 @@ def _stream(profile: str, emissions: list[Emission], rng: random.Random) -> list
             *emissions,
             Emission("replay_identical", src.batch, last.arrival_ts + 30, 200, True),
             Emission(
-                "replay_resigned_ts",
+                "replay_header_ts_bumped",
                 src.batch,
                 last.arrival_ts + 60,
                 401,
@@ -165,6 +167,14 @@ def _stream(profile: str, emissions: list[Emission], rng: random.Random) -> list
     return emissions
 
 
+def _profile_extras(profile: str) -> dict[str, Any]:
+    if profile == "doh_user":
+        return {"doh_resolvers": list(DOH_RESOLVERS)}
+    if profile == "rolling_overlap_veto":
+        return {"grace_s": GRACE_S}
+    return {}
+
+
 def generate(
     profile: str = "baseline",
     *,
@@ -186,7 +196,8 @@ def generate(
     if roll_interval_s is None and profile == "rolling_mac":
         roll_interval_s = 180
     end = start + windows * window_s
-    devices, anomalies = build_roster(profile, seed, start, end, window_s, roll_interval_s)
+    variant = resolve_variant(profile, variant)
+    devices, anomalies = build_roster(profile, seed, start, end, window_s, roll_interval_s, variant)
     rngs = {d.device_id: random.Random(f"{seed}:{d.device_id}") for d in devices}
     crng = random.Random(f"{seed}:{profile}:collector")
     flap = next((a for a in anomalies if a["kind"] == "ip_flap"), None)
@@ -232,6 +243,9 @@ def generate(
         "key_id": key_id,
         "boot_id": boot_id,
         "roll_interval_s": roll_interval_s,
+        "variant": variant,
+        "note": NOTES.get(f"{profile}:{variant}") or NOTES[profile],
+        **_profile_extras(profile),
         "devices": [d.to_manifest() for d in devices],
         "anomalies": anomalies,
     }
