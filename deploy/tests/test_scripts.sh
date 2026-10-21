@@ -52,6 +52,7 @@ case "$1 $2" in
 "secret inspect") [ -e "$STUB_STATE/secret.$3" ] ;;
 "secret rm") shift 2; for n in "$@"; do rm -f "$STUB_STATE/secret.$n"; done ;;
 "secret create")
+	[ -e "$STUB_STATE/fail.create" ] && exit 1
 	if [ "$4" = "-" ]; then cat >"$STUB_STATE/secret.$3"; else cp "$4" "$STUB_STATE/secret.$3"; fi
 	;;
 *) exit 1 ;;
@@ -61,6 +62,8 @@ chmod +x "$T/bin/podman"
 cat >"$T/bin/fake-admin" <<'STUB'
 #!/bin/sh
 printf '%s\n' "$*" >>"$STUB_STATE/admin.log"
+[ -e "$STUB_STATE/admin.fail" ] && { echo "collector is revoked" >&2; exit 1; }
+exit 0
 STUB
 chmod +x "$T/bin/fake-admin"
 # Failing, logging stand-ins for every way to reach a real container runtime; first on PATH.
@@ -119,6 +122,37 @@ check "rejects SAN without DNS:/IP: prefix" test $? -ne 0
 check "failed runs leave no output dir content" sh -c '[ ! -e "$1/server.key" ]' _ "$T/bad"
 VIGIE_CERT_SAN="DNS:vigie.lan" sh "$G" --out "$T/c2" --create-secrets >/dev/null 2>&1
 check "--create-secrets creates both secrets" test -s "$T/state/secret.vigie_tls_key" -a -s "$T/state/secret.vigie_tls_cert"
+check "ingest role does not create api secrets" test ! -e "$T/state/secret.vigie_api_tls_key" -a ! -e "$T/state/secret.vigie_api_tls_cert"
+ingest_key_before=$(cat "$T/state/secret.vigie_tls_key")
+VIGIE_CERT_SAN="DNS:vigie.lan" sh "$G" --role api --out "$T/c-api" --create-secrets >/dev/null 2>&1
+check "--role api creates its own secrets" test -s "$T/state/secret.vigie_api_tls_key" -a -s "$T/state/secret.vigie_api_tls_cert"
+check "--role api leaves the ingest secrets alone" test "$(cat "$T/state/secret.vigie_tls_key")" = "$ingest_key_before"
+check "api key differs from the ingest key" test "$(cat "$T/state/secret.vigie_api_tls_key")" != "$ingest_key_before"
+VIGIE_CERT_SAN="DNS:vigie.lan" sh "$G" --role bogus --out "$T/c-bogus" >/dev/null 2>&1
+check "rejects an unknown role (64)" test $? -eq 64
+check "unknown role writes nothing" test ! -e "$T/c-bogus"
+# default --out is next to the script, not the current directory
+mkdir "$T/here" "$T/elsewhere"
+cp "$G" "$T/here/gen-certs.sh"
+(cd "$T/elsewhere" && VIGIE_CERT_SAN="DNS:vigie.lan" sh "$T/here/gen-certs.sh" >/dev/null 2>&1)
+check "default out is <script dir>/certs" test -f "$T/here/certs/server.key"
+check "nothing is written in the cwd" test -z "$(ls -A "$T/elsewhere")"
+(cd "$T/elsewhere" && VIGIE_CERT_SAN="DNS:vigie.lan" sh "$T/here/gen-certs.sh" --role api >/dev/null 2>&1)
+check "default api out is <script dir>/certs-api" test -f "$T/here/certs-api/server.key"
+# an existing --out directory is not chmodded
+mkdir "$T/shared"
+chmod 0755 "$T/shared"
+VIGIE_CERT_SAN="DNS:vigie.lan" sh "$G" --out "$T/shared" >/dev/null 2>&1
+check "existing out dir keeps its mode" is_mode "$T/shared" 755
+check "key in an existing dir is still 0600" is_mode "$T/shared/server.key" 600
+# an openssl failure is shown, not swallowed
+mkdir "$T/failbin"
+printf '#!/bin/sh\necho "openssl-said-boom" >&2\nexit 1\n' >"$T/failbin/openssl"
+chmod +x "$T/failbin/openssl"
+fail_out=$(PATH="$T/failbin:$PATH" VIGIE_CERT_SAN="DNS:vigie.lan" sh "$G" --out "$T/c-fail" 2>&1)
+check "openssl failure exits non-zero" test $? -ne 0
+check "openssl stderr is shown" sh -c 'printf %s "$1" | grep -q openssl-said-boom' _ "$fail_out"
+check "failed run leaves no key" test ! -e "$T/c-fail/server.key"
 
 # ---- provision-collector.sh ------------------------------------------------------------------
 P="$DEPLOY/provision-collector.sh"
@@ -128,9 +162,32 @@ secrets:
   - source: vigie_tls_cert
 Y
 cat >"$T/compose-yes.yaml" <<'Y'
+services:
+  ingest:
+    secrets:
+      - source: collector_key_k1
+        uid: "10001"
 secrets:
-  - source: collector_key_k1
-    uid: "10001"
+  collector_key_k1:
+    external: true
+Y
+# decoys: substring / prefix matches must NOT count as listing collector_key_k1
+cat >"$T/compose-decoy.yaml" <<'Y'
+services:
+  ingest:
+    secrets:
+      - source: collector_key_k10
+      - source: xcollector_key_k1
+      # - source: collector_key_k1
+secrets:
+  collector_key_k10:
+    external: true
+Y
+cat >"$T/compose-nodef.yaml" <<'Y'
+services:
+  ingest:
+    secrets:
+      - source: collector_key_k1
 Y
 export VIGIE_ADMIN_CMD="$T/bin/fake-admin"
 
@@ -159,6 +216,36 @@ VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/
 check "--force rotates the key" test "$(cat "$PO/key-k1")" != "$KEY"
 check "--force with listed secret registers" grep -q "provision rtr-1 k1" "$T/state/admin.log"
 check "rotated key file still 0600" is_mode "$PO/key-k1" 600
+
+rm -f "$T/state/admin.log"
+VIGIE_COMPOSE_FILE="$T/compose-decoy.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
+check "decoy secret names do not count as listed" test ! -e "$T/state/admin.log"
+VIGIE_COMPOSE_FILE="$T/compose-nodef.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
+check "a secret not defined at top level does not count" test ! -e "$T/state/admin.log"
+reg_out=$(VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --force --out "$PO" rtr-1 k1 2>&1)
+check "exact match registers" grep -q "provision rtr-1 k1" "$T/state/admin.log"
+check "registration warns about immediate key_id switch" sh -c 'printf %s "$1" | grep -q "WARNING: ingest now expects key id k1"' _ "$reg_out"
+check "no temporary secret is left behind" sh -c '! ls "$1" | grep -q "\.tmp"' _ "$T/state"
+# registration failure (revoked collector): honest message, non-zero exit
+: >"$T/state/admin.fail"
+fail_reg=$(VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --force --out "$PO" rtr-1 k1 2>&1)
+check "failed registration exits 1" test $? -eq 1
+check "failed registration mentions a revoked collector" sh -c 'printf %s "$1" | grep -q REVOKED' _ "$fail_reg"
+check "failed registration does not claim ingest has no row" sh -c '! printf %s "$1" | grep -q "no row"' _ "$fail_reg"
+rm -f "$T/state/admin.fail"
+# a failing podman: nothing is written, the old key file survives
+OLD_KEY=$(cat "$PO/key-k1")
+: >"$T/state/fail.create"
+VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
+check "podman failure exits non-zero" test $? -ne 0
+check "podman failure leaves the old key file" test "$(cat "$PO/key-k1")" = "$OLD_KEY"
+VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --out "$T/fresh" rtr-9 >/dev/null 2>&1
+check "podman failure writes no key file for a new collector" test ! -e "$T/fresh/key-k1"
+rm -f "$T/state/fail.create"
+mkdir "$T/preexisting"
+chmod 0755 "$T/preexisting"
+VIGIE_COMPOSE_FILE="$T/compose-no.yaml" sh "$P" --out "$T/preexisting" rtr-2 >/dev/null 2>&1
+check "existing --out directory keeps its mode" is_mode "$T/preexisting" 755
 
 sh "$P" --out "$T/x" 'bad id' >/dev/null 2>&1
 check "rejects id with a space" test $? -ne 0
@@ -210,6 +297,11 @@ python3 -I "$H" http 1 /healthz >/dev/null 2>&1
 check "healthcheck: closed port is unhealthy (1)" test $? -eq 1
 python3 -I "$H" proc definitely-not-a-process-name >/dev/null 2>&1
 check "healthcheck: proc mismatch is unhealthy (1)" test $? -eq 1
+python3 -I "$H" fresh "$T/no-such-heartbeat" >/dev/null 2>&1
+check "healthcheck: missing heartbeat is unhealthy (1)" test $? -eq 1
+: >"$T/heartbeat"
+python3 -I "$H" fresh "$T/heartbeat" >/dev/null 2>&1
+check "healthcheck: fresh heartbeat is healthy (0)" test $? -eq 0
 python3 -I "$H" bogus >/dev/null 2>&1
 check "healthcheck: bad usage is 2" test $? -eq 2
 

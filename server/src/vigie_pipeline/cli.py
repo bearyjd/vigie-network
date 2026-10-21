@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -53,6 +54,18 @@ def _config(args: argparse.Namespace) -> PipelineConfig:
     )
 
 
+def _touch_health_file() -> None:
+    """Mark a successful pass for the container healthcheck (deploy/healthcheck.py fresh).
+    Only set in the container (VIGIE_HEALTH_FILE, on tmpfs); a failure here never stops the loop."""
+    target = os.environ.get("VIGIE_HEALTH_FILE")
+    if not target:
+        return
+    try:
+        Path(target).touch()
+    except OSError as exc:
+        log(logger, logging.WARNING, "health_file_failed", error=str(exc))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -78,6 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             held.hold(config.inventory_path)
             try:
                 run_once(config)
+                _touch_health_file()
             except (sqlite3.Error, ShardReadError) as exc:  # log, retry next tick
                 log(logger, logging.ERROR, "run_failed", error=str(exc))
             time.sleep(args.loop)

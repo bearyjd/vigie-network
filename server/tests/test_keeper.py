@@ -127,3 +127,28 @@ def test_pipeline_once_does_not_hold(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(pipeline_cli, "run_once", lambda c: seen.append(_has_sidecars(inv)))
     assert pipeline_cli.main(["run", "--once"]) == 0
     assert seen == [False]
+
+
+def test_pipeline_loop_touches_the_health_file_only_after_a_good_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    health = tmp_path / "ok"
+    calls: list[int] = []
+
+    def flaky_run_once(config) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("boom")
+
+    def after_tick(_: float) -> None:
+        if len(calls) == 1:
+            assert not health.exists()  # a failed pass is not a heartbeat
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setenv("VIGIE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("VIGIE_HEALTH_FILE", str(health))
+    monkeypatch.setattr(pipeline_cli, "run_once", flaky_run_once)
+    monkeypatch.setattr(time, "sleep", after_tick)
+    assert pipeline_cli.main(["run", "--loop", "5"]) == 0
+    assert health.exists()
