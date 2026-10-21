@@ -236,11 +236,13 @@ fn one_mac_with_two_interleaved_xids_keeps_the_lines_apart() {
 
 #[test]
 fn a_tainted_xid_stays_unfingerprinted_even_for_the_matching_mac() {
-    let lines = vec![
-        l(&format!("22 DHCPINFORM(br-lan) 192.168.1.66 {ATT}")),
-        l(&format!("22 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
-        l("22 vendor class: victim-own-but-untrusted"),
-        l(&format!("22 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
-    ];
-    assert_clean(&run(&lines)[0]);
+    for verb in ["DHCPINFORM", "DHCPRELEASE", "DHCPDECLINE", "DHCPNAK"] {
+        let lines = vec![
+            l(&format!("22 {verb}(br-lan) 192.168.1.66 {ATT}")),
+            l(&format!("22 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+            l("22 vendor class: victim-own-but-untrusted"),
+            l(&format!("22 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+        ];
+        assert_clean(&run(&lines)[0]);
+    }
 }
