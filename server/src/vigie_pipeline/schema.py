@@ -54,6 +54,31 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
           limited_emitted INTEGER NOT NULL DEFAULT 0
         )""",
     ),
+    (
+        # events gets a monotonic AUTOINCREMENT seq (the API's paging cursor): rowids can be
+        # renumbered by VACUUM or reused after deleting the newest row. Rows keep rowid order.
+        """CREATE TABLE events_v3 (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+          device_id TEXT REFERENCES devices(id), ts TEXT NOT NULL,
+          kind TEXT NOT NULL, severity TEXT NOT NULL, summary TEXT NOT NULL
+        )""",
+        "INSERT INTO events_v3 (id, device_id, ts, kind, severity, summary)"
+        " SELECT id, device_id, ts, kind, severity, summary FROM events ORDER BY rowid",
+        "DROP TABLE events",
+        "ALTER TABLE events_v3 RENAME TO events",
+        "CREATE UNIQUE INDEX uq_events_new_device ON events(device_id) WHERE kind = 'new_device'",
+        # PRP section 5; immutable by convention, decisions live in overrides.db
+        """CREATE TABLE IF NOT EXISTS suggestions (
+          id TEXT PRIMARY KEY,
+          action TEXT NOT NULL CHECK (
+            action IN ('label','move_group','quarantine','merge_identity')),
+          device_ids TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          reason_code TEXT NOT NULL, reason_text TEXT,
+          basis TEXT NOT NULL,
+          created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+        )""",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -63,6 +88,7 @@ PIPELINE_TABLES = (
     "transient_hours",
     "transient_state",
     "promotion_log",
+    "suggestions",
 )
 
 
