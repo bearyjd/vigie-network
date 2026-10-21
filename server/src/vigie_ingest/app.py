@@ -103,12 +103,17 @@ def _matches_envelope(batch: Batch, env: Envelope) -> bool:
 
 
 def process_batch(
-    settings: Settings, env: Envelope, body: bytes, now: float
+    settings: Settings,
+    env: Envelope,
+    body: bytes,
+    now: float,
+    collector_allow: Callable[[str], bool] | None = None,
 ) -> tuple[int, dict[str, object]]:
     """PRP section 4 checks after size cap and rate limit. Sync; runs in a worker thread.
 
     The HMAC is verified before any database connection is opened, so unauthenticated
-    requests cost no database work.
+    requests cost no database work. `collector_allow` is the per-collector rate limiter; it is
+    charged only after the HMAC verifies, so unauthenticated requests never touch its table.
     """
     key = auth.load_key(settings.secrets_dir, env.key_id)
     message = auth.signing_string(
@@ -116,6 +121,8 @@ def process_batch(
     )
     if not auth.verify(key, env.signature, message):
         return 401, {"error": "unauthorized"}
+    if collector_allow is not None and not collector_allow(env.collector_id):
+        return 429, {"error": "rate_limited"}
 
     conn = connect(settings.inventory_path)
     try:
@@ -124,8 +131,14 @@ def process_batch(
             return 401, {"error": "unauthorized"}
 
         rejection = store.check_state(
-            conn, collector, env.batch_id, env.boot_id, int(env.seq), int(env.sent_ts),
-            now, settings.max_clock_skew_s,
+            conn,
+            collector,
+            env.batch_id,
+            env.boot_id,
+            int(env.seq),
+            int(env.sent_ts),
+            now,
+            settings.max_clock_skew_s,
         )
         if rejection:
             return _rejection_response(rejection)
@@ -140,6 +153,9 @@ def process_batch(
         if not _matches_envelope(batch, env):
             store.record_parse_failure(conn, env.collector_id)
             return 422, {"error": "envelope_mismatch"}
+        if len(store.rows_by_day(batch)) > settings.max_shard_days:
+            store.record_parse_failure(conn, env.collector_id)
+            return 422, {"error": "too_many_shard_days"}
     finally:
         conn.close()
 
@@ -162,11 +178,16 @@ def _rejection_response(rejection: store.Rejection) -> tuple[int, dict[str, obje
 
 
 def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> FastAPI:
-    limiter = RateLimiter(
-        settings.rate_limit_per_window,
+    # Pre-auth: keyed by peer address only (a CPU guard; the claimed collector id is untrusted).
+    peer_limiter = RateLimiter(
+        settings.rate_limit_preauth_per_min,
         settings.rate_limit_window_s,
         clock,
         ipv6_prefix=settings.rate_limit_ipv6_prefix,
+    )
+    # Post-auth: keyed by collector id, charged only once the HMAC has verified.
+    collector_limiter = RateLimiter(
+        settings.rate_limit_per_window, settings.rate_limit_window_s, clock
     )
 
     @contextlib.asynccontextmanager
@@ -185,13 +206,14 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         title="vigie-ingest", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
     )
 
+    app.state.peer_limiter = peer_limiter
+    app.state.collector_limiter = collector_limiter
+
     @app.post("/v1/batch")
     async def post_batch(request: Request) -> Response:
         env = _parse_envelope(request.headers)
-        # Pre-auth bucket: the claimed collector id when headers parse, else the source address.
         peer = request.client.host if request.client else "?"
-        bucket = f"cid:{env.collector_id}" if env else peer
-        if not limiter.allow(bucket):
+        if not peer_limiter.allow(peer):
             return JSONResponse({"error": "rate_limited"}, status_code=429)
         if env is None:
             return _unauthorized()  # before the body is read or any other work is done
@@ -203,7 +225,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             return JSONResponse({"error": "body_too_large"}, status_code=413)
         except BodyTimeout:
             return JSONResponse({"error": "body_timeout"}, status_code=408)
-        status, payload = await run_in_threadpool(process_batch, settings, env, body, clock())
+        status, payload = await run_in_threadpool(
+            process_batch, settings, env, body, clock(), collector_limiter.allow
+        )
         return JSONResponse(payload, status_code=status)
 
     return app

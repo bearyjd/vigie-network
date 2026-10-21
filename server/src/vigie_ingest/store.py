@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 from vigie_ingest.db import (
+    LOCKED_BUSY_TIMEOUT_MS,
     SHARD_LOCK,
     SHARD_TABLES,
     connect,
@@ -162,13 +163,18 @@ def rows_by_day(batch: Batch) -> dict[date, ShardRows]:
     return out
 
 
+def _connect_locked(path: Path | str) -> sqlite3.Connection:
+    """Connection for use while holding SHARD_LOCK (short busy timeout)."""
+    return connect(path, LOCKED_BUSY_TIMEOUT_MS)
+
+
 def _after_shard_commit() -> None:
     """Test seam: crash tests replace this to simulate dying before the inventory commit."""
 
 
 def _write_shard(data_dir: Path, day: date, tables: ShardRows, batch: Batch) -> None:
-    ensure_shard(data_dir, day)
-    conn = connect(data_dir / shard_name(day))
+    ensure_shard(data_dir, day, LOCKED_BUSY_TIMEOUT_MS)
+    conn = _connect_locked(data_dir / shard_name(day))
     try:
         with immediate(conn):
             _delete_batch_rows(conn, batch)
@@ -196,7 +202,7 @@ def _remove_shard_rows(data_dir: Path, days: list[date], batch: Batch) -> None:
             path = data_dir / shard_name(day)
             if not path.exists():
                 continue
-            conn = connect(path)
+            conn = _connect_locked(path)
             try:
                 with immediate(conn):
                     _delete_batch_rows(conn, batch)
@@ -211,8 +217,11 @@ def apply_batch(
 
     One lock spans the state pre-check, shard writes, inventory commit and any compensation, so
     a duplicate or concurrent request can neither overwrite nor delete another request's rows.
+    Connections opened under the lock use a short busy timeout.
     """
     by_day = rows_by_day(batch)
+    if _is_duplicate(inventory_path, batch):  # fast read-only check; re-checked under the lock
+        return "duplicate"
     with SHARD_LOCK:
         rejected = _precheck(inventory_path, batch, now, max_skew_s)
         if rejected:  # nothing is written for duplicates or rejected batches
@@ -221,7 +230,7 @@ def apply_batch(
             _write_shard(data_dir, day, tables, batch)
         _after_shard_commit()
 
-        conn = connect(inventory_path)
+        conn = _connect_locked(inventory_path)
         try:
             with immediate(conn):
                 result = _commit_inventory(conn, batch, now, max_skew_s)
@@ -233,8 +242,22 @@ def apply_batch(
         return result
 
 
-def _precheck(inventory_path: Path, batch: Batch, now: float, max_skew_s: int) -> Outcome | None:
+def _is_duplicate(inventory_path: Path, batch: Batch) -> bool:
     conn = connect(inventory_path)
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM batches WHERE collector_id=? AND batch_id=?",
+                (batch.collector_id, batch.batch_id),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def _precheck(inventory_path: Path, batch: Batch, now: float, max_skew_s: int) -> Outcome | None:
+    conn = _connect_locked(inventory_path)
     try:
         return _evaluate(conn, batch, now, max_skew_s)
     finally:
@@ -273,8 +296,7 @@ def _commit_inventory(
          batch.dropped_batches),
     )  # fmt: skip
     conn.execute(
-        "UPDATE collectors SET last_seq=?, boot_id=?, last_sent_ts=MAX(last_sent_ts, ?)"
-        " WHERE id=?",
+        "UPDATE collectors SET last_seq=?, boot_id=?, last_sent_ts=MAX(last_sent_ts, ?) WHERE id=?",
         (batch.seq, batch.boot_id, batch.sent_ts, batch.collector_id),
     )
     return "applied"

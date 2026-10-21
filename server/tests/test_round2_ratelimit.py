@@ -1,23 +1,9 @@
-"""Round-2 N3: rate limiter keyed by claimed collector id pre-auth, overflow bucket."""
+"""Round-2 N3: overflow bucket and IPv6 grouping (pre-auth keying is covered in round 3)."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
-from conftest import Env, make_batch
-
 from vigie_ingest.config import Settings
 from vigie_ingest.ratelimit import RateLimiter
-
-
-def test_one_flooding_device_does_not_exhaust_the_collectors_bucket(
-    make_env: Callable[..., Env],
-) -> None:
-    env = make_env(rate_limit_per_window=5)
-    codes = [env.client.post("/v1/batch", content=b"{}").status_code for _ in range(20)]
-    assert 429 in codes  # the IoT device (no valid envelope) hit its own source bucket
-    resp = env.post(make_batch(seq=1))  # same TCP peer, but keyed by claimed collector id
-    assert resp.status_code == 200
 
 
 def test_table_full_routes_new_sources_to_a_shared_overflow_bucket() -> None:

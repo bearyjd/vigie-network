@@ -83,8 +83,13 @@ def test_crash_between_shard_commit_and_inventory_commit_retries_exactly_once(
     body_file.write_bytes(encode(batch))
     proc = subprocess.run(  # noqa: S603
         [
-            sys.executable, "-c", CRASH_SCRIPT, str(env.settings.inventory_path),
-            str(env.settings.data_dir), str(body_file), str(NOW),
+            sys.executable,
+            "-c",
+            CRASH_SCRIPT,
+            str(env.settings.inventory_path),
+            str(env.settings.data_dir),
+            str(body_file),
+            str(NOW),
         ],
         env={**os.environ, "PYTHONPATH": str(SRC)},
         capture_output=True,
@@ -427,8 +432,11 @@ def _collect_401(env: Env) -> list:
     out = []
     batch = make_batch(seq=1)
     body = encode(batch)
-    out.append(env.client.post("/v1/batch", content=body, headers=signed_headers(
-        body, batch, key=b"\x01" * 32)))  # bad hmac
+    out.append(
+        env.client.post(
+            "/v1/batch", content=body, headers=signed_headers(body, batch, key=b"\x01" * 32)
+        )
+    )  # bad hmac
     out.append(env.client.post("/v1/batch", content=body))  # no headers
     out.append(env.post(make_batch(seq=1, collector_id="ghost")))  # unknown collector
     (env.settings.secrets_dir / "collector_key_k1").unlink()
@@ -450,8 +458,13 @@ def test_all_401_responses_are_byte_identical(env: Env) -> None:
     responses = _collect_401(env)
     batch = make_batch(seq=1)
     body = encode(batch)
-    responses.append(env.client.post("/v1/batch", content=body, headers=signed_headers(
-        body, batch, **{"X-Vigie-Signature": "zz"})))  # malformed signature
+    responses.append(
+        env.client.post(
+            "/v1/batch",
+            content=body,
+            headers=signed_headers(body, batch, **{"X-Vigie-Signature": "zz"}),
+        )
+    )  # malformed signature
     assert {r.status_code for r in responses} == {401}
     assert len({r.content for r in responses}) == 1
     assert len({tuple(sorted(r.headers.items())) for r in responses}) == 1

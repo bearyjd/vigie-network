@@ -12,6 +12,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 BUSY_TIMEOUT_MS = 5000
+# Connections opened under SHARD_LOCK wait less, so a stuck writer cannot stall every request.
+LOCKED_BUSY_TIMEOUT_MS = 1500
 WAL_RETRIES = 8
 # Serialises shard writes with shard-file deletion (in-process; one ingest process per data dir).
 SHARD_LOCK = threading.RLock()
@@ -117,11 +119,11 @@ SHARD_MIGRATIONS: Sequence[str] = (
 )
 
 
-def connect(path: Path | str) -> sqlite3.Connection:
+def connect(path: Path | str, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> sqlite3.Connection:
     """Open a connection with the mandatory pragmas (WAL, secure_delete, busy timeout)."""
-    conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    conn = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     _enable_wal(conn)
     conn.execute("PRAGMA secure_delete=ON")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -199,9 +201,9 @@ def shard_name(day: date) -> str:
     return f"raw-{day:%Y%m%d}.db"
 
 
-def ensure_shard(data_dir: Path, day: date) -> Path:
+def ensure_shard(data_dir: Path, day: date, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> Path:
     path = data_dir / shard_name(day)
-    conn = connect(path)
+    conn = connect(path, busy_timeout_ms)
     try:
         migrate(conn, SHARD_MIGRATIONS)
     finally:

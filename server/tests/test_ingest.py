@@ -246,9 +246,7 @@ def test_sent_ts_window(env: Env, delta: int, expected: int) -> None:
 def test_spooled_old_window_accepted_when_sent_ts_fresh(env: Env) -> None:
     old_end = int(NOW) - 20 * 3600  # spooled ~20h, previous UTC day
     dns = {**make_batch()["dns"][0], "ts": old_end - 5}
-    batch = make_batch(
-        seq=1, window_start=old_end - 60, window_end=old_end, dns=[dns]
-    )
+    batch = make_batch(seq=1, window_start=old_end - 60, window_end=old_end, dns=[dns])
     resp = env.post(batch)
     assert resp.status_code == 200
     assert shard_count(env, "raw_dns", ts=old_end - 5) == 1
@@ -325,7 +323,7 @@ def test_invalid_content_length_rejected(env: Env) -> None:
 def test_rate_limit_applies_before_body_is_read(
     make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    env = make_env(rate_limit_per_window=3)
+    env = make_env(rate_limit_preauth_per_min=3)
     for _ in range(3):
         assert env.client.post("/v1/batch", content=b"{}").status_code == 401
 
@@ -338,7 +336,7 @@ def test_rate_limit_applies_before_body_is_read(
 
 
 def test_rate_limit_recovers_after_window(make_env: Callable[..., Env]) -> None:
-    env = make_env(rate_limit_per_window=1, rate_limit_window_s=60)
+    env = make_env(rate_limit_preauth_per_min=1, rate_limit_window_s=60)
     assert env.client.post("/v1/batch", content=b"{}").status_code == 401
     assert env.client.post("/v1/batch", content=b"{}").status_code == 429
     env.clock[0] += 61
