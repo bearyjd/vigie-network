@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import sqlite3
+from itertools import islice
 from typing import Any
 
 from vigie_api.effective import decode_cursor, encode_cursor, rows
@@ -14,42 +16,53 @@ PROSE_SUPPRESSED = frozenset({"move_group", "quarantine", "merge_identity"})
 SUGGESTION_STATES = ("pending", "accepted", "rejected", "expired")
 
 
-def _split_cursor(cursor: str | None) -> tuple[str, str]:
+_CURSOR_KEYS = ("inv", "audit")
+_MAX_ROWID = 2**63 - 1
+
+
+def _decode_event_cursor(cursor: str | None) -> dict[str, int]:
+    """Opaque `{"inv": <events.rowid>, "audit": <audit_log.rowid>}`; anything else is a 400."""
     if not cursor:
-        return "", ""
-    ts, sep, event_id = decode_cursor(cursor).partition("|")
-    if not sep:
-        raise ApiError(422, "invalid_cursor", "malformed cursor")
-    return ts, event_id
-
-
-def _inventory_events(inv, ts, eid, kind, severity, limit) -> list[dict[str, Any]]:
-    sql = (
-        "SELECT id, device_id, ts, kind, severity, summary FROM events"
-        " WHERE (ts > ? OR (ts = ? AND id > ?))"
+        return dict.fromkeys(_CURSOR_KEYS, 0)
+    try:
+        raw = json.loads(decode_cursor(cursor))
+    except ValueError as exc:
+        raise ApiError(400, "invalid_cursor", "malformed cursor") from exc
+    valid = isinstance(raw, dict) and set(raw) <= set(_CURSOR_KEYS)
+    valid = valid and all(
+        type(v) is int and 0 <= v <= _MAX_ROWID  # noqa: E721 - bool is not a rowid
+        for v in raw.values()
     )
-    params: list[Any] = [ts, ts, eid]
+    if not valid:
+        raise ApiError(400, "invalid_cursor", "malformed cursor")
+    return {key: raw.get(key, 0) for key in _CURSOR_KEYS}
+
+
+def _inventory_events(inv, after, kind, severity, limit) -> list[dict[str, Any]]:
+    sql = (
+        "SELECT rowid AS rid, id, device_id, ts, kind, severity, summary FROM events"
+        " WHERE rowid > ?"
+    )
+    params: list[Any] = [after]
     if kind:
         sql, params = sql + " AND kind = ?", [*params, kind]
     if severity:
         sql, params = sql + " AND severity = ?", [*params, severity]
-    found = rows(inv, sql + " ORDER BY ts, id LIMIT ?", (*params, limit))
+    found = rows(inv, sql + " ORDER BY rowid LIMIT ?", (*params, limit))
     return [{**dict(r), "source": "inventory"} for r in found]
 
 
-def _audit_events(ov, ts, eid, kind, severity, limit) -> list[dict[str, Any]]:
+def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
     if severity not in (None, "info"):  # human actions are always informational
         return []
-    sql = (
-        "SELECT id, target, ts, principal, action FROM audit_log"
-        " WHERE (ts > ? OR (ts = ? AND id > ?))"
-    )
-    params: list[Any] = [ts, ts, eid]
+    sql = "SELECT rowid AS rid, id, target, ts, principal, action FROM audit_log WHERE rowid > ?"
+    params: list[Any] = [after]
     if kind:
         sql, params = sql + " AND action = ?", [*params, kind]
-    found = rows(ov, sql + " ORDER BY ts, id LIMIT ?", (*params, limit))
+    found = rows(ov, sql + " ORDER BY rowid LIMIT ?", (*params, limit))
     return [
         {
+            "rid": r["rid"],
             "id": r["id"],
             "device_id": r["target"],
             "ts": r["ts"],
@@ -71,16 +84,28 @@ def list_events(
     severity: str | None,
     limit: int,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Oldest-first; `next_cursor` is the resume point (last item), echoing `since` if empty."""
-    ts, eid = _split_cursor(since)
-    merged = _inventory_events(inv, ts, eid, kind, severity, limit)
-    merged += _audit_events(ov, ts, eid, kind, severity, limit)
-    merged.sort(key=lambda e: (e["ts"], e["id"]))
-    page = merged[:limit]
+    """Paginate on insertion order (rowid per source); `ts` is for display only.
+
+    A late-arriving row can carry an older `ts` than rows already served, so a (ts, id) cursor
+    would skip it. The page is the merge of both sources' rowid-ordered streams (so it is always
+    a rowid prefix per source), re-sorted by ts for display. `next_cursor` is the resume point
+    (the last included rowid per source); an empty page echoes `since`.
+    """
+    cursor = _decode_event_cursor(since)
+    streams = [
+        _inventory_events(inv, cursor["inv"], kind, severity, limit),
+        _audit_events(ov, cursor["audit"], kind, severity, limit),
+    ]
+    page = list(islice(heapq.merge(*streams, key=lambda e: (e["ts"], e["id"])), limit))
     if not page:
         return [], since
-    last = page[-1]
-    return page, encode_cursor(f"{last['ts']}|{last['id']}")
+    resume = dict(cursor)
+    for event in page:
+        key = "inv" if event["source"] == "inventory" else "audit"
+        resume[key] = max(resume[key], event["rid"])
+    page.sort(key=lambda e: (e["ts"], e["id"]))
+    token = encode_cursor(json.dumps(resume, sort_keys=True, separators=(",", ":")))
+    return [{k: v for k, v in e.items() if k != "rid"} for e in page], token
 
 
 def _suggestion(row: sqlite3.Row, decision: sqlite3.Row | None, now_iso: str) -> dict[str, Any]:

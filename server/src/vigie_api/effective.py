@@ -37,7 +37,7 @@ def decode_cursor(cursor: str) -> str:
         standard = cursor.replace("-", "+").replace("_", "/") + "=" * (-len(cursor) % 4)
         return base64.b64decode(standard, validate=True).decode()
     except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
-        raise ApiError(422, "invalid_cursor", "malformed cursor") from exc
+        raise ApiError(400, "invalid_cursor", "malformed cursor") from exc
 
 
 def normalize_mac(raw: str) -> str:

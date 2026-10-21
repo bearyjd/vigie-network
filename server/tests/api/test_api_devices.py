@@ -92,8 +92,8 @@ def test_exact_page_boundary_has_no_dangling_cursor(env: Env) -> None:
     assert env.get("/devices", limit=2).json()["page"]["next_cursor"] is None
 
 
-def test_bad_cursor_is_422(env: Env) -> None:
-    assert env.get("/devices", cursor="!!!").status_code == 422
+def test_bad_cursor_is_400(env: Env) -> None:
+    assert env.get("/devices", cursor="!!!").status_code == 400
 
 
 def test_alias_follows_identity_link(env: Env) -> None:

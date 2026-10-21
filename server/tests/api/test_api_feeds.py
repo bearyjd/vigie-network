@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from api_helpers import Env, env  # noqa: F401
+import pytest
+from api_helpers import Env, env, ts  # noqa: F401
+
+from vigie_api.effective import decode_cursor, encode_cursor
 
 
 def kinds(r) -> list[str]:
@@ -59,11 +62,65 @@ def test_events_same_timestamp_ties_do_not_skip(env: Env) -> None:
     assert len(seen) == 4 == len(set(seen))
 
 
-def test_events_bad_cursor(env: Env) -> None:
-    assert env.get("/events", since="!!").status_code == 422
-    from vigie_api.effective import encode_cursor
+def test_events_late_arriving_event_is_not_skipped(env: Env) -> None:
+    """Pipeline stamps events with observation time, so a later insert can carry an older ts."""
+    env.device("d1")
+    e2 = env.event("d1", -60, "anomaly")  # "12:00"
+    first = env.get("/events").json()
+    assert [e["id"] for e in first["data"]] == [e2]
+    e1 = env.event("d1", -120, "anomaly")  # "11:59", inserted after the cursor was taken
+    again = env.get("/events", since=first["page"]["next_cursor"]).json()
+    assert [e["id"] for e in again["data"]] == [e1]
 
-    assert env.get("/events", since=encode_cursor("nopipe")).status_code == 422
+
+def test_events_late_audit_row_is_not_skipped(env: Env) -> None:
+    env.device("d1")
+    env.event("d1", -60, "anomaly")
+    cursor = env.get("/events").json()["page"]["next_cursor"]
+    env.ov.execute(
+        "INSERT INTO audit_log (id, ts, principal, action, target) VALUES ('late',?,?,?,?)",
+        (ts(-500), "cli", "token.create", None),
+    )
+    got = env.get("/events", since=cursor).json()["data"]
+    assert [e["id"] for e in got] == ["late"]
+
+
+def test_events_page_is_display_sorted_by_ts_and_limit_is_total(env: Env) -> None:
+    env.device("d1")
+    for i, when in enumerate((-10, -50, -30)):
+        env.event("d1", when, "anomaly")
+    page = env.get("/events", limit=3).json()["data"]
+    assert [e["ts"] for e in page] == sorted(e["ts"] for e in page)
+    assert len(env.get("/events", limit=2).json()["data"]) == 2
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "!!",
+        encode_cursor("nopipe"),
+        encode_cursor("[1,2]"),
+        encode_cursor('{"inv": -1}'),
+        encode_cursor('{"inv": "x"}'),
+        encode_cursor('{"inv": 1.5}'),
+        encode_cursor('{"inv": true}'),
+        encode_cursor('{"evil": 1}'),
+        encode_cursor('{"inv": 99999999999999999999}'),
+    ],
+)
+def test_events_bad_or_tampered_cursor_is_400(env: Env, bad: str) -> None:
+    r = env.get("/events", since=bad)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_events_next_cursor_is_resume_point_and_opaque(env: Env) -> None:
+    """next_cursor = last included row per source; empty page echoes `since` unchanged."""
+    env.device("d1")
+    env.event("d1", -5, "anomaly")
+    cursor = env.get("/events").json()["page"]["next_cursor"]
+    assert decode_cursor(cursor) == '{"audit":0,"inv":1}'
+    empty = env.get("/events", since=cursor).json()
+    assert empty["data"] == [] and empty["page"]["next_cursor"] == cursor
 
 
 def test_suggestion_effective_state_computed_on_read(env: Env) -> None:
