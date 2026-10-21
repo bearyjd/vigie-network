@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use crate::model::Proto;
 
 /// Longest accepted line, newline excluded. The helper allows 2 MiB (`MAX_SNAPSHOT_BYTES`).
-pub const MAX_LINE: usize = 1024 * 1024;
+pub const MAX_LINE: usize = 2 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 8192;
 pub const MAX_DEPTH: usize = 8;
 const MAX_KEY: usize = 64;

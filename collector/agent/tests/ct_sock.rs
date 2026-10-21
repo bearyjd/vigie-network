@@ -506,3 +506,42 @@ fn the_real_helper_publisher_end_to_end() {
     assert!(got.table_pressure);
     assert_eq!(got.records[0].bytes_down, 120);
 }
+
+/// The agent must accept every line the helper can produce: same cap as the helper's publisher,
+/// and the widest snapshot the helper's argument limits allow is below it.
+#[test]
+fn line_cap_matches_the_helpers_and_the_widest_accepted_snapshot_fits() {
+    assert_eq!(MAX_LINE, vigie_conntrack::sock::MAX_SNAPSHOT_BYTES);
+    let ip: std::net::IpAddr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+    let rec = vigie_conntrack::agg::Record {
+        src: ip,
+        dst: Some(ip),
+        dport: Some(65535),
+        proto: Some(255),
+        bytes_up: u64::MAX,
+        bytes_down: u64::MAX,
+        packets_up: u64::MAX,
+        packets_down: u64::MAX,
+        flows: u64::MAX,
+        new_flows: u64::MAX,
+        global: false,
+    };
+    let n = vigie_conntrack::cli::MAX_RECORDS - 1;
+    let snap = vigie_conntrack::agg::Snapshot {
+        records: vec![rec; n],
+        ..Default::default()
+    };
+    let meta = vigie_conntrack::json::Meta {
+        seq: u64::MAX,
+        ts: u64::MAX,
+        interval_s: u64::MAX,
+        skipped_lines: usize::MAX,
+        acct_off: true,
+    };
+    let line = vigie_conntrack::json::snapshot_json(&meta, &snap);
+    assert!(line.len() <= MAX_LINE, "{} bytes", line.len());
+    assert!(
+        vigie_agent::ctparse::parse_snapshot(line.as_bytes()).is_ok(),
+        "the agent parses the widest snapshot"
+    );
+}
