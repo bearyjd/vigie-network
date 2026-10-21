@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from conftest import COLLECTOR, NOW, Env, encode, make_batch
 from test_review import inv, rows
 
@@ -50,3 +51,22 @@ def test_n2_same_batch_id_different_content_cannot_alter_stored_rows(env: Env) -
     changed = {**batch, "dns": [{**batch["dns"][0], "qname": "evil.example"}]}
     assert _apply(env, changed) == "duplicate"
     assert [r["qname"] for r in rows(env, "raw_dns")] == ["example.com"]
+
+
+def test_duplicate_found_at_commit_time_never_triggers_compensation(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process records the same batch between our shard commit and inventory commit."""
+    batch = make_batch(seq=1)
+
+    def other_process_wins() -> None:
+        conn = env.inventory()
+        conn.execute(
+            "INSERT INTO batches (collector_id, batch_id, received_at) VALUES (?,?,'t')",
+            (COLLECTOR, batch["batch_id"]),
+        )
+        conn.close()
+
+    monkeypatch.setattr(store, "_after_shard_commit", other_process_wins)
+    assert _apply(env, batch) == "duplicate"
+    assert len(rows(env, "raw_dns")) == 1  # the winner's rows are not deleted

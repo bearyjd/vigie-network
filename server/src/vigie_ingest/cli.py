@@ -35,14 +35,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    tls: dict[str, str] = {}
     if args.tls_cert or args.tls_key:
         if not (args.tls_cert and args.tls_key):
             return _refuse("--tls-cert and --tls-key must be given together")
         missing = [p for p in (args.tls_cert, args.tls_key) if not Path(p).is_file()]
         if missing:
             return _refuse(f"TLS file(s) not found: {missing}")
-        tls = {"ssl_certfile": args.tls_cert, "ssl_keyfile": args.tls_key}
     elif not args.insecure_dev:
         return _refuse("TLS is required: pass --tls-cert/--tls-key (or --insecure-dev for dev)")
     uvicorn.run(
@@ -51,7 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         limit_concurrency=args.limit_concurrency,
         timeout_keep_alive=args.timeout_keep_alive,
-        **tls,
+        ssl_certfile=args.tls_cert,
+        ssl_keyfile=args.tls_key,
     )
     return 0
 

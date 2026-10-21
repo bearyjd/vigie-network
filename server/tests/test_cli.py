@@ -49,7 +49,8 @@ def test_starts_with_tls(uvicorn_calls: list[dict], tmp_path: Path) -> None:
 
 def test_insecure_dev_flag_allows_plain_http(uvicorn_calls: list[dict]) -> None:
     assert cli.main(["--insecure-dev"]) == 0
-    assert "ssl_certfile" not in uvicorn_calls[0] or uvicorn_calls[0]["ssl_certfile"] is None
+    assert uvicorn_calls[0]["ssl_certfile"] is None
+    assert uvicorn_calls[0]["ssl_keyfile"] is None
 
 
 def test_insecure_dev_env_allows_plain_http(

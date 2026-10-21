@@ -95,5 +95,19 @@ idempotent), then the inventory transaction records the batch and advances `seq`
 between makes the retry apply normally rather than report `duplicate`. Single process per data
 dir is assumed (shard purge and writes are serialised by an in-process lock).
 
+Raw-shard readers must join against `batches`: a crash between the shard commit and the
+inventory commit can leave orphan shard rows (same `collector_id`/`batch_id`, no `batches` row).
+The collector's retry replaces them, but until then they are not part of an applied batch.
+
+Upgrade note: migration v3 sets `last_sent_ts = 0` for existing collectors, so the first batch
+after the upgrade skips the boot_id-rollback guard (the 5-minute `sent_ts` skew check still
+applies).
+
+Rate limiting: before authentication the bucket is the claimed collector id (headers that parse),
+otherwise the source address (IPv6 by full address; set `VIGIE_RATE_LIMIT_IPV6_PREFIX=64` to
+group by /64). When the table is full, new keys share one overflow bucket. The claimed id is
+unauthenticated, so a LAN host that floods with a collector's id can still exhaust that id's
+bucket; TLS plus network placement are the mitigation, not this limiter.
+
 Retention: raw shards deleted after `VIGIE_SHARD_RETENTION_DAYS` (default 7, max 30); `batches`
 rows older than 7 days purged. Maintenance runs at startup and hourly.
