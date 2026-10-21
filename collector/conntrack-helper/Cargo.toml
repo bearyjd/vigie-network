@@ -1,0 +1,16 @@
+[package]
+name = "vigie-conntrack"
+description = "Root-only helper: parses /proc/net/nf_conntrack and serves aggregated deltas to the unprivileged agent over a unix socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vigie_conntrack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigie-conntrack"
+path = "src/main.rs"
+
+[dependencies]
