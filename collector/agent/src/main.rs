@@ -453,6 +453,50 @@ mod tests {
         );
     }
 
+    fn log_agent(tag: &str) -> (Agent, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("vigie-main-{}-{tag}.log", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let mut a = agent();
+        a.tail = Tail::new(path.clone());
+        a.poll_log(0);
+        (a, path)
+    }
+
+    fn append(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn tail_counters_reach_the_batch_drops() {
+        let (mut a, path) = log_agent("counts");
+        append(&path, &format!("{}\n", "z".repeat(5000)));
+        a.poll_log(1);
+        let (_, drops) = a.window.take_with_drops();
+        assert_eq!(drops.get("tail_bytes_skipped"), Some(&5000), "{drops:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn an_unparsed_line_between_request_and_options_detaches_them() {
+        let (mut a, path) = log_agent("break");
+        let p = "Oct 20 14:00:00 dnsmasq-dhcp[5]:";
+        append(
+            &path,
+            &format!(
+                "{p} 7 DHCPREQUEST(br-lan) 192.168.1.50 {MAC}\nnot a dnsmasq line\n\
+                 {p} 7 vendor class: injected\n{p} 7 DHCPACK(br-lan) 192.168.1.50 {MAC}\n"
+            ),
+        );
+        a.poll_log(1);
+        let leases = a.window.take_identity().leases;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].opt60, None);
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn parse_args_takes_allow_root_only_when_given() {
         let none = parse_args(["--config".to_string(), "/x".to_string()].into_iter()).unwrap();
