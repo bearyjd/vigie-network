@@ -1,14 +1,43 @@
-//! Validated parameters for the (not yet written) SPKI-pinned HTTPS transport.
+//! Validated parameters for the SPKI-pinned HTTPS transport, and the factory the agent uses.
 //!
-//! A future TLS transport must be built from a `PinnedTransport`, which can only be made with an
-//! https URL without userinfo and at least one valid SHA-256 SPKI pin, so "TLS without pins" is not
-//! constructible. Nothing here talks to the network and `PinnedTransport` is not a `sender::Transport`:
-//! `NoTransport` in `main.rs` remains the only implementation shipped.
+//! `HttpsTransport` (in `https.rs`) can only be built from a `PinnedTransport`, which can only be
+//! made with an https URL without userinfo and at least one valid SHA-256 SPKI pin, so "TLS without
+//! pins" is not constructible. `PinnedTransport` itself does no I/O.
 
 use std::fmt;
 
+use crate::config::Config;
+use crate::https::HttpsTransport;
+use crate::sender::{Headers, HttpReply, Transport, TransportError};
+
 /// SHA-256 digest of a certificate's SubjectPublicKeyInfo.
 pub type Pin = [u8; 32];
+
+/// The transport the agent runs with, built from the (already validated) config. Never panics: if
+/// the URL or pins cannot be turned into a transport, every `post` fails with that reason.
+pub fn make(cfg: &Config) -> impl Transport {
+    match PinnedTransport::new(&cfg.server_url, &cfg.pins)
+        .map_err(|e| TransportError(format!("server_url/pins: {e}")))
+        .and_then(HttpsTransport::new)
+    {
+        Ok(t) => Made::Https(Box::new(t)),
+        Err(e) => Made::Broken(e),
+    }
+}
+
+enum Made {
+    Https(Box<HttpsTransport>),
+    Broken(TransportError),
+}
+
+impl Transport for Made {
+    fn post(&mut self, headers: &Headers, body: &[u8]) -> Result<HttpReply, TransportError> {
+        match self {
+            Self::Https(t) => t.post(headers, body),
+            Self::Broken(e) => Err(e.clone()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinError {

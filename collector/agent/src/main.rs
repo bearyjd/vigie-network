@@ -327,7 +327,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         let known = parse_leases(&t);
         agent.urgent.prime(known.iter().map(|l| l.mac.as_str()));
     }
-    let mut transport = NoTransport;
+    let mut transport = vigie_agent::transport::make(&agent.cfg);
     let (mut last_flush, mut last_neigh) = (0u64, 0u64);
     loop {
         let mono = agent.started.elapsed().as_secs();
