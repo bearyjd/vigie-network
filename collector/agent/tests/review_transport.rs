@@ -1,0 +1,138 @@
+//! Security review item 11: the future TLS transport can only be built from a validated
+//! `PinnedTransport` (https only, no userinfo, at least one SPKI pin).
+
+use vigie_agent::transport::{PinError, PinnedTransport};
+
+// base64 of 32 bytes (0..32) and of 32 x 0xff
+const PIN_A: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+const PIN_B: &str = "//////////////////////////////////////////8=";
+const HEX_PIN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const URL: &str = "https://vigie.example.lan:8443/v1/batch";
+
+fn ok(url: &str, pins: &[&str]) -> PinnedTransport {
+    PinnedTransport::new(url, pins).unwrap()
+}
+
+#[test]
+fn accepts_a_plain_https_url_with_pins() {
+    let t = ok(URL, &[PIN_A, PIN_B]);
+    assert_eq!(t.host(), "vigie.example.lan");
+    assert_eq!(t.port(), 8443);
+    assert_eq!(t.path(), "/v1/batch");
+    assert_eq!(t.pins().len(), 2);
+    assert_eq!(t.pins()[0][0], 0);
+    assert_eq!(t.pins()[0][31], 31);
+    assert_eq!(t.pins()[1], [0xff; 32]);
+}
+
+#[test]
+fn scheme_is_checked_case_insensitively_and_must_be_https() {
+    assert!(PinnedTransport::new("HTTPS://h.example/x", &[PIN_A]).is_ok());
+    assert!(PinnedTransport::new("HtTpS://h.example/x", &[PIN_A]).is_ok());
+    for bad in [
+        "http://h.example/x",
+        "HTTP://h.example/x",
+        "ftp://h.example/x",
+        "h.example/x",
+        "//h.example/x",
+        "https:/h.example/x",
+        "https:h.example",
+        "httpss://h.example",
+        " https://h.example/x",
+        "",
+    ] {
+        assert_eq!(
+            PinnedTransport::new(bad, &[PIN_A]).err(),
+            Some(PinError::Scheme),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn userinfo_is_rejected_however_it_is_spelled() {
+    for bad in [
+        "https://user@h.example/x",
+        "https://user:pw@h.example/x",
+        "https://@h.example/x",
+        "https://h.example@evil.example/x",
+        "https://h.example%40evil.example/x",
+        "https://h.example\\@evil.example/x",
+        "https://evil.example\\.h.example/x",
+    ] {
+        assert!(PinnedTransport::new(bad, &[PIN_A]).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        PinnedTransport::new("https://u:p@h.example/", &[PIN_A]).err(),
+        Some(PinError::Userinfo)
+    );
+}
+
+#[test]
+fn needs_at_least_one_valid_pin() {
+    assert_eq!(
+        PinnedTransport::new(URL, &[] as &[&str]).err(),
+        Some(PinError::NoPins)
+    );
+    for bad in [
+        "",
+        "AAAA",
+        "not base64!",
+        // 44 chars but 33 bytes would need different padding; one char too long
+        &format!("{PIN_A}A"),
+        // non-canonical trailing bits
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9=",
+        // valid base64 of 31 bytes
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==",
+        // URL-safe alphabet is not accepted
+        "__________________________________________8=",
+    ] {
+        assert!(
+            matches!(PinnedTransport::new(URL, &[bad]), Err(PinError::BadPin(_))),
+            "{bad:?}"
+        );
+    }
+    // one good pin and one bad pin is still a refusal (a typo must not silently drop a pin)
+    assert!(PinnedTransport::new(URL, &[PIN_A, "oops"]).is_err());
+}
+
+#[test]
+fn the_hex_pins_of_the_config_file_are_accepted_too() {
+    let t = ok(URL, &[HEX_PIN]);
+    assert_eq!(t.pins()[0][0], 0x01);
+    assert_eq!(t.pins()[0][1], 0x23);
+    assert!(
+        PinnedTransport::new(
+            URL,
+            &["0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"]
+        )
+        .is_err(),
+        "uppercase hex is not the config format"
+    );
+}
+
+#[test]
+fn host_and_port_are_validated() {
+    assert_eq!(ok("https://h.example/x", &[PIN_A]).port(), 443);
+    assert_eq!(ok("https://[fd00::1]:9443/x", &[PIN_A]).host(), "[fd00::1]");
+    assert_eq!(ok("https://h.example", &[PIN_A]).path(), "/");
+    for bad in [
+        "https:///x",
+        "https://:443/x",
+        "https://h.example:0/x",
+        "https://h.example:65536/x",
+        "https://h.example:port/x",
+        "https://h exa.example/x",
+        "https://h.example\r\n/x",
+    ] {
+        assert!(PinnedTransport::new(bad, &[PIN_A]).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn the_pinned_transport_does_not_implement_transport_itself() {
+    // Nothing in this build can send through it: NoTransport stays the only Transport.
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/transport.rs")).unwrap();
+    assert!(!src.contains("impl Transport for"));
+}

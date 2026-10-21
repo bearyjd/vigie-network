@@ -24,6 +24,7 @@ use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport,
 use vigie_agent::spool::SPOOL_CAP;
 use vigie_agent::syncstate::{FlushPlan, SyncState};
 use vigie_agent::tail::Tail;
+use vigie_agent::transport::PinnedTransport;
 use vigie_agent::urgent::Urgent;
 use vigie_agent::window::{SnapshotDelta, Window, WindowClock};
 
@@ -86,6 +87,10 @@ fn load(args: &Args) -> Result<(Config, Vec<u8>), String> {
     let text =
         std::fs::read_to_string(&args.config).map_err(|e| format!("{}: {e}", args.config))?;
     let cfg = parse_config(&text).map_err(|e| format!("config: {e}"))?;
+    // The real TLS transport will be built from this value; validating here makes a URL with
+    // userinfo or a bad pin a startup (and `--check`) failure.
+    PinnedTransport::new(&cfg.server_url, &cfg.pins)
+        .map_err(|e| format!("server_url/pins: {e}"))?;
     let key = load_key(&cfg.key_file).map_err(|e| format!("key: {e}"))?;
     Ok((cfg, key))
 }

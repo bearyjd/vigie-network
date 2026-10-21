@@ -22,5 +22,6 @@ pub mod spool;
 pub mod syncstate;
 pub mod tail;
 pub mod timegate;
+pub mod transport;
 pub mod urgent;
 pub mod window;
