@@ -213,8 +213,11 @@ name = "vigie-collector"
 version = "0.1.0"
 dependencies = [
  "hmac",
+ "net-spike",
  "serde_json",
  "sha2",
+ "socket2",
+ "vigie-conntrack",
  "vigie-parse",
 ]
 

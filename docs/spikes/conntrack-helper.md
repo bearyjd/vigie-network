@@ -106,7 +106,12 @@ the neighbor table.
      (max 2048 each); everything else folds into ONE `"other_global":true` record with
      `"src":"0.0.0.0"` carrying the summed counters. Totals are preserved exactly; at most
      `top_n + k_lan + k_wan + 1` = 769 records by default, far below the 2 MiB publisher cap
-     (16384 distinct v6 sources: ~90 KiB, `tests/flood.rs`). `folded` says how many
+     (16384 distinct v6 sources: ~90 KiB, `tests/flood.rs`). The three limits are also bounded
+     together: `top_n + k_lan + k_wan + 2 <= 2500` (startup error otherwise), so even a snapshot
+     of worst-width records (full IPv6 src and dst, `proto-255`, 20-digit counters, ~350 bytes
+     each, under 1 MiB at the limit) is below the 2 MiB line cap, which the agent's
+     `ctparse::MAX_LINE` matches (a line over the agent's cap would be rejected forever and the
+     peer dropped in a reconnect loop). `folded` says how many
      per-destination records were folded.
      **LAN classification** is by source address: `--lan-cidr` (repeatable; giving any replaces the
      defaults) defaults to 10/8, 172.16/12, 192.168/16, 100.64/10, fe80::/10, fc00::/7.

@@ -7,9 +7,12 @@ pub const DEFAULT_SOURCE: &str = "/proc/net/nf_conntrack";
 pub const DEFAULT_SOCKET: &str = "/tmp/vigie/conntrack.sock";
 pub const DEFAULT_INTERVAL_S: u64 = 60;
 pub const DEFAULT_CT_MAX_FILE: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
-/// Bounds keep one snapshot line far below the publisher's 2 MiB cap (~230 bytes per record).
+/// Each bound alone keeps a snapshot line below the publisher's 2 MiB cap; `MAX_RECORDS` bounds their sum.
 pub const MAX_TOP_N: usize = 2048;
 pub const MAX_K: usize = 2048;
+/// Most records one snapshot may carry (`top_n + k_lan + k_wan + 1` global remainder); the sum
+/// check keeps the worst-width snapshot (~350 bytes per record) far below the 2 MiB line cap.
+pub const MAX_RECORDS: usize = 2500;
 /// uids that other services commonly share; a dedicated one is required unless overridden.
 pub const SHARED_UIDS: [u32; 2] = [0, 65534];
 /// Below this are system uids (daemons, root-adjacent accounts); not a dedicated agent user.
@@ -129,8 +132,22 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             _ => return Err(format!("unknown flag {flag:?}")),
         }
     }
+    check_records(&o)?;
     check_uid(&o)?;
     Ok(o)
+}
+
+/// A snapshot holds at most `top_n + k_lan + k_wan + 1` records; bound the sum so the widest
+/// possible snapshot always fits the line cap the agent also enforces.
+fn check_records(o: &Opts) -> Result<(), String> {
+    if o.top_n + o.k_lan + o.k_wan + 2 > MAX_RECORDS {
+        return Err(format!(
+            "--top-n + --k-lan + --k-wan must be at most {} (a larger snapshot could exceed the {} byte line cap)",
+            MAX_RECORDS - 2,
+            crate::sock::MAX_SNAPSHOT_BYTES
+        ));
+    }
+    Ok(())
 }
 
 /// The dedicated-uid rule, applied after parsing: see the shared-uid section of the doc.
@@ -270,5 +287,65 @@ mod tests {
         assert!(p(&["--k-lan", "0", "--k-wan", "0"]).is_ok());
         assert!(p(&["--lan-cidr", "10.0.0.0/33"]).is_err());
         assert!(p(&["--lan-cidr", "garbage"]).is_err());
+    }
+
+    /// The widest record the serializer can emit: full-width IPv6 addresses, `proto-255`,
+    /// a five-digit port and 20-digit counters.
+    fn worst_record() -> crate::agg::Record {
+        let ip: std::net::IpAddr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+        crate::agg::Record {
+            src: ip,
+            dst: Some(ip),
+            dport: Some(65535),
+            proto: Some(255),
+            bytes_up: u64::MAX,
+            bytes_down: u64::MAX,
+            packets_up: u64::MAX,
+            packets_down: u64::MAX,
+            flows: u64::MAX,
+            new_flows: u64::MAX,
+            global: false,
+        }
+    }
+
+    #[test]
+    fn the_largest_accepted_combination_always_fits_the_snapshot_cap() {
+        let o = p(&[
+            "--top-n",
+            &MAX_TOP_N.to_string(),
+            "--k-lan",
+            &(MAX_RECORDS - MAX_TOP_N - 2).to_string(),
+            "--k-wan",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(o.top_n + o.k_lan + o.k_wan + 2, MAX_RECORDS);
+        let snap = crate::agg::Snapshot {
+            records: vec![worst_record(); o.top_n + o.k_lan + o.k_wan + 1],
+            ..Default::default()
+        };
+        let meta = crate::json::Meta {
+            seq: u64::MAX,
+            ts: u64::MAX,
+            interval_s: u64::MAX,
+            skipped_lines: usize::MAX,
+            acct_off: true,
+        };
+        let line = crate::json::snapshot_json(&meta, &snap);
+        assert!(
+            line.len() < crate::sock::MAX_SNAPSHOT_BYTES,
+            "{} bytes",
+            line.len()
+        );
+        // The agent reads lines up to the same cap (ctparse::MAX_LINE, checked in its tests).
+        assert_eq!(crate::sock::MAX_SNAPSHOT_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_combination_over_the_record_budget_is_refused() {
+        assert!(p(&["--top-n", "2048", "--k-lan", "2048", "--k-wan", "2048"]).is_err());
+        let e = p(&["--top-n", "2048", "--k-lan", "451", "--k-wan", "0"]).unwrap_err();
+        assert!(e.contains("2498"), "{e}");
+        assert!(p(&["--top-n", "2048", "--k-lan", "450", "--k-wan", "0"]).is_ok());
     }
 }

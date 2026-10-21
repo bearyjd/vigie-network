@@ -87,6 +87,16 @@ fn main() {
         bytes_down: 0,
         flows: 1,
     });
+    // the per-MAC overflow bucket the helper's `other` records become
+    s.conntrack.push(ConntrackSummary {
+        mac: MAC.into(),
+        dst_ip: None,
+        dst_port: None,
+        proto: Proto::Other,
+        bytes_up: 5,
+        bytes_down: 6,
+        flows: 7,
+    });
     cases.push((
         "hostile strings and boundaries",
         meta(2),
@@ -180,9 +190,17 @@ fn main() {
         "dns_client_throttled",
         "tail_truncated",
         "tail_bytes_skipped",
+        // source wiring: more keys than the server allows, so the builder must merge
+        "ct_errors",
+        "ct_recounted",
+        "ct_dropped_keys",
+        "ct_unmapped_bytes",
+        "mcast_unmapped",
+        "mcast_dropped",
     ]
     .iter()
     .map(|k| (k.to_string(), i64::MAX as u64))
+    .chain([("source_flags".to_string(), 15)])
     .collect();
     let b = build_with_drops(
         &meta(4),

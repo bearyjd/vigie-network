@@ -2,12 +2,12 @@
 //! P1 spike: can an unprivileged process share UDP 5353 with avahi and hear mDNS/SSDP?
 
 mod evidence;
-mod filter;
+
 mod json;
-mod recv;
-mod sock;
+
 mod stats;
 
+use net_spike::{filter, recv, sock};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::num::IntErrorKind;

@@ -6,7 +6,7 @@
 //! identity records that re-attach a rolled MAC. Budgets are filled in that order; the
 //! identity group is capped so a lease/mDNS flood cannot starve DNS and conntrack either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model::*;
 
@@ -65,6 +65,42 @@ fn note(truncated: &mut BTreeMap<String, u64>, kind: &str, dropped: u64) {
     }
 }
 
+/// Server limit: a `truncated` map with more keys is a 422 for the whole batch.
+pub const MAX_TRUNCATED_KEYS: usize = 16;
+/// Bitmask key (not a count): never merged into the overflow key.
+pub const FLAGS_KEY: &str = "source_flags";
+pub const OTHER_KEY: &str = "truncated_other";
+/// Keys that yield first when the map is over the key cap, whatever their count: the redundant
+/// companions of a kept signal (`ct_unmapped_flows` accompanies `ct_unmapped_bytes`).
+const YIELD_FIRST: [&str; 1] = ["ct_unmapped_flows"];
+
+/// At most `MAX_TRUNCATED_KEYS` keys: the `YIELD_FIRST` keys go first, then the smallest counts;
+/// the removed counts are summed into `truncated_other`. The `source_flags` bitmask is always kept verbatim.
+fn cap_truncated_keys(t: &mut BTreeMap<String, u64>) {
+    if t.len() <= MAX_TRUNCATED_KEYS {
+        return;
+    }
+    let flags = t.remove(FLAGS_KEY);
+    let mut rows: Vec<(String, u64)> = std::mem::take(t).into_iter().collect();
+    rows.sort_by(|a, b| {
+        let yields = |k: &str| YIELD_FIRST.contains(&k);
+        yields(&a.0)
+            .cmp(&yields(&b.0))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let keep = MAX_TRUNCATED_KEYS - 1 - usize::from(flags.is_some());
+    let overflow = rows
+        .split_off(keep.min(rows.len()))
+        .iter()
+        .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
+    t.extend(rows);
+    t.insert(OTHER_KEY.to_string(), overflow);
+    if let Some(f) = flags {
+        t.insert(FLAGS_KEY.to_string(), f);
+    }
+}
+
 fn conntrack_size(rows: &[ConntrackSummary]) -> usize {
     rows.iter().map(|r| json_len(|o| r.write(o)) + 1).sum()
 }
@@ -79,10 +115,22 @@ fn fold_after(sorted: &[ConntrackSummary], k: usize) -> Vec<ConntrackSummary> {
         b.2 = b.2.saturating_add(r.flows);
     }
     let mut out: Vec<ConntrackSummary> = sorted[..k].to_vec();
-    out.extend(
-        buckets
-            .into_iter()
-            .map(|(mac, (up, down, flows))| ConntrackSummary {
+    // A surviving verbatim `other` row of a MAC absorbs that MAC's bucket: one row per MAC.
+    let verbatim_other: HashMap<&str, usize> = sorted[..k]
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.dst_ip.is_none() && r.dst_port.is_none() && r.proto == Proto::Other)
+        .map(|(i, r)| (r.mac.as_str(), i))
+        .collect();
+    for (mac, (up, down, flows)) in buckets {
+        match verbatim_other.get(mac) {
+            Some(&i) => {
+                let r = &mut out[i];
+                r.bytes_up = r.bytes_up.saturating_add(up);
+                r.bytes_down = r.bytes_down.saturating_add(down);
+                r.flows = r.flows.saturating_add(flows);
+            }
+            None => out.push(ConntrackSummary {
                 mac: mac.to_string(),
                 dst_ip: None,
                 dst_port: None,
@@ -91,7 +139,8 @@ fn fold_after(sorted: &[ConntrackSummary], k: usize) -> Vec<ConntrackSummary> {
                 bytes_down: down,
                 flows,
             }),
-    );
+        }
+    }
     out
 }
 
@@ -207,6 +256,7 @@ pub fn build_with_drops(
     note(&mut truncated, "conntrack", folded);
     note(&mut truncated, "conntrack_lost", lost);
 
+    cap_truncated_keys(&mut truncated);
     let sections = Sections {
         leases,
         neigh,
