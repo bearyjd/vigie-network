@@ -218,3 +218,29 @@ fn split_option_lists_in_one_context_still_accumulate() {
     ];
     assert_eq!(run(&lines)[0].opt55, vec![1, 3, 15, 28]);
 }
+
+#[test]
+fn one_mac_with_two_interleaved_xids_keeps_the_lines_apart() {
+    let lines = vec![
+        l(&format!("20 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+        l(&format!("21 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+        l("20 vendor class: belongs-to-20"),
+        l(&format!("20 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+        l(&format!("21 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+    ];
+    let got = run(&lines);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].opt60, None, "context was 21 when the 20 line came");
+    assert_eq!(got[1].opt60, None);
+}
+
+#[test]
+fn a_tainted_xid_stays_unfingerprinted_even_for_the_matching_mac() {
+    let lines = vec![
+        l(&format!("22 DHCPINFORM(br-lan) 192.168.1.66 {ATT}")),
+        l(&format!("22 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+        l("22 vendor class: victim-own-but-untrusted"),
+        l(&format!("22 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+    ];
+    assert_clean(&run(&lines)[0]);
+}

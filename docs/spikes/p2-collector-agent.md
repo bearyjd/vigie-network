@@ -75,27 +75,26 @@ The router clock can step by days when NTP syncs mid-window, and the server reje
 
 ## Security review fixes (second pass)
 
-**DHCP serial collisions.** dnsmasq's per-transaction serial (xid) is chosen by the client, so lines of two
-transactions can share one. `DhcpAssembler` keeps the normalized MAC of the opening
-`DHCPREQUEST`/`DHCPDISCOVER` in the entry. A second MAC on the same serial, option lines seen before any
-request, or a `DHCPACK` for a different MAC taints the entry for good: the lease is still emitted (it comes from
-dnsmasq's own ACK) but without opt55, opt60 or the client-supplied hostname (a hostname on the ACK line itself is
-kept). The reviewer's repro (attacker request + vendor class + name + options on xid X, then the victim's
-request/ACK on X) is `attacker_cannot_poison_victim_fingerprint_with_same_xid`.
+**DHCP serial collisions.** dnsmasq's per-transaction serial (xid) is chosen by the client, so it proves nothing
+about which MAC a line belongs to. First pass tainted an entry when a second MAC showed up; the re-review showed
+that MAC-less lines (INFORM and the option/vendor/name lines that follow it) still slip in. The current rule is in
+"Re-review fixes" below (the log is a sequential stream; fingerprint lines attach only to the packet line right
+before them).
 
 **Root scripts in `/tmp`.** `vigie-dnsmasq-dropin.sh` and `vigie-log-watchdog.sh` run as root in world-writable
 `/tmp`, so both source `vigie-lib.sh`, which refuses (exit 70, message on stderr) when a directory is a
 symlink, not owned by the trusted uid (0), or group/other-writable, and when the log or drop-in is a symlink, not
 a regular file or owned by an unexpected uid. Directories are created with `mkdir` under `umask 077` (fails on any
-existing name, symlinks included) and then chowned/chmodded, never `mkdir -p`; the log is created with
+existing name, symlinks included), never `mkdir -p`; owner and mode are set only when that very `mkdir` succeeded
+(see "Re-review fixes"); the log is created with
 noclobber (`O_EXCL`); the drop-in is written to `mktemp` inside the verified directory and `mv`ed. Layout:
-`/tmp/vigie` is `root:vigie 0750`, `dnsmasq.log` is `0640`, `/tmp/dnsmasq.d` is `root 0755`, the key is `0600`
-owned by `vigie`. Test hooks (`VIGIE_TRUSTED_UID`, `VIGIE_OWNER`, `VIGIE_LOG_ALLOWED_UIDS`) exist because the
-tests are not root; production cron/procd start the scripts with a clean environment.
+`/tmp/vigie` is `root:vigie 0751` (traverse-only for dnsmasq's run user), `dnsmasq.log` is `0640 root:vigie`,
+`/tmp/dnsmasq.d` is `root 0755`, the key is `0600` owned by `vigie`. All `VIGIE_*` overrides are honoured only
+with `VIGIE_TEST=1` (tests are not root); production ignores them and pins `PATH`.
 **Assumption, not verified on the router:** dnsmasq opens its `log-facility` file as root before dropping
 privileges and `fchown`s it to its run user while keeping the group (from dnsmasq's source), so the file stays
 group-readable by `vigie`. That is why the log may be owned by uid 0, `dnsmasq` or `nobody`. Verify after the first
-start with `ls -ln /tmp/vigie/dnsmasq.log` (group = the vigie gid, `-rw-r-----`) and `tail -n1`. Also unverified:
+start with the checks in "Re-review fixes" (item 8). Also unverified:
 busybox `stat -c %u/%a`, `mktemp` with a path template and `install` on GL.iNet (they work with the host busybox).
 
 **Floods.** `Window` caps DNS rows (10,000 per window) and sightings (4,096 distinct), with a per-MAC DNS quota of
@@ -103,12 +102,12 @@ busybox `stat -c %u/%a`, `mktemp` with a path template and `install` on GL.iNet 
 client IP (256 between two polls) so a flood within one 2 s poll cannot evict other clients' queries, and counts
 global evictions. Everything dropped is reported in the batch `truncated` map: `dns_quota_dropped`,
 `dns_dropped`, `sightings_dropped`, `dns_pending_evicted`, `dns_client_throttled` (plus the builder's own keys: at
-most 12 of the 16 the schema allows; `TRUNCATED_RESERVE` is now 512 bytes, enough for all of them at int64 max).
+most 14 of the 16 the schema allows, including `tail_truncated` and `tail_bytes_skipped`; `TRUNCATED_RESERVE` is now 768 bytes, enough for all of them at int64 max).
 
 **Clock before first contact.** Until a server `Date` has been seen, no data window is built. Rows are stamped with
 monotonic seconds (`SyncState::stamp`), the window just accumulates (bounded), and each flush queues only an empty
 probe batch: its reply, accepted or rejected (422 included), carries the `Date`. On the first `Date` the
-provisional stamps are shifted to wall time in one step (`Window::rebase_dns`), so an NTP step of days before
+provisional stamps are shifted to server time in one step (`Window::rebase_dns`, offset = server `Date` minus the monotonic second it arrived, never the local wall clock), so an NTP step of days before
 first contact loses nothing and mis-times nothing. Urgent pushes are gated the same way. The server's 422 body is
 only `{"error":"invalid_batch"}`, so staleness is judged locally: a 422 for a batch whose `window_end` is more than
 24 h older than `sent_ts` is discarded as before, but counted in `Engine::dropped_stale`, reported to the server
@@ -133,6 +132,61 @@ case-insensitively, rejects userinfo (also `%40` and backslash tricks), and requ
 of 32 bytes, or the config file's lowercase hex); it is not a `Transport`, so `NoTransport` remains the only
 implementation. `load()` runs it on the config, so a bad URL or pin fails startup and `--check`. `BATCH_CAP` (256 KiB) is
 asserted to stay within the server body limit (`SERVER_MAX_BODY`, 512 KiB).
+
+## Re-review fixes (third pass)
+
+1. **DHCP xid poisoning (HIGH).** `DhcpAssembler` reads the log as a sequential stream. Packet lines
+   (`DHCPREQUEST`/`DHCPDISCOVER`) open a context (xid + normalized MAC). `requested options:`, `vendor class:` and
+   `client provides name:` attach only while that context is live, i.e. directly after the packet line (or after
+   another attached line) with the same xid. Any other line ends the context: every other `DHCP*(` verb
+   (`DHCPOFFER`, `DHCPACK`, and `DHCPINFORM`/`RELEASE`/`DECLINE`/`NAK`, which also taint the xid entry), DNS lines, a
+   line with a different xid, and any line that did not parse (`break_context`, called from `main`). A second MAC
+   on the xid taints it as before. Cost: an attacker can still make a victim's lease arrive without a fingerprint
+   (denial of enrichment); it can no longer choose one. Each first `requested options:` of a context replaces the list
+   (DISCOVER and REQUEST no longer concatenate), and a new DISCOVER for the same MAC resets opt55/opt60/name.
+   Tests: `tests/review_dhcp_stream.rs` (reviewer's INFORM and between-REQUEST-and-ACK repros, other verbs, OFFER,
+   interleaved MACs, legitimate xid reuse, DISCOVER reset). Not covered: an overlong line dropped by the tail
+   does not break the context (dnsmasq never writes lines over 4 KiB, and the attacker cannot insert lines).
+2. **Log truncate-and-refill (MED).** `parse_line` requires the exact prefix
+   `<Mon> <d> hh:mm:ss dnsmasq[-dhcp][pid]: ` at the start of the line (no `contains`). The tail keeps the 64 bytes
+   before its cursor and compares them on every poll; a shorter file or different bytes restart at offset 0 and drop
+   the partial line, so a cursor that lands inside somebody's vendor class is never trusted (the reviewer's pad
+   100/200/240 repro, plus a variant with a complete forged prefix, which only the fingerprint stops). Counted as
+   `tail_truncated` (resets) and `tail_bytes_skipped` (overlong lines and discarded partial lines) in the batch
+   `truncated` map. A reset replays the current file from 0 (duplicates are possible, nothing forged). The watchdog now
+   rotates by rename (`dnsmasq.log` -> `.log.1`), creates a fresh `0640` file with the old owner and group `vigie`,
+   and sends SIGUSR2 to dnsmasq (`pidof dnsmasq`; dnsmasq closes and reopens a file `log-facility`). In-place truncation
+   remains only as an emergency when the log (or a `.1` dnsmasq never let go of) exceeds 2x the cap. Unverified on
+   the router: that GL.iNet's dnsmasq reopens on SIGUSR2 and can write the fresh file (it is created with the previous
+   file's owner so that it can).
+3. **`ensure_dir`.** Owner and mode are set only when our own `mkdir` (no `-p`) created the leaf; an existing
+   directory, or one that won the race, must already pass `require_dir` (root-owned, no group/other write, not a
+   symlink) and is never chmod'ed or chown'ed by path. Every refusal also writes a `daemon.crit` line through
+   `logger -t vigie`. Test: a `mkdir` stub that creates the attacker's directory and then fails.
+4. **Fail closed on uid.** The init script returns 1 (and logs `vigie user missing`) unless `id -u vigie` succeeds,
+   so procd can never fall back to root. `vigie-collector` reads the effective uid from `/proc/self/status` (no
+   `unsafe`) and exits 77 for euid 0, or an unreadable status, unless `--allow-root` is passed (tests only; do not
+   put it in the init script). The key-owner == euid check stays.
+5. **uid.** `vigie-print-install-commands.sh` no longer creates `/tmp/vigie` (the root drop-in script does) and
+   picks the first uid in 6700..6799 that is unused in `/etc/passwd` (gid = uid, unused in `/etc/group`); an explicit
+   `VIGIE_UID` that is in use or outside the range is refused; it still only prints. The conntrack helper (separate
+   branch) runs as root and creates a `0600` socket owned by the agent's uid; access is restricted by file ownership
+   alone, so the printed commands tell the owner to pass the same uid to it as `--uid`.
+6. **Rebase offset** now comes from `TimeGate::server_offset()` (server `Date` minus the monotonic second it was
+   seen); `SyncState::observe` takes the gate, so the local wall clock cannot reach it. Test with a wall clock that
+   is years off.
+7. See item 1 (DISCOVER reset).
+8. **Overrides and permissions.** `VIGIE_*` overrides in the root scripts (and `VIGIE_PASSWD`/`VIGIE_GROUP_FILE` in
+   the print helper) are honoured only when `VIGIE_TEST=1`. `/tmp/vigie` is `root:vigie 0751` so dnsmasq's run user
+   can traverse it, and the log is `0640 root:vigie`, created by the script before dnsmasq first opens it (dnsmasq
+   is assumed to keep an existing file's group). **What to check on the router, in this order:**
+   `ls -ln /tmp/vigie /tmp/vigie/dnsmasq.log` (directory `drwxr-x--x`, uid 0, group = the vigie gid; log
+   `-rw-r-----`, group = the vigie gid, owner 0 or dnsmasq's uid), then restart dnsmasq and run
+   `logread | grep dnsmasq | tail` (no "cannot open log file" / permission errors, and lines still arrive in
+   `/tmp/vigie/dnsmasq.log`).
+9. **Wiring tests** now live in `main.rs` (`#[cfg(test)]`): an unsynced `flush_window` queues exactly one empty
+   probe and keeps its data; `push_identity` builds nothing until a server `Date` was seen. Both wiring mutants
+   from the previous run (Probe early return, `allow_identity_push`) are killed.
 
 ## Findings that change the PRP
 
