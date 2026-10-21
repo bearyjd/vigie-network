@@ -16,7 +16,11 @@ pub const IDENTITY_BUDGET: usize = 96 * 1024;
 /// Conntrack is guaranteed this much (or what it needs, if less) before DNS may use the rest.
 pub const CONNTRACK_RESERVE: usize = 48 * 1024;
 /// Room kept for the `truncated` map (at most six keys).
-const TRUNCATED_RESERVE: usize = 256;
+const TRUNCATED_RESERVE: usize = 320;
+/// Server rule: a window may span at most 24 h.
+pub const MAX_WINDOW_S: u64 = 24 * 3600;
+/// Server rule: every `dns.ts` must lie within this many seconds of the window.
+pub const DNS_TS_SLACK_S: u64 = 300;
 
 pub struct Built {
     pub encoded: EncodedBatch,
@@ -136,9 +140,26 @@ fn truncate_conntrack(
 
 /// Build one batch from a window of data. `cap` is the maximum body size including the tail.
 pub fn build(meta: &Meta, input: Sections, health: &Health, cap: usize) -> Built {
+    // The server rejects a whole batch for an overlong window or a DNS row outside the window
+    // (both happen after an NTP step on a router without an RTC), so enforce them here.
+    let meta = &Meta {
+        window_start: meta
+            .window_start
+            .max(meta.window_end.saturating_sub(MAX_WINDOW_S)),
+        ..meta.clone()
+    };
+    let (lo, hi) = (
+        meta.window_start.saturating_sub(DNS_TS_SLACK_S),
+        meta.window_end.saturating_add(DNS_TS_SLACK_S),
+    );
+    let total_dns = input.dns.len();
+    let mut input = input;
+    input.dns.retain(|q| (lo..=hi).contains(&q.ts));
+    let out_of_window = (total_dns - input.dns.len()) as u64;
     let base = encode(meta, &Sections::default(), &BTreeMap::new(), health).len();
     let avail = cap.saturating_sub(base + TRUNCATED_RESERVE);
     let mut truncated = BTreeMap::new();
+    note(&mut truncated, "dns_out_of_window", out_of_window);
 
     // 1. Identity group: leases, then neighbours, then mDNS/SSDP sightings.
     let mut left = avail.min(IDENTITY_BUDGET);

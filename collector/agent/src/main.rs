@@ -24,7 +24,7 @@ use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport,
 use vigie_agent::spool::SPOOL_CAP;
 use vigie_agent::tail::Tail;
 use vigie_agent::urgent::Urgent;
-use vigie_agent::window::{SnapshotDelta, Window};
+use vigie_agent::window::{SnapshotDelta, Window, WindowClock};
 
 const BUILD_TS: u64 = parse_build_ts(env!("VIGIE_BUILD_TS"));
 const DEFAULT_CONFIG: &str = "/etc/vigie/collector.conf";
@@ -42,7 +42,7 @@ const fn parse_build_ts(s: &str) -> u64 {
     n
 }
 
-/// Placeholder transport: HTTPS with two SPKI pins is not implemented yet.
+/// Placeholder transport. TODO: HTTPS client with two SPKI pins (see docs/spikes/p2-collector-agent.md).
 struct NoTransport;
 
 impl Transport for NoTransport {
@@ -94,7 +94,7 @@ struct Agent {
     boot_id: String,
     seq: u64,
     window: Window,
-    window_start: u64,
+    clock: WindowClock,
     tail: Tail,
     dhcp: DhcpAssembler,
     dns: DnsCorrelator,
@@ -114,7 +114,7 @@ impl Agent {
             boot_id: self.boot_id.clone(),
             seq: self.seq,
             batch_id: ids::uuid7(wall_ms(), random::<10>()),
-            window_start: self.window_start.min(now),
+            window_start: self.clock.start(now, self.started.elapsed().as_secs()),
             window_end: now,
         }
     }
@@ -174,6 +174,7 @@ impl Agent {
             // No sane clock: batches would carry wrong times. Drop the window and count it.
             drop(self.window.take());
             self.engine.spool.note_dropped(1);
+            self.clock.mark_flush(mono_s);
             return;
         }
         self.refresh_neighbors();
@@ -193,7 +194,7 @@ impl Agent {
         let sections: Sections = self.window.take();
         let (meta, health) = (self.meta(now), self.health(quiet));
         let b = build(&meta, sections, &health, BATCH_CAP);
-        self.window_start = now;
+        self.clock.mark_flush(mono_s);
         self.engine.enqueue(b.encoded);
     }
 }
@@ -231,7 +232,6 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         key_id: cfg.key_id.clone(),
         boot_id: boot_id.clone(),
     };
-    let now = wall_secs();
     let mut agent = Agent {
         tail: Tail::new(cfg.dnsmasq_log.clone()),
         cfg,
@@ -239,7 +239,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         boot_id,
         seq: 0,
         window: Window::default(),
-        window_start: now,
+        clock: WindowClock::new(0),
         dhcp: DhcpAssembler::default(),
         dns: DnsCorrelator::default(),
         delta: SnapshotDelta::default(),

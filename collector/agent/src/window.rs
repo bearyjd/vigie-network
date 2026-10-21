@@ -8,6 +8,30 @@ use crate::model::{ConntrackSummary, DnsQuery, Lease, Neighbor, Sections, Sighti
 /// (mac, kind, name, service, ua)
 type SightingKey = (String, u8, Option<String>, Option<String>, Option<String>);
 
+/// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
+/// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
+/// span the jump and the server would reject the whole batch (window > 24 h).
+#[derive(Debug, Default)]
+pub struct WindowClock {
+    last_flush_mono_s: u64,
+}
+
+impl WindowClock {
+    pub fn new(mono_s: u64) -> Self {
+        Self {
+            last_flush_mono_s: mono_s,
+        }
+    }
+    /// Wall time the current window started, given the current wall and monotonic clocks.
+    pub fn start(&self, wall_s: u64, mono_s: u64) -> u64 {
+        wall_s.saturating_sub(mono_s.saturating_sub(self.last_flush_mono_s))
+    }
+    /// Call after every flush attempt, including one skipped because the clock is not sane.
+    pub fn mark_flush(&mut self, mono_s: u64) {
+        self.last_flush_mono_s = mono_s;
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Window {
     leases: BTreeMap<String, Lease>,

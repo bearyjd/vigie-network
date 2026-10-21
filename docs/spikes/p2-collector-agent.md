@@ -44,18 +44,39 @@ Schema array caps (1000/2000/5000/5000/1000) are applied too, and everything dro
 `truncated`. If the PRP meant the opposite (drop leases/neigh/mDNS first), it is a one-line change in
 `builder::build`; **please confirm the intended reading**.
 
+## Clock jumps (no RTC)
+
+The router clock can step by days when NTP syncs mid-window, and the server rejects a whole batch
+(422, discarded by the engine) for a window over 24 h, `window_end` beyond `sent_ts + 300`, or any
+`dns.ts` outside the window +-300 s. So:
+
+- `window::WindowClock` derives `window_start` from the monotonic clock (`wall - (mono - last_flush)`),
+  and a flush skipped by the time hold also restarts the window.
+- `builder::build` clamps the window to 24 h and drops DNS rows outside window +-300 s, counting them
+  as `truncated.dns_out_of_window`.
+- Build date as a gate: OpenWrt's sysfixtime usually sets the boot clock from the newest file time in
+  `/etc`, and installing the agent writes `/etc/vigie` after the build, so the build-date check will
+  often pass on a stale clock. **The server `Date` check is the real gate**, and it is only exercised
+  end to end once a transport parses response headers (`httpdate::parse_imf_fixdate` is ready).
+
 ## Assumed, not verified
 
 - **dnsmasq DHCP log lines** (`requested options:`, `vendor class:`, `client provides name:`,
   `DHCPACK(...)`) and the `log-queries=extra` query/answer format are assumed from dnsmasq docs and the
   P0 sample fixture. P0 checklist items 2 and 3 are still open. Wrong formats make the parsers yield
   nothing (they never panic); the symptom is missing opt55/opt60 and `dns_log_quiet`.
+- Two hedges written from memory of dnsmasq's source, also unverified: a long `requested options:` list
+  may be split over several lines (the assembler accumulates, capped at 64), and scoped IPv6 clients
+  may be logged as `fe80::1%br-lan/port` (the scope is stripped before the neighbor lookup).
 - DNS queries are stamped with the **read time**, not the log time (log lines carry no year or zone).
 - `procd_set_param user nobody`, `su`-less privilege drop, and `/etc/init.d/dnsmasq reload` on GL.iNet
   4.8.3 are unverified.
 
 ## Findings that change the PRP
 
+0. **Running as `nobody` shares the HMAC key with avahi**, which P0 shows also runs as `nobody`. Use a
+   dedicated uid for the collector (and own the key file by it). The init template currently says
+   `nobody` only because no dedicated user exists yet.
 1. **The unprivileged collector cannot rotate dnsmasq's log or signal it.** PRP section 4 says the
    collector renames the file and sends `SIGUSR2` to dnsmasq; as `nobody` it can do neither (dnsmasq is
    root's, `/tmp/vigie` is root's). The tail copes with rotation by anyone (rename + reopen, tested) and
@@ -87,7 +108,7 @@ Schema array caps (1000/2000/5000/5000/1000) are applied too, and everything dro
 
 ## Tests
 
-67 agent tests (17 unit, 50 integration incl. 2 that run the shell scripts) plus the unchanged 91 from the
+72 agent tests (17 unit, 55 integration incl. 2 that run the shell scripts) plus the unchanged 91 from the
 spike crates; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
 Cross-language: `tests/vectors/signing.json` (12 vectors from the real `vigie_ingest.auth`: empty body,
 unicode, non-UTF-8 bytes, NUL, `|` in body, int64-max seq, max sent_ts, 64-char ids, 256 KiB body) is
@@ -102,11 +123,12 @@ were each run red first (assertion failures against stubs; for config the shell-
 because the scripts did not exist yet). The batch model, `json`, `mac`, `ids`, `sightings`, `window`,
 `httpdate` and `procstat` were written with their tests, green on the first run.
 
-Mutation (hand-rolled, `cargo test` after each single edit): 63 mutants over signing order, truncation
+Mutation (hand-rolled, `cargo test` after each single edit): 75 mutants over signing order, truncation
 order and budgets, spool drop-oldest, backoff, duplicate handling, key checks, neighbor
-normalization, tail, drop-in and others. First pass: 56 killed, 5 survived, 1 did not compile, 1 did
-not apply. The 4 real gaps (spool exact-fit boundary, multicast MAC, first-answer-wins, rotated
-backlog) got tests in `agent/tests/edge_cases.rs` and now die. **2 survive**: `backoff` without the
+normalization, tail, drop-in, window clock and DNS window filter. First pass over the first 63: 56
+killed, 5 survived, 1 did not compile, 1 did not apply. The 4 real gaps (spool exact-fit boundary,
+multicast MAC, first-answer-wins, rotated backlog) got tests in `agent/tests/edge_cases.rs` and now
+die; the 12 mutants added with the clock fix (`tests/clock_and_formats.rs`) all die. **2 survive**: `backoff` without the
 cap in the shift branch (equivalent: 5 << k is at most 160 there) and the tail's "old file fully
 drained" guard before switching to a rotated file (redundant with the byte budget; it only matters
 for a write racing the drain, which cannot be tested deterministically).
@@ -115,7 +137,7 @@ for a write racing the drain, which cannot be tested deterministically).
 
 | Metric | Value |
 |---|---|
-| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 488,800 bytes (477 KiB); x86_64-musl 556,376 |
+| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 489,360 bytes (478 KiB); x86_64-musl about 556 KB |
 | Dependencies (runtime) | `hmac`, `sha2` (+ `digest`, `generic-array`, `typenum`, `subtle`, `block-buffer`, `crypto-common`, `cpufeatures`, `cfg-if`) and `vigie-parse`; `serde_json` is a dev-dependency only. No C code |
-| Idle RSS, x86_64-musl on the host, 5 s windows for 40 s, `ip neigh` run each 10 s, tail fed 1 line/5 s | 496 kB at start, 596 kB (VmHWM 596 kB) after 40 s; budget is 10 MB. Slow growth is the empty-batch spool |
+| Idle RSS, x86_64-musl on the host, 5 s windows for 40 s, `ip neigh` run each 10 s, tail fed 1 line/5 s | 496 kB at start, 600 kB (VmHWM 600 kB) after 40 s; budget is 10 MB. Slow growth is the empty-batch spool |
 | Not measured | aarch64 RSS (the binary was cross-compiled but never executed; no qemu, no router), CPU, behaviour under load or over 24 h |

@@ -75,7 +75,9 @@ pub fn parse_line(line: &str) -> Option<LogEvent> {
 fn parse_dns(id: &str, rest: &str) -> Option<LogEvent> {
     let toks: Vec<&str> = rest.split_whitespace().collect();
     let (addr_port, kind) = (toks.first()?, toks.get(1)?);
-    let client_ip: IpAddr = addr_port.rsplit_once('/')?.0.parse().ok()?;
+    // Scoped IPv6 clients may be logged as `fe80::1%br-lan/port` (assumed); drop the scope.
+    let host = addr_port.rsplit_once('/')?.0;
+    let client_ip: IpAddr = host.split('%').next()?.parse().ok()?;
     let client_ip = client_ip.to_string();
     if let Some(t) = kind
         .strip_prefix("query[")
@@ -185,7 +187,12 @@ impl DhcpAssembler {
             LogEvent::DhcpRequest { id, .. } => {
                 self.entry(id);
             }
-            LogEvent::DhcpOptions { id, opt55 } => self.entry(id).opt55 = opt55.clone(),
+            // dnsmasq may split a long list over several lines (assumed); accumulate.
+            LogEvent::DhcpOptions { id, opt55 } => {
+                let p = self.entry(id);
+                p.opt55.extend(opt55.iter().copied());
+                p.opt55.truncate(MAX_OPT55);
+            }
             LogEvent::DhcpVendor { id, class } => self.entry(id).class = Some(class.clone()),
             LogEvent::DhcpName { id, name } => self.entry(id).name = Some(name.clone()),
             LogEvent::DhcpAck { id, mac, ip, name } => {
