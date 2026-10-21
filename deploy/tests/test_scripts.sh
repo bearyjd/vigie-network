@@ -84,9 +84,11 @@ check "guard accepts the stub" guard_podman "$T/bin/podman"
 for bad in podman "distrobox-host-exec podman" "$T/bin/podman extra" /usr/bin/podman "" "$T/bin/fake-admin" "$T/bin/podman-compose"; do
 	if guard_podman "$bad"; then fail "guard accepted '$bad'"; else pass; fi
 done
-inherited=$(PODMAN=podman sh "$0" 2>&1)
-check "script refuses an inherited PODMAN (exit 2)" test $? -eq 2
-check "refusal names PODMAN" sh -c 'printf %s "$1" | grep -q "refusing to run with PODMAN"' _ "$inherited"
+if [ -z "${VIGIE_TEST_NESTED:-}" ]; then # the nested run is the probe itself: no recursion
+	inherited=$(VIGIE_TEST_NESTED=1 PODMAN=podman sh "$0" 2>&1)
+	check "script refuses an inherited PODMAN (exit 2)" test $? -eq 2
+	check "refusal names PODMAN" sh -c 'printf %s "$1" | grep -q "refusing to run with PODMAN"' _ "$inherited"
+fi
 check "guard self-test touched no tool" test ! -e "$T/state/argv.log" -a ! -e "$T/state/real-tool.log"
 
 # ---- gen-certs.sh ----------------------------------------------------------------------------
