@@ -87,7 +87,7 @@ Schema array caps (1000/2000/5000/5000/1000) are applied too, and everything dro
 
 ## Tests
 
-67 agent tests (17 unit, 50 integration incl. 4 on the shell scripts) plus the unchanged 91 from the
+67 agent tests (17 unit, 50 integration incl. 2 that run the shell scripts) plus the unchanged 91 from the
 spike crates; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
 Cross-language: `tests/vectors/signing.json` (12 vectors from the real `vigie_ingest.auth`: empty body,
 unicode, non-UTF-8 bytes, NUL, `|` in body, int64-max seq, max sent_ts, 64-char ids, 256 KiB body) is
