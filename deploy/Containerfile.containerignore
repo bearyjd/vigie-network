@@ -1,0 +1,15 @@
+.git
+.omc
+.ruff_cache
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.coverage
+server/tests
+tests
+tools
+docs
+collector
+deploy/certs
+deploy/.env
+deploy/collector-*

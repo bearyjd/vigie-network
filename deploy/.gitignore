@@ -1,0 +1,4 @@
+# Generated locally; never commit keys, certificates, or the filled-in environment.
+/.env
+/certs/
+/collector-*/

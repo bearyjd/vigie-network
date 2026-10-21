@@ -1,0 +1,182 @@
+# Vigie server stack for rootless podman-compose. Run from deploy/ with a filled-in .env:
+#   cp .env.example .env && $EDITOR .env
+#   podman-compose up -d
+#
+# NOT verified by a real build/run in this repo's review (no container runtime was available):
+# only static checks (yaml parse, `podman-compose config`, shellcheck, hand review).
+#
+# Three processes, one image, one writer per database:
+#   ingest    collector principal. Writes inventory.db batches/collectors rows + raw shards.
+#             Does NOT mount the overrides volume. MUST run as a single worker (flock on
+#             <data>/.ingest.lock); the data volume MUST be on a local filesystem (no NFS/SMB).
+#   pipeline  writes inventory.db (derived tables). Reads overrides.db.
+#   api       app principal. Reads inventory.db, writes overrides.db (+ audit_log, tokens).
+#
+# DEVIATION from "api: inventory ro, pipeline: overrides ro" at the MOUNT level: both databases are
+# SQLite WAL files, and a reader needs a writable directory to create/attach the -shm file. On a
+# read-only mount a reader fails with "attempt to write a readonly database" whenever no writer
+# currently has the file open, which is most of the time (every request/run opens and closes its own
+# connection). Verified with a stand-in test (scratchpad, not in the repo): a clean-closed WAL db
+# in a read-only directory cannot be read with mode=ro. So the volumes are mounted rw and the read
+# only boundary is enforced in code: vigie_api/schema.py (inventory: mode=ro URI + query_only) and
+# vigie_pipeline/overrides.py (overrides: mode=ro URI + query_only). The ingest isolation from
+# overrides.db IS structural (ingest never mounts that volume).
+#
+# All three containers run as the same numeric user (10001) because files are created 0600 and
+# podman rootless maps volumes to one owner; separation is by mount + code, not by uid.
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+  restart: unless-stopped
+  pids_limit: 256
+
+x-image: &image
+  image: localhost/vigie-server:${VIGIE_IMAGE_TAG:-dev}
+  build:
+    # Repository root, so the image can copy both server/ and deploy/.
+    context: ..
+    dockerfile: deploy/Containerfile
+
+x-common-env: &common-env
+  VIGIE_DATA_DIR: /var/lib/vigie
+
+services:
+  ingest:
+    <<: [*hardening, *image]
+    command:
+      - python
+      - -m
+      - vigie_ingest
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8443"
+      - --tls-cert
+      - /run/secrets/vigie_tls_cert
+      - --tls-key
+      - /run/secrets/vigie_tls_key
+      - --workers
+      - "1"
+    environment:
+      <<: *common-env
+      VIGIE_SECRETS_DIR: /run/secrets
+      VIGIE_SHARD_RETENTION_DAYS: ${VIGIE_SHARD_RETENTION_DAYS:-7}
+      VIGIE_MAX_SPOOL_AGE_S: ${VIGIE_MAX_SPOOL_AGE_S:-86400}
+      VIGIE_RATE_LIMIT_PER_MIN: ${VIGIE_RATE_LIMIT_PER_MIN:-60}
+      VIGIE_RATE_LIMIT_PREAUTH_PER_MIN: ${VIGIE_RATE_LIMIT_PREAUTH_PER_MIN:-120}
+      VIGIE_RATE_LIMIT_IPV6_PREFIX: ${VIGIE_RATE_LIMIT_IPV6_PREFIX:-64}
+      VIGIE_MAX_SHARD_DAYS: ${VIGIE_MAX_SHARD_DAYS:-3}
+      VIGIE_BODY_TIMEOUT_S: ${VIGIE_BODY_TIMEOUT_S:-10}
+    volumes:
+      - vigie_data:/var/lib/vigie:rw
+    secrets:
+      - source: vigie_tls_cert
+        uid: "10001"
+        gid: "10001"
+        mode: "0400"
+      - source: vigie_tls_key
+        uid: "10001"
+        gid: "10001"
+        mode: "0400"
+      # One entry per provisioned, non-revoked collector key (ingest refuses to start when a
+      # provisioned collector has no valid key file). provision-collector.sh prints the lines.
+      - source: collector_key_k1
+        uid: "10001"
+        gid: "10001"
+        mode: "0400"
+    ports:
+      # No default for the address: an unset VIGIE_LAN_ADDR fails the config instead of
+      # publishing on every interface.
+      - "${VIGIE_LAN_ADDR:?set VIGIE_LAN_ADDR in .env to the LAN address to listen on}:${VIGIE_INGEST_PORT:-8443}:8443"
+    healthcheck:
+      # Ingest has no GET endpoint: any HTTP answer (405) over TLS means it is up.
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http", "8443", "/v1/batch", "--any-status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  pipeline:
+    <<: [*hardening, *image]
+    command: ["python", "-m", "vigie_pipeline", "run", "--loop", "${VIGIE_PIPELINE_INTERVAL_S:-30}"]
+    # Exits non-zero (SchemaVersionError) until ingest's schema exists: provision a collector
+    # first (quick start) or run once with --migrate. restart: on-failure retries until then.
+    restart: on-failure
+    environment:
+      <<: *common-env
+      VIGIE_LINK_OVERRIDES: "1"
+      VIGIE_TRANSIENT_WINDOW_S: ${VIGIE_TRANSIENT_WINDOW_S:-86400}
+      VIGIE_TRANSIENT_MIN_DWELL_S: ${VIGIE_TRANSIENT_MIN_DWELL_S:-7200}
+      VIGIE_PROMOTION_CAP_PER_HOUR: ${VIGIE_PROMOTION_CAP_PER_HOUR:-20}
+    volumes:
+      - vigie_data:/var/lib/vigie:rw
+      # rw at the mount for the WAL reason above; the code opens it mode=ro + query_only.
+      - vigie_overrides:/overrides:rw
+    healthcheck:
+      # Liveness only (the pipeline has no endpoint): PID 1 is the pipeline process.
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "proc", "vigie_pipeline"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  api:
+    <<: [*hardening, *image]
+    command:
+      - python
+      - -m
+      - vigie_api
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8444"
+      - --tls-cert
+      - /run/secrets/vigie_tls_cert
+      - --tls-key
+      - /run/secrets/vigie_tls_key
+    environment:
+      <<: *common-env
+      VIGIE_LINK_OVERRIDES: "1"
+      VIGIE_API_RATE_LIMIT: ${VIGIE_API_RATE_LIMIT:-120}
+      VIGIE_API_RATE_WINDOW_S: ${VIGIE_API_RATE_WINDOW_S:-60}
+      VIGIE_API_MAX_BODY_BYTES: ${VIGIE_API_MAX_BODY_BYTES:-16384}
+    volumes:
+      # rw at the mount (SQLite WAL reader needs a writable directory); the code opens
+      # inventory.db with mode=ro + query_only and has no code path that writes it.
+      - vigie_data:/var/lib/vigie:rw
+      - vigie_overrides:/overrides:rw
+    secrets:
+      - source: vigie_tls_cert
+        uid: "10001"
+        gid: "10001"
+        mode: "0400"
+      - source: vigie_tls_key
+        uid: "10001"
+        gid: "10001"
+        mode: "0400"
+    ports:
+      - "${VIGIE_LAN_ADDR:?set VIGIE_LAN_ADDR in .env to the LAN address to listen on}:${VIGIE_API_PORT:-8444}:8444"
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http", "8444", "/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  vigie_data: {}
+  vigie_overrides: {}
+
+# External podman secrets, created with `podman secret create` (gen-certs.sh and
+# provision-collector.sh do it). External, not `file:`, because podman-compose only honours
+# uid/gid/mode for external secrets; a `file:` secret is a bind mount owned by the host user,
+# which the unprivileged container user could not read.
+secrets:
+  vigie_tls_cert:
+    external: true
+  vigie_tls_key:
+    external: true
+  collector_key_k1:
+    external: true
