@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vigie_conntrack::agg::{AggConfig, Aggregator, Snapshot};
 use vigie_conntrack::cli::{parse_args, Opts, USAGE};
 use vigie_conntrack::json::{snapshot_json, Meta};
+use vigie_conntrack::lan::default_lan;
 use vigie_conntrack::limits::{recheck_due, recheck_pressure, resolve_max_flows, stub_cap, CtMax};
 use vigie_conntrack::parse::scan_flows;
 use vigie_conntrack::sock::{bind_secure, current_ids, Outcome, Publisher};
@@ -39,7 +40,13 @@ fn agg_config(opts: &Opts, max_flows: usize, baseline_first: bool) -> AggConfig 
         max_flows,
         max_stubs: stub_cap(max_flows),
         top_n: opts.top_n,
-        other_k: opts.other_k,
+        k_lan: opts.k_lan,
+        k_wan: opts.k_wan,
+        lan: if opts.lan_cidrs.is_empty() {
+            default_lan()
+        } else {
+            opts.lan_cidrs.clone()
+        },
         baseline_first,
     }
 }

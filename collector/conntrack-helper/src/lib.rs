@@ -5,6 +5,7 @@
 pub mod agg;
 pub mod cli;
 pub mod json;
+pub mod lan;
 pub mod limits;
 pub mod parse;
 pub mod sock;

@@ -1,6 +1,7 @@
 //! Per-flow delta tracking (bounded) and aggregation per (src_ip, dst_ip, dst_port, proto).
 //! Samples are streamed in with `begin`/`add`/`finish`; no per-sample flow list is kept.
 
+use crate::lan::{default_lan, is_lan, Cidr};
 use crate::parse::{Counters, Flow, FlowKey};
 use std::collections::hash_map::{Entry as MapEntry, RandomState};
 use std::collections::HashMap;
@@ -10,17 +11,25 @@ use std::net::{IpAddr, Ipv4Addr};
 /// 3 x the GL-XE3000's nf_conntrack_max (16384): live flows plus two samples of tombstones.
 pub const DEFAULT_MAX_FLOWS: usize = 3 * 16_384;
 pub const DEFAULT_TOP_N: usize = 512;
-pub const DEFAULT_OTHER_K: usize = 64;
+/// Per-src `other` records kept for LAN sources / for all other sources.
+pub const DEFAULT_K_LAN: usize = 192;
+pub const DEFAULT_K_WAN: usize = 64;
 /// Consecutive samples a tracked flow may be absent and still be remembered; it is forgotten on
 /// the next absence after that.
 pub const TOMBSTONE_SAMPLES: u8 = 2;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AggConfig {
     pub max_flows: usize,
     pub top_n: usize,
-    /// Per-src `other` records kept; the rest fold into one global remainder record.
-    pub other_k: usize,
+    /// Per-src `other` records kept for LAN sources (most bytes first).
+    pub k_lan: usize,
+    /// Per-src `other` records kept for all other sources; whatever neither quota keeps folds
+    /// into one global remainder record.
+    pub k_wan: usize,
+    /// Which sources count as LAN. Spoofed sources from the WAN can still claim these
+    /// prefixes, so the owner should list the real LAN prefixes.
+    pub lan: Vec<Cidr>,
     /// Compact stubs kept for evicted live flows (see `Aggregator`).
     pub max_stubs: usize,
     /// First sample only records baselines (no historic bytes are reported as a delta).
@@ -32,7 +41,9 @@ impl Default for AggConfig {
         Self {
             max_flows: DEFAULT_MAX_FLOWS,
             top_n: DEFAULT_TOP_N,
-            other_k: DEFAULT_OTHER_K,
+            k_lan: DEFAULT_K_LAN,
+            k_wan: DEFAULT_K_WAN,
+            lan: default_lan(),
             max_stubs: DEFAULT_MAX_FLOWS / 3 * 2,
             baseline_first: true,
         }
@@ -276,7 +287,12 @@ impl Aggregator {
             }
             same
         });
-        let (records, folded) = top_n_fold(recs, self.cfg.top_n, self.cfg.other_k);
+        let (records, folded) = top_n_fold(
+            recs,
+            self.cfg.top_n,
+            (self.cfg.k_lan, self.cfg.k_wan),
+            &self.cfg.lan,
+        );
         Snapshot {
             records,
             folded,
@@ -352,17 +368,6 @@ fn total(r: &Record) -> u64 {
     r.bytes_up.saturating_add(r.bytes_down)
 }
 
-/// Private, link-local, loopback and unique-local sources: the router's own LAN.
-fn is_lan(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(a) => a.is_private() || a.is_link_local() || a.is_loopback(),
-        IpAddr::V6(a) => {
-            let s0 = a.segments()[0];
-            a.is_loopback() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80
-        }
-    }
-}
-
 fn empty_other(src: IpAddr, global: bool) -> Record {
     Record {
         src,
@@ -379,11 +384,17 @@ fn empty_other(src: IpAddr, global: bool) -> Record {
     }
 }
 
-/// Keeps the `n` records with the most bytes (ties broken by key for determinism), folds the
-/// rest into one `other` record per src, keeps the `k` best of those (most bytes; LAN sources
-/// first among equals) and folds all remaining ones into ONE global record. In place, so peak
-/// memory stays one record vector. Returns (records, number of records folded).
-fn top_n_fold(mut recs: Vec<Record>, n: usize, k: usize) -> (Vec<Record>, usize) {
+/// Keeps the `n` records with the most bytes (ties broken by key for determinism) and folds the
+/// rest into one `other` record per src. Of those, the `k_lan` LAN sources and the `k_wan` other
+/// sources with the most bytes are kept (separate quotas, so a flood of one kind cannot push the
+/// other out); all remaining ones fold into ONE global record. In place, so peak memory stays
+/// one record vector. Returns (records, number of records folded).
+fn top_n_fold(
+    mut recs: Vec<Record>,
+    n: usize,
+    (k_lan, k_wan): (usize, usize),
+    lan: &[Cidr],
+) -> (Vec<Record>, usize) {
     recs.sort_unstable_by(|a, b| {
         total(b)
             .cmp(&total(a))
@@ -408,18 +419,32 @@ fn top_n_fold(mut recs: Vec<Record>, n: usize, k: usize) -> (Vec<Record>, usize)
     }
     recs.truncate(w);
     recs[n..].sort_unstable_by(|a, b| {
-        total(b)
-            .cmp(&total(a))
-            .then_with(|| is_lan(b.src).cmp(&is_lan(a.src)))
+        is_lan(lan, b.src)
+            .cmp(&is_lan(lan, a.src))
+            .then_with(|| total(b).cmp(&total(a)))
             .then_with(|| a.src.cmp(&b.src))
     });
-    if recs.len() > n + k {
-        let mut g = empty_other(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true);
-        for r in &recs[n + k..] {
-            merge(&mut g, r);
+    let lan_end = n + recs[n..].partition_point(|r| is_lan(lan, r.src));
+    let mut global = empty_other(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true);
+    let (mut w, mut any) = (n, false);
+    for i in n..recs.len() {
+        let (rank, quota) = if i < lan_end {
+            (i - n, k_lan)
+        } else {
+            (i - lan_end, k_wan)
+        };
+        let rec = recs[i];
+        if rank < quota {
+            recs[w] = rec;
+            w += 1;
+        } else {
+            merge(&mut global, &rec);
+            any = true;
         }
-        recs.truncate(n + k);
-        recs.push(g);
+    }
+    recs.truncate(w);
+    if any {
+        recs.push(global);
     }
     (recs, folded)
 }
@@ -678,7 +703,7 @@ mod tests {
         let want: u64 = flows.iter().map(|f| f.orig.bytes + f.reply.bytes).sum();
         let s = a.ingest(&flows);
         assert!(
-            s.records.len() <= DEFAULT_TOP_N + DEFAULT_OTHER_K + 1,
+            s.records.len() <= DEFAULT_TOP_N + DEFAULT_K_LAN + DEFAULT_K_WAN + 1,
             "{} records",
             s.records.len()
         );
@@ -691,7 +716,7 @@ mod tests {
             .iter()
             .filter(|r| r.dst.is_none() && !r.global)
             .count();
-        assert_eq!(others, DEFAULT_OTHER_K);
+        assert_eq!(others, DEFAULT_K_WAN);
         assert_eq!(s.records.iter().map(|r| r.flows).sum::<u64>(), 16_384);
     }
 
@@ -699,7 +724,8 @@ mod tests {
     fn other_records_keep_lan_sources_first_among_equals() {
         let mut a = Aggregator::new(AggConfig {
             top_n: 1,
-            other_k: 2,
+            k_lan: 2,
+            k_wan: 0,
             ..cfg(false)
         });
         let mut fl = vec![flow("8.8.4.4", "9.9.9.9", 1, 1, 9999, 9999)];
@@ -903,6 +929,94 @@ mod tests {
         assert_eq!(s.recounted_flows, 3);
         let s = a.ingest(&flows[..2]);
         assert!(!s.table_pressure, "pressure is per sample");
+    }
+
+    fn wan(i: usize) -> String {
+        format!("203.0.{}.{}", i / 250, i % 250 + 1)
+    }
+
+    fn is_other(r: &Record) -> bool {
+        r.dst.is_none() && !r.global
+    }
+
+    #[test]
+    fn quiet_lan_host_keeps_its_attribution_under_a_spoofed_wan_flood() {
+        let mut a = Aggregator::new(cfg(false));
+        let mut fl = vec![flow("192.168.1.50", "9.9.9.9", 1, 443, 5000, 0)];
+        fl.extend((0..1000).map(|i| flow(&wan(i), "9.9.9.9", 2, 443, 1_000_000, 0)));
+        let want: u64 = 5000 + 1000 * 1_000_000;
+        let s = a.ingest(&fl);
+        assert_eq!(sum_bytes(&s), want, "totals stay exact");
+        let lan = s
+            .records
+            .iter()
+            .find(|r| r.src == ip("192.168.1.50"))
+            .unwrap();
+        assert_eq!(
+            lan.bytes_up, 5000,
+            "LAN host is attributed, not folded into global"
+        );
+        assert!(!lan.global);
+        let wan_others = s.records.iter().filter(|r| is_other(r)).count();
+        assert!(wan_others <= DEFAULT_K_LAN + DEFAULT_K_WAN, "{wan_others}");
+    }
+
+    #[test]
+    fn spoofed_private_sources_fill_only_the_lan_quota() {
+        let mut a = Aggregator::new(cfg(false));
+        let mut fl: Vec<Flow> = (0..2000)
+            .map(|i| {
+                flow(
+                    &format!("10.{}.{}.1", i / 250, i % 250),
+                    "9.9.9.9",
+                    2,
+                    443,
+                    1_000_000,
+                    0,
+                )
+            })
+            .collect();
+        fl.push(flow("8.8.4.4", "9.9.9.9", 3, 443, 5000, 0));
+        let want: u64 = 2000 * 1_000_000 + 5000;
+        let s = a.ingest(&fl);
+        assert_eq!(sum_bytes(&s), want);
+        let others: Vec<&Record> = s.records.iter().filter(|r| is_other(r)).collect();
+        let lan = others
+            .iter()
+            .filter(|r| is_lan(&default_lan(), r.src))
+            .count();
+        assert_eq!(lan, DEFAULT_K_LAN, "the flood is limited to the LAN quota");
+        let wanrec = s.records.iter().find(|r| r.src == ip("8.8.4.4")).unwrap();
+        assert_eq!(
+            wanrec.bytes_up, 5000,
+            "the WAN quota is untouched by the flood"
+        );
+        assert_eq!(s.records.iter().filter(|r| r.global).count(), 1);
+    }
+
+    #[test]
+    fn lan_cidr_overrides_the_default_lan_definition() {
+        let lan_net = vec![Cidr::parse("203.0.113.0/24").unwrap()];
+        let mut a = Aggregator::new(AggConfig {
+            top_n: 1,
+            k_lan: 1,
+            k_wan: 1,
+            lan: lan_net,
+            ..cfg(false)
+        });
+        let s = a.ingest(&[
+            flow("8.8.8.8", "9.9.9.9", 1, 443, 9999, 0),
+            flow("203.0.113.5", "9.9.9.9", 2, 443, 10, 0),
+            flow("192.168.1.2", "9.9.9.9", 3, 443, 20, 0),
+            flow("1.2.3.4", "9.9.9.9", 4, 443, 30, 0),
+        ]);
+        let src = |ip_s: &str| s.records.iter().any(|r| r.src == ip(ip_s) && is_other(r));
+        assert!(src("203.0.113.5"), "inside the configured LAN: LAN quota");
+        assert!(src("1.2.3.4"), "WAN quota, best by bytes among the rest");
+        assert!(
+            !src("192.168.1.2"),
+            "RFC1918 is WAN once --lan-cidr replaces the default"
+        );
     }
 
     fn top_n_input() -> Vec<Flow> {

@@ -1,5 +1,6 @@
 //! Minimal std-only argument parsing.
 
+use crate::lan::Cidr;
 use std::path::PathBuf;
 
 pub const DEFAULT_SOURCE: &str = "/proc/net/nf_conntrack";
@@ -8,17 +9,20 @@ pub const DEFAULT_INTERVAL_S: u64 = 60;
 pub const DEFAULT_CT_MAX_FILE: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
 /// Bounds keep one snapshot line far below the publisher's 2 MiB cap (~230 bytes per record).
 pub const MAX_TOP_N: usize = 2048;
-pub const MAX_OTHER_K: usize = 2048;
+pub const MAX_K: usize = 2048;
 /// uids that other services commonly share; a dedicated one is required unless overridden.
 pub const SHARED_UIDS: [u32; 2] = [0, 65534];
 
 pub const USAGE: &str =
     "usage: vigie-conntrack [--once] [--file PATH] [--socket PATH] [--interval SECS]\n\
-  [--top-n N] [--max-flows N] [--uid UID] [--gid GID]\n\
+  [--top-n N] [--k-lan N] [--k-wan N] [--lan-cidr NET] [--max-flows N] [--uid UID] [--gid GID]\n\
   --once --file PATH   aggregate one file, print the snapshot JSON, exit (no socket)\n\
   defaults: --file /proc/net/nf_conntrack --socket /tmp/vigie/conntrack.sock --interval 60\n\
-            --top-n 512 --other-k 64 --conntrack-max-file
+            --top-n 512 --k-lan 192 --k-wan 64 --conntrack-max-file
             /proc/sys/net/netfilter/nf_conntrack_max --ct-recheck-samples 60
+  --lan-cidr NET (repeatable) replaces the default LAN prefixes (10/8 172.16/12 192.168/16
+  100.64/10 fe80::/10 fc00::/7); LAN and other sources get separate record quotas, so list the
+  real LAN prefixes: spoofed private sources arriving from the WAN can fill the LAN quota
   --max-flows defaults to 3 x nf_conntrack_max; the daemon refuses to start when that file is
   unreadable or the cap is below 3 x it, unless --max-flows is given explicitly (then a lower
   cap only warns loudly and sets table_pressure)
@@ -31,7 +35,10 @@ pub struct Opts {
     pub socket: PathBuf,
     pub interval_s: u64,
     pub top_n: usize,
-    pub other_k: usize,
+    pub k_lan: usize,
+    pub k_wan: usize,
+    /// `--lan-cidr` values; empty means the defaults (see `lan::default_lan`).
+    pub lan_cidrs: Vec<Cidr>,
     pub max_flows: usize,
     /// `--max-flows` was given, so the nf_conntrack_max startup check is the owner's call.
     pub max_flows_set: bool,
@@ -51,7 +58,9 @@ impl Default for Opts {
             socket: PathBuf::from(DEFAULT_SOCKET),
             interval_s: DEFAULT_INTERVAL_S,
             top_n: crate::agg::DEFAULT_TOP_N,
-            other_k: crate::agg::DEFAULT_OTHER_K,
+            k_lan: crate::agg::DEFAULT_K_LAN,
+            k_wan: crate::agg::DEFAULT_K_WAN,
+            lan_cidrs: Vec::new(),
             max_flows: crate::agg::DEFAULT_MAX_FLOWS,
             max_flows_set: false,
             ct_recheck_samples: crate::limits::DEFAULT_RECHECK_SAMPLES,
@@ -99,7 +108,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             "--socket" => o.socket = PathBuf::from(v),
             "--interval" => o.interval_s = ranged(&flag, &v, 1, 86_400)?,
             "--top-n" => o.top_n = ranged(&flag, &v, 1, MAX_TOP_N)?,
-            "--other-k" => o.other_k = ranged(&flag, &v, 0, MAX_OTHER_K)?,
+            "--k-lan" => o.k_lan = ranged(&flag, &v, 0, MAX_K)?,
+            "--k-wan" => o.k_wan = ranged(&flag, &v, 0, MAX_K)?,
+            "--lan-cidr" => o.lan_cidrs.push(Cidr::parse(&v)?),
             "--max-flows" => {
                 o.max_flows = ranged(&flag, &v, 1, usize::MAX)?;
                 o.max_flows_set = true;
@@ -141,7 +152,8 @@ mod tests {
         assert_eq!(o.top_n, 512);
         assert_eq!(o.max_flows, 49152);
         assert!(!o.once);
-        assert_eq!(o.other_k, 64);
+        assert_eq!((o.k_lan, o.k_wan), (192, 64));
+        assert!(o.lan_cidrs.is_empty());
         assert!(!o.max_flows_set && !o.allow_shared_uid);
     }
 
@@ -163,8 +175,14 @@ mod tests {
             "20001",
             "--gid",
             "20002",
-            "--other-k",
+            "--k-lan",
             "9",
+            "--k-wan",
+            "3",
+            "--lan-cidr",
+            "192.168.8.0/24",
+            "--lan-cidr",
+            "fd00::/8",
         ])
         .unwrap();
         assert!(o.once);
@@ -172,7 +190,8 @@ mod tests {
         assert_eq!(o.socket, PathBuf::from("/run/s"));
         assert_eq!((o.interval_s, o.top_n, o.max_flows), (30, 7, 99));
         assert!(o.max_flows_set);
-        assert_eq!(o.other_k, 9);
+        assert_eq!((o.k_lan, o.k_wan), (9, 3));
+        assert_eq!(o.lan_cidrs.len(), 2);
         assert_eq!((o.uid, o.gid), (Some(20001), Some(20002)));
     }
 
@@ -206,7 +225,10 @@ mod tests {
     #[test]
     fn record_caps_are_bounded() {
         assert!(p(&["--top-n", "2049"]).is_err());
-        assert!(p(&["--other-k", "2049"]).is_err());
-        assert!(p(&["--other-k", "0"]).is_ok());
+        assert!(p(&["--k-lan", "2049"]).is_err());
+        assert!(p(&["--k-wan", "2049"]).is_err());
+        assert!(p(&["--k-lan", "0", "--k-wan", "0"]).is_ok());
+        assert!(p(&["--lan-cidr", "10.0.0.0/33"]).is_err());
+        assert!(p(&["--lan-cidr", "garbage"]).is_err());
     }
 }

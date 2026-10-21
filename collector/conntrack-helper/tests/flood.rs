@@ -1,7 +1,7 @@
 //! Attacker-shaped input: 16384 distinct spoofed sources must not black out monitoring.
 
 use std::fmt::Write;
-use vigie_conntrack::agg::{AggConfig, Aggregator, DEFAULT_OTHER_K, DEFAULT_TOP_N};
+use vigie_conntrack::agg::{AggConfig, Aggregator, DEFAULT_K_LAN, DEFAULT_K_WAN, DEFAULT_TOP_N};
 use vigie_conntrack::json::{snapshot_json, Meta};
 use vigie_conntrack::parse::scan_flows;
 use vigie_conntrack::sock::MAX_SNAPSHOT_BYTES;
@@ -47,7 +47,7 @@ fn distinct_source_flood_fits_in_a_small_snapshot_and_keeps_every_byte() {
     );
     assert!(line.len() < 256 * 1024, "snapshot is {} bytes", line.len());
     assert!(line.len() < MAX_SNAPSHOT_BYTES);
-    assert!(snap.records.len() <= DEFAULT_TOP_N + DEFAULT_OTHER_K + 1);
+    assert!(snap.records.len() <= DEFAULT_TOP_N + DEFAULT_K_LAN + DEFAULT_K_WAN + 1);
     let got: u64 = snap.records.iter().map(|r| r.bytes_up + r.bytes_down).sum();
     assert_eq!(got, want, "bytes lost or invented by folding");
     assert!(line.contains(r#""other_global":true"#));
