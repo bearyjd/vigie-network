@@ -54,6 +54,30 @@ def test_streamed_oversized_body_without_content_length_rejected(env: Env) -> No
     assert env.ov.execute("SELECT COUNT(*) FROM device_overrides").fetchone()[0] == 0
 
 
+def test_declared_content_length_over_cap_rejected_before_app_runs() -> None:
+    import asyncio
+
+    from vigie_api.bodylimit import BodyLimitMiddleware
+
+    reached: list[bool] = []
+    sent: list[dict] = []
+
+    async def inner(scope, receive, send) -> None:
+        reached.append(True)
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    async def receive() -> dict:
+        raise AssertionError("body must not be read")
+
+    for length in (b"101", b"abc"):
+        sent.clear()
+        scope = {"type": "http", "headers": [(b"content-length", length)]}
+        asyncio.run(BodyLimitMiddleware(inner, max_bytes=100)(scope, receive, send))
+        assert sent[0]["status"] == 413 and not reached
+
+
 def test_settings_validation(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         Settings(data_dir=tmp_path, max_body_bytes=0)
