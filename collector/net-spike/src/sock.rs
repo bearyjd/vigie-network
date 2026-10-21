@@ -27,7 +27,7 @@ fn v4(group: Ipv4Addr, port: u16, lan: Ipv4Addr) -> io::Result<UdpSocket> {
     s.set_multicast_all_v4(false)?;
     s.bind(&SocketAddr::V4(SocketAddrV4::new(group, port)).into())?;
     s.join_multicast_v4(&group, &lan)?;
-    s.set_multicast_loop_v4(false)?;
+    // Receive-only socket: IP_MULTICAST_LOOP is a *send* option and is deliberately not set.
     Ok(s.into())
 }
 
@@ -60,6 +60,74 @@ pub fn mdns_v6(iface: &str) -> io::Result<UdpSocket> {
     s.set_multicast_all_v6(false)?;
     s.bind(&SocketAddr::V6(SocketAddrV6::new(group, 5353, 0, idx)).into())?;
     s.join_multicast_v6(&group, idx)?;
-    s.set_multicast_loop_v6(false)?;
     Ok(s.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket2::SockRef;
+
+    fn common(s: &UdpSocket) {
+        let r = SockRef::from(s);
+        assert!(r.reuse_address().unwrap(), "SO_REUSEADDR");
+        assert!(r.reuse_port().unwrap(), "SO_REUSEPORT");
+        assert_eq!(s.read_timeout().unwrap(), Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn mdns_v4_binds_group_and_clears_multicast_all() {
+        let s = mdns_v4(Ipv4Addr::UNSPECIFIED).unwrap();
+        assert_eq!(s.local_addr().unwrap(), "224.0.0.251:5353".parse().unwrap());
+        assert!(!SockRef::from(&s).multicast_all_v4().unwrap());
+        common(&s);
+    }
+
+    #[test]
+    fn ssdp_v4_binds_group_and_clears_multicast_all() {
+        let s = ssdp_v4(Ipv4Addr::UNSPECIFIED).unwrap();
+        assert_eq!(
+            s.local_addr().unwrap(),
+            "239.255.255.250:1900".parse().unwrap()
+        );
+        assert!(!SockRef::from(&s).multicast_all_v4().unwrap());
+        common(&s);
+    }
+
+    /// Any interface where the v6 join works (CI sandboxes differ); None if there is none.
+    fn v6_socket() -> Option<(UdpSocket, u32)> {
+        for e in fs::read_dir("/sys/class/net").ok()?.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let (Ok(s), Ok(idx)) = (mdns_v6(&name), ifindex(&name)) {
+                return Some((s, idx));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn mdns_v6_binds_scoped_group_and_clears_multicast_all() {
+        let Some((s, idx)) = v6_socket() else {
+            eprintln!("skipped: no interface accepts the ff02::fb join in this environment");
+            return;
+        };
+        let want = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb),
+            5353,
+            0,
+            idx,
+        ));
+        assert_eq!(s.local_addr().unwrap(), want);
+        let r = SockRef::from(&s);
+        assert!(!r.multicast_all_v6().unwrap());
+        assert!(r.only_v6().unwrap());
+        common(&s);
+    }
+
+    #[test]
+    fn ifindex_rejects_path_tricks() {
+        assert!(ifindex("").is_err());
+        assert!(ifindex("../lo").is_err());
+        assert!(ifindex("no-such-iface").is_err());
+    }
 }

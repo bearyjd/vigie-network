@@ -170,16 +170,61 @@ mod tests {
     #[test]
     fn one_source_cannot_exceed_its_quota() {
         let mut s = Stats::default();
-        for i in 0..20 {
+        for i in 0..70 {
             let label = format!("h{i}");
-            s.on_mdns(
-                &filter(),
-                addr("192.168.1.66:5353"),
-                &query(&[&label, "local"]),
-            );
+            s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&[&label, "local"]));
         }
-        assert_eq!(s.mdns_names.len(), crate::evidence::PER_SOURCE);
-        assert_eq!(s.evidence.dropped, 4);
+        assert_eq!(s.mdns_names.len(), 64);
+        assert_eq!(s.evidence.dropped, 6);
+    }
+
+    #[test]
+    fn service_set_respects_the_quota_too() {
+        let mut s = Stats::default();
+        for i in 0..64 {
+            let label = format!("h{i}");
+            s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&[&label, "local"]));
+        }
+        // quota exhausted: a new service type must not slip into `services` or `names`
+        s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&["_late", "_tcp", "local"]));
+        assert!(s.mdns_services.is_empty(), "{:?}", s.mdns_services);
+        assert_eq!(s.mdns_names.len(), 64);
+        assert_eq!(s.evidence.dropped, 2); // the name and its service suffix
+        // another source is unaffected
+        s.on_mdns(&filter(), addr("192.168.1.67:5353"), &query(&["_ok", "_tcp", "local"]));
+        assert!(s.mdns_services.contains("_ok._tcp.local"));
+    }
+
+    #[test]
+    fn ssdp_flood_is_quota_limited_across_all_three_sets() {
+        let mut s = Stats::default();
+        for i in 0..30 {
+            let m = format!(
+                "NOTIFY * HTTP/1.1\r\nSERVER: srv{i}\r\nNT: nt{i}\r\nUSN: usn{i}\r\n\r\n"
+            );
+            s.on_ssdp(&filter(), addr("192.168.1.66:1900"), m.as_bytes());
+        }
+        let kept = s.ssdp_servers.len() + s.ssdp_nt.len() + s.ssdp_usn.len();
+        assert_eq!(kept, 64);
+        assert_eq!(s.evidence.dropped, 26);
+        // each of the three sets is exercised: server filled first, so it has the extra one
+        assert_eq!(s.ssdp_servers.len(), 22);
+        assert_eq!(s.ssdp_nt.len(), 21);
+        assert_eq!(s.ssdp_usn.len(), 21);
+    }
+
+    #[test]
+    fn one_healthy_device_stays_inside_its_quota() {
+        let mut s = Stats::default();
+        let m = "NOTIFY * HTTP/1.1\r\nSERVER: S/1\r\nNT: upnp:rootdevice\r\nUSN: uuid:a::upnp:rootdevice\r\n\r\n";
+        for _ in 0..10 {
+            s.on_ssdp(&filter(), addr("192.168.1.50:1900"), m.as_bytes());
+        }
+        for i in 0..8 {
+            let label = format!("svc{i}");
+            s.on_mdns(&filter(), addr("192.168.1.50:5353"), &query(&["x", &label, "_tcp", "local"]));
+        }
+        assert_eq!(s.evidence.dropped, 0);
     }
 
     #[test]
