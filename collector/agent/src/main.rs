@@ -32,6 +32,7 @@ const DEFAULT_CONFIG: &str = "/etc/vigie/collector.conf";
 const POLL: Duration = Duration::from_secs(2);
 const NEIGH_REFRESH_S: u64 = 10;
 const EXIT_CONFIG: u8 = 78;
+const EXIT_NO_RANDOM: u8 = 71;
 
 const fn parse_build_ts(s: &str) -> u64 {
     let b = s.as_bytes();
@@ -108,17 +109,25 @@ struct Agent {
 }
 
 impl Agent {
-    fn meta(&mut self, now: u64) -> Meta {
+    /// `None` when no random batch id can be had; the caller keeps its data and retries later.
+    fn meta(&mut self, now: u64) -> Option<Meta> {
+        let rand = match random::<10>() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("/dev/urandom: {e}; batch not built");
+                return None;
+            }
+        };
         self.seq += 1;
-        Meta {
+        Some(Meta {
             collector_id: self.cfg.collector_id.clone(),
             key_id: self.cfg.key_id.clone(),
             boot_id: self.boot_id.clone(),
             seq: self.seq,
-            batch_id: ids::uuid7(wall_ms(), random::<10>()),
+            batch_id: ids::uuid7(wall_ms(), rand),
             window_start: self.clock.start(now, self.started.elapsed().as_secs()),
             window_end: now,
-        }
+        })
     }
 
     fn health(&self, quiet: bool) -> Health {
@@ -153,6 +162,9 @@ impl Agent {
             let new_mac = self.urgent.on_lease(&lease.mac, started_ms(self.started));
             self.window.add_lease(lease);
             if new_mac {
+                // A new device is the case where the 10 s neighbor snapshot is stale: refresh
+                // now so its first queries are attributed and its neighbor entry rides along.
+                self.refresh_neighbors();
                 self.push_identity();
             }
         }
@@ -173,9 +185,9 @@ impl Agent {
         if !self.sync.is_synced() || !self.engine.gate.is_sane(now, mono) {
             return;
         }
+        let Some(meta) = self.meta(now) else { return };
         let sections = self.window.take_identity();
-        let (meta, health) = (self.meta(now), self.health(false));
-        let b = build(&meta, sections, &health, BATCH_CAP);
+        let b = build(&meta, sections, &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded);
     }
 
@@ -185,8 +197,8 @@ impl Agent {
         if !self.engine.spool.is_empty() {
             return;
         }
-        let (meta, health) = (self.meta(now), self.health(false));
-        let b = build(&meta, Sections::default(), &health, BATCH_CAP);
+        let Some(meta) = self.meta(now) else { return };
+        let b = build(&meta, Sections::default(), &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded);
     }
 
@@ -217,9 +229,9 @@ impl Agent {
         let quiet = self
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
+        let Some(meta) = self.meta(now) else { return };
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
-        let (meta, health) = (self.meta(now), self.health(quiet));
-        let b = build_with_drops(&meta, sections, &health, BATCH_CAP, &drops);
+        let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
         self.clock.mark_flush(mono_s);
         self.engine.enqueue(b.encoded);
     }
@@ -252,7 +264,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
-    let boot_id = ids::boot_id(random::<8>());
+    let boot_id = match random::<8>() {
+        Ok(r) => ids::boot_id(r),
+        Err(e) => {
+            eprintln!("vigie-collector: /dev/urandom: {e}; refusing to start without unique ids");
+            return ExitCode::from(EXIT_NO_RANDOM);
+        }
+    };
     let id = Identity {
         collector_id: cfg.collector_id.clone(),
         key_id: cfg.key_id.clone(),
@@ -297,7 +315,10 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
             agent.flush_window(wall, mono);
             last_flush = mono;
         }
-        let tick = agent.engine.tick(&mut transport, wall, mono, random_u64());
+        // Jitter only spreads retries; if the kernel RNG is unavailable it is 0 (batch ids, which
+        // must be unique, are never built without it: see `Agent::meta`).
+        let jitter = random_u64().unwrap_or(0);
+        let tick = agent.engine.tick(&mut transport, wall, mono, jitter);
         let date_seen = agent.engine.gate.has_server_date();
         if let Some(offset) = agent.sync.observe(date_seen, wall, mono) {
             agent.window.rebase_dns(offset);

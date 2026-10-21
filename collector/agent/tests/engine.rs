@@ -208,7 +208,11 @@ fn duplicate_true_counts_as_success() {
         e.spool.is_empty(),
         "lost-ACK retry must not be re-sent forever"
     );
-    assert_eq!(e.spool.dropped_unreported(), 0);
+    assert_eq!(
+        e.spool.dropped_unreported(),
+        1,
+        "a duplicate does not acknowledge the retry's dropped_batches"
+    );
     assert_eq!(e.backoff.attempts(), 0);
 }
 

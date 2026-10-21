@@ -2,7 +2,8 @@
 //! unit-testing lives here; it is kept out of `main.rs` to keep that readable.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,27 +24,21 @@ pub fn wall_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Random bytes from the kernel. Used for batch/boot ids and jitter only (never for the HMAC
-/// key); on failure falls back to clock bits, which is acceptable for those uses.
-pub fn random<const N: usize>() -> [u8; N] {
+/// Exactly `N` random bytes from `path`. Any failure, including a short read, is an error: ids
+/// must never repeat, so there is deliberately no weaker fallback.
+pub fn random_from<const N: usize>(path: &Path) -> io::Result<[u8; N]> {
     let mut buf = [0u8; N];
-    let ok = File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !ok {
-        let mut x = wall_ms() ^ 0x9E37_79B9_7F4A_7C15;
-        for b in &mut buf {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = x as u8;
-        }
-    }
-    buf
+    File::open(path)?.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
-pub fn random_u64() -> u64 {
-    u64::from_le_bytes(random::<8>())
+/// Random bytes from the kernel, for batch/boot ids and jitter (never for the HMAC key).
+pub fn random<const N: usize>() -> io::Result<[u8; N]> {
+    random_from(Path::new("/dev/urandom"))
+}
+
+pub fn random_u64() -> io::Result<u64> {
+    random::<8>().map(u64::from_le_bytes)
 }
 
 /// IPv4 and IPv6 neighbor tables (`ip -4 neigh show`, `ip -6 neigh show`).

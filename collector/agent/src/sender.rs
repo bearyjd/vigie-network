@@ -150,7 +150,11 @@ impl Engine {
             200 => {
                 let duplicate = body_says_duplicate(&reply.body);
                 self.spool.pop_front();
-                self.spool.mark_reported(dropped);
+                // A duplicate reply means the server kept the first attempt and ignored this
+                // retry's `dropped_batches`: only a fresh batch acknowledges what it carried.
+                if !duplicate {
+                    self.spool.mark_reported(dropped);
+                }
                 self.backoff.reset();
                 self.next_attempt_s = mono_s;
                 Tick::Sent { duplicate }
