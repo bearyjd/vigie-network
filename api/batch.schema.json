@@ -1,0 +1,474 @@
+{
+  "$defs": {
+    "ConntrackSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_down": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Bytes Down",
+          "type": "integer"
+        },
+        "bytes_up": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Bytes Up",
+          "type": "integer"
+        },
+        "dst_ip": {
+          "anyOf": [
+            {
+              "maxLength": 45,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dst Ip"
+        },
+        "dst_port": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dst Port"
+        },
+        "flows": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Flows",
+          "type": "integer"
+        },
+        "mac": {
+          "maxLength": 17,
+          "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+          "title": "Mac",
+          "type": "string"
+        },
+        "proto": {
+          "enum": [
+            "tcp",
+            "udp",
+            "icmp",
+            "icmpv6",
+            "other"
+          ],
+          "title": "Proto",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mac",
+        "proto",
+        "bytes_up",
+        "bytes_down",
+        "flows"
+      ],
+      "title": "ConntrackSummary",
+      "type": "object"
+    },
+    "DnsQuery": {
+      "additionalProperties": false,
+      "properties": {
+        "answer_ip": {
+          "anyOf": [
+            {
+              "maxLength": 45,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Answer Ip"
+        },
+        "mac": {
+          "maxLength": 17,
+          "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+          "title": "Mac",
+          "type": "string"
+        },
+        "qname": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Qname",
+          "type": "string"
+        },
+        "qtype": {
+          "pattern": "^[A-Z0-9]{1,16}$",
+          "title": "Qtype",
+          "type": "string"
+        },
+        "ts": {
+          "maximum": 1099511627776,
+          "minimum": 0,
+          "title": "Ts",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ts",
+        "mac",
+        "qname",
+        "qtype"
+      ],
+      "title": "DnsQuery",
+      "type": "object"
+    },
+    "Health": {
+      "additionalProperties": false,
+      "properties": {
+        "dns_log_quiet": {
+          "default": false,
+          "title": "Dns Log Quiet",
+          "type": "boolean"
+        },
+        "rss_kb": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rss Kb"
+        },
+        "spool_batches": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spool Batches"
+        },
+        "uptime_s": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uptime S"
+        }
+      },
+      "title": "Health",
+      "type": "object"
+    },
+    "Lease": {
+      "additionalProperties": false,
+      "properties": {
+        "hostname": {
+          "anyOf": [
+            {
+              "maxLength": 253,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hostname"
+        },
+        "ip": {
+          "maxLength": 45,
+          "title": "Ip",
+          "type": "string"
+        },
+        "mac": {
+          "maxLength": 17,
+          "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+          "title": "Mac",
+          "type": "string"
+        },
+        "opt55": {
+          "default": [],
+          "items": {
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 64,
+          "title": "Opt55",
+          "type": "array"
+        },
+        "opt60": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Opt60"
+        }
+      },
+      "required": [
+        "mac",
+        "ip"
+      ],
+      "title": "Lease",
+      "type": "object"
+    },
+    "Neighbor": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "enum": [
+            "inet",
+            "inet6"
+          ],
+          "title": "Family",
+          "type": "string"
+        },
+        "ip": {
+          "maxLength": 45,
+          "title": "Ip",
+          "type": "string"
+        },
+        "mac": {
+          "maxLength": 17,
+          "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+          "title": "Mac",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ip",
+        "mac",
+        "family"
+      ],
+      "title": "Neighbor",
+      "type": "object"
+    },
+    "Sighting": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "mdns",
+            "ssdp"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "mac": {
+          "maxLength": 17,
+          "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+          "title": "Mac",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service"
+        },
+        "ua": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ua"
+        }
+      },
+      "required": [
+        "mac",
+        "kind"
+      ],
+      "title": "Sighting",
+      "type": "object"
+    }
+  },
+  "$id": "https://vigie.invalid/api/batch.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "batch_id": {
+      "maxLength": 36,
+      "title": "Batch Id",
+      "type": "string"
+    },
+    "boot_id": {
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+      "title": "Boot Id",
+      "type": "string"
+    },
+    "collector_id": {
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+      "title": "Collector Id",
+      "type": "string"
+    },
+    "conntrack": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ConntrackSummary"
+      },
+      "maxItems": 5000,
+      "title": "Conntrack",
+      "type": "array"
+    },
+    "dns": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/DnsQuery"
+      },
+      "maxItems": 5000,
+      "title": "Dns",
+      "type": "array"
+    },
+    "dropped_batches": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Dropped Batches",
+      "type": "integer"
+    },
+    "health": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Health"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "key_id": {
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+      "title": "Key Id",
+      "type": "string"
+    },
+    "leases": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Lease"
+      },
+      "maxItems": 1000,
+      "title": "Leases",
+      "type": "array"
+    },
+    "neigh": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Neighbor"
+      },
+      "maxItems": 2000,
+      "title": "Neigh",
+      "type": "array"
+    },
+    "sent_ts": {
+      "maximum": 1099511627776,
+      "minimum": 0,
+      "title": "Sent Ts",
+      "type": "integer"
+    },
+    "seq": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "sightings": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Sighting"
+      },
+      "maxItems": 1000,
+      "title": "Sightings",
+      "type": "array"
+    },
+    "truncated": {
+      "default": {},
+      "maxProperties": 16,
+      "patternProperties": {
+        "^[a-z_]{1,32}$": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "title": "Truncated",
+      "type": "object"
+    },
+    "window_end": {
+      "maximum": 1099511627776,
+      "minimum": 0,
+      "title": "Window End",
+      "type": "integer"
+    },
+    "window_start": {
+      "maximum": 1099511627776,
+      "minimum": 0,
+      "title": "Window Start",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "collector_id",
+    "key_id",
+    "boot_id",
+    "seq",
+    "batch_id",
+    "window_start",
+    "window_end",
+    "sent_ts"
+  ],
+  "title": "Batch",
+  "type": "object"
+}
