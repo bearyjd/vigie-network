@@ -105,7 +105,7 @@ fn handshake_signed_by_a_different_key_is_refused() {
         &[&rustls::version::TLS13][..],
         &[&rustls::version::TLS12][..],
     ] {
-        let r = try_post(&genuine, &attacker, &pins(&genuine, &genuine), v);
+        let r = try_post(&genuine, &attacker, &[genuine.pin_hex()], v);
         assert!(
             r.is_err(),
             "forged handshake signature accepted ({v:?} only)"
@@ -116,7 +116,7 @@ fn handshake_signed_by_a_different_key_is_refused() {
 #[test]
 fn both_tls_versions_work_and_nothing_older_exists() {
     let srv = Ident::new();
-    let p = pins(&srv, &srv);
+    let p = vec![srv.pin_hex()];
     assert_eq!(
         try_post(&srv, &srv, &p, &[&rustls::version::TLS13]).unwrap(),
         200

@@ -199,6 +199,7 @@ fn parse_head(raw: &[u8], body_start: usize) -> Result<Head, String> {
     let mut lines = text.split("\r\n");
     let status = parse_status(lines.next().unwrap_or(""))?;
     let (mut date, mut content_length) = (None, None);
+    let mut dates_seen = 0u32;
     for line in lines {
         let (name, value) = line.split_once(':').ok_or("malformed header line")?;
         if name.is_empty() || name.bytes().any(|b| b <= b' ' || b == 0x7f) {
@@ -222,7 +223,15 @@ fn parse_head(raw: &[u8], body_start: usize) -> Result<Head, String> {
                 }
                 content_length = Some(n);
             }
-            "date" if date.is_none() => date = parse_imf_fixdate(value),
+            // Only a single Date header is believed: with two, which one is real is unknowable.
+            "date" => {
+                dates_seen += 1;
+                date = if dates_seen == 1 {
+                    parse_imf_fixdate(value)
+                } else {
+                    None
+                };
+            }
             _ => {}
         }
     }
@@ -301,6 +310,29 @@ mod tests {
         let mut fits = format!("HTTP/1.1 200 OK\r\nContent-Length: {ok_len}\r\n\r\n").into_bytes();
         fits.extend(std::iter::repeat_n(b'x', ok_len));
         assert_eq!(reply(&fits).unwrap().body.len(), ok_len);
+    }
+
+    #[test]
+    fn only_the_first_date_header_counts() {
+        const GOOD: &str = "Date: Tue, 20 Oct 2026 21:59:38 GMT";
+        for heads in [
+            // bad first, good second (the bypass the old `date.is_none()` guard allowed)
+            format!("Date: yesterday\r\n{GOOD}"),
+            format!("Date: Mon, 31 Feb 2026 10:00:00 GMT\r\n{GOOD}"),
+            // good twice, same or different
+            format!("{GOOD}\r\n{GOOD}"),
+            format!("{GOOD}\r\nDate: Wed, 21 Oct 2026 21:59:38 GMT"),
+            // good, then bad
+            format!("{GOOD}\r\nDate: yesterday"),
+            // three, the case of the name does not matter
+            format!("date: yesterday\r\nDATE: yesterday\r\n{GOOD}"),
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\n{heads}\r\nContent-Length: 0\r\n\r\n");
+            let r = reply(raw.as_bytes()).unwrap();
+            assert_eq!((r.status, r.date), (200, None), "{heads:?}");
+        }
+        let one = format!("HTTP/1.1 200 OK\r\nX: y\r\n{GOOD}\r\nContent-Length: 0\r\n\r\n");
+        assert!(reply(one.as_bytes()).unwrap().date.is_some());
     }
 
     #[test]
