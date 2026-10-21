@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["parse", "net-spike", "agent"]
+members = ["parse", "net-spike", "agent", "conntrack-helper"]
 
 [workspace.package]
 edition = "2021"

@@ -219,6 +219,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigie-conntrack"
+version = "0.1.0"
+
+[[package]]
 name = "vigie-parse"
 version = "0.1.0"
 

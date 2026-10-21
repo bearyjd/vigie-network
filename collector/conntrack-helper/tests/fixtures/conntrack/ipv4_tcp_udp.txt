@@ -1,0 +1,6 @@
+ipv4     2 tcp      6 431999 ESTABLISHED src=192.168.8.10 dst=93.184.216.34 sport=51234 dport=443 packets=10 bytes=1200 src=93.184.216.34 dst=192.168.8.10 sport=443 dport=51234 packets=8 bytes=9000 [ASSURED] mark=0 zone=0 use=2
+ipv4     2 udp      17 29 src=192.168.8.10 dst=8.8.8.8 sport=40000 dport=53 packets=1 bytes=70 src=8.8.8.8 dst=192.168.8.10 sport=53 dport=40000 packets=1 bytes=120 mark=0 use=2
+ipv4     2 udp      17 25 src=192.168.8.11 dst=239.255.255.250 sport=50000 dport=1900 packets=3 bytes=540 [UNREPLIED] src=239.255.255.250 dst=192.168.8.11 sport=1900 dport=50000 packets=0 bytes=0 mark=0 use=2
+ipv4     2 icmp     1 29 src=192.168.8.10 dst=1.1.1.1 type=8 code=0 id=4242 packets=4 bytes=336 src=1.1.1.1 dst=192.168.8.10 type=0 code=0 id=4242 packets=4 bytes=336 mark=0 use=2
+ipv4     2 tcp      6 118 SYN_SENT src=192.168.8.12 dst=203.0.113.9 sport=33333 dport=8443 packets=1 bytes=60 [UNREPLIED] src=203.0.113.9 dst=192.168.8.12 sport=8443 dport=33333 packets=0 bytes=0 mark=0 secctx=system_u:object_r:unlabeled_t zone=0 use=2
+ipv4     2 gre      47 599 src=192.168.8.13 dst=198.51.100.7 packets=5 bytes=500 src=198.51.100.7 dst=192.168.8.13 packets=5 bytes=500 mark=0 use=2
