@@ -1,0 +1,38 @@
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 DHCPREQUEST(br-lan) 192.168.1.50 c2:11:22:33:44:01
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 requested options: 1:netmask, 3:router, 6:dns-server, 15:domain-name, 26:mtu, 28:broadcast, 51:lease-time, 58:T1, 59:T2
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 vendor class: android-dhcp-14
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 client provides name: Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1000 DHCPACK(br-lan) 192.168.1.50 c2:11:22:33:44:01 Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 DHCPREQUEST(br-lan) 192.168.1.50 c2:11:22:33:44:02
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 requested options: 1:netmask, 3:router, 6:dns-server, 15:domain-name, 26:mtu, 28:broadcast, 51:lease-time, 58:T1, 59:T2
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 vendor class: android-dhcp-14
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 client provides name: Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1001 DHCPACK(br-lan) 192.168.1.50 c2:11:22:33:44:02 Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 DHCPREQUEST(br-lan) 192.168.1.50 c2:11:22:33:44:03
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 requested options: 1:netmask, 3:router, 6:dns-server, 15:domain-name, 26:mtu, 28:broadcast, 51:lease-time, 58:T1, 59:T2
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 vendor class: android-dhcp-14
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 client provides name: Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1002 DHCPACK(br-lan) 192.168.1.50 c2:11:22:33:44:03 Pixel-8
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1003 DHCPREQUEST(br-lan) 192.168.1.51 6a:aa:bb:cc:dd:01
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1003 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1003 requested options: 1:netmask, 121:classless-static-route, 3:router, 6:dns-server, 15:domain-name, 119:domain-search, 252:wpad
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1003 client provides name: iPhone
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1003 DHCPACK(br-lan) 192.168.1.51 6a:aa:bb:cc:dd:01 iPhone
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1004 DHCPREQUEST(br-lan) 192.168.1.51 6a:aa:bb:cc:dd:02
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1004 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1004 requested options: 1:netmask, 121:classless-static-route, 3:router, 6:dns-server, 15:domain-name, 119:domain-search, 252:wpad
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1004 client provides name: iPhone
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1004 DHCPACK(br-lan) 192.168.1.51 6a:aa:bb:cc:dd:02 iPhone
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1005 DHCPREQUEST(br-lan) 192.168.1.60 00:11:32:aa:bb:cc
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1005 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1005 requested options: 1:netmask, 3:router, 6:dns-server
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1005 client provides name: DiskStation
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1005 DHCPACK(br-lan) 192.168.1.60 00:11:32:aa:bb:cc DiskStation
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1006 DHCPREQUEST(br-lan) 192.168.1.60 00:11:32:aa:bb:cc
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1006 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1006 requested options: 1:netmask, 3:router, 6:dns-server
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1006 client provides name: DiskStation
+Oct 20 14:00:00 dnsmasq-dhcp[5023]: 1006 DHCPACK(br-lan) 192.168.1.60 00:11:32:aa:bb:cc DiskStation
