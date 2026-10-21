@@ -1,0 +1,21 @@
+[package]
+name = "vigie-collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vigie_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigie-collector"
+path = "src/main.rs"
+
+[dependencies]
+vigie-parse = { path = "../parse" }
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

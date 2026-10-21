@@ -1,0 +1,12 @@
+# /etc/vigie/collector.conf (mode 0644; the HMAC key lives in /etc/vigie/key, mode 0600)
+server_url=https://vigie.example.lan:8443/v1/batch
+collector_id=router-1
+key_id=k2026-10
+# SHA-256 of the server certificate SubjectPublicKeyInfo, lowercase hex. Two pins for rotation:
+# publish the new pin, then rotate the certificate, then retire the old pin.
+pin1=0000000000000000000000000000000000000000000000000000000000000000
+pin2=1111111111111111111111111111111111111111111111111111111111111111
+# Optional (defaults shown):
+# key_file=/etc/vigie/key
+# dnsmasq_log=/tmp/vigie/dnsmasq.log
+# leases_file=/tmp/dhcp.leases

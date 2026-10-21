@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+# procd init script TEMPLATE for the Vigie collector (OpenWrt / GL.iNet). NOT yet run on the
+# router. Install: /etc/init.d/vigie-collector (chmod 755), then `enable` and `start`.
+#
+# Layout (see docs/spikes/p2-collector-agent.md):
+#   /usr/bin/vigie-collector                       unprivileged agent
+#   /usr/libexec/vigie/vigie-dnsmasq-dropin.sh     root helper (this script runs it)
+#   /usr/libexec/vigie/vigie-log-watchdog.sh       root cron, every 5 min
+#   /usr/libexec/vigie/vigie-run.sh                procd command wrapper (counts exits 77/78)
+#   /etc/vigie/collector.conf                      0644, no secrets
+#   /usr/libexec/vigie/vigie-lib.sh                sourced by both root scripts
+#   /etc/vigie/key                                 0600, owner vigie, hex HMAC key
+#   user/group `vigie` (dedicated, NOT nobody): see vigie-print-install-commands.sh
+#
+# cron (root):  */5 * * * * /usr/libexec/vigie/vigie-dnsmasq-dropin.sh ensure; /usr/libexec/vigie/vigie-log-watchdog.sh
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	# Fail closed: without the dedicated user procd would fall back to running as root.
+	id -u vigie >/dev/null 2>&1 || { logger -t vigie 'vigie user missing'; return 1; }
+	# Recreate the tmpfs drop-in and reload dnsmasq (root).
+	/usr/libexec/vigie/vigie-dnsmasq-dropin.sh ensure || return 1
+
+	# Failure counter for vigie-run.sh, writable by the dedicated user, reset on every start.
+	rm -rf /var/run/vigie-collector && mkdir /var/run/vigie-collector && chown vigie /var/run/vigie-collector || return 1
+
+	procd_open_instance
+	procd_set_param command /usr/libexec/vigie/vigie-run.sh --config /etc/vigie/collector.conf
+	# procd drops to this dedicated user itself (no ujail needed). Never nobody: avahi shares
+	# that uid and could read the HMAC key. Unverified on this firmware.
+	procd_set_param user vigie
+	# Retry limit 5 (not infinite): exits 77/78 (root refused, bad config) never fix themselves.
+	# vigie-run.sh logs when the limit is reached. Unverified on this firmware: procd's exact
+	# off-by-one semantics.
+	procd_set_param respawn 3600 5 5
+	procd_set_param stderr 1
+	procd_close_instance
+}
