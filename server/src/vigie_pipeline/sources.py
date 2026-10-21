@@ -9,8 +9,10 @@ import json
 import logging
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from vigie_ingest.db import SHARD_RE
 from vigie_pipeline.logs import log
@@ -19,6 +21,10 @@ logger = logging.getLogger("vigie_pipeline")
 
 MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 RANDOMIZED_DIGITS = frozenset("26ae")  # second hex digit of first octet: locally administered
+
+
+class ShardReadError(RuntimeError):
+    """A shard that exists could not be read; the batch must stay pending."""
 
 
 @dataclass
@@ -80,46 +86,76 @@ def _note(
     return act
 
 
-def _fold_shard(
-    conn: sqlite3.Connection, key: tuple[str, str], acts: dict[str, MacActivity], skipped: set[str]
-) -> None:
-    where = "WHERE collector_id=? AND batch_id=?"
-    for r in conn.execute(f"SELECT ts, mac, hostname, opt55, opt60 FROM raw_lease {where}", key):  # noqa: S608
+def _steps(
+    acts: dict[str, MacActivity], skipped: set[str]
+) -> tuple[tuple[str, str, Callable[[sqlite3.Row], object]], ...]:
+    def lease(r: sqlite3.Row) -> None:
         act = _note(acts, skipped, r["mac"], r["ts"])
         if act:
             act.hostname = _clean(r["hostname"]) or act.hostname
             act.opt55 = opt55_string(r["opt55"]) or act.opt55
             act.opt60 = _clean(r["opt60"]) or act.opt60
-    for r in conn.execute(f"SELECT ts, mac FROM raw_neigh {where}", key):  # noqa: S608
-        _note(acts, skipped, r["mac"], r["ts"])
-    for r in conn.execute(f"SELECT ts, mac, kind, name FROM raw_sighting {where}", key):  # noqa: S608
+
+    def sighting(r: sqlite3.Row) -> None:
         act = _note(acts, skipped, r["mac"], r["ts"])
         if act and r["kind"] == "mdns":
             act.mdns_name = _clean(r["name"]) or act.mdns_name
-    for r in conn.execute(f"SELECT ts, device_mac FROM raw_dns {where}", key):  # noqa: S608
-        _note(acts, skipped, r["device_mac"], r["ts"])
-    for r in conn.execute(f"SELECT ts, device_mac FROM raw_flow {where}", key):  # noqa: S608
-        _note(acts, skipped, r["device_mac"], r["ts"])
+
+    return (
+        ("raw_lease", "ts, mac, hostname, opt55, opt60", lease),
+        ("raw_neigh", "ts, mac", lambda r: _note(acts, skipped, r["mac"], r["ts"])),
+        ("raw_sighting", "ts, mac, kind, name", sighting),
+        ("raw_dns", "ts, device_mac", lambda r: _note(acts, skipped, r["device_mac"], r["ts"])),
+        ("raw_flow", "ts, device_mac", lambda r: _note(acts, skipped, r["device_mac"], r["ts"])),
+    )
+
+
+def _fold_shard(
+    conn: sqlite3.Connection,
+    key: tuple[str, str],
+    acts: dict[str, MacActivity],
+    skipped: set[str],
+    shard: str,
+) -> list[str]:
+    """Read each table independently so every failure is reported; returns failed tables."""
+    failed: list[str] = []
+    for table, columns, handle in _steps(acts, skipped):
+        sql = f"SELECT {columns} FROM {table} WHERE collector_id=? AND batch_id=?"  # noqa: S608
+        try:
+            for row in conn.execute(sql, key):
+                handle(row)
+        except sqlite3.Error as exc:
+            failed.append(table)
+            log(
+                logger, logging.ERROR, "shard_read_failed", shard=shard, table=table, error=str(exc)
+            )
+    return failed
 
 
 def read_batch(
     data_dir: Path, collector_id: str, batch_id: str
 ) -> tuple[dict[str, MacActivity], int]:
     """Fold a recorded batch's rows across every shard it spans. Returns (acts, skipped_macs).
-    A shard deleted by retention mid-read is skipped, not fatal."""
+    A shard FILE that is gone (retention) is skipped; any other failure raises ShardReadError
+    so the caller leaves the batch pending."""
     acts: dict[str, MacActivity] = {}
     skipped: set[str] = set()
+    failures: list[str] = []
     for path in shard_paths(data_dir):
+        if not path.exists():
+            continue
         try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
-        except sqlite3.Error:
-            log(logger, logging.WARNING, "shard_unreadable", shard=path.name)
+            conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error as exc:
+            failures.append(path.name)
+            log(logger, logging.ERROR, "shard_read_failed", shard=path.name, error=str(exc))
             continue
         conn.row_factory = sqlite3.Row
         try:
-            _fold_shard(conn, (collector_id, batch_id), acts, skipped)
-        except sqlite3.Error as exc:
-            log(logger, logging.WARNING, "shard_read_failed", shard=path.name, error=str(exc))
+            failed = _fold_shard(conn, (collector_id, batch_id), acts, skipped, path.name)
         finally:
             conn.close()
+        failures.extend(f"{path.name}:{t}" for t in failed)
+    if failures:
+        raise ShardReadError(f"batch {batch_id} unreadable: {', '.join(failures)}")
     return acts, len(skipped)

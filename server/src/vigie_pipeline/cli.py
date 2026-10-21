@@ -12,6 +12,7 @@ from pathlib import Path
 from vigie_pipeline.config import TRANSIENT_WINDOW_DEFAULT_S, PipelineConfig
 from vigie_pipeline.logs import configure_logging, log
 from vigie_pipeline.processor import run_once
+from vigie_pipeline.sources import ShardReadError
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -45,13 +46,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     config = _config(args)
     if args.once:
-        run_once(config)
+        try:
+            run_once(config)
+        except (sqlite3.Error, ShardReadError) as exc:
+            log(logger, logging.ERROR, "run_failed", error=str(exc))
+            return 1
         return 0
     try:
         while True:
             try:
                 run_once(config)
-            except sqlite3.Error as exc:  # transient lock/IO trouble: log and retry next tick
+            except (sqlite3.Error, ShardReadError) as exc:  # transient lock/IO trouble: log and retry next tick
                 log(logger, logging.ERROR, "run_failed", error=str(exc))
             time.sleep(args.loop)
     except KeyboardInterrupt:

@@ -13,7 +13,7 @@ from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.schema import open_pipeline_inventory
-from vigie_pipeline.sources import MacActivity, is_randomized, read_batch
+from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -35,26 +35,37 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     clock = time.time() if now is None else now
     inv = open_pipeline_inventory(config.inventory_path)
     overrides = open_overrides_ro(config.overrides_path)
+    failures: list[ShardReadError] = []
     try:
-        totals = _process_batches(inv, overrides, config)
+        totals = _process_batches(inv, overrides, config, failures)
         promoted, retired = sweep_transients(inv, clock, config)
     finally:
         inv.close()
         if overrides is not None:
             overrides.close()
     stats = RunStats(**totals, promoted=promoted, retired=retired)
-    log(logger, logging.INFO, "run_complete", **stats.__dict__)
+    log(logger, logging.INFO, "run_complete", failed_collectors=len(failures), **stats.__dict__)
+    if failures:
+        raise failures[0]
     return stats
 
 
 def _process_batches(
-    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, config: PipelineConfig
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    failures: list[ShardReadError],
 ) -> dict[str, int]:
     totals = {"batches": 0, "macs": 0, "new_devices": 0, "skipped_macs": 0}
     collectors = [r[0] for r in inv.execute("SELECT DISTINCT collector_id FROM batches")]
     for collector in sorted(collectors):
         for rowid, batch_id, received in _pending(inv, collector):
-            acts, skipped = read_batch(config.data_dir, collector, batch_id)
+            try:
+                acts, skipped = read_batch(config.data_dir, collector, batch_id)
+            except ShardReadError as exc:
+                # never advance past an unreadable batch: it and its successors stay pending
+                failures.append(exc)
+                break
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
                 _advance_cursor(inv, collector, rowid, batch_id)
