@@ -151,3 +151,55 @@ the `batches` row stay.
 
 Retention: raw shards deleted after `VIGIE_SHARD_RETENTION_DAYS` (default 7, max 30); `batches`
 rows older than 7 days purged. Maintenance runs at startup and hourly.
+
+## App API (`vigie_api`)
+
+The app principal's HTTP surface (PRP section 6), separate process and port from ingest.
+Contract: `../api/openapi.yaml` (OpenAPI 3.1, emitted as JSON, which is valid YAML; a test fails
+on drift). Regenerate with `uv run python -m vigie_api.openapi_export`.
+
+```sh
+export VIGIE_DATA_DIR=/var/lib/vigie      # inventory.db (opened read-only) + overrides.db (rw)
+uv run python -m vigie_api tokens create --id control-app   # prints the token once, stores SHA-256
+uv run python -m vigie_api tokens revoke control-app
+uv run python -m vigie_api --host <LAN-IP> --port 8444 --tls-cert ... --tls-key ...
+```
+
+TLS is required (`--insecure-dev` / `VIGIE_INSECURE_DEV=1` for development only). No CORS.
+`Authorization: Bearer vgt_<id>.<secret>`; every auth failure is the same 401. Limits:
+`VIGIE_API_RATE_LIMIT` per `VIGIE_API_RATE_WINDOW_S` per token (failed auth is limited per source
+address), `VIGIE_API_MAX_BODY_BYTES` (default 16 KiB, 413).
+
+Envelope: `{ok, data, error:{code,message}|null, page:{next_cursor}|null}`. Implemented:
+`GET /devices` (filters `type`, `group` (`unassigned` for none), `identity_state`, `status`,
+`updated_since`; transient hidden unless `include_transient=1` or `status=transient`),
+`GET /devices/{id}`, `GET /macs/{mac}`, `PATCH /devices/{id}`, `GET /events`, `GET /suggestions`,
+`GET /healthz`. Not yet: accept/reject/merge/undo, identity rules, SSE, metrics.
+
+`PATCH` needs `If-Match: "<override version>"` (428 if absent, 412 on mismatch with the current
+`ETag`); a device with no override has version 0 and the first write creates version 1. Only the
+fields present in the body change; `null` clears one. Aliases (merged devices) return the
+canonical device with `merged_into` on reads and 409 on PATCH. `group_id` comes only from
+`device_overrides`; inferred data never assigns a group. `/events` is oldest-first and
+`page.next_cursor` is the resume point (pass it as `since`).
+
+**Event cursors are rowids.** `GET /events` pages on `events.rowid` (inventory.db) and
+`audit_log.rowid` (overrides.db). `audit_log` is `AUTOINCREMENT`, so its rowids are never reused.
+The pipeline `events` table is NOT yet `INTEGER PRIMARY KEY AUTOINCREMENT`: until it is, never
+`VACUUM` inventory.db and never delete the newest `events` rows (a reused rowid lands behind a
+client's cursor and the event is silently skipped). An xfail test
+(`tests/api/test_api_rowid_review.py`) records the requirement; fixing it is a pipeline schema
+migration.
+
+**Text safety.** Every free-text field returned (hostnames, event summaries, names, reason text,
+suggestion payload strings) is sanitised on output: control, format/bidi, line/paragraph
+separator and tag characters are stripped and the length is bounded; stored values are untouched.
+`name`/`owner` writes additionally reject those characters (NFKC-normalised first).
+
+**Failed-auth limiter.** Counts failed authentications only, per source (IPv6 by /64, IPv4-mapped
+addresses as their IPv4). A valid token is never blocked by it. A blocked source presenting no
+token-shaped credential costs no database work; one presenting a well-formed token costs one
+indexed lookup (needed so that a valid token still works from a shared address).
+
+Overrides are loaded whole per list request (home-scale: hundreds of devices); revisit before
+use on a large network.
