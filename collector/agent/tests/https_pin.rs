@@ -336,5 +336,8 @@ fn handshake_with_a_malformed_certificate_fails_cleanly() {
         cert: CertificateDer::from(without_outer_signature(id.cert.as_ref(), false)),
     };
     let e = try_post(&bad, &id, &[id.pin_hex()], BOTH).unwrap_err();
-    assert!(e.0.contains("receive") || e.0.contains("send") || e.0.contains("tls"), "{e:?}");
+    assert!(
+        e.0.contains("receive") || e.0.contains("send") || e.0.contains("tls"),
+        "{e:?}"
+    );
 }

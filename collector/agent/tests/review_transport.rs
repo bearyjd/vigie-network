@@ -110,7 +110,11 @@ fn uppercase_and_mixed_case_hex_pins_are_accepted_and_equal_to_lowercase() {
         HEX_PIN.to_ascii_uppercase(),
         "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
     ] {
-        assert_eq!(ok(URL, &[variant.as_str()]).pins(), lower.pins(), "{variant}");
+        assert_eq!(
+            ok(URL, &[variant.as_str()]).pins(),
+            lower.pins(),
+            "{variant}"
+        );
     }
     // Still strict about everything else: non-hex and wrong lengths stay refused.
     let g = HEX_PIN.replacen('0', "G", 1);
@@ -137,7 +141,9 @@ fn identical_pins_are_refused_whatever_their_spelling() {
             other => panic!("{pins:?}: {other:?}"),
         }
     }
-    let msg = PinnedTransport::new(URL, &[PIN_A, PIN_A]).unwrap_err().to_string();
+    let msg = PinnedTransport::new(URL, &[PIN_A, PIN_A])
+        .unwrap_err()
+        .to_string();
     assert!(msg.contains("pin 2") && msg.contains("same"), "{msg}");
     // Distinct pins still work.
     assert_eq!(ok(URL, &[PIN_A, PIN_B, HEX_PIN]).pins().len(), 3);

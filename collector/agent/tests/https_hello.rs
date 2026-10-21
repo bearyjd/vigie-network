@@ -184,8 +184,14 @@ fn never_offers_session_resumption() {
         for (n, rec) in [first, second].iter().enumerate() {
             let exts = parse(rec).exts;
             assert!(!exts.is_empty(), "{name} hello {n} has no extensions");
-            assert!(!exts.contains(&PRE_SHARED_KEY), "{name} hello {n}: psk {exts:x?}");
-            assert!(!exts.contains(&SESSION_TICKET), "{name} hello {n}: ticket {exts:x?}");
+            assert!(
+                !exts.contains(&PRE_SHARED_KEY),
+                "{name} hello {n}: psk {exts:x?}"
+            );
+            assert!(
+                !exts.contains(&SESSION_TICKET),
+                "{name} hello {n}: ticket {exts:x?}"
+            );
         }
     }
 }

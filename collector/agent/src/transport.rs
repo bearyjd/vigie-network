@@ -192,10 +192,7 @@ fn decode_hex(s: &str) -> Option<Pin> {
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
         let pair = s.get(2 * i..2 * i + 2)?;
-        if !pair
-            .bytes()
-            .all(|c| c.is_ascii_hexdigit())
-        {
+        if !pair.bytes().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         *b = u8::from_str_radix(pair, 16).ok()?;

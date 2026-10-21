@@ -193,8 +193,166 @@ impl Engine {
     }
 }
 
-fn body_says_duplicate(body: &[u8]) -> bool {
-    String::from_utf8_lossy(body)
-        .replace(' ', "")
-        .contains("\"duplicate\":true")
+/// True only if the body is one JSON object whose top-level `"duplicate"` member is `true`.
+/// Nested keys and string contents are skipped, not searched; a repeated `"duplicate"` key, a
+/// non-boolean value, malformed JSON, trailing bytes or nesting deeper than `MAX_DEPTH` all give
+/// false (the server's reply is then treated as a fresh acceptance).
+pub fn body_says_duplicate(body: &[u8]) -> bool {
+    let mut p = Scan { b: body, i: 0 };
+    p.top_level_duplicate().unwrap_or(false)
+}
+
+const MAX_DEPTH: usize = 32;
+
+struct Scan<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Scan<'_> {
+    fn ws(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> Option<()> {
+        self.ws();
+        (self.b.get(self.i) == Some(&c)).then(|| self.i += 1)
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.ws();
+        self.b.get(self.i).copied()
+    }
+
+    fn top_level_duplicate(&mut self) -> Option<bool> {
+        self.eat(b'{')?;
+        let mut found: Option<bool> = None;
+        if self.peek()? == b'}' {
+            self.i += 1;
+        } else {
+            loop {
+                let key = self.string()?;
+                self.eat(b':')?;
+                if key == b"duplicate" {
+                    let v = self.boolean()?;
+                    if found.replace(v).is_some() {
+                        return None;
+                    }
+                } else {
+                    self.value(1)?;
+                }
+                match self.peek()? {
+                    b',' => self.i += 1,
+                    b'}' => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        self.ws();
+        (self.i == self.b.len()).then_some(found.unwrap_or(false))
+    }
+
+    fn boolean(&mut self) -> Option<bool> {
+        self.ws();
+        for (lit, v) in [(&b"true"[..], true), (&b"false"[..], false)] {
+            if self.b[self.i..].starts_with(lit) {
+                self.i += lit.len();
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// A string; returns its unescaped bytes. Raw control characters are malformed JSON.
+    fn string(&mut self) -> Option<Vec<u8>> {
+        self.eat(b'"')?;
+        let mut out = Vec::new();
+        loop {
+            let c = *self.b.get(self.i)?;
+            self.i += 1;
+            match c {
+                b'"' => return Some(out),
+                0..=0x1f => return None,
+                b'\\' => {
+                    let e = *self.b.get(self.i)?;
+                    self.i += 1;
+                    match e {
+                        b'"' | b'\\' | b'/' => out.push(e),
+                        b'b' => out.push(8),
+                        b'f' => out.push(12),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let hex = self.b.get(self.i..self.i + 4)?;
+                            self.i += 4;
+                            let n = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                            let ch = char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER);
+                            out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Option<()> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match self.peek()? {
+            b'"' => self.string().map(drop),
+            b'{' => {
+                self.i += 1;
+                self.members(b'}', depth, true)
+            }
+            b'[' => {
+                self.i += 1;
+                self.members(b']', depth, false)
+            }
+            b't' | b'f' => self.boolean().map(drop),
+            b'n' => self.b[self.i..].starts_with(b"null").then(|| self.i += 4),
+            b'-' | b'0'..=b'9' => {
+                let start = self.i;
+                while matches!(
+                    self.b.get(self.i),
+                    Some(b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                ) {
+                    self.i += 1;
+                }
+                (self.i > start).then_some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Members of an object (`keyed`) or elements of an array, after the opening bracket.
+    fn members(&mut self, close: u8, depth: usize, keyed: bool) -> Option<()> {
+        if self.peek()? == close {
+            self.i += 1;
+            return Some(());
+        }
+        loop {
+            if keyed {
+                self.string()?;
+                self.eat(b':')?;
+            }
+            self.value(depth + 1)?;
+            match self.peek()? {
+                b',' => self.i += 1,
+                c if c == close => {
+                    self.i += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
 }
