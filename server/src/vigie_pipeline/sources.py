@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from vigie_ingest.db import SHARD_RE
 from vigie_pipeline.logs import log
+from vigie_pipeline.sanitize import clean_text
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -74,7 +75,7 @@ def opt55_string(raw: str | None) -> str | None:
 
 
 def _clean(value: str | None) -> str | None:
-    return (value or "").strip() or None
+    return clean_text(value)
 
 
 def shard_paths(data_dir: Path) -> list[Path]:
