@@ -356,6 +356,8 @@ pub struct Sections {
 pub struct EncodedBatch {
     pub seq: u64,
     pub batch_id: String,
+    /// End of the batch's window (epoch seconds), kept for stale-batch accounting.
+    pub window_end: u64,
     head: String,
 }
 
@@ -417,6 +419,7 @@ pub fn encode(
     EncodedBatch {
         seq: meta.seq,
         batch_id: meta.batch_id.clone(),
+        window_end: meta.window_end,
         head: out,
     }
 }

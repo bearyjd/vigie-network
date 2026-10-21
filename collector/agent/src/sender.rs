@@ -7,6 +7,9 @@ use crate::sign;
 use crate::spool::Spool;
 use crate::timegate::TimeGate;
 
+/// Server rule: `window_end` older than `sent_ts` by more than this is rejected (422).
+pub const MAX_SPOOL_AGE_S: u64 = 24 * 3600;
+
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub collector_id: String,
@@ -62,6 +65,7 @@ pub enum Tick {
     Waiting,
     Sent { duplicate: bool },
     Discarded(u16),
+    DiscardedStale,
     Retry { status: Option<u16>, delay_s: u64 },
 }
 
@@ -69,6 +73,7 @@ pub struct Engine {
     pub spool: Spool,
     pub backoff: Backoff,
     pub gate: TimeGate,
+    pub dropped_stale: u64,
     id: Identity,
     key: Vec<u8>,
     next_attempt_s: u64,
@@ -80,6 +85,7 @@ impl Engine {
             spool: Spool::new(spool_cap),
             backoff: Backoff::default(),
             gate: TimeGate::new(build_ts),
+            dropped_stale: 0,
             id,
             key,
             next_attempt_s: 0,
@@ -122,12 +128,19 @@ impl Engine {
             signature: sign::sign(&self.key, &env, &body),
         };
         match t.post(&headers, &body) {
-            Ok(reply) => self.on_reply(reply, dropped, mono_s, rand),
+            Ok(reply) => self.on_reply(reply, dropped, wall_ts, mono_s, rand),
             Err(_) => self.retry(None, mono_s, rand),
         }
     }
 
-    fn on_reply(&mut self, reply: HttpReply, dropped: u64, mono_s: u64, rand: u64) -> Tick {
+    fn on_reply(
+        &mut self,
+        reply: HttpReply,
+        dropped: u64,
+        wall_ts: u64,
+        mono_s: u64,
+        rand: u64,
+    ) -> Tick {
         if let Some(date) = reply.date {
             self.gate.observe_server_date(date, mono_s);
         }
@@ -144,8 +157,18 @@ impl Engine {
             }
             // The server will never accept this batch: discard it so it cannot block the queue.
             status @ (409 | 413 | 422) => {
+                let stale = status == 422
+                    && self
+                        .spool
+                        .front()
+                        .is_some_and(|b| b.window_end.saturating_add(MAX_SPOOL_AGE_S) < wall_ts);
                 self.spool.pop_front();
                 self.spool.note_dropped(1);
+                if stale {
+                    // The server's 422 body does not say why, so staleness is judged locally.
+                    self.dropped_stale = self.dropped_stale.saturating_add(1);
+                    return Tick::DiscardedStale;
+                }
                 Tick::Discarded(status)
             }
             status => self.retry(Some(status), mono_s, rand),

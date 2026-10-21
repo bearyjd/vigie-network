@@ -116,6 +116,13 @@ impl Window {
         (sections, w.drops)
     }
 
+    /// Shift every DNS timestamp by `offset` seconds (provisional monotonic stamps to wall time).
+    pub fn rebase_dns(&mut self, offset: u64) {
+        for q in &mut self.dns {
+            q.ts = q.ts.saturating_add(offset).min(crate::model::MAX_EPOCH);
+        }
+    }
+
     /// Record `n` items lost upstream of the window (e.g. by the DNS correlator).
     pub fn note_drops(&mut self, kind: &str, n: u64) {
         if n > 0 {

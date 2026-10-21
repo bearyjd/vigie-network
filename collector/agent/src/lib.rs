@@ -19,6 +19,7 @@ pub mod sender;
 pub mod sightings;
 pub mod sign;
 pub mod spool;
+pub mod syncstate;
 pub mod tail;
 pub mod timegate;
 pub mod urgent;

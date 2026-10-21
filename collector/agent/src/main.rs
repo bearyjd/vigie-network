@@ -22,6 +22,7 @@ use vigie_agent::procstat::read_rss_kb;
 use vigie_agent::runtime::{random, random_u64, read_neighbors, wall_ms, wall_secs};
 use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport, TransportError};
 use vigie_agent::spool::SPOOL_CAP;
+use vigie_agent::syncstate::{FlushPlan, SyncState};
 use vigie_agent::tail::Tail;
 use vigie_agent::urgent::Urgent;
 use vigie_agent::window::{SnapshotDelta, Window, WindowClock};
@@ -95,6 +96,7 @@ struct Agent {
     seq: u64,
     window: Window,
     clock: WindowClock,
+    sync: SyncState,
     tail: Tail,
     dhcp: DhcpAssembler,
     dns: DnsCorrelator,
@@ -166,14 +168,35 @@ impl Agent {
 
     fn push_identity(&mut self) {
         let now = wall_secs();
+        // Same gate as a regular window: nothing is built from an unverified wall clock.
+        let mono = self.started.elapsed().as_secs();
+        if !self.sync.is_synced() || !self.engine.gate.is_sane(now, mono) {
+            return;
+        }
         let sections = self.window.take_identity();
         let (meta, health) = (self.meta(now), self.health(false));
         let b = build(&meta, sections, &health, BATCH_CAP);
         self.engine.enqueue(b.encoded);
     }
 
+    /// Before the first server `Date` the only thing sent is an empty probe: its reply, accepted
+    /// or rejected, tells us the time. Data stays in the window (bounded) with monotonic stamps.
+    fn queue_probe(&mut self, now: u64) {
+        if !self.engine.spool.is_empty() {
+            return;
+        }
+        let (meta, health) = (self.meta(now), self.health(false));
+        let b = build(&meta, Sections::default(), &health, BATCH_CAP);
+        self.engine.enqueue(b.encoded);
+    }
+
     fn flush_window(&mut self, now: u64, mono_s: u64) {
-        if !self.engine.gate.is_sane(now, mono_s) {
+        let plan = self.sync.plan(self.engine.gate.is_sane(now, mono_s));
+        if plan == FlushPlan::Probe {
+            self.queue_probe(now);
+            return;
+        }
+        if plan == FlushPlan::Hold {
             // No sane clock: batches would carry wrong times. Drop the window and count it.
             drop(self.window.take());
             self.engine.spool.note_dropped(1);
@@ -243,6 +266,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         seq: 0,
         window: Window::default(),
         clock: WindowClock::new(0),
+        sync: SyncState::new(),
         dhcp: DhcpAssembler::default(),
         dns: DnsCorrelator::default(),
         delta: SnapshotDelta::default(),
@@ -265,7 +289,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
             agent.refresh_neighbors();
             last_neigh = mono;
         }
-        agent.poll_log(wall);
+        agent.poll_log(agent.sync.stamp(wall, mono));
         if agent.urgent.take_pending(started_ms(agent.started)) {
             agent.push_identity();
         }
@@ -273,10 +297,20 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
             agent.flush_window(wall, mono);
             last_flush = mono;
         }
-        match agent.engine.tick(&mut transport, wall, mono, random_u64()) {
+        let tick = agent.engine.tick(&mut transport, wall, mono, random_u64());
+        let date_seen = agent.engine.gate.has_server_date();
+        if let Some(offset) = agent.sync.observe(date_seen, wall, mono) {
+            agent.window.rebase_dns(offset);
+        }
+        match tick {
             Tick::Retry { status, delay_s } => {
                 eprintln!("send failed (status {status:?}); retry in {delay_s}s");
             }
+            Tick::DiscardedStale => eprintln!(
+                "server rejected a batch whose window is older than the spool age; \
+                 dropped_stale={}",
+                agent.engine.dropped_stale
+            ),
             Tick::Discarded(s) => eprintln!("server rejected a batch with status {s}; discarded"),
             Tick::Idle | Tick::Held | Tick::Waiting | Tick::Sent { .. } => {}
         }

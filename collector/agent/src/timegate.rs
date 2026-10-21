@@ -24,6 +24,9 @@ impl TimeGate {
     pub fn observe_server_date(&mut self, server_ts: u64, mono_s: u64) {
         self.server = Some((server_ts, mono_s));
     }
+    pub fn has_server_date(&self) -> bool {
+        self.server.is_some()
+    }
     pub fn is_sane(&self, wall_ts: u64, mono_s: u64) -> bool {
         if wall_ts < self.build_ts || wall_ts > MAX_PLAUSIBLE_TS {
             return false;
