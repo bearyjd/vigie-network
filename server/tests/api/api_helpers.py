@@ -115,7 +115,7 @@ class Env:
 
 @pytest.fixture
 def env(tmp_path: Path) -> Iterator[Env]:
-    inv = open_pipeline_inventory(tmp_path / "inventory.db")
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     inv.execute(SUGGESTIONS_DDL)
     ov = open_overrides(tmp_path / "overrides.db")
     token_id, token = tokens.create_token(ov, "test")
