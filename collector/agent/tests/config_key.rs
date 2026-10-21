@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -217,6 +217,16 @@ fn dist(name: &str) -> String {
     format!("{}/deploy/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The scripts verify root ownership; unprivileged tests trust the current user instead.
+fn trust_env() -> Vec<(&'static str, String)> {
+    let m = fs::metadata("/proc/self").unwrap();
+    vec![
+        ("VIGIE_TRUSTED_UID", m.uid().to_string()),
+        ("VIGIE_OWNER", format!("{}:{}", m.uid(), m.gid())),
+        ("VIGIE_LOG_ALLOWED_UIDS", m.uid().to_string()),
+    ]
+}
+
 fn run_dropin(
     args: &[&str],
     dropin_dir: &Path,
@@ -228,6 +238,7 @@ fn run_dropin(
         .args(args)
         .env("VIGIE_DROPIN_DIR", dropin_dir)
         .env("VIGIE_LOG_DIR", log_dir)
+        .envs(trust_env())
         .env(
             "VIGIE_RELOAD_CMD",
             format!("echo reloaded >> {}", reload_log.display()),
@@ -268,7 +279,7 @@ fn dropin_script_creates_repairs_and_reloads_only_on_change() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(mode, 0o644, "log is world-readable by design");
+    assert_eq!(mode, 0o640, "log is readable by the vigie group only");
     assert_eq!(run_dropin(&["check"], &dropin, &logd, &reload).0, 0);
 
     run_dropin(&["ensure"], &dropin, &logd, &reload);
@@ -302,12 +313,14 @@ fn dropin_script_creates_repairs_and_reloads_only_on_change() {
 #[test]
 fn watchdog_script_truncates_only_above_the_limit() {
     let d = tmpdir();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o750)).unwrap();
     let log = d.join("dnsmasq.log");
     let run = |limit: &str| {
         Command::new("sh")
             .arg(dist("vigie-log-watchdog.sh"))
             .env("VIGIE_LOG_FILE", &log)
             .env("VIGIE_LOG_MAX_BYTES", limit)
+            .envs(trust_env())
             .status()
             .unwrap()
             .code()
