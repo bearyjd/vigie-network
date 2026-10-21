@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use vigie_agent::builder::{build_with_drops, BATCH_CAP, TRUNCATED_RESERVE};
 use vigie_agent::dnsmasq::{parse_line, DnsCorrelator};
+use vigie_agent::model::TAIL_RESERVE;
 use vigie_agent::model::*;
 use vigie_agent::window::{Window, DNS_PER_MAC_QUOTA, MAX_WINDOW_DNS, MAX_WINDOW_SIGHTINGS};
 

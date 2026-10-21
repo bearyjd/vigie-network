@@ -63,6 +63,18 @@ fn nothing_is_built_before_a_server_date_and_the_probe_gets_one() {
 }
 
 #[test]
+fn urgent_pushes_need_a_synced_and_sane_clock() {
+    let mut s = SyncState::new();
+    assert!(!s.allow_identity_push(true), "no server Date yet");
+    s.observe(true, 5_000, 10);
+    assert!(s.allow_identity_push(true));
+    assert!(
+        !s.allow_identity_push(false),
+        "clock disagrees with the server"
+    );
+}
+
+#[test]
 fn after_first_date_windows_are_built_unless_the_clock_is_off() {
     let mut s = SyncState::new();
     assert_eq!(s.observe(false, 5_000, 10), None, "no Date yet");

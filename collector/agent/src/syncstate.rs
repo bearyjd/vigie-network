@@ -48,6 +48,11 @@ impl SyncState {
         }
     }
 
+    /// An urgent identity push is a data batch like any other: same gate as `FlushPlan::Build`.
+    pub fn allow_identity_push(&self, sane: bool) -> bool {
+        self.plan(sane) == FlushPlan::Build
+    }
+
     /// Call after every send attempt. The first time a server `Date` has been seen, returns the
     /// offset (`wall - mono`) that turns provisional stamps into wall time; `None` otherwise.
     pub fn observe(&mut self, server_date_seen: bool, wall_s: u64, mono_s: u64) -> Option<u64> {

@@ -187,7 +187,10 @@ impl Agent {
         let now = wall_secs();
         // Same gate as a regular window: nothing is built from an unverified wall clock.
         let mono = self.started.elapsed().as_secs();
-        if !self.sync.is_synced() || !self.engine.gate.is_sane(now, mono) {
+        if !self
+            .sync
+            .allow_identity_push(self.engine.gate.is_sane(now, mono))
+        {
             return;
         }
         let Some(meta) = self.meta(now) else { return };

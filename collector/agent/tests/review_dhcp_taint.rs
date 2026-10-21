@@ -91,3 +91,52 @@ fn fingerprint_without_any_request_line_is_not_trusted() {
     ];
     assert_eq!(feed_all(&lines)[0].opt60, None);
 }
+
+// A taint must not depend on the final ACK check: here the ACK is for the FIRST request's MAC, so
+// only the sticky taint (set when the second MAC appeared) keeps the foreign lines out.
+
+#[test]
+fn second_mac_on_the_serial_taints_even_when_the_ack_is_for_the_first_mac() {
+    let lines = [
+        l(&format!("6000 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+        l("6000 vendor class: victim-class"),
+        l(&format!("6000 DHCPREQUEST(br-lan) 192.168.1.66 {ATT}")),
+        l(&format!("6000 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+    ];
+    let v = &feed_all(&lines)[0];
+    assert_eq!(v.mac, VIC);
+    assert_eq!(
+        v.opt60, None,
+        "lines that may belong to another MAC are dropped for both"
+    );
+}
+
+#[test]
+fn lines_after_a_taint_are_ignored_for_every_kind() {
+    for (kind, line) in [
+        ("vendor", "7000 vendor class: late"),
+        ("opt55", "7000 requested options: 1:netmask, 3:router"),
+        ("name", "7000 client provides name: late-host"),
+    ] {
+        let lines = [
+            l(&format!("7000 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+            l(&format!("7000 DHCPREQUEST(br-lan) 192.168.1.66 {ATT}")),
+            l(line),
+            l(&format!("7000 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+        ];
+        let v = &feed_all(&lines)[0];
+        assert_eq!(v.opt60, None, "{kind}");
+        assert!(v.opt55.is_empty(), "{kind}");
+        assert_eq!(v.hostname, None, "{kind}");
+    }
+}
+
+#[test]
+fn fingerprint_lines_that_precede_the_request_are_not_attributed_to_it() {
+    let lines = [
+        l("8000 vendor class: before-any-request"),
+        l(&format!("8000 DHCPREQUEST(br-lan) 192.168.1.50 {VIC}")),
+        l(&format!("8000 DHCPACK(br-lan) 192.168.1.50 {VIC}")),
+    ];
+    assert_eq!(feed_all(&lines)[0].opt60, None);
+}
