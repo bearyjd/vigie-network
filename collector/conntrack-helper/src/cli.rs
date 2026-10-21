@@ -17,11 +17,11 @@ pub const MIN_DEDICATED_UID: u32 = 1000;
 
 pub const USAGE: &str =
     "usage: vigie-conntrack [--once] [--file PATH] [--socket PATH] [--interval SECS]\n\
-  [--top-n N] [--k-lan N] [--k-wan N] [--lan-cidr NET] [--max-flows N] [--uid UID] [--gid GID]\n\
+  [--top-n N] [--k-lan N] [--k-wan N] [--lan-cidr NET] [--max-flows N] [--stub-ttl-samples N] [--uid UID] [--gid GID]\n\
   --once --file PATH   aggregate one file, print the snapshot JSON, exit (no socket)\n\
   defaults: --file /proc/net/nf_conntrack --socket /tmp/vigie/conntrack.sock --interval 60\n\
             --top-n 512 --k-lan 192 --k-wan 64 --conntrack-max-file
-            /proc/sys/net/netfilter/nf_conntrack_max --ct-recheck-samples 60
+            /proc/sys/net/netfilter/nf_conntrack_max --ct-recheck-samples 60 --stub-ttl-samples 30
   --lan-cidr NET (repeatable) replaces the default LAN prefixes (10/8 172.16/12 192.168/16
   100.64/10 fe80::/10 fc00::/7); LAN and other sources get separate record quotas, so list the
   real LAN prefixes: spoofed private sources arriving from the WAN can fill the LAN quota
@@ -49,6 +49,8 @@ pub struct Opts {
     pub ct_recheck_samples: u64,
     pub conntrack_max_file: PathBuf,
     pub allow_shared_uid: bool,
+    /// Samples an eviction stub is kept (see `agg::AggConfig::stub_ttl_samples`).
+    pub stub_ttl_samples: u64,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
 }
@@ -69,6 +71,7 @@ impl Default for Opts {
             ct_recheck_samples: crate::limits::DEFAULT_RECHECK_SAMPLES,
             conntrack_max_file: PathBuf::from(DEFAULT_CT_MAX_FILE),
             allow_shared_uid: false,
+            stub_ttl_samples: crate::agg::DEFAULT_STUB_TTL_SAMPLES,
             uid: None,
             gid: None,
         }
@@ -118,6 +121,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
                 o.max_flows = ranged(&flag, &v, 1, usize::MAX)?;
                 o.max_flows_set = true;
             }
+            "--stub-ttl-samples" => o.stub_ttl_samples = ranged(&flag, &v, 1, 1_000_000)?,
             "--ct-recheck-samples" => o.ct_recheck_samples = ranged(&flag, &v, 1, 1_000_000)?,
             "--conntrack-max-file" => o.conntrack_max_file = PathBuf::from(v),
             "--uid" => o.uid = Some(ranged(&flag, &v, 0, u32::MAX)?),
@@ -170,6 +174,14 @@ mod tests {
         assert_eq!((o.k_lan, o.k_wan), (192, 64));
         assert!(o.lan_cidrs.is_empty());
         assert!(!o.max_flows_set && !o.allow_shared_uid);
+        assert_eq!(o.stub_ttl_samples, 30);
+    }
+
+    #[test]
+    fn stub_ttl_flag_is_parsed_and_bounded() {
+        assert_eq!(p(&["--stub-ttl-samples", "5"]).unwrap().stub_ttl_samples, 5);
+        assert!(p(&["--stub-ttl-samples", "0"]).is_err());
+        assert!(p(&["--stub-ttl-samples", "1000001"]).is_err());
     }
 
     #[test]

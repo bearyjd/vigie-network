@@ -39,6 +39,7 @@ fn agg_config(opts: &Opts, max_flows: usize, baseline_first: bool) -> AggConfig 
     AggConfig {
         max_flows,
         max_stubs: stub_cap(max_flows),
+        stub_ttl_samples: opts.stub_ttl_samples,
         top_n: opts.top_n,
         k_lan: opts.k_lan,
         k_wan: opts.k_wan,

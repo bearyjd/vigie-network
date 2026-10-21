@@ -17,6 +17,8 @@ pub const DEFAULT_K_WAN: usize = 64;
 /// Consecutive samples a tracked flow may be absent and still be remembered; it is forgotten on
 /// the next absence after that.
 pub const TOMBSTONE_SAMPLES: u8 = 2;
+/// Samples an eviction stub is kept; after that a returning tuple counts as a new flow.
+pub const DEFAULT_STUB_TTL_SAMPLES: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct AggConfig {
@@ -32,6 +34,8 @@ pub struct AggConfig {
     pub lan: Vec<Cidr>,
     /// Compact stubs kept for evicted live flows (see `Aggregator`).
     pub max_stubs: usize,
+    /// Samples a stub (or the memory of an evicted tombstone) survives.
+    pub stub_ttl_samples: u64,
     /// First sample only records baselines (no historic bytes are reported as a delta).
     pub baseline_first: bool,
 }
@@ -45,6 +49,7 @@ impl Default for AggConfig {
             k_wan: DEFAULT_K_WAN,
             lan: default_lan(),
             max_stubs: DEFAULT_MAX_FLOWS / 3 * 2,
+            stub_ttl_samples: DEFAULT_STUB_TTL_SAMPLES,
             baseline_first: true,
         }
     }
@@ -136,6 +141,8 @@ struct Stub {
     pair: Pair,
     /// Eviction order; the smallest is dropped first when the stub table overflows.
     seq: u64,
+    /// Sample the flow was evicted in.
+    stamp: u64,
 }
 
 fn stub_key(h: &RandomState, key: &FlowKey) -> u64 {
@@ -293,6 +300,7 @@ impl Aggregator {
             true
         });
         self.next_seq = next_seq;
+        self.expire_stubs();
         let (evicted, dropped_stubs) = self.enforce_cap();
         let recounted_flows = dropped_stubs + std::mem::take(&mut self.tomb_recounts);
         recs.sort_unstable_by_key(|r| (r.src, r.dst, r.dport, r.proto));
@@ -316,6 +324,13 @@ impl Aggregator {
             recounted_flows,
             table_pressure: recounted_flows > 0,
         }
+    }
+
+    /// Drops stubs (and evicted-tombstone memory) that cannot be used next sample any more.
+    fn expire_stubs(&mut self) {
+        let (sample, ttl) = (self.sample, self.cfg.stub_ttl_samples);
+        self.stubs.retain(|_, s| sample - s.stamp < ttl);
+        self.forgotten.retain(|_, stamp| sample - *stamp < ttl);
     }
 
     /// Brings the table to `max_flows`: absent flows (tombstones) go first, oldest first; only
@@ -373,7 +388,14 @@ impl Aggregator {
         for (_, pair, k) in evicted_live {
             self.stub_seq += 1;
             let seq = self.stub_seq;
-            self.stubs.insert(k, Stub { pair, seq });
+            self.stubs.insert(
+                k,
+                Stub {
+                    pair,
+                    seq,
+                    stamp: sample,
+                },
+            );
         }
         let dropped = self.stubs.len().saturating_sub(self.cfg.max_stubs);
         if dropped > 0 {
@@ -908,6 +930,52 @@ mod tests {
         );
         let new: u64 = s.records.iter().map(|r| r.new_flows).sum();
         assert_eq!(new, 0);
+    }
+
+    #[test]
+    fn stubs_expire_so_a_reused_tuple_is_a_new_flow() {
+        // (gap in samples after eviction, expected new flows, expected bytes)
+        for (gap, new, bytes) in [(3u64, 0u64, 200u64), (4, 1, 2400)] {
+            let mut a = Aggregator::new(AggConfig {
+                max_flows: 1,
+                max_stubs: 10,
+                stub_ttl_samples: 3,
+                ..cfg(true)
+            });
+            let f1 = |up: u64| flow("10.0.0.2", "1.1.1.1", 1, 443, up, up);
+            let f2 = || flow("10.0.0.2", "1.1.1.1", 2, 443, 50, 50);
+            a.ingest(&[f1(1000)]);
+            a.ingest(&[f1(1100), f2()]); // sample 2: f1 evicted to a stub
+            assert_eq!(a.stubs(), 1);
+            for _ in 3..2 + gap {
+                a.ingest(&[f2()]);
+            }
+            let s = a.ingest(&[f1(1200), f2()]);
+            let r = one(&s);
+            assert_eq!(
+                (r.new_flows, r.bytes_up + r.bytes_down),
+                (new, bytes),
+                "gap {gap}"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_stubs_are_freed() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 1,
+            max_stubs: 10,
+            stub_ttl_samples: 2,
+            ..cfg(true)
+        });
+        let f = |p: u16| flow("10.0.0.2", "1.1.1.1", p, 443, 100, 100);
+        a.ingest(&[f(1)]);
+        a.ingest(&[f(1), f(2)]);
+        assert_eq!(a.stubs(), 1);
+        a.ingest(&[f(2)]);
+        assert_eq!(a.stubs(), 1);
+        a.ingest(&[f(2)]);
+        assert_eq!(a.stubs(), 0);
     }
 
     #[test]
