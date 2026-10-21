@@ -339,8 +339,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         // must be unique, are never built without it: see `Agent::meta`).
         let jitter = random_u64().unwrap_or(0);
         let tick = agent.engine.tick(&mut transport, wall, mono, jitter);
-        let date_seen = agent.engine.gate.has_server_date();
-        if let Some(offset) = agent.sync.observe(date_seen, wall, mono) {
+        if let Some(offset) = agent.sync.observe(&agent.engine.gate) {
             agent.window.rebase_dns(offset);
         }
         match tick {

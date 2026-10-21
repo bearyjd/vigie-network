@@ -7,6 +7,7 @@ use vigie_agent::builder::{build, BATCH_CAP};
 use vigie_agent::model::*;
 use vigie_agent::sender::*;
 use vigie_agent::syncstate::{FlushPlan, SyncState};
+use vigie_agent::timegate::TimeGate;
 use vigie_agent::window::{Window, WindowClock};
 
 const BUILD_TS: u64 = 1_760_000_000;
@@ -24,6 +25,13 @@ fn engine() -> Engine {
         BUILD_TS,
         1024 * 1024,
     )
+}
+
+/// A gate that has seen a server `Date` of `server_ts` at monotonic second `mono`.
+fn dated(server_ts: u64, mono: u64) -> TimeGate {
+    let mut g = TimeGate::new(BUILD_TS);
+    g.observe_server_date(server_ts, mono);
+    g
 }
 
 fn meta(seq: u64, start: u64, end: u64) -> Meta {
@@ -66,7 +74,7 @@ fn nothing_is_built_before_a_server_date_and_the_probe_gets_one() {
 fn urgent_pushes_need_a_synced_and_sane_clock() {
     let mut s = SyncState::new();
     assert!(!s.allow_identity_push(true), "no server Date yet");
-    s.observe(true, 5_000, 10);
+    s.observe(&dated(5_000, 10));
     assert!(s.allow_identity_push(true));
     assert!(
         !s.allow_identity_push(false),
@@ -77,15 +85,15 @@ fn urgent_pushes_need_a_synced_and_sane_clock() {
 #[test]
 fn after_first_date_windows_are_built_unless_the_clock_is_off() {
     let mut s = SyncState::new();
-    assert_eq!(s.observe(false, 5_000, 10), None, "no Date yet");
+    assert_eq!(s.observe(&TimeGate::new(BUILD_TS)), None, "no Date yet");
     assert!(!s.is_synced());
     assert_eq!(
-        s.observe(true, 5_000, 10),
+        s.observe(&dated(5_000, 10)),
         Some(4_990),
-        "wall - mono offset"
+        "server Date - mono offset"
     );
     assert!(s.is_synced());
-    assert_eq!(s.observe(true, 6_000, 20), None, "reported once");
+    assert_eq!(s.observe(&dated(6_000, 20)), None, "reported once");
     assert_eq!(s.plan(true), FlushPlan::Build);
     assert_eq!(
         s.plan(false),
@@ -98,7 +106,7 @@ fn after_first_date_windows_are_built_unless_the_clock_is_off() {
 fn provisional_rows_carry_monotonic_stamps_then_wall_stamps() {
     let mut s = SyncState::new();
     assert_eq!(s.stamp(1_760_000_555, 42), 42);
-    s.observe(true, 1_760_000_555, 42);
+    s.observe(&dated(1_760_000_555, 42));
     assert_eq!(s.stamp(1_760_000_600, 87), 1_760_000_600);
 }
 
@@ -135,9 +143,7 @@ fn ntp_step_before_first_contact_keeps_rows_correctly_timed() {
     eng.enqueue(probe);
     let mut t = Reply(422, Some(real_wall), "{\"error\":\"invalid_batch\"}");
     eng.tick(&mut t, real_wall, mono, 0);
-    let offset = sync
-        .observe(eng.gate.has_server_date(), real_wall, mono)
-        .expect("Date observed");
+    let offset = sync.observe(&eng.gate).expect("Date observed");
     win.rebase_dns(offset);
     assert_eq!(
         sync.plan(eng.gate.is_sane(real_wall, mono)),
@@ -204,4 +210,31 @@ fn a_422_for_a_fresh_window_is_a_plain_discard() {
     let mut t = Reply(422, None, "{\"error\":\"invalid_batch\"}");
     assert_eq!(eng.tick(&mut t, now, 1, 0), Tick::Discarded(422));
     assert_eq!(eng.dropped_stale, 0);
+}
+
+#[test]
+fn rebase_offset_comes_from_the_server_date_not_the_local_wall_clock() {
+    // Provisional DNS stamps are monotonic seconds. The local wall clock is wrong by years at
+    // the moment the first reply arrives; the offset must still map them onto server time.
+    let server_ts = 1_900_000_000u64;
+    let mono_at_reply = 61u64;
+    let mut sync = SyncState::new();
+    let mut win = Window::default();
+    win.add_dns(DnsQuery::new(5, MAC, "a.example.com", "A", None).unwrap());
+    win.add_dns(DnsQuery::new(50, MAC, "b.example.com", "A", None).unwrap());
+    let offset = sync
+        .observe(&dated(server_ts, mono_at_reply))
+        .expect("first Date");
+    assert_eq!(offset, server_ts - mono_at_reply);
+    win.rebase_dns(offset);
+    let (sections, _) = win.take_with_drops();
+    let ts: Vec<u64> = sections.dns.iter().map(|q| q.ts).collect();
+    assert_eq!(
+        ts,
+        vec![
+            server_ts - mono_at_reply + 5,
+            server_ts - mono_at_reply + 50
+        ],
+        "stamps land in server time (a query read 11 s before the reply is 11 s before its Date)"
+    );
 }

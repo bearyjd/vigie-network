@@ -5,7 +5,9 @@
 //!   - rows are stamped with the monotonic clock (provisional), never the wall clock;
 //!   - no data window is built (only an empty probe batch, whose reply, accepted or rejected,
 //!     carries the server `Date`);
-//!   - once the `Date` is known, provisional stamps are shifted to wall time in one go.
+//!   - once the `Date` is known, provisional stamps are shifted to server time in one go.
+
+use crate::timegate::TimeGate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushPlan {
@@ -54,12 +56,15 @@ impl SyncState {
     }
 
     /// Call after every send attempt. The first time a server `Date` has been seen, returns the
-    /// offset (`wall - mono`) that turns provisional stamps into wall time; `None` otherwise.
-    pub fn observe(&mut self, server_date_seen: bool, wall_s: u64, mono_s: u64) -> Option<u64> {
-        if self.synced || !server_date_seen {
+    /// offset (`server Date - mono at receipt`) that turns provisional stamps into server time;
+    /// `None` otherwise. The local wall clock plays no part: it may be wrong (that is why the
+    /// stamps are provisional) and is only checked against the server by the time gate.
+    pub fn observe(&mut self, gate: &TimeGate) -> Option<u64> {
+        if self.synced {
             return None;
         }
+        let offset = gate.server_offset()?;
         self.synced = true;
-        Some(wall_s.saturating_sub(mono_s))
+        Some(offset)
     }
 }

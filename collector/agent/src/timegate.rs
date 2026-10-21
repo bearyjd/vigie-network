@@ -27,6 +27,12 @@ impl TimeGate {
     pub fn has_server_date(&self) -> bool {
         self.server.is_some()
     }
+    /// Seconds to add to a monotonic stamp to get server time (`server Date - mono at receipt`).
+    /// Derived from the server's clock only; the local wall clock is untrusted until verified.
+    pub fn server_offset(&self) -> Option<u64> {
+        self.server
+            .map(|(server_ts, seen_mono)| server_ts.saturating_sub(seen_mono))
+    }
     pub fn is_sane(&self, wall_ts: u64, mono_s: u64) -> bool {
         if wall_ts < self.build_ts || wall_ts > MAX_PLAUSIBLE_TS {
             return false;
