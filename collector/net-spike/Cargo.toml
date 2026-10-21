@@ -1,0 +1,9 @@
+[package]
+name = "net-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vigie-parse = { path = "../parse" }
+socket2 = { version = "0.5", features = ["all"] }
