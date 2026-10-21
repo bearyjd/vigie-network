@@ -8,6 +8,13 @@ use crate::model::{ConntrackSummary, DnsQuery, Lease, Neighbor, Sections, Sighti
 /// (mac, kind, name, service, ua)
 type SightingKey = (String, u8, Option<String>, Option<String>, Option<String>);
 
+/// Most DNS rows one window holds (memory bound; the batch itself is capped separately).
+pub const MAX_WINDOW_DNS: usize = 10_000;
+/// Most DNS rows one MAC may contribute per window, so one chatty device cannot crowd out others.
+pub const DNS_PER_MAC_QUOTA: usize = 1024;
+/// Most distinct sightings one window holds.
+pub const MAX_WINDOW_SIGHTINGS: usize = 4096;
+
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
 /// span the jump and the server would reject the whole batch (window > 24 h).
@@ -39,6 +46,9 @@ pub struct Window {
     dns: Vec<DnsQuery>,
     conntrack: Vec<ConntrackSummary>,
     sightings: BTreeMap<SightingKey, Sighting>,
+    dns_per_mac: HashMap<String, usize>,
+    /// Rows dropped by the caps above, by `truncated` key.
+    drops: BTreeMap<String, u64>,
 }
 
 impl Window {
@@ -49,7 +59,18 @@ impl Window {
     pub fn add_neighbor(&mut self, n: Neighbor) {
         self.neigh.insert((n.ip.clone(), n.mac.clone()), n);
     }
+    /// Adds a DNS row unless the MAC's quota or the window cap is used up (counted, not silent).
     pub fn add_dns(&mut self, q: DnsQuery) {
+        if self.dns.len() >= MAX_WINDOW_DNS {
+            self.note_drops("dns_dropped", 1);
+            return;
+        }
+        let used = self.dns_per_mac.entry(q.mac.clone()).or_default();
+        if *used >= DNS_PER_MAC_QUOTA {
+            self.note_drops("dns_quota_dropped", 1);
+            return;
+        }
+        *used += 1;
         self.dns.push(q);
     }
     pub fn add_conntrack(&mut self, c: ConntrackSummary) {
@@ -63,6 +84,10 @@ impl Window {
             s.service.clone(),
             s.ua.clone(),
         );
+        if self.sightings.len() >= MAX_WINDOW_SIGHTINGS && !self.sightings.contains_key(&key) {
+            self.note_drops("sightings_dropped", 1);
+            return;
+        }
         self.sightings.insert(key, s);
     }
 
@@ -75,13 +100,27 @@ impl Window {
 
     /// Everything collected so far, leaving the window empty.
     pub fn take(&mut self) -> Sections {
+        self.take_with_drops().0
+    }
+
+    /// Like `take`, plus what the window caps dropped (for the batch `truncated` map).
+    pub fn take_with_drops(&mut self) -> (Sections, BTreeMap<String, u64>) {
         let w = std::mem::take(self);
-        Sections {
+        let sections = Sections {
             leases: w.leases.into_values().collect(),
             neigh: w.neigh.into_values().collect(),
             dns: w.dns,
             conntrack: w.conntrack,
             sightings: w.sightings.into_values().collect(),
+        };
+        (sections, w.drops)
+    }
+
+    /// Record `n` items lost upstream of the window (e.g. by the DNS correlator).
+    pub fn note_drops(&mut self, kind: &str, n: u64) {
+        if n > 0 {
+            let c = self.drops.entry(kind.to_string()).or_default();
+            *c = c.saturating_add(n);
         }
     }
 

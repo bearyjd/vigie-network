@@ -17,6 +17,9 @@ use std::net::IpAddr;
 use crate::model::{DnsQuery, Lease, MAX_OPT55};
 
 const MAX_PENDING_DNS: usize = 1024;
+/// Most pending queries one client IP may hold, so a flood from one device cannot evict the
+/// others' queries between two polls.
+const MAX_PENDING_PER_CLIENT: usize = 256;
 const MAX_PENDING_DHCP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +270,8 @@ struct PendingQuery {
 #[derive(Debug, Default)]
 pub struct DnsCorrelator {
     pending: VecDeque<PendingQuery>,
+    evicted: u64,
+    throttled: u64,
 }
 
 impl DnsCorrelator {
@@ -278,8 +283,19 @@ impl DnsCorrelator {
                 qtype,
                 name,
             } => {
+                if self
+                    .pending
+                    .iter()
+                    .filter(|p| &p.client_ip == client_ip)
+                    .count()
+                    >= MAX_PENDING_PER_CLIENT
+                {
+                    self.throttled += 1;
+                    return;
+                }
                 if self.pending.len() >= MAX_PENDING_DNS {
                     self.pending.pop_front();
+                    self.evicted += 1;
                 }
                 self.pending.push_back(PendingQuery {
                     id: id.clone(),
@@ -302,6 +318,20 @@ impl DnsCorrelator {
             }
             _ => {}
         }
+    }
+
+    /// Drained counters of queries lost before they reached the window, by `truncated` key.
+    pub fn take_counts(&mut self) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        for (k, v) in [
+            ("dns_pending_evicted", std::mem::take(&mut self.evicted)),
+            ("dns_client_throttled", std::mem::take(&mut self.throttled)),
+        ] {
+            if v > 0 {
+                out.insert(k.to_string(), v);
+            }
+        }
+        out
     }
 
     /// Everything pending, with MACs resolved; queries from unknown clients are dropped.

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use vigie_agent::builder::{build, BATCH_CAP};
+use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
 use vigie_agent::config::{load_key, parse_config, Config};
 use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
 use vigie_agent::dropin::{check_dropin, QuietDetector, DROPIN_PATH, LOG_DIR};
@@ -141,6 +141,9 @@ impl Agent {
         for q in self.dns.take_ready(&self.ip_to_mac) {
             self.window.add_dns(q);
         }
+        for (kind, n) in self.dns.take_counts() {
+            self.window.note_drops(&kind, n);
+        }
     }
 
     fn on_dhcp(&mut self, ev: &LogEvent) {
@@ -191,9 +194,9 @@ impl Agent {
         let quiet = self
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
-        let sections: Sections = self.window.take();
+        let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let (meta, health) = (self.meta(now), self.health(quiet));
-        let b = build(&meta, sections, &health, BATCH_CAP);
+        let b = build_with_drops(&meta, sections, &health, BATCH_CAP, &drops);
         self.clock.mark_flush(mono_s);
         self.engine.enqueue(b.encoded);
     }
