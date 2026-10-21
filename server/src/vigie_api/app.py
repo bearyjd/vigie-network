@@ -108,28 +108,40 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         LOG.error("storage error on %s %s: %r", request.method, request.url.path, exc)
         return JSONResponse(error_envelope("internal_error", "internal error"), status_code=500)
 
-    def check_auth(request: Request, ov: sqlite3.Connection, authorization: str | None):
+    def check_auth(request: Request, authorization: str | None):
+        """Limiter pre-check, then token verification.
+
+        The limiter counts failed authentications only and never blocks a valid token. A blocked
+        source that presents nothing token-shaped is refused without opening any database; one
+        that does present a plausible token costs a single indexed lookup, so that a valid token
+        keeps working from a shared (NAT / dual-stack) address.
+        """
         source = request.client.host if request.client else "unknown"
-        wait = failure_limit.retry_after(source)  # before any token lookup
-        if wait is not None:
-            raise ApiError(429, "rate_limited", "too many requests", {"Retry-After": str(wait)})
-        principal = tokens.verify_token(ov, _bearer(authorization))
+        wait = failure_limit.retry_after(source)
+        presented = _bearer(authorization)
+        if wait is not None and not tokens.TOKEN_RE.fullmatch(presented):
+            raise _rate_limited(wait)
+        conn = open_overrides(settings.overrides_path)
+        try:
+            principal = tokens.verify_token(conn, presented)
+        finally:
+            conn.close()
         if principal is None:
+            if wait is not None:
+                raise _rate_limited(wait)
             failure_limit.record(source)
             LOG.warning("authentication failed from %s", source)  # never the credential
             raise _unauthorized()
         if not token_limit.allow(principal.token_id):
-            retry = {"Retry-After": str(settings.rate_limit_window_s)}
-            raise ApiError(429, "rate_limited", "too many requests", retry)
+            raise _rate_limited(settings.rate_limit_window_s)
         request.state.authenticated = True
         return principal
 
+    def _rate_limited(wait: int | float) -> ApiError:
+        return ApiError(429, "rate_limited", "too many requests", {"Retry-After": str(wait)})
+
     def reject_if_unauthenticated(request: Request) -> None:
-        conn = open_overrides(settings.overrides_path)
-        try:
-            check_auth(request, conn, request.headers.get("authorization"))
-        finally:
-            conn.close()
+        check_auth(request, request.headers.get("authorization"))
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -165,11 +177,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     Inv = Annotated[sqlite3.Connection, Depends(get_inv)]
 
     def authenticate(
-        request: Request,
-        ov: Ov,
-        authorization: Annotated[str | None, Header()] = None,
+        request: Request, authorization: Annotated[str | None, Header()] = None
     ) -> tokens.Principal:
-        return check_auth(request, ov, authorization)
+        return check_auth(request, authorization)
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
 

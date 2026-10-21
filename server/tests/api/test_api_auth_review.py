@@ -88,7 +88,7 @@ def test_failure_limit_blocks_source_with_retry_after_then_recovers(tmp_path: Pa
         )
 
 
-def test_over_limit_source_is_refused_before_any_token_lookup(
+def test_over_limit_source_without_a_plausible_token_is_refused_before_any_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client, _, token = _limited(tmp_path)
@@ -99,8 +99,11 @@ def test_over_limit_source_is_refused_before_any_token_lookup(
         lookups: list[str] = []
         real = tokens.verify_token
         monkeypatch.setattr(tokens, "verify_token", lambda c, p: lookups.append(p) or real(c, p))
+        assert client.get("/devices", headers={"Authorization": "Bearer junk"}).status_code == 429
+        assert not lookups
+        # a well-formed token is looked up, and a valid one is served (never blocked)
         r = client.get("/devices", headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 429 and not lookups
+        assert r.status_code in (200, 503) and len(lookups) == 1
 
 
 def test_ipv6_sources_are_limited_by_slash_64(tmp_path: Path) -> None:

@@ -1,7 +1,7 @@
-"""Failed-authentication limiter: per source, IPv6 grouped by /64, bounded memory.
+"""Failed-authentication limiter: per source, IPv6 grouped by /64, IPv4-mapped unwrapped.
 
-Unlike a consuming limiter it can be asked *before* any token lookup whether a source is already
-over the limit, so a blocked source costs no database work and learns nothing from the answer.
+It counts failed authentications only and bounds memory by evicting the oldest-active sources,
+never by pooling new sources into a shared bucket an attacker could saturate.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from collections.abc import Callable
 
 MAX_SOURCES = 4096
 IPV6_PREFIX = 64
-_OVERFLOW = "*overflow*"
 
 
 def source_key(source: str) -> str:
@@ -22,6 +21,8 @@ def source_key(source: str) -> str:
         addr = ipaddress.ip_address(source)
     except ValueError:
         return source
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return str(addr.ipv4_mapped)  # dual-stack listener: key on the real IPv4 client
     if addr.version == 6:
         return str(ipaddress.ip_network(f"{addr}/{IPV6_PREFIX}", strict=False))
     return str(addr)
@@ -38,7 +39,7 @@ class FailureLimiter:
         key = source_key(source)
         now = self._clock()
         with self._lock:
-            hits = self._hits.get(key, self._hits.get(_OVERFLOW))
+            hits = self._hits.get(key)
             if hits is None:
                 return None
             self._expire(hits, now)
@@ -52,9 +53,8 @@ class FailureLimiter:
         with self._lock:
             if key not in self._hits and len(self._hits) >= MAX_SOURCES:
                 self._evict(now)
-                if len(self._hits) >= MAX_SOURCES:
-                    key = _OVERFLOW
-            hits = self._hits.setdefault(key, deque())
+            hits = self._hits.pop(key, None) or deque()
+            self._hits[key] = hits  # re-insert: dict order is least- to most-recently active
             self._expire(hits, now)
             hits.append(now)
 
@@ -65,3 +65,5 @@ class FailureLimiter:
     def _evict(self, now: float) -> None:
         for key in [k for k, v in self._hits.items() if not v or v[-1] <= now - self._window]:
             del self._hits[key]
+        while len(self._hits) >= MAX_SOURCES:
+            del self._hits[next(iter(self._hits))]  # oldest-active first
