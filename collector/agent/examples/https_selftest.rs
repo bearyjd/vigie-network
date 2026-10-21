@@ -38,7 +38,7 @@ fn main() {
         eprintln!("usage: https_selftest <server_url> <pin>");
         std::process::exit(64);
     };
-    let pinned = PinnedTransport::new(url, &[pin.as_str(), pin.as_str()]).unwrap_or_else(|e| {
+    let pinned = PinnedTransport::new(url, &[pin.as_str()]).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(64);
     });
