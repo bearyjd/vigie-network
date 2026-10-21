@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import make_batch
 from fastapi.testclient import TestClient
 
 from vigie_api.app import create_app as create_api
@@ -152,3 +153,13 @@ def test_pipeline_loop_touches_the_health_file_only_after_a_good_pass(
     monkeypatch.setattr(time, "sleep", after_tick)
     assert pipeline_cli.main(["run", "--loop", "5"]) == 0
     assert health.exists()
+
+
+def test_a_shard_created_by_a_batch_is_held_with_live_sidecars(make_env) -> None:
+    env = make_env()
+    assert keeper.ACTIVE is not None
+    before = set(keeper.ACTIVE.held())
+    assert env.post(make_batch(seq=1)).status_code == 200
+    shards = [p for p in keeper.ACTIVE.held() if p not in before]
+    assert shards and all(p.name.startswith("raw-") for p in shards)
+    assert all(_has_sidecars(p) for p in shards)  # what the pipeline's read-only mount needs

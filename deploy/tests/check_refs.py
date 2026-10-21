@@ -281,6 +281,19 @@ def check_flags() -> None:
     print("flags: ok")
 
 
+def check_firewall(readme: str) -> None:
+    """The README firewalld recipe must explicitly reject other sources on BOTH published ports,
+    reload, say how to undo it and how to verify it."""
+    for port in ("8443", "8444"):
+        accept = rf'source address="[^"]+" port port="{port}" protocol="tcp" accept'
+        reject = rf'source not address="[^"]+" port port="{port}" protocol="tcp" reject'
+        if not re.search(accept, readme) or not re.search(reject, readme):
+            err(f"README: firewalld recipe lacks accept + 'source not address' reject for {port}")
+    for needle in ("--reload", "--remove-rich-rule", "nc -vz"):
+        if needle not in readme:
+            err(f"README: firewalld recipe lacks {needle}")
+
+
 BOGUS_PATH_DOC = "See `deploy/does-not-exist.sh` and `docs/nope.md`."
 BOGUS_FLAG_DOC = "Run it with --definitely-not-a-flag now."
 
@@ -309,6 +322,9 @@ def self_test() -> None:
     ingest_sees_overrides["services"]["ingest"]["volumes"].append("vigie-overrides:/overrides:rw")
     shared_cert = yaml.safe_load((ROOT / "deploy" / "compose.yaml").read_text())
     shared_cert["services"]["api"]["secrets"] = [{"source": "vigie_tls_cert"}, {"source": "vigie_tls_key"}]
+    readme = (ROOT / "README.md").read_text()
+    _fails("firewalld recipe without explicit reject", check_firewall, readme.replace(" reject'", " accept'"))
+    _fails("firewalld recipe without the 8444 rule", check_firewall, readme.replace('port="8444"', 'port="9"'))
     _fails("a path that does not exist", check_paths_in, "bogus.md", BOGUS_PATH_DOC)
     _fails("a flag nobody defines", check_flags_in, "bogus.md", BOGUS_FLAG_DOC, "--real-flag")
     _fails("api inventory mounted rw", check_mounts, wrong_mount, deploy_md)
@@ -318,6 +334,7 @@ def self_test() -> None:
     _fails("an unpinned base image under --release", check_images, "ARG PYTHON_IMAGE=python:3.12\nARG UV_IMAGE=uv:1", True)
     # and the checks accept the real inputs
     check_mounts(good, deploy_md)
+    check_firewall(readme)
     check_images((ROOT / "deploy" / "Containerfile").read_text(), True)
 
 
@@ -326,6 +343,7 @@ def main() -> int:
     self_test()
     check_yaml()
     check_images((ROOT / "deploy" / "Containerfile").read_text(), release)
+    check_firewall((ROOT / "README.md").read_text())
     check_compose_config()
     check_env_names()
     check_paths()

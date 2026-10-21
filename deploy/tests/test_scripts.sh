@@ -297,7 +297,8 @@ ign() { git -C "$REPO" check-ignore --no-index -q "$1"; }
 if command -v git >/dev/null 2>&1 && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
 	for f in deploy/certs-next/server.key collector-rtr-1/key-k2 certs-next/server.key \
 		deploy/collector-rtr-1/key-k2 deploy/certs/pins.txt deploy/certs-api/server.crt \
-		some/dir/token.secret deploy/other.key; do
+		some/dir/token.secret deploy/other.key elsewhere/key-k3 collector-rtr-1/anything \
+		certs-next/server.crt deploy/pins.txt; do
 		check ".gitignore ignores $f" ign "$f"
 	done
 	for f in deploy/compose.yaml deploy/gen-certs.sh deploy/tests/test_scripts.sh .gitignore; do
