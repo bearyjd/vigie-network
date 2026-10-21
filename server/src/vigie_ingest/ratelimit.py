@@ -1,4 +1,10 @@
-"""Per-source-IP sliding-window rate limiter (in-memory, thread-safe)."""
+"""Sliding-window rate limiter (in-memory, thread-safe).
+
+Keys are chosen by the caller: the claimed collector id when the request headers parse, else the
+source address. IPv6 sources use the full address unless `ipv6_prefix` groups them (e.g. 64).
+The table is bounded; once full of live keys, new keys share one overflow bucket with its own
+limit, so a new legitimate source is never refused outright and memory never grows.
+"""
 
 from __future__ import annotations
 
@@ -11,14 +17,13 @@ MAX_TRACKED_SOURCES = 4096
 _EVICT_INTERVAL_S = 1.0
 
 
-def _source_key(source: str) -> str:
-    """IPv6 clients are keyed by /64 (privacy addresses rotate within it)."""
+def _source_key(source: str, ipv6_prefix: int | None) -> str:
     try:
         addr = ipaddress.ip_address(source)
     except ValueError:
         return source
-    if addr.version == 6:
-        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    if addr.version == 6 and ipv6_prefix is not None:
+        return str(ipaddress.ip_network(f"{addr}/{ipv6_prefix}", strict=False))
     return str(addr)
 
 
@@ -29,17 +34,20 @@ class RateLimiter:
         window_s: int,
         clock: Callable[[], float],
         max_sources: int = MAX_TRACKED_SOURCES,
+        ipv6_prefix: int | None = None,
     ) -> None:
         self._limit = limit
         self._window = window_s
         self._clock = clock
-        self._hits: dict[str, deque[float]] = {}
         self._max_sources = max_sources
+        self._ipv6_prefix = ipv6_prefix
+        self._hits: dict[str, deque[float]] = {}
+        self._overflow: deque[float] = deque()
         self._last_evict = float("-inf")
         self._lock = threading.Lock()
 
     def allow(self, source: str) -> bool:
-        key = _source_key(source)
+        key = _source_key(source, self._ipv6_prefix)
         now = self._clock()
         cutoff = now - self._window
         with self._lock:
@@ -48,14 +56,16 @@ class RateLimiter:
                     self._last_evict = now
                     self._evict(cutoff)
                 if len(self._hits) >= self._max_sources:
-                    return False  # table full of live sources: refuse new ones, never grow
-            hits = self._hits.setdefault(key, deque())
-            while hits and hits[0] <= cutoff:
-                hits.popleft()
-            if len(hits) >= self._limit:
-                return False
-            hits.append(now)
-            return True
+                    return self._admit(self._overflow, now, cutoff)
+            return self._admit(self._hits.setdefault(key, deque()), now, cutoff)
+
+    def _admit(self, hits: deque[float], now: float, cutoff: float) -> bool:
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
+        if len(hits) >= self._limit:
+            return False
+        hits.append(now)
+        return True
 
     def _evict(self, cutoff: float) -> None:
         stale = [k for k, v in self._hits.items() if not v or v[-1] <= cutoff]

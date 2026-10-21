@@ -162,7 +162,12 @@ def _rejection_response(rejection: store.Rejection) -> tuple[int, dict[str, obje
 
 
 def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> FastAPI:
-    limiter = RateLimiter(settings.rate_limit_per_window, settings.rate_limit_window_s, clock)
+    limiter = RateLimiter(
+        settings.rate_limit_per_window,
+        settings.rate_limit_window_s,
+        clock,
+        ipv6_prefix=settings.rate_limit_ipv6_prefix,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -182,10 +187,12 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
 
     @app.post("/v1/batch")
     async def post_batch(request: Request) -> Response:
-        source = request.client.host if request.client else "unknown"
-        if not limiter.allow(source):
-            return JSONResponse({"error": "rate_limited"}, status_code=429)
         env = _parse_envelope(request.headers)
+        # Pre-auth bucket: the claimed collector id when headers parse, else the source address.
+        peer = request.client.host if request.client else "?"
+        bucket = f"cid:{env.collector_id}" if env else peer
+        if not limiter.allow(bucket):
+            return JSONResponse({"error": "rate_limited"}, status_code=429)
         if env is None:
             return _unauthorized()  # before the body is read or any other work is done
         try:

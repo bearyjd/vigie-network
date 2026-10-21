@@ -12,6 +12,10 @@ SHARD_RETENTION_MAX_DAYS = 30
 BATCH_RETENTION_DAYS = 7
 
 
+def _opt_int(value: str | None) -> int | None:
+    return None if value in (None, "") else int(value)
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -19,6 +23,7 @@ class Settings:
     max_body_bytes: int = MAX_BODY_BYTES
     rate_limit_per_window: int = 60
     rate_limit_window_s: int = 60
+    rate_limit_ipv6_prefix: int | None = None
     max_clock_skew_s: int = 300
     body_timeout_s: float = 10.0
     max_spool_age_s: int = 86400
@@ -43,6 +48,8 @@ class Settings:
         return cls(
             data_dir=Path(source.get("VIGIE_DATA_DIR", "/var/lib/vigie")),
             secrets_dir=Path(source.get("VIGIE_SECRETS_DIR", "/run/secrets")),
+            rate_limit_ipv6_prefix=_opt_int(source.get("VIGIE_RATE_LIMIT_IPV6_PREFIX")),
+            max_spool_age_s=int(source.get("VIGIE_MAX_SPOOL_AGE_S", 86400)),
             body_timeout_s=float(source.get("VIGIE_BODY_TIMEOUT_S", 10.0)),
             shard_retention_days=int(
                 source.get("VIGIE_SHARD_RETENTION_DAYS", SHARD_RETENTION_DEFAULT_DAYS)

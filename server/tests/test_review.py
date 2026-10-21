@@ -160,15 +160,8 @@ def test_rate_limiter_tracked_sources_never_exceed_cap() -> None:
     assert len(limiter._hits) <= 4096
 
 
-def test_rate_limiter_full_table_refuses_new_sources_but_serves_known() -> None:
-    limiter = RateLimiter(5, 60, lambda: 1000.0, max_sources=3)
-    assert all(limiter.allow(f"10.0.0.{i}") for i in range(3))
-    assert limiter.allow("10.0.0.9") is False
-    assert limiter.allow("10.0.0.1") is True
-
-
 def test_rate_limiter_ipv6_keyed_by_slash_64() -> None:
-    limiter = RateLimiter(2, 60, lambda: 0.0)
+    limiter = RateLimiter(2, 60, lambda: 0.0, ipv6_prefix=64)
     assert limiter.allow("2001:db8:1:2::1") and limiter.allow("2001:db8:1:2:ffff::9")
     assert limiter.allow("2001:db8:1:2::77") is False  # same /64 shares one budget
     assert limiter.allow("2001:db8:1:3::1") is True  # different /64
