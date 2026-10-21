@@ -34,8 +34,6 @@ def render() -> str:
             continue
         for method, operation in item.items():
             operation["security"] = [{"bearer": []}]
-            operation["responses"].setdefault("401", {"description": "Unauthorized (uniform)"})
-            operation["responses"].setdefault("429", {"description": "Rate limited"})
             if method == "patch":
                 _document_if_match(operation)
     return json.dumps(spec, indent=2, sort_keys=True) + "\n"
@@ -48,8 +46,6 @@ def _document_if_match(operation: dict) -> None:
             param["description"] = (
                 "Override version from the last ETag (0 when the device has no override yet)."
             )
-    operation["responses"]["412"] = {"description": "If-Match does not match; current ETag sent"}
-    operation["responses"]["428"] = {"description": "If-Match header missing"}
 
 
 def main(argv: list[str]) -> int:

@@ -4,12 +4,11 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, Path, Query, Request
+from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -17,36 +16,54 @@ from vigie_api import effective, feeds, tokens, writes
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
+from vigie_api.models import (
+    DevicePatch,
+    DeviceResponse,
+    DevicesResponse,
+    DeviceStatus,
+    DeviceType,
+    ErrorEnvelope,
+    EventsResponse,
+    HealthResponse,
+    IdentityState,
+    MacResponse,
+    PatchResponse,
+    SuggestionsResponse,
+    SuggestionState,
+)
 from vigie_api.ratelimit import FailureLimiter
 from vigie_api.schema import open_inventory_ro, open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_ingest.ratelimit import RateLimiter
 
-DeviceType = Literal["phone", "tv", "iot", "camera", "laptop", "console", "unknown"]
-IdentityState = Literal["ok", "conflict", "pending_confirm"]
-DeviceStatus = Literal["active", "transient", "retired"]
-SuggestionState = Literal["pending", "accepted", "rejected", "expired"]
 DeviceId = Annotated[str, Path(min_length=1, max_length=64)]
 Limit = Annotated[int, Query(ge=1, le=500)]
 VERSION = "0.1.0"
 LOG = logging.getLogger("vigie_api")
+ERROR_TEXT = {
+    400: "Malformed cursor, If-Match or updated_since",
+    401: "Unauthorized (uniform for every authentication failure)",
+    404: "Not found",
+    409: "device_merged: the device was merged into another; patch the canonical one",
+    412: "version_mismatch: If-Match does not match; the current ETag is sent back",
+    413: "Request body too large",
+    422: "Validation error",
+    428: "If-Match header missing",
+    429: "Rate limited; see Retry-After",
+    503: "inventory_unavailable: inventory.db does not exist yet",
+}
+ETAG_HEADER = {
+    "headers": {
+        "ETag": {
+            "description": "Override version of the device; send it back as If-Match.",
+            "schema": {"type": "string"},
+        }
+    }
+}
 
 
-class DevicePatch(BaseModel):
-    """Only fields present in the body change; an explicit null clears the field."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: Annotated[str | None, Field(max_length=128)] = None
-    owner: Annotated[str | None, Field(max_length=128)] = None
-    type: DeviceType | None = None
-    group_id: Annotated[str | None, Field(max_length=32)] = None
-
-    @model_validator(mode="after")
-    def _non_empty(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("body must set at least one of name, owner, type, group_id")
-        return self
+def _errors(*codes: int) -> dict[int | str, dict[str, Any]]:
+    return {c: {"model": ErrorEnvelope, "description": ERROR_TEXT[c]} for c in codes}
 
 
 def _unauthorized() -> ApiError:
@@ -156,11 +173,25 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
 
-    @app.get("/healthz", tags=["health"], summary="Liveness (unauthenticated)")
+    @app.get(
+        "/healthz", tags=["health"], summary="Liveness (unauthenticated)",
+        response_model=HealthResponse,
+    )  # fmt: skip
     def healthz() -> dict[str, Any]:
         return envelope("ok")
 
-    @app.get("/devices", tags=["devices"], summary="List devices (effective view)")
+    @app.get(
+        "/devices",
+        tags=["devices"],
+        summary="List devices (effective view)",
+        description=(
+            "Aliases (devices merged into another) are hidden unless `include_aliases=1`, and an "
+            "alias shows its canonical device's override. Retired and transient devices are "
+            "hidden unless `include_retired=1` / `include_transient=1` (or `status=` is given)."
+        ),
+        response_model=DevicesResponse,
+        responses=_errors(400, 401, 422, 429, 503),
+    )
     def list_devices(
         _: Principal,
         inv: Inv,
@@ -169,7 +200,10 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         group: Annotated[str | None, Query(max_length=32)] = None,
         identity_state: IdentityState | None = None,
         status: DeviceStatus | None = None,
-        updated_since: Annotated[str | None, Query(max_length=64)] = None,
+        updated_since: Annotated[
+            str | None,
+            Query(max_length=64, description="ISO-8601 UTC, e.g. 2026-01-01T00:00:00Z"),
+        ] = None,
         include_transient: bool = False,
         include_retired: bool = False,
         include_aliases: bool = False,
@@ -192,22 +226,36 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
         return envelope(items, page={"next_cursor": nxt})
 
-    @app.get("/devices/{device_id}", tags=["devices"], summary="Device detail")
-    def get_device(device_id: DeviceId, _: Principal, inv: Inv, ov: Ov) -> JSONResponse:
-        detail = effective.device_detail(inv, ov, device_id)
-        return JSONResponse(
-            envelope(detail), headers={"ETag": writes.etag(detail["override_version"])}
-        )
+    @app.get(
+        "/devices/{device_id}",
+        tags=["devices"],
+        summary="Device detail",
+        response_model=DeviceResponse,
+        responses={200: ETAG_HEADER, **_errors(401, 404, 422, 429, 503)},
+    )
+    def get_device(
+        device_id: DeviceId, _: Principal, inv: Inv, ov: Ov, response: Response
+    ) -> dict[str, Any]:
+        detail = effective.device_detail(inv, ov, device_id, now_iso=iso_utc(clock()))
+        response.headers["ETag"] = writes.etag(detail["override_version"])
+        return envelope(detail)
 
-    @app.patch("/devices/{device_id}", tags=["devices"], summary="Set or clear overrides")
+    @app.patch(
+        "/devices/{device_id}",
+        tags=["devices"],
+        summary="Set or clear overrides",
+        response_model=PatchResponse,
+        responses={200: ETAG_HEADER, **_errors(400, 401, 404, 409, 412, 413, 422, 428, 429, 503)},
+    )
     def patch_device(
         device_id: DeviceId,
         body: DevicePatch,
         principal: Principal,
         inv: Inv,
         ov: Ov,
+        response: Response,
         if_match: Annotated[str | None, Header()] = None,
-    ) -> JSONResponse:
+    ) -> dict[str, Any]:
         result = writes.patch_override(
             inv,
             ov,
@@ -217,14 +265,34 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             principal=principal.name,
             now_iso=iso_utc(clock()),
         )
-        return JSONResponse(envelope(result), headers={"ETag": writes.etag(result["version"])})
+        response.headers["ETag"] = writes.etag(result["version"])
+        return envelope(result)
 
-    @app.get("/macs/{mac}", tags=["devices"], summary="Resolve a MAC to its canonical device")
-    def get_mac(mac: Annotated[str, Path(min_length=1, max_length=32)], _: Principal, inv: Inv,
-                ov: Ov) -> dict[str, Any]:  # fmt: skip
+    @app.get(
+        "/macs/{mac}",
+        tags=["devices"],
+        summary="Resolve a MAC to its canonical device",
+        response_model=MacResponse,
+        responses=_errors(401, 404, 422, 429, 503),
+    )
+    def get_mac(
+        mac: Annotated[str, Path(min_length=1, max_length=32)], _: Principal, inv: Inv, ov: Ov
+    ) -> dict[str, Any]:
         return envelope(effective.resolve_mac(inv, ov, mac))
 
-    @app.get("/events", tags=["events"], summary="Events feed (inventory + human actions)")
+    @app.get(
+        "/events",
+        tags=["events"],
+        summary="Events feed (inventory + human actions)",
+        description=(
+            "Paged by insertion order, so an event that arrives late with an older `ts` is never "
+            "skipped. Items within a page are sorted by `ts` for display only. `since` is the "
+            "opaque `page.next_cursor` of a previous response: the resume point, i.e. the last "
+            "row included per source. An empty page returns the `since` you sent."
+        ),
+        response_model=EventsResponse,
+        responses=_errors(400, 401, 422, 429, 503),
+    )
     def get_events(
         _: Principal,
         inv: Inv,
@@ -239,7 +307,13 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
         return envelope(items, page={"next_cursor": nxt})
 
-    @app.get("/suggestions", tags=["suggestions"], summary="Suggestions (read-only)")
+    @app.get(
+        "/suggestions",
+        tags=["suggestions"],
+        summary="Suggestions (read-only)",
+        response_model=SuggestionsResponse,
+        responses=_errors(400, 401, 422, 429, 503),
+    )
     def get_suggestions(
         _: Principal,
         inv: Inv,

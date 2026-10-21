@@ -16,6 +16,8 @@ from vigie_api.errors import ApiError
 DEVICE_TYPES = ("phone", "tv", "iot", "camera", "laptop", "console", "unknown")
 MAX_LINK_DEPTH = 32
 RECENT_EVENTS = 20
+# reason_text is shown for these actions only (an allowlist: anything else is suppressed)
+PROSE_ALLOWED_ACTIONS = frozenset({"label"})
 _MAC_RE = re.compile(r"^[0-9a-f]{12}$")
 _MAC_SEPARATORS = re.compile(r"[:.\-]")
 _ISO_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
@@ -260,7 +262,34 @@ def _device_row(inv: sqlite3.Connection, device_id: str) -> sqlite3.Row:
     return found[0]
 
 
-def device_detail(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str) -> dict:
+def _trust_suggestion_pending(
+    inv: sqlite3.Connection, ov: sqlite3.Connection, members: list[str], now_iso: str
+) -> bool:
+    """Any undecided, unexpired suggestion that is not a plain label touching these devices."""
+    decided = {
+        r["suggestion_id"] for r in rows(ov, "SELECT suggestion_id FROM suggestion_decisions")
+    }
+    wanted = set(members)
+    for row in rows(
+        inv,
+        "SELECT id, device_ids FROM suggestions WHERE expires_at >= ?"
+        " AND action NOT IN (SELECT value FROM json_each(?))",
+        (now_iso, json.dumps(sorted(PROSE_ALLOWED_ACTIONS))),
+    ):
+        if row["id"] in decided:
+            continue
+        try:
+            touched = set(json.loads(row["device_ids"]))
+        except (ValueError, TypeError):
+            return True  # unreadable: fail closed, hide the prose
+        if touched & wanted:
+            return True
+    return False
+
+
+def device_detail(
+    inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str, *, now_iso: str
+) -> dict:
     links = link_map(ov)
     canonical = resolve(links, device_id)
     row = _device_row(inv, canonical)
@@ -285,6 +314,7 @@ def device_detail(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: st
         " ORDER BY ts DESC, id DESC LIMIT ?",
         (*members, RECENT_EVENTS),
     )
+    suppress = _trust_suggestion_pending(inv, ov, members, now_iso)
     return {
         **item,
         "merged_into": canonical if canonical != device_id else None,
@@ -304,7 +334,8 @@ def device_detail(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: st
         "recent_events": [dict(e) for e in events],
         "explanation": {
             "reason_code": row["inferred_reason_code"],
-            "reason_text": row["inferred_reason_text"],  # informational only
+            # informational only, and withheld while a trust-changing suggestion is pending
+            "reason_text": None if suppress else row["inferred_reason_text"],
             "model_version": row["inferred_model_version"],
         },
     }

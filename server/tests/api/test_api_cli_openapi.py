@@ -99,3 +99,65 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
     assert any(p["name"] == "if-match" and p["required"] for p in patch["parameters"])
     assert {"412", "428"} <= set(patch["responses"])
     assert "security" not in spec["paths"]["/healthz"]["get"]
+
+
+EXPECTED_ERRORS = {
+    ("get", "/devices"): {"400", "401", "422", "429", "503"},
+    ("get", "/devices/{device_id}"): {"401", "404", "422", "429", "503"},
+    ("patch", "/devices/{device_id}"): {
+        "400",
+        "401",
+        "404",
+        "409",
+        "412",
+        "413",
+        "422",
+        "428",
+        "429",
+        "503",
+    },  # fmt: skip
+    ("get", "/macs/{mac}"): {"401", "404", "422", "429", "503"},
+    ("get", "/events"): {"400", "401", "422", "429", "503"},
+    ("get", "/suggestions"): {"400", "401", "422", "429", "503"},
+}
+
+
+def test_every_route_declares_its_error_responses() -> None:
+    spec = json.loads(render())
+    for (method, path), codes in EXPECTED_ERRORS.items():
+        responses = spec["paths"][path][method]["responses"]
+        assert codes <= set(responses), (method, path, codes - set(responses))
+        for code in codes:
+            ref = responses[code]["content"]["application/json"]["schema"]["$ref"]
+            assert ref.endswith("/ErrorEnvelope"), (method, path, code)
+
+
+def test_every_2xx_has_a_typed_schema_and_etag_where_expected() -> None:
+    spec = json.loads(render())
+    for path, item in spec["paths"].items():
+        for method, operation in item.items():
+            ok = operation["responses"]["200"]["content"]["application/json"]["schema"]
+            assert "$ref" in ok, (method, path)
+    for method, path in (("get", "/devices/{device_id}"), ("patch", "/devices/{device_id}")):
+        assert "ETag" in spec["paths"][path][method]["responses"]["200"]["headers"]
+
+
+def test_untrusted_text_fields_are_marked_in_the_schema() -> None:
+    schemas = json.loads(render())["components"]["schemas"]
+    expected = {
+        "DeviceOut": ["name", "owner"],
+        "MacOut": ["hostname"],
+        "RecentEvent": ["summary"],
+        "EventOut": ["summary"],
+        "Explanation": ["reason_text"],
+        "SuggestionOut": ["reason_text"],
+        "DevicePatch": ["name", "owner"],
+    }
+    for schema, fields in expected.items():
+        for field in fields:
+            prop = schemas[schema]["properties"][field]
+            text = prop.get("description") or next(
+                (o["description"] for o in prop.get("anyOf", []) if "description" in o), ""
+            )
+            assert "UNTRUSTED" in text, (schema, field)
+    assert "label" in schemas["SuggestionOut"]["properties"]["reason_text"]["description"]

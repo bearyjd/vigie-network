@@ -8,11 +8,9 @@ import sqlite3
 from itertools import islice
 from typing import Any
 
-from vigie_api.effective import decode_cursor, encode_cursor, rows
+from vigie_api.effective import PROSE_ALLOWED_ACTIONS, decode_cursor, encode_cursor, rows
 from vigie_api.errors import ApiError
 
-# LLM/ML prose is never shown for actions that change trust (PRP section 7).
-PROSE_SUPPRESSED = frozenset({"move_group", "quarantine", "merge_identity"})
 SUGGESTION_STATES = ("pending", "accepted", "rejected", "expired")
 
 
@@ -121,7 +119,8 @@ def _suggestion(row: sqlite3.Row, decision: sqlite3.Row | None, now_iso: str) ->
         "device_ids": json.loads(row["device_ids"]),
         "payload": json.loads(row["payload"]),
         "reason_code": row["reason_code"],
-        "reason_text": None if row["action"] in PROSE_SUPPRESSED else row["reason_text"],
+        # LLM/ML prose is shown for allowlisted actions only (PRP section 7)
+        "reason_text": row["reason_text"] if row["action"] in PROSE_ALLOWED_ACTIONS else None,
         "basis": json.loads(row["basis"]),
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
