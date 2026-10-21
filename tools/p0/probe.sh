@@ -57,9 +57,10 @@ wc -l < /tmp/dhcp.leases
 awk '{ c=substr($2,2,1); if (c ~ /[26aAeE]/) r++; else g++ }
      END { print "randomized=" r+0, "global=" g+0 }' /tmp/dhcp.leases
 
-sec "neighbors: randomized vs global MACs on br-lan"
-ip neigh show dev br-lan 2>/dev/null | awk '{ c=substr($5,2,1); if (c ~ /[26aAeE]/) r++; else g++ }
-     END { print "randomized=" r+0, "global=" g+0 }'
+sec "neighbors: distinct MACs on br-lan (IPv4+IPv6 entries deduped)"
+ip neigh show dev br-lan 2>/dev/null | awk '/lladdr/ { print $5 }' | sort -u |
+	awk '{ c=substr($1,2,1); if (c ~ /[26aAeE]/) r++; else g++ }
+	     END { print "randomized=" r+0, "global=" g+0 }'
 
 sec "conntrack"
 echo "acct=$(cat /proc/sys/net/netfilter/nf_conntrack_acct) max=$(cat /proc/sys/net/netfilter/nf_conntrack_max) entries=$(wc -l < /proc/net/nf_conntrack)"

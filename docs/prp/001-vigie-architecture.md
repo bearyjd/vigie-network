@@ -24,7 +24,7 @@ License: AGPL-3.0-or-later. Branch: `docs/prp-initial`.
 | SoC / arch | MediaTek MT7981, `aarch64_cortex-a53` | target `aarch64-unknown-linux-musl` |
 | Memory | ~480 MB total, ~230 MB available; `/tmp` is a 240 MB tmpfs (shares RAM) | 10 MB RSS budget is comfortable; tmpfs files count against RAM |
 | Resolver | plain **dnsmasq**; no AdGuard Home; query/DHCP logging **not enabled** | collector needs `log-queries=extra`, `log-dhcp`, `log-facility` in `/tmp/vigie/` |
-| conntrack | `nf_conntrack_acct=1`; ~574 entries; `/proc/net/nf_conntrack` is `root:root 0440` | byte counters available; **collector must run as root** (see §3) |
+| conntrack | `nf_conntrack_acct=1`; ~574 entries; `/proc/net/nf_conntrack` is `root:root 0440` | byte counters available; **needs a root helper** (see §4 privilege separation) |
 | mDNS | `avahi-daemon` owns :5353; port 1900 free | multicast join needs `SO_REUSEPORT`; verify coexistence |
 | Tools | `iptables`, `logread` present; **no `nft`, no `tcpdump`** | firewall docs use iptables/UCI; no packet capture |
 | LAN layout | one bridge `br-lan` (wired `eth1` + both home Wi-Fi bands, `isolate=0`); guest Wi-Fi on separate `guest` network with `isolate=1` | see visibility limits |
@@ -43,7 +43,7 @@ flowchart LR
     CT[/proc/net/nf_conntrack/] --> C
     ARP[ip neigh] --> C
     MC[mDNS/SSDP listener] --> C
-    C[vigie-collector<br/>static Rust, root in ujail, <10MB RSS]
+    C[vigie-collector + root conntrack helper<br/>static Rust, <10MB RSS]
   end
   C -- "HTTPS POST /v1/batch<br/>HMAC-signed, SPKI-pinned" --> ING
   subgraph Server[Homelab podman pod]
@@ -69,10 +69,15 @@ flowchart LR
 
 ## 4. Collector (router side)
 
-**Process and privilege.** Runs as root because `/proc/net/nf_conntrack` is root-only, but confined with procd `ujail`: read-only filesystem view, writable only `/tmp/vigie`, no TCP listener, no inbound management port. Drops all capabilities except those needed for multicast socket setup and reading `/proc`. Multicast parsers (mDNS/SSDP/DHCP-log) are fuzz targets; `#![forbid(unsafe_code)]` outside a small socket shim.
+**Process and privilege (privilege separation; `ujail` is not installed on this firmware).** Two processes under procd:
+- `vigie-conntrack` (root): reads `/proc/net/nf_conntrack` (root-only) and does nothing else. It parses only kernel-generated text, aggregates per `(src_mac, dst_ip, dst_port, proto)`, and writes the result to a unix socket owned by the unprivileged user. It has no network access and parses no LAN-supplied data.
+- `vigie-collector` (unprivileged user, e.g. `nobody`): everything that touches attacker-influenced data (mDNS/SSDP multicast, dnsmasq log, DHCP-log lines, neighbor tables) plus the HTTPS push. mDNS needs no root (port 5353 > 1024). The dnsmasq log is world-readable by design (mode 0644).
+- No TCP listener and no inbound management port. Parsers are fuzz targets; `#![forbid(unsafe_code)]` outside a small socket shim. Installing `procd-ujail` via opkg is an optional hardening step, not a dependency.
 
 **Sources and logging.**
-- dnsmasq: `log-queries=extra`, `log-dhcp`, `log-facility=/tmp/vigie/dnsmasq.log` (exact UCI option names on 21.02 and whether the GL.iNet firmware regenerates `dnsmasq.conf` on reload/boot are **P0 verification items**).
+- dnsmasq: `log-queries=extra`, `log-dhcp`, `log-facility=/tmp/vigie/dnsmasq.log`, delivered as a drop-in in dnsmasq's `conf-dir` (`/tmp/dnsmasq.d`, **verified on this router**). That directory is tmpfs, so the collector's init script recreates the drop-in at every start and reloads dnsmasq. The UCI options `logqueries`/`logdhcp`/`logfacility` exist but `logqueries` yields plain `log-queries` (no `extra`), so the drop-in is used. Whether GL.iNet reloads clear the drop-in is a P0 check; the collector verifies it periodically and re-creates it.
+- **IPv4 and IPv6 attribution.** The router's neighbor table carries several IPv6 addresses per host (privacy addresses rotate too), plus stale/failed entries. Mapping flows and DNS queries to MACs uses both families' neighbor entries, only entries with a link-layer address, deduplicated by MAC.
+- **AdGuard Home guard.** GL.iNet can enable AdGuard Home from its UI; dnsmasq would then stop seeing client queries. The collector reports a `dns_log_quiet` condition when the log has no queries while flows exist, and Vigie raises an event.
 - **Bounded log file:** dnsmasq never rotates its facility file, so a stopped collector could fill router RAM. Mechanism: the collector rotates (rename, then `SIGUSR2` to dnsmasq to reopen); an **independent cron watchdog** (every 5 min, not part of the collector) truncates the file if it exceeds 8 MB. P0 test: kill the collector for 24 h and confirm RAM stays flat.
 - Lease file + `log-dhcp` lines (opt-55 request list, opt-60 vendor class — **verify fields present**); `ip neigh`; conntrack summary; multicast join on 224.0.0.251:5353 (`SO_REUSEPORT` beside avahi) and 239.255.255.250:1900, parsing names/service types/UA strings with hard length caps.
 
@@ -90,7 +95,7 @@ flowchart LR
 - Each collector has a 256-bit **HMAC key**, provisioned at install, stored on the router in `/etc/vigie/key` (mode 0600) and on the server as a **podman secret** (`collector_key_<key_id>`). The key is never sent on the wire; the database stores only `key_id`, `last_seq`, `boot_id`, `revoked`.
 - Signature: `HMAC-SHA256(key, collector_id | key_id | boot_id | seq | sent_ts | batch_id | SHA256(raw_body_bytes))`. The body is signed as the exact bytes sent (no re-canonicalization).
 - TLS with the server certificate **pinned by SPKI hash**; the collector accepts **two pins** to allow rotation. Rotation procedure is documented (push new pin, then rotate cert).
-- Note: sysupgrade backups include `/etc`; the install docs say to treat router config backups as secret or exclude `/etc/vigie` in `/etc/sysupgrade.conf`.
+- Key storage: `/etc/vigie/key` on the overlay (flash; written once at install). Verified: the default sysupgrade keep list on this router does not include `/etc/vigie`, so a firmware upgrade removes the binary, init script, and key; the install guide covers re-provisioning, and warns that adding `/etc/vigie` to `/etc/sysupgrade.conf` puts the key into config backups.
 
 **Server-side ingest checks (order matters):** cap body size (512 KB) and per-source rate **before** reading the body → verify HMAC → duplicate `batch_id` ⇒ `200 duplicate:true` → `|sent_ts − now| ≤ 5 min` → `seq > last_seq` within `boot_id` (gaps allowed; new `boot_id` resets) → parse/validate against schema. Parse failures after auth are counted, never partially applied.
 
@@ -327,7 +332,7 @@ The pipeline can **never** create trust on its own: it can only *apply* a rule a
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **P0** | Router spike (findings in `docs/spikes/`): UCI options for `log-queries`/`log-dhcp`/`log-facility` and whether GL.iNet firmware regenerates them; opt-55/60 present in log; `ujail` available and sufficient; `SO_REUSEPORT` with avahi; NTP/time sanity detection; collector-killed-24 h RAM test; WAN port-53 firewall check | all items answered in writing |
+| **P0** | Router spike (`docs/spikes/p0-router.md`). **Answered by probe:** conf-dir drop-in works; `ujail` absent (→ privilege separation); `logread` buffer is 64 KB; WAN port 53 dropped by zone policy (outside test pending); sysupgrade behavior. **Still open:** opt-55/60 present in `log-dhcp` output and log line formats; whether GL.iNet reloads clear the drop-in; how the owner's devices roll MACs; log growth; `SO_REUSEPORT` beside avahi (needs Rust test in P1); collector-killed 24 h RAM test (P1) | all items answered in writing |
 | **P1** | Collector + `ingest` + `api` (read) + inventory (devices, observations, `new_device`), OpenAPI, compose, trafficgen, README + install steps, auth/replay tests | collector < 10 MB RSS for 48 h on the router; every device holding a DHCP lease appears; security tests green |
 | **P2** | Stage 1 rules + stage 2 features + DoH detection + retention purge + stitching: candidates, standing rules, overlap veto, behavioral demotion, `/macs/{mac}`, `mac_attached` events | ≥ 85 % correct on owner-labeled devices (or documented reasons); shard purge verified |
 | **P3 (conditional)** | Per-device drift ML first; classifier + LLM **only if** P2 leaves a residual `unknown` set worth it | drift false-alert budget over 14 days; injection invariance test passes |
@@ -349,6 +354,8 @@ Each phase = feature branch(es) and PRs, each reviewed by a separate reviewer pa
 |---|---|---|
 | Router logging config reset by GL.iNet firmware | DNS data lost | P0 verification; reapply hook; collector health event |
 | tmpfs fills router RAM | network outage | rotation + independent watchdog; 24 h kill test |
+| GL.iNet UI enables AdGuard Home | DNS data silently lost | `dns_log_quiet` health condition and event |
+| No `ujail`; root helper compromise | router root | helper parses only kernel text, no network, minimal code |
 | MAC clone or fingerprint copy inherits trusted `device_id` | wrong trust | overlap veto, behavioral demotion, `conflict`, per-group `auto_inherit`; documented residual risk |
 | Rolled MAC unassigned until matched | brief wrong posture | urgent push on new lease (seconds); control app default for unknown MAC is its call |
 | Spoofable strings poison rules/ML | wrong labels | confidence caps; excluded from training |
