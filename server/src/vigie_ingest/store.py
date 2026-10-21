@@ -207,33 +207,63 @@ def _remove_shard_rows(data_dir: Path, days: list[date], batch: Batch) -> None:
 def apply_batch(
     inventory_path: Path, data_dir: Path, batch: Batch, now: float, max_skew_s: int
 ) -> Outcome:
-    """Apply one validated batch; see the module docstring for the ordering guarantees."""
+    """Apply one validated batch; see the module docstring for the ordering guarantees.
+
+    One lock spans the state pre-check, shard writes, inventory commit and any compensation, so
+    a duplicate or concurrent request can neither overwrite nor delete another request's rows.
+    """
     by_day = rows_by_day(batch)
     with SHARD_LOCK:
+        rejected = _precheck(inventory_path, batch, now, max_skew_s)
+        if rejected:  # nothing is written for duplicates or rejected batches
+            return rejected
         for day, tables in by_day.items():
             _write_shard(data_dir, day, tables, batch)
-    _after_shard_commit()
+        _after_shard_commit()
 
+        conn = connect(inventory_path)
+        try:
+            with immediate(conn):
+                result = _commit_inventory(conn, batch, now, max_skew_s)
+        finally:
+            conn.close()
+        if result not in ("applied", "duplicate"):
+            # State changed after the pre-check (e.g. revoked by another process): undo our rows.
+            _remove_shard_rows(data_dir, list(by_day), batch)
+        return result
+
+
+def _precheck(inventory_path: Path, batch: Batch, now: float, max_skew_s: int) -> Outcome | None:
     conn = connect(inventory_path)
     try:
-        with immediate(conn):
-            result = _commit_inventory(conn, batch, now, max_skew_s)
+        return _evaluate(conn, batch, now, max_skew_s)
     finally:
         conn.close()
-    if result not in ("applied", "duplicate"):
-        _remove_shard_rows(data_dir, list(by_day), batch)  # rejected: compensate
-    return result
+
+
+def _evaluate(
+    conn: sqlite3.Connection, batch: Batch, now: float, max_skew_s: int
+) -> Outcome | None:
+    """Duplicate first (an applied batch stays a duplicate even if the collector is revoked
+    later), then revoked/key, then timestamp and sequence."""
+    already = conn.execute(
+        "SELECT 1 FROM batches WHERE collector_id=? AND batch_id=?",
+        (batch.collector_id, batch.batch_id),
+    ).fetchone()
+    if already:
+        return "duplicate"
+    collector = get_collector(conn, batch.collector_id)
+    if collector is None or collector.revoked or collector.key_id != batch.key_id:
+        return "revoked"
+    return check_state(
+        conn, collector, batch.batch_id, batch.boot_id, batch.seq, batch.sent_ts, now, max_skew_s
+    )
 
 
 def _commit_inventory(
     conn: sqlite3.Connection, batch: Batch, now: float, max_skew_s: int
 ) -> Outcome:
-    collector = get_collector(conn, batch.collector_id)
-    if collector is None or collector.revoked or collector.key_id != batch.key_id:
-        return "revoked"
-    rejection = check_state(
-        conn, collector, batch.batch_id, batch.boot_id, batch.seq, batch.sent_ts, now, max_skew_s
-    )
+    rejection = _evaluate(conn, batch, now, max_skew_s)
     if rejection:
         return rejection
     conn.execute(

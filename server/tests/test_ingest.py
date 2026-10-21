@@ -374,15 +374,13 @@ def test_body_fields_must_match_signed_headers(env: Env) -> None:
 
 def test_revoked_during_apply_is_rejected(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     batch = make_batch(seq=1)
-    real_apply = store.apply_batch
 
-    def revoke_then_apply(*args, **kwargs):
+    def revoke_after_shard_commit() -> None:  # e.g. the admin CLI in another process
         conn = env.inventory()
         store.revoke_collector(conn, COLLECTOR)
         conn.close()
-        return real_apply(*args, **kwargs)
 
-    monkeypatch.setattr(store, "apply_batch", revoke_then_apply)
+    monkeypatch.setattr(store, "_after_shard_commit", revoke_after_shard_commit)
     resp = env.post(batch)
     assert resp.status_code == 401 and resp.json() == UNAUTH
     assert batch_count(env) == 0
