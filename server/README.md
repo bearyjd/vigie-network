@@ -183,5 +183,23 @@ canonical device with `merged_into` on reads and 409 on PATCH. `group_id` comes 
 `device_overrides`; inferred data never assigns a group. `/events` is oldest-first and
 `page.next_cursor` is the resume point (pass it as `since`).
 
+**Event cursors are rowids.** `GET /events` pages on `events.rowid` (inventory.db) and
+`audit_log.rowid` (overrides.db). `audit_log` is `AUTOINCREMENT`, so its rowids are never reused.
+The pipeline `events` table is NOT yet `INTEGER PRIMARY KEY AUTOINCREMENT`: until it is, never
+`VACUUM` inventory.db and never delete the newest `events` rows (a reused rowid lands behind a
+client's cursor and the event is silently skipped). An xfail test
+(`tests/api/test_api_rowid_review.py`) records the requirement; fixing it is a pipeline schema
+migration.
+
+**Text safety.** Every free-text field returned (hostnames, event summaries, names, reason text,
+suggestion payload strings) is sanitised on output: control, format/bidi, line/paragraph
+separator and tag characters are stripped and the length is bounded; stored values are untouched.
+`name`/`owner` writes additionally reject those characters (NFKC-normalised first).
+
+**Failed-auth limiter.** Counts failed authentications only, per source (IPv6 by /64, IPv4-mapped
+addresses as their IPv4). A valid token is never blocked by it. A blocked source presenting no
+token-shaped credential costs no database work; one presenting a well-formed token costs one
+indexed lookup (needed so that a valid token still works from a shared address).
+
 Overrides are loaded whole per list request (home-scale: hundreds of devices); revisit before
 use on a large network.

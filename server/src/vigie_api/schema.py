@@ -85,6 +85,20 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "DROP TABLE api_tokens",
         "ALTER TABLE api_tokens_new RENAME TO api_tokens",
     ),
+    (
+        # /events pages on audit_log.rowid: AUTOINCREMENT so a rowid is never reused (deleting the
+        # newest row or VACUUM would otherwise let a new row land behind a client's cursor).
+        """CREATE TABLE audit_log_new (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE, ts TEXT NOT NULL, principal TEXT NOT NULL,
+          action TEXT NOT NULL, target TEXT, detail TEXT
+        )""",
+        "INSERT INTO audit_log_new (seq, id, ts, principal, action, target, detail)"
+        " SELECT rowid, id, ts, principal, action, target, detail FROM audit_log ORDER BY rowid",
+        "DROP TABLE audit_log",
+        "ALTER TABLE audit_log_new RENAME TO audit_log",
+        "CREATE INDEX idx_audit_ts ON audit_log(ts, id)",
+    ),
 )
 
 
