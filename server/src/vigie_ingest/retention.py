@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from vigie_ingest.config import SHARD_RETENTION_MAX_DAYS, Settings
-from vigie_ingest.db import SHARD_RE, iso_utc, open_inventory
+from vigie_ingest.db import SHARD_LOCK, SHARD_RE, iso_utc, open_inventory
 
 log = logging.getLogger("vigie.ingest.retention")
 _SIDECARS = ("-wal", "-shm")
@@ -24,6 +24,12 @@ def purge_shards(data_dir: Path, now: float, retention_days: int) -> list[str]:
         raise ValueError(f"retention_days must be 1..{SHARD_RETENTION_MAX_DAYS}")
     cutoff = datetime.fromtimestamp(now, tz=UTC).date() - timedelta(days=retention_days)
     removed: list[str] = []
+    with SHARD_LOCK:  # never unlink a shard while apply_batch is writing shards
+        _unlink_old(data_dir, cutoff, removed)
+    return removed
+
+
+def _unlink_old(data_dir: Path, cutoff: date, removed: list[str]) -> None:
     for entry in sorted(data_dir.iterdir()):
         match = SHARD_RE.fullmatch(entry.name)
         if not match or not entry.is_file() or entry.is_symlink():
@@ -37,12 +43,12 @@ def purge_shards(data_dir: Path, now: float, retention_days: int) -> list[str]:
             for suffix in _SIDECARS:
                 Path(f"{entry}{suffix}").unlink(missing_ok=True)
             removed.append(entry.name)
-    return removed
 
 
 def purge_batches(conn: sqlite3.Connection, now: float, retention_days: int) -> int:
     cutoff = iso_utc(now - retention_days * 86400)
     cursor = conn.execute("DELETE FROM batches WHERE received_at < ?", (cutoff,))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return cursor.rowcount
 
 

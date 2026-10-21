@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 BUSY_TIMEOUT_MS = 5000
 WAL_RETRIES = 8
+# Serialises shard writes with shard-file deletion (in-process; one ingest process per data dir).
+SHARD_LOCK = threading.RLock()
+SHARD_TABLES = ("raw_dns", "raw_flow", "raw_lease", "raw_neigh", "raw_sighting", "raw_health")
 SHARD_RE = re.compile(r"^raw-(\d{4})(\d{2})(\d{2})\.db$")
 
 INVENTORY_MIGRATIONS: Sequence[str] = (
@@ -52,6 +57,20 @@ INVENTORY_MIGRATIONS: Sequence[str] = (
     ALTER TABLE collectors ADD COLUMN parse_failures INTEGER NOT NULL DEFAULT 0;
     CREATE INDEX idx_batches_received ON batches(received_at);
     """,
+    # v3: boot_id-rollback guard, per-collector batch ids, truncation counters on the batch row.
+    """
+    ALTER TABLE collectors ADD COLUMN last_sent_ts INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE batches_new (
+      collector_id TEXT NOT NULL, batch_id TEXT NOT NULL, received_at TEXT NOT NULL,
+      truncated TEXT, dropped_batches INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (collector_id, batch_id)
+    );
+    INSERT INTO batches_new (collector_id, batch_id, received_at)
+      SELECT collector_id, batch_id, received_at FROM batches;
+    DROP TABLE batches;
+    ALTER TABLE batches_new RENAME TO batches;
+    CREATE INDEX idx_batches_received ON batches(received_at);
+    """,
 )
 
 SHARD_MIGRATIONS: Sequence[str] = (
@@ -67,6 +86,33 @@ SHARD_MIGRATIONS: Sequence[str] = (
     );
     CREATE INDEX idx_raw_dns_ts ON raw_dns(ts);
     CREATE INDEX idx_raw_flow_ts ON raw_flow(ts);
+    """,
+    # v2: batch_id for idempotent re-apply (delete-by-batch then insert) + remaining payloads.
+    """
+    ALTER TABLE raw_dns ADD COLUMN batch_id TEXT;
+    ALTER TABLE raw_flow ADD COLUMN batch_id TEXT;
+    CREATE INDEX idx_raw_dns_batch ON raw_dns(collector_id, batch_id);
+    CREATE INDEX idx_raw_flow_batch ON raw_flow(collector_id, batch_id);
+    CREATE TABLE raw_lease (
+      batch_id TEXT NOT NULL, collector_id TEXT NOT NULL, ts INTEGER NOT NULL,
+      mac TEXT NOT NULL, ip TEXT NOT NULL, hostname TEXT, opt55 TEXT, opt60 TEXT
+    );
+    CREATE TABLE raw_neigh (
+      batch_id TEXT NOT NULL, collector_id TEXT NOT NULL, ts INTEGER NOT NULL,
+      ip TEXT NOT NULL, mac TEXT NOT NULL, family TEXT NOT NULL
+    );
+    CREATE TABLE raw_sighting (
+      batch_id TEXT NOT NULL, collector_id TEXT NOT NULL, ts INTEGER NOT NULL,
+      mac TEXT NOT NULL, kind TEXT NOT NULL, name TEXT, service TEXT, ua TEXT
+    );
+    CREATE TABLE raw_health (
+      batch_id TEXT NOT NULL, collector_id TEXT NOT NULL, ts INTEGER NOT NULL,
+      dns_log_quiet INTEGER NOT NULL, rss_kb INTEGER, spool_batches INTEGER, uptime_s INTEGER
+    );
+    CREATE INDEX idx_raw_lease_batch ON raw_lease(collector_id, batch_id);
+    CREATE INDEX idx_raw_neigh_batch ON raw_neigh(collector_id, batch_id);
+    CREATE INDEX idx_raw_sighting_batch ON raw_sighting(collector_id, batch_id);
+    CREATE INDEX idx_raw_health_batch ON raw_health(collector_id, batch_id);
     """,
 )
 
@@ -94,6 +140,19 @@ def _enable_wal(conn: sqlite3.Connection) -> None:
             if attempt == WAL_RETRIES - 1:
                 raise
             time.sleep(0.05 * (attempt + 1))
+
+
+@contextmanager
+def immediate(conn: sqlite3.Connection) -> Iterator[None]:
+    """BEGIN IMMEDIATE ... COMMIT; any failure (including COMMIT itself) rolls back."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def migrate(conn: sqlite3.Connection, migrations: Sequence[str]) -> int:

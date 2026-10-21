@@ -13,11 +13,13 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationInfo,
     model_validator,
 )
 
 MAX_WINDOW_SECONDS = 24 * 3600
 FUTURE_WINDOW_SLACK = 300
+MAX_SPOOL_AGE_SECONDS = 24 * 3600  # default; override via validation context 'max_spool_age_s'
 
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _IDENT_PATTERN = r"^[A-Za-z0-9_.-]{1,64}$"  # no '|' (signature field separator)
@@ -123,7 +125,10 @@ class Batch(_Strict):
     health: Health | None = None
 
     @model_validator(mode="after")
-    def _check_window(self) -> Batch:
+    def _check_window(self, info: ValidationInfo) -> Batch:
+        max_age = (info.context or {}).get("max_spool_age_s", MAX_SPOOL_AGE_SECONDS)
+        if self.window_end < self.sent_ts - max_age:
+            raise ValueError("window_end older than the maximum spool age")
         if self.window_end < self.window_start:
             raise ValueError("window_end precedes window_start")
         if self.window_end - self.window_start > MAX_WINDOW_SECONDS:
