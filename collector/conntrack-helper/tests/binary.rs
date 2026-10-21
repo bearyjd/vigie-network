@@ -30,6 +30,22 @@ fn ct_max_file(dir: &std::path::Path, value: &str) -> String {
     p.to_str().unwrap().to_string()
 }
 
+/// Runs a command that must exit by itself; a daemon that wrongly keeps running is killed after
+/// 10 s so a regression fails the test instead of hanging the suite.
+fn output_within_10s(cmd: &mut Command) -> std::process::Output {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t = Instant::now();
+    while child.try_wait().unwrap().is_none() && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    child.wait_with_output().unwrap()
+}
+
 fn wait_for(path: &std::path::Path) {
     let t = Instant::now();
     while !path.exists() && t.elapsed() < Duration::from_secs(5) {
@@ -85,12 +101,12 @@ fn missing_file_and_bad_flag_exit_nonzero_with_message() {
 fn daemon_refuses_world_writable_socket_dir() {
     let d = tmpdir("ww");
     fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
-    let out = Command::new(BIN)
-        .args(["--socket", d.join("c.sock").to_str().unwrap()])
-        .args(["--conntrack-max-file", &ct_max_file(&d, "16384")])
-        .args(["--file", &fixture("ipv6.txt")])
-        .output()
-        .unwrap();
+    let out = output_within_10s(
+        Command::new(BIN)
+            .args(["--socket", d.join("c.sock").to_str().unwrap()])
+            .args(["--conntrack-max-file", &ct_max_file(&d, "16384")])
+            .args(["--file", &fixture("ipv6.txt")]),
+    );
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("world-writable"));
 }
@@ -174,12 +190,12 @@ fn first_daemon_snapshot_is_a_baseline_with_zero_bytes() {
 fn daemon_refuses_a_kernel_table_larger_than_max_flows() {
     let d = tmpdir("ctmax");
     let sock = d.join("c.sock");
-    let out = Command::new(BIN)
-        .args(["--socket", sock.to_str().unwrap()])
-        .args(["--conntrack-max-file", &ct_max_file(&d, "262144\n")])
-        .args(["--file", &fixture("ipv6.txt")])
-        .output()
-        .unwrap();
+    let out = output_within_10s(
+        Command::new(BIN)
+            .args(["--socket", sock.to_str().unwrap()])
+            .args(["--conntrack-max-file", &ct_max_file(&d, "262144\n")])
+            .args(["--file", &fixture("ipv6.txt")]),
+    );
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("nf_conntrack_max is 262144"), "{err}");
@@ -247,12 +263,12 @@ fn daemon_creates_a_missing_socket_dir_0755() {
 fn daemon_refuses_group_writable_socket_dir() {
     let d = tmpdir("gw");
     fs::set_permissions(&d, fs::Permissions::from_mode(0o775)).unwrap();
-    let out = Command::new(BIN)
-        .args(["--socket", d.join("c.sock").to_str().unwrap()])
-        .args(["--conntrack-max-file", &ct_max_file(&d, "16384")])
-        .args(["--file", &fixture("ipv6.txt")])
-        .output()
-        .unwrap();
+    let out = output_within_10s(
+        Command::new(BIN)
+            .args(["--socket", d.join("c.sock").to_str().unwrap()])
+            .args(["--conntrack-max-file", &ct_max_file(&d, "16384")])
+            .args(["--file", &fixture("ipv6.txt")]),
+    );
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("writable"));
 }

@@ -3,7 +3,7 @@
 Crate: `collector/conntrack-helper` (binary `vigie-conntrack`). Implements the root half of the
 PRP-001 §4 privilege split: it reads `/proc/net/nf_conntrack` (root:root 0440 on the GL-XE3000),
 aggregates, and serves the result to the unprivileged agent over a unix socket. std only, no
-dependencies, `#![forbid(unsafe_code)]`, no network access, parses kernel-generated text only.
+dependencies, `#![forbid(unsafe_code)]`, no network access.
 
 ## Status: NOT verified on the router
 
@@ -13,76 +13,151 @@ dependencies, `#![forbid(unsafe_code)]`, no network access, parses kernel-genera
   hand-written. The owner must capture a real sample and run it through the parser (steps below).
 - Not checked on the router: flow-offload behaviour (offloaded flows may not update counters in
   `nf_conntrack`; `[OFFLOAD]`/`[HW_OFFLOAD]` flags are ignored by the parser), the kernel's actual
-  `acct` field order, ICMP/ICMPv6 line shape, and how many entries a busy network really holds.
+  `acct` field order, the placement of `zone=`, ICMP/ICMPv6 line shape, and how many entries a
+  busy network really holds.
+- Not checked anywhere: the chown/lchown step (needs root or a usable second group, neither
+  exists in the dev sandbox); see "Running the tests as root".
+
+## Trust model: what the parser sees
+
+Not "no LAN data". `/proc/net/nf_conntrack` is kernel-generated text, but the **values in it are
+attacker-influenced**: any host that can send packets through the router chooses source and
+destination IPs (spoofed sources included), ports and, by sending or not sending, the counters.
+So the parser treats every field as hostile: bounded line length (4 KiB), bounded input (32 MiB
+per sample), strict numeric/IP parsing (a bad value skips the line, counted in `skipped_lines`),
+bounded memory (see below), and the output is bounded no matter how many distinct sources appear.
+
+The helper emits one record per **src_ip**; it knows no MACs. The agent maps src_ip to MAC via
+the neighbor table.
 
 ## What it does
 
-1. **Parse** each line: `l3name l3num protoname protonum timeout [STATE] <orig tuple> packets= bytes=
-   [flags] <reply tuple> packets= bytes= extras`. Keys `mark= zone= secctx= use=` and unknown
-   `[FLAGS]` are ignored; missing `packets=/bytes=` (acct off) count as 0; `[UNREPLIED]`/`[ASSURED]`
-   are recorded. ICMP uses `id=` as the flow's source-port slot (so two pings differ) and has
-   dport 0. Truncated, garbage, non-UTF-8 and over-long (>4 KiB) lines are skipped and counted in
-   `skipped_lines`; the parser never panics (prefix and noise tests). Input per sample is capped at
-   32 MiB.
-2. **Aggregate** every sample (default 60 s). Flows are keyed by `(proto, original src, dst, sport,
-   dport)`; the original tuple is the LAN-side view even when NAT rewrites the reply.
+1. **Parse** (streamed: lines go straight into the aggregator, no `Vec` of flows).
+   `l3name l3num protoname protonum timeout [STATE] <orig tuple> packets= bytes= [flags]
+   <reply tuple> packets= bytes= extras`. Used: the original tuple, `packets=/bytes=` per
+   direction, `zone=`. Everything else (state words, `[FLAGS]`, `mark= secctx= use=`) is ignored
+   and not stored. ICMP uses `id=` as the source-port slot (two pings differ), dport 0. Truncated,
+   garbage, non-UTF-8 and over-long lines are skipped and counted in `skipped_lines`; the parser
+   never panics (prefix and noise tests).
+   - **acct_off**: if a parsed line has no `bytes=` (kernel accounting off,
+     `nf_conntrack_acct=0`, or a flow created before it was switched on) its counters are zero.
+     That is no longer silent: the snapshot header carries `"acct_off":true` when any parsed line
+     lacked `bytes=`. The agent should treat byte counts as unreliable then and say so.
+2. **Aggregate** every sample (default 60 s). Flows are keyed by `(proto, original src, dst,
+   sport, dport, zone)`; the original tuple is the LAN-side view even when NAT rewrites the reply.
+   - **Duplicates**: identical keys within one sample merge by taking the **max per counter**, not
+     the sum. A duplicated line is not extra traffic and does not disturb the next delta.
    - delta = current - previous counters per direction. If either counter went backwards the
      tuple was reused: delta = current values and it counts as a new flow.
-   - A flow absent from a sample has ended and is forgotten.
+   - **Tombstones**: a flow absent from a sample is remembered for 2 consecutive absences and
+     forgotten on the 3rd. A flow that reappears within that window with counters >= the
+     remembered ones is a continuation (only the growth is reported, lifetime bytes are not
+     counted again); with smaller counters it is a reset (new flow). Tombstones are not active
+     flows (not in `flows`) but count against the memory cap.
    - Tracked state is capped (`--max-flows`, default 32768). Over the cap the **oldest** (first
      seen) tracked flows are evicted. Cost: an evicted long-lived flow later looks new and its
-     cumulative bytes are counted once more. Router max is 16384, so the cap normally never fires.
+     cumulative bytes are counted once more. At startup the daemon reads
+     `/proc/sys/net/netfilter/nf_conntrack_max` (override: `--conntrack-max-file`) and **refuses
+     to run** if it exceeds `--max-flows` (the GL-XE3000 is 16384). Passing `--max-flows`
+     explicitly accepts the risk (a warning is logged). An unreadable file only warns.
    - The first sample after start is a **baseline**: flows are counted but bytes are 0, so
      pre-existing history is not reported as one 60 s delta. (`--once` does not baseline.)
    - Output per `(src_ip, dst_ip, dst_port, proto)`: `bytes_up` (original direction),
      `bytes_down` (reply direction), packets both ways, `flows` (active), `new_flows`.
-   - Top-N by total bytes (`--top-n`, default 512); the remainder is folded into one
-     `"other":true` record per src_ip with summed counters (PRP §4 truncation order). `folded`
-     says how many records were folded.
-   - conntrack has IPs, not MACs: the **agent maps src_ip to MAC** via the neighbor table. Flows
-     whose original source is external (port-forwards, router-originated) are emitted too; the
-     agent decides what to drop.
+   - **Bounded output** (a spoofed-source flood cannot blind monitoring): top-N records by
+     bytes (`--top-n`, default 512, max 2048) stay named. The rest fold into one
+     `"other":true` record per src_ip. Of those, only the top K (`--other-k`, default 64, max
+     2048; most bytes first, LAN/private sources ahead of public ones among equals) are kept; all
+     remaining ones fold into ONE `"other_global":true` record with `"src":"0.0.0.0"` carrying
+     the summed counters. Totals are preserved exactly; at most `top_n + K + 1` records, so a
+     line is far below the 2 MiB publisher cap (16384 distinct v6 sources: ~90 KiB, test
+     `tests/flood.rs`). `folded` says how many per-destination records were folded.
+     Limitation: ranking is by bytes first, so a spoofer that moves more bytes than a quiet LAN
+     host can push that host into the global remainder.
+   - Flows whose original source is external (port-forwards, router-originated) are emitted
+     too; the agent decides what to drop.
 3. **Serve**: one JSON line per interval to the connected reader, example:
-   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"folded":0,"evicted":0,"records":[{"src":"192.168.8.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
+   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"acct_off":false,"folded":0,"evicted":0,"records":[{"src":"192.168.8.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
    `ts` comes from the router clock (no RTC): the agent should stamp by its own sane clock and use
-   `seq` for ordering. Only one reader is served (a new connection replaces the old). With no
-   reader the snapshot is dropped; a slow reader gets at most one queued snapshot (<= 2 MiB) and
-   later ones are dropped (`DroppedBusy`). Sampling never blocks.
+   `seq` for ordering.
+   - **One reader at a time.** A new connection never cuts a line already in flight: it waits
+     (one slot, newest wins) until the current line has been fully written, then takes over and
+     the previous reader is closed. A reader that connects and never reads therefore holds the
+     slot until its connection closes; with a dedicated uid only the agent can connect, and an
+     agent restart closes its old connection.
+   - With no reader the snapshot is dropped; a slow reader gets at most one queued snapshot
+     (<= 2 MiB) and later ones are dropped (`DroppedBusy`). Sampling never blocks.
 
-## Socket safety
+## Socket and uid safety
 
-- Refuses to start if the socket directory is a symlink, not a directory, world-writable (sticky
-  does not excuse it), or owned by anyone other than root or the helper's own uid. Not the agent's
-  uid: root chmods/chowns in that directory, so a less-privileged owner must not control it.
-- Refuses a symlink or non-socket at the socket path; a stale socket is replaced.
-- The socket is bound inside a private `0700` staging directory, chmod 0600, chowned to
-  `--uid/--gid` (`std::os::unix::fs::chown`), verified (type, mode exactly 0600, owner), then
-  renamed into place. Nobody can connect before mode/owner are right. Verified again after rename.
+- **Directory.** The helper creates the socket directory itself (mkdir 0755) if it is absent. If
+  it exists it must be a real directory (not a symlink), owned by root (or the helper's own uid
+  when not run as root, for tests), with **no group- or other-write bit** (`mode & 0o022 == 0`,
+  sticky does not excuse it). Otherwise it refuses with a message and does not repair anything.
+  Do **not** share this directory with the agent's own files.
+- **Socket.** Refuses a symlink or non-socket at the socket path; a stale socket is replaced.
+  The socket is bound inside a fresh `0700` staging directory with a random name (64 bits from
+  `/dev/urandom`; a pre-existing directory of any name is never deleted or reused), chmod 0600,
+  `lchown`ed (never follows a symlink) to `--uid/--gid`, verified (type, mode exactly 0600,
+  owner), then renamed into place and verified again. Before the chmod, the lchown and the rename
+  the staged path is re-checked to still be the very socket we created (same device and inode,
+  not a symlink); after the rename the installed path is checked again and removed if it is not
+  ours. The staging directory is cleaned with `remove_file` + `remove_dir`, never recursively.
+  Residual: `chmod` and `rename` are path based (std has no `fchmodat(NOFOLLOW)`), so a swap in
+  the microseconds between the re-check and the call is only detectable afterwards; the staging
+  directory is `0700` root-owned, so only root-equivalent code could race it.
+- **Dedicated uid.** The helper refuses `--uid 0` and `--uid 65534` (nobody) unless
+  `--allow-shared-uid` is given. A uid shared with other services means every one of them can
+  read conntrack data (who talks to whom). Use a dedicated `vigie` user for the agent.
 - As root without `--uid` it refuses to start (the agent could not connect).
 - No `setuid`/`setgid` (no unsafe, no libc): it stays root; the surface is a parser of
   kernel text plus one 0600 socket. No signal handlers: after SIGTERM a stale socket remains and is
-  replaced at the next start.
+  replaced at the next start. A crash can leave a `.vigie-stage-*` directory inside the socket
+  directory; inspect it and remove it by hand (the helper never deletes a directory it did not
+  just create in this run).
+- Check `/proc/sys/fs/protected_symlinks` (should be `1`) on the router: it stops root from
+  following symlinks planted by other users in sticky world-writable directories such as `/tmp`.
+  The helper does not depend on it, but it is cheap defence in depth.
+
+## Dedicated user on OpenWrt (commands for the OWNER, run by hand on the router)
+
+The helper does not create users. Pick a free id (here 10001) and check
+`grep -E ':(10001):' /etc/passwd /etc/group` first. Then:
+
+```sh
+echo 'vigie:x:10001:' >> /etc/group
+echo 'vigie:x:10001:10001:vigie:/var/empty:/bin/false' >> /etc/passwd
+# optional, only if the router uses shadow:
+grep -q '^vigie:' /etc/shadow || echo 'vigie:x:0:0:99999:7:::' >> /etc/shadow
+id vigie     # expect uid=10001(vigie) gid=10001(vigie)
+```
+
+The shell `/bin/false` (or `/sbin/nologin` if present) means nobody can log in as it.
 
 ## procd
 
-Run as root as its own service; the agent is a separate service under `nobody`:
+Run as root as its own service; the agent is a separate service under the `vigie` user:
 
 ```sh
 # /etc/init.d/vigie-conntrack (sketch)
 USE_PROCD=1
 START=96
 start_service() {
-    mkdir -p /tmp/vigie && chmod 0755 /tmp/vigie    # root-owned, not world-writable
     procd_open_instance
     procd_set_param command /usr/bin/vigie-conntrack \
-        --socket /tmp/vigie/conntrack.sock --uid 65534 --gid 65534 --interval 60
+        --socket /tmp/vigie/conntrack.sock --uid 10001 --gid 10001 --interval 60
     procd_set_param respawn
     procd_close_instance
 }
 ```
 
+No `mkdir` in the init script: the helper creates `/tmp/vigie` (0755, root) itself. If something
+else already created it wrongly (symlink, group/other-writable, not root-owned) the helper refuses
+to start and says why. Look at it with `ls -ld /tmp/vigie` and, if it is not yours, remove or fix
+it by hand after inspecting what it is; the helper and these docs never remove it.
+
 The agent connects to `/tmp/vigie/conntrack.sock` and reads newline-delimited JSON. The agent's own
-files (dnsmasq log etc.) should live in a different directory, since this one must not be agent-owned.
+files (dnsmasq log etc.) should live in a different directory.
 
 ## Router test steps (owner)
 
@@ -93,44 +168,70 @@ Binary: `collector/target/aarch64-unknown-linux-musl/release/vigie-conntrack`
 2. On the router, capture a raw sample first (this validates the assumed format):
    `head -5 /proc/net/nf_conntrack` (and `grep -m2 ipv6 /proc/net/nf_conntrack`,
    `grep -m2 -E 'icmp|unknown' /proc/net/nf_conntrack`). **Mask IPs** (e.g. keep the first two
-   octets, replace the rest with `x`) and paste it back. Also `cat /proc/sys/net/netfilter/nf_conntrack_acct`
-   and `ls /sys/module/nf_flow_table 2>&1` (flow offload).
+   octets, replace the rest with `x`) and paste it back. Also
+   `cat /proc/sys/net/netfilter/nf_conntrack_acct /proc/sys/net/netfilter/nf_conntrack_max
+   /proc/sys/fs/protected_symlinks` and `ls /sys/module/nf_flow_table 2>&1` (flow offload).
 3. `/tmp/vigie-conntrack --once --file /proc/net/nf_conntrack > /tmp/ct.json; echo rc=$?`
-   Paste back `head -c 1500 /tmp/ct.json`, masked, and the `"skipped_lines"` value. A high
-   `skipped_lines` means the format assumption is wrong.
-4. Daemon smoke test (also gives memory): `mkdir -p /tmp/vigie && chmod 755 /tmp/vigie;
-   /tmp/vigie-conntrack --uid 65534 --gid 65534 --interval 10 & sleep 12; ls -l /tmp/vigie/;
-   grep -E 'VmRSS|VmHWM' /proc/$!/status; kill $!`.
-   Expect `srw-------` owned by `nobody` (this is the chown check the host tests could not run),
-   and paste back the two Vm lines. If `socat` is installed,
-   `socat - UNIX-CONNECT:/tmp/vigie/conntrack.sock` as nobody shows a snapshot line every 10 s.
+   Paste back `head -c 1500 /tmp/ct.json`, masked, and the `"skipped_lines"` and `"acct_off"`
+   values. A high `skipped_lines` means the format assumption is wrong.
+4. Create the `vigie` user (section above), then the daemon smoke test (also gives memory):
+   `/tmp/vigie-conntrack --uid 10001 --gid 10001 --interval 10 & sleep 12; ls -ld /tmp/vigie;
+   ls -l /tmp/vigie/; grep -E 'VmRSS|VmHWM' /proc/$!/status; kill $!`.
+   Expect a root-owned `drwxr-xr-x` directory and `srw-------` owned by `vigie` (this is the
+   lchown check the host tests could not run), and paste back the two Vm lines. If `socat` is
+   installed, `socat - UNIX-CONNECT:/tmp/vigie/conntrack.sock` as `vigie` shows a snapshot line
+   every 10 s.
+
+## Running the tests as root
+
+The chown/lchown tests need a group the test user can chown to. As an ordinary user they use a
+supplementary group if one is usable and otherwise print `SKIPPED ... <reason>` and pass (run with
+`-- --nocapture` to see it). As root they always run and **fail loudly** if the chown does not
+work. Owner, on a machine where you have sudo:
+
+```sh
+cd collector && sudo -E "$(command -v cargo)" test -p vigie-conntrack -- --nocapture
+```
+
+(equivalent to `sudo cargo test -p vigie-conntrack`; `-E`/the explicit path only keep your
+toolchain visible to root). The dev sandbox for this work had no sudo, so this was **not** run.
 
 ## Test and build evidence (host, x86_64)
 
-- `cargo test -p vigie-conntrack`: 58 tests pass (46 unit, 6 fixture, 5 binary/e2e, 1 RSS).
-  `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
-- Release build `aarch64-unknown-linux-musl` (rust-lld): **396 KiB**, static, stripped. Not run
-  (no emulator); only built.
-- Memory, 16384 synthetic entries (the router's `nf_conntrack_max`), host x86_64:
-  - `--once`, musl release: **10.6 MB** max RSS; 800 entries (typical): **0.5 MB**.
-  - Daemon (glibc, two samples, so previous-sample state plus new state): peak VmHWM **16.7 MB**
-    (VmRSS 9.6 MB after). `tests/rss.rs` asserts peak <= 24 MB. Roughly 1 KB per tracked entry.
-  - This is above the 10 MB RSS budget in PRP §4 only at a completely full table; that budget
-    covers the collector, and the helper is a separate process. If it matters, the next step is
-    streaming parse into the aggregator instead of a `Vec<Flow>` (saves ~2 MB).
-- Hand mutation check (each mutant run against lib + fixtures + binary tests):
-  - Killed: delta computation (2), counter-reset conditions (each of the four counters
-    individually, `<` vs `<=`), reset-counts-as-new, baseline (3), vanished-flow pruning, eviction
-    cutoff / off-by-one / disabled / keeps-oldest (5), top-N (n+1, order), per-src fold (4),
-    aggregation key (dport, dst), duplicate summing, world-writable check (2), dir owner check,
-    dir and target symlink refusal, non-socket refusal, socket mode (loose and removed), owner and
-    group verification (3), socket type check, chmod value, staging cleanup, publisher
-    busy/size-cap/error-drop/newline/replace logic, IPv6 family check, tcp port requirement,
-    over-long line detection, input byte cap, reply counter parsing, blank-line counting.
-  - Survived: `topn <` (equivalent: with `len == n` the split is empty either way); staged and
-    final `verify_socket` calls removed (equivalent: they re-check what the preceding calls just
-    did, kept as defence in depth); staging dir mode 0700 -> 0777 (not observable from tests: the
-    dir is removed before `bind_secure` returns); **chown skipped (a real gap)**: chown needs root
-    or a usable supplementary group, and this sandbox has neither, so
-    `bind_chowns_socket_to_requested_group` skips here. Run `cargo test` as root (or check
-    `ls -l /tmp/vigie/` on the router per step 5) to cover it.
+- `cargo test -p vigie-conntrack`: **87 tests pass** (68 unit, 11 binary/e2e, 6 fixture, 1 flood,
+  1 RSS). `cargo clippy -p vigie-conntrack --all-targets -- -D warnings` and `cargo fmt --check`
+  clean. Not run as root (no sudo): the chown and lchown-swap tests print `SKIPPED` here.
+- Release build `aarch64-unknown-linux-musl` (rust-lld): **401 KiB** (410720 bytes), static,
+  stripped. Not run (no emulator); only built.
+- Memory, attacker-shaped input: 16384 DISTINCT IPv6 sources (generated by the tests, not
+  committed), host x86_64, `--once`, static musl release, `/usr/bin/time -v` max RSS:
+  - before this change: **12.5 MB** and a 2.17 MB output line (over the 2 MiB cap, so every daemon
+    sample would have been dropped as too large);
+  - after: **6.6-6.7 MB** (3 runs) and a 90 KB line. Peak is the state hash table (16384 flows
+    grow it to 32768 buckets; the old table coexists with the new one while it rehashes).
+  - `tests/rss.rs` runs the daemon (glibc debug build) on the same shape of table and asserts
+    peak growth over idle <= 7 MB (measured 6.1 MB; idle there is 2.5 MB because of glibc and
+    unoptimised code) and an absolute ceiling of 12 MB. That test cannot assert the musl 8 MB
+    figure itself; the musl number above is a manual measurement.
+  - Changes: parse streams into the aggregator (no `Vec<Flow>`), `Flow` dropped its state and
+    flag fields, one hash map holds previous and current counters, records are sorted/folded in
+    place, the snapshot `String` is moved into the publisher instead of cloned.
+- Mutation check (hand-applied mutants, each run against the whole suite):
+  - Killed: delta, reset (never; reply.packets only), eviction (disabled; keeps oldest), other-cap K
+    disabled, global remainder dropped, LAN-first ranking, zone key, duplicate sum instead of max,
+    tombstone (none; 1 absence only), baseline off in the daemon, acct_off (never; counter),
+    dir symlink check, target symlink check, `0o022` -> `0o002`, no re-check before chmod, no
+    post-rename re-check, predictable staging name, dir created 0750, dir owner check removed,
+    in-flight line truncated, uid refusal removed / only 0, nf_conntrack_max check removed.
+  - **Survived: `lchown` -> `chown`.** Observable only with a group the user can chown to; the dev
+    sandbox has none and no root, so `symlink_swapped_in_before_lchown_is_never_followed` skips.
+    Run the tests as root (above) to cover it. **Not verified.**
+  - Survived (equivalent): no re-check before the rename. The post-rename re-check catches the
+    same swap and removes the imposter, so the outcome is identical; the pre-check only avoids
+    the rename.
+  - Two mutants made the suite hang rather than fail (daemon kept running); the binary refusal
+    tests now kill a daemon after 10 s so a regression fails cleanly.
+- Test order: the agg/cli tests were run red against the old behaviour first (6 agg tests and the
+  shared-uid test failed, then passed after the fix). For the socket, publisher and binary tests
+  the signatures changed, so red was shown by reverting each fix as a mutant (list above) rather
+  than by running the new test on the old code.
