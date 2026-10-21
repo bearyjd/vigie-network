@@ -1,0 +1,8 @@
+# Cross-compiling without a C cross toolchain: use the rust-lld shipped with rustup.
+# musl targets bundle their own crt objects and libc (self-contained), and this
+# workspace has no C dependencies, so no gcc is needed.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
