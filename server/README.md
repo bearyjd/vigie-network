@@ -26,7 +26,8 @@ TLS is mandatory. The service refuses to start without `--tls-cert`/`--tls-key` 
 `--insecure-dev` (or `VIGIE_INSECURE_DEV=1`) is given; never use that outside development.
 
 ```sh
-export VIGIE_DATA_DIR=/var/lib/vigie          # inventory.db + raw-YYYYMMDD.db
+export VIGIE_DATA_DIR=/var/lib/vigie          # raw-YYYYMMDD.db shards + .ingest.lock (+ inventory.db by default)
+# export VIGIE_INVENTORY_PATH=/inv/inventory.db  # optional: inventory.db on its own volume
 export VIGIE_SECRETS_DIR=/run/secrets         # collector_key_<key_id> files (podman secrets)
 export VIGIE_SHARD_RETENTION_DAYS=7           # 1..30 (hard max 30)
 uv run python -m vigie_ingest.admin provision rtr-1 k1   # register collector id + key id
@@ -159,7 +160,9 @@ Contract: `../api/openapi.yaml` (OpenAPI 3.1, emitted as JSON, which is valid YA
 on drift). Regenerate with `uv run python -m vigie_api.openapi_export`.
 
 ```sh
-export VIGIE_DATA_DIR=/var/lib/vigie      # inventory.db (opened read-only) + overrides.db (rw)
+export VIGIE_DATA_DIR=/var/lib/vigie      # default home of inventory.db (opened read-only) + overrides.db (rw)
+# export VIGIE_INVENTORY_PATH=/inv/inventory.db        # address them directly (the container deployment does;
+# export VIGIE_OVERRIDES_PATH=/overrides/overrides.db  # see docs/deploy.md): no path under VIGIE_DATA_DIR then
 uv run python -m vigie_api tokens create --id control-app   # prints the token once, stores SHA-256
 uv run python -m vigie_api tokens revoke control-app
 uv run python -m vigie_api --host <LAN-IP> --port 8444 --tls-cert ... --tls-key ...

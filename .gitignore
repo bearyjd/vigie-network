@@ -9,3 +9,13 @@ __pycache__/
 .env
 target/
 dist/
+
+# Key material and generated provisioning output, wherever it lands (deploy/gen-certs.sh and
+# deploy/provision-collector.sh write next to themselves by default, but --out can be anywhere).
+**/server.key
+**/*.key
+**/key-*
+collector-*/
+certs*/
+pins.txt
+*.secret

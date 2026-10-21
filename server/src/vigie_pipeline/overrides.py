@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
 MAX_LINK_DEPTH = 32
+logger = logging.getLogger("vigie_pipeline")
 
 
 def overrides_uri(path: Path) -> str:
@@ -15,13 +17,25 @@ def overrides_uri(path: Path) -> str:
 
 
 def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
-    """Open overrides.db with mode=ro (URI) plus query_only; None when it does not exist yet.
+    """Open overrides.db with mode=ro (URI) plus query_only.
+
+    Returns None when there is nothing usable: the file does not exist yet, or it cannot be read
+    (corrupt, unreadable, or a read-only mount whose writer holds no connection). None means "no
+    identity links, no rules": the pipeline then trusts nothing from overrides.db (it never
+    reads None as permission), and an unreadable file is logged at ERROR so it is noticed.
     The file is never created, written, or migrated from here."""
     if not path.exists():
         return None
-    conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
+    try:
+        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # really readable?
+    except sqlite3.Error as exc:
+        logger.error(
+            "overrides_unreadable path=%s error=%s: continuing with no identity links", path, exc
+        )
+        return None
     return conn
 
 

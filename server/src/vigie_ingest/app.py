@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 
 from fastapi import FastAPI, Request
@@ -15,9 +15,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
-from vigie_ingest import auth, store
+from vigie_ingest import auth, keeper, store
 from vigie_ingest.config import Settings
-from vigie_ingest.db import connect, open_inventory
+from vigie_ingest.db import SHARD_RE, connect, open_inventory
 from vigie_ingest.lock import exclusive_data_dir
 from vigie_ingest.models import Batch
 from vigie_ingest.ratelimit import RateLimiter
@@ -208,6 +208,7 @@ def create_app(
                 stack.enter_context(exclusive_data_dir(settings.data_dir))
             settings.data_dir.mkdir(parents=True, exist_ok=True)
             active = _require_keys(settings)
+            stack.enter_context(_keepers(settings))
             peer_limiter.set_trusted_capacity(active * TRUSTED_PEERS_PER_COLLECTOR)
             task = asyncio.create_task(_maintenance_loop(settings, clock))
             try:
@@ -252,6 +253,22 @@ def create_app(
         return JSONResponse(payload, status_code=status)
 
     return app
+
+
+@contextlib.contextmanager
+def _keepers(settings: Settings) -> Iterator[None]:
+    """Hold inventory.db and every existing raw shard open while serving (see keeper.py)."""
+    k = keeper.Keeper()
+    keeper.ACTIVE = k
+    try:
+        k.hold(settings.inventory_path)
+        for shard in sorted(settings.data_dir.glob("raw-*.db")):
+            if SHARD_RE.fullmatch(shard.name) and shard.is_file() and not shard.is_symlink():
+                k.hold(shard)
+        yield
+    finally:
+        keeper.ACTIVE = None
+        k.close()
 
 
 def _require_keys(settings: Settings) -> int:

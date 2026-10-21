@@ -1,0 +1,10 @@
+# Build-backend pins for the container build (UV_BUILD_CONSTRAINT in deploy/Containerfile).
+# server/pyproject.toml says `requires = ["hatchling"]` unpinned; uv.lock does not cover build
+# requirements, so without this file every image build would fetch whatever hatchling is newest.
+# Versions looked up on PyPI on 2026-10-21; bump deliberately. No hashes: a hash-pinned build
+# environment is not implemented.
+hatchling==1.32.4
+pathspec==1.1.1
+packaging==26.3
+pluggy==1.7.0
+trove-classifiers==2026.9.21.13
