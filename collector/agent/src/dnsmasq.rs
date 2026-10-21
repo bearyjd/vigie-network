@@ -157,6 +157,11 @@ fn parse_dhcp(id: &str, rest: &str) -> Option<LogEvent> {
 
 #[derive(Debug, Default)]
 struct DhcpPartial {
+    /// MAC of the `DHCPREQUEST`/`DHCPDISCOVER` that opened this entry (normalized).
+    mac: Option<String>,
+    /// Two different MACs (or data without a request) shared this serial: nothing here can be
+    /// attributed to the ACKed MAC, so no fingerprint fields are emitted.
+    tainted: bool,
     opt55: Vec<u8>,
     class: Option<String>,
     name: Option<String>,
@@ -184,26 +189,66 @@ impl DhcpAssembler {
 
     pub fn feed(&mut self, ev: &LogEvent) -> Option<Lease> {
         match ev {
-            LogEvent::DhcpRequest { id, .. } => {
-                self.entry(id);
+            LogEvent::DhcpRequest { id, mac } => {
+                let mac = crate::mac::normalize(mac);
+                let p = self.entry(id);
+                // The serial is attacker-chosen: a second MAC on it, or fingerprint lines that
+                // came before any request, poison the entry for good.
+                let foreign = match (&p.mac, &mac) {
+                    (Some(old), new) => Some(old) != new.as_ref(),
+                    (None, _) => p.has_fingerprint(),
+                };
+                if foreign || mac.is_none() {
+                    p.taint();
+                }
+                if p.mac.is_none() {
+                    p.mac = mac;
+                }
             }
             // dnsmasq may split a long list over several lines (assumed); accumulate.
             LogEvent::DhcpOptions { id, opt55 } => {
                 let p = self.entry(id);
-                p.opt55.extend(opt55.iter().copied());
-                p.opt55.truncate(MAX_OPT55);
+                if !p.tainted {
+                    p.opt55.extend(opt55.iter().copied());
+                    p.opt55.truncate(MAX_OPT55);
+                }
             }
-            LogEvent::DhcpVendor { id, class } => self.entry(id).class = Some(class.clone()),
-            LogEvent::DhcpName { id, name } => self.entry(id).name = Some(name.clone()),
+            LogEvent::DhcpVendor { id, class } => {
+                let p = self.entry(id);
+                if !p.tainted {
+                    p.class = Some(class.clone());
+                }
+            }
+            LogEvent::DhcpName { id, name } => {
+                let p = self.entry(id);
+                if !p.tainted {
+                    p.name = Some(name.clone());
+                }
+            }
             LogEvent::DhcpAck { id, mac, ip, name } => {
-                let p = self.partial.remove(id).unwrap_or_default();
+                let mut p = self.partial.remove(id).unwrap_or_default();
                 self.order.retain(|o| o != id);
+                if p.mac.is_none() || p.mac != crate::mac::normalize(mac) {
+                    p.taint();
+                }
                 let host = name.as_deref().or(p.name.as_deref());
                 return Lease::new(mac, ip, host, &p.opt55, p.class.as_deref());
             }
             LogEvent::Query { .. } | LogEvent::Answer { .. } => {}
         }
         None
+    }
+}
+
+impl DhcpPartial {
+    fn has_fingerprint(&self) -> bool {
+        !self.opt55.is_empty() || self.class.is_some() || self.name.is_some()
+    }
+    fn taint(&mut self) {
+        self.tainted = true;
+        self.opt55.clear();
+        self.class = None;
+        self.name = None;
     }
 }
 
