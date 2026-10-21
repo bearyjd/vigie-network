@@ -11,6 +11,10 @@ TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
 PROMOTION_CAP_DEFAULT = 20
 
 
+def _opt_path(value: str | None) -> Path | None:
+    return Path(value) if value else None
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     data_dir: Path
@@ -18,6 +22,9 @@ class PipelineConfig:
     transient_min_dwell_s: int = TRANSIENT_MIN_DWELL_DEFAULT_S
     promotion_cap_per_hour: int = PROMOTION_CAP_DEFAULT
     migrate: bool = False  # let the pipeline apply ingest-owned migrations (bootstrap)
+    # Direct locations (VIGIE_INVENTORY_PATH / VIGIE_OVERRIDES_PATH); None = under data_dir.
+    inventory_db: Path | None = None
+    overrides_db: Path | None = None
 
     def __post_init__(self) -> None:
         if self.transient_window_s < 1:
@@ -27,11 +34,11 @@ class PipelineConfig:
 
     @property
     def inventory_path(self) -> Path:
-        return self.data_dir / "inventory.db"
+        return self.inventory_db or self.data_dir / "inventory.db"
 
     @property
     def overrides_path(self) -> Path:
-        return self.data_dir / "overrides.db"
+        return self.overrides_db or self.data_dir / "overrides.db"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> PipelineConfig:
@@ -47,4 +54,6 @@ class PipelineConfig:
             promotion_cap_per_hour=int(
                 source.get("VIGIE_PROMOTION_CAP_PER_HOUR", PROMOTION_CAP_DEFAULT)
             ),
+            inventory_db=_opt_path(source.get("VIGIE_INVENTORY_PATH")),
+            overrides_db=_opt_path(source.get("VIGIE_OVERRIDES_PATH")),
         )

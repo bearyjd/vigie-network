@@ -1,34 +1,37 @@
 #!/bin/sh
-# Container entrypoint: when VIGIE_LINK_OVERRIDES=1 (api, pipeline), make
-# $VIGIE_DATA_DIR/overrides.db a symlink to the separate overrides volume, then exec the command.
+# Container entrypoint. With VIGIE_GUARD_OVERRIDES=1 (api, pipeline) it checks, before exec'ing the
+# command, that nothing ingest can write could stand in for the trusted overrides.db.
 #
-# Why: the api and the pipeline both derive overrides.db from VIGIE_DATA_DIR (no separate
-# setting), but overrides.db lives on its own volume so that ingest never mounts it and so it can
-# be backed up on its own. SQLite names -wal/-shm after the resolved path, so they land on the
-# overrides volume too.
-#
-# Safety: never replaces anything. An existing symlink must already point at the right target;
-# a regular file at that path (human labels created by an earlier layout) makes the container
-# refuse to start rather than be shadowed or deleted.
+# Why: api and pipeline trust overrides.db (identity links, rules, API tokens). They address it
+# directly through VIGIE_OVERRIDES_PATH on its own volume, which ingest never mounts. If a file or
+# symlink named overrides.db existed in a directory ingest CAN write (the raw/data volume or the
+# inventory volume), a compromised ingest could plant something there, and anything that still
+# resolved the default <data dir>/overrides.db would trust it. So the container refuses to start:
+#   - VIGIE_OVERRIDES_PATH is unset (the code would fall back to <data dir>/overrides.db), or
+#   - VIGIE_OVERRIDES_PATH lies inside the data dir or the inventory dir, or
+#   - overrides.db exists AT ALL (file, symlink, even a dangling one) in either of those.
+# Nothing is ever deleted or repaired here; a human removes the stale entry.
 set -eu
 
 DATA_DIR="${VIGIE_DATA_DIR:-/var/lib/vigie}"
-TARGET="${VIGIE_OVERRIDES_TARGET:-/overrides/overrides.db}"
-LINK="$DATA_DIR/overrides.db"
+INVENTORY_DIR=$(dirname -- "${VIGIE_INVENTORY_PATH:-$DATA_DIR/inventory.db}")
 
-if [ "${VIGIE_LINK_OVERRIDES:-0}" = 1 ]; then
-	if [ ! -L "$LINK" ] && [ ! -e "$LINK" ]; then
-		# Two containers may race here; "File exists" from the loser is fine, re-checked below.
-		ln -s "$TARGET" "$LINK" 2>/dev/null || true
-	fi
-	if [ ! -L "$LINK" ]; then
-		echo "vigie-entrypoint: refusing: $LINK exists and is not a symlink to $TARGET" >&2
-		exit 70
-	fi
-	if [ "$(readlink "$LINK")" != "$TARGET" ]; then
-		echo "vigie-entrypoint: refusing: $LINK points at $(readlink "$LINK"), expected $TARGET" >&2
-		exit 70
-	fi
+refuse() {
+	echo "vigie-entrypoint: refusing: $1" >&2
+	exit 70
+}
+
+if [ "${VIGIE_GUARD_OVERRIDES:-0}" = 1 ]; then
+	OVERRIDES="${VIGIE_OVERRIDES_PATH:-}"
+	[ -n "$OVERRIDES" ] || refuse "VIGIE_OVERRIDES_PATH is not set"
+	for dir in "$DATA_DIR" "$INVENTORY_DIR"; do
+		case "$OVERRIDES" in
+		"$dir"/*) refuse "VIGIE_OVERRIDES_PATH ($OVERRIDES) is inside $dir, which ingest can write" ;;
+		esac
+		if [ -e "$dir/overrides.db" ] || [ -L "$dir/overrides.db" ]; then
+			refuse "$dir/overrides.db exists (stale file or link); remove it by hand"
+		fi
+	done
 fi
 
 exec "$@"

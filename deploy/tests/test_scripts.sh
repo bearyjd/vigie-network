@@ -169,28 +169,40 @@ check "needs a collector id" test $? -ne 0
 
 # ---- entrypoint.sh ---------------------------------------------------------------------------
 E="$DEPLOY/entrypoint.sh"
-D="$T/data"
-mkdir "$D"
-VIGIE_LINK_OVERRIDES=1 VIGIE_DATA_DIR="$D" VIGIE_OVERRIDES_TARGET=/overrides/overrides.db sh "$E" true
-check "entrypoint creates symlink" test "$(readlink "$D/overrides.db")" = /overrides/overrides.db
-VIGIE_LINK_OVERRIDES=1 VIGIE_DATA_DIR="$D" VIGIE_OVERRIDES_TARGET=/overrides/overrides.db sh "$E" true
-check "entrypoint is idempotent" test "$(readlink "$D/overrides.db")" = /overrides/overrides.db
-D2="$T/data2"
-mkdir "$D2"
-echo human-labels >"$D2/overrides.db"
-VIGIE_LINK_OVERRIDES=1 VIGIE_DATA_DIR="$D2" sh "$E" true >/dev/null 2>&1
-check "entrypoint refuses a regular overrides.db (70)" test $? -eq 70
-check "regular file untouched" test "$(cat "$D2/overrides.db")" = human-labels
-D3="$T/data3"
-mkdir "$D3"
-ln -s /elsewhere/overrides.db "$D3/overrides.db"
-VIGIE_LINK_OVERRIDES=1 VIGIE_DATA_DIR="$D3" sh "$E" true >/dev/null 2>&1
-check "entrypoint refuses a symlink to the wrong target" test $? -eq 70
-D4="$T/data4"
-mkdir "$D4"
-VIGIE_DATA_DIR="$D4" sh "$E" true
-check "no link without VIGIE_LINK_OVERRIDES" test ! -e "$D4/overrides.db" -a ! -L "$D4/overrides.db"
-check "entrypoint execs its command" test "$(VIGIE_DATA_DIR="$D4" sh "$E" echo hi)" = hi
+ep() { # ep DATA_DIR INVENTORY_PATH OVERRIDES_PATH CMD... ; guard on
+	d=$1 i=$2 o=$3
+	shift 3
+	VIGIE_GUARD_OVERRIDES=1 VIGIE_DATA_DIR="$d" VIGIE_INVENTORY_PATH="$i" VIGIE_OVERRIDES_PATH="$o" sh "$E" "$@"
+}
+mkdir -p "$T/raw" "$T/inv" "$T/ovr"
+ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" true >/dev/null 2>&1
+check "entrypoint passes on clean volumes" test $? -eq 0
+check "entrypoint execs its command" test "$(ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" echo hi)" = hi
+check "entrypoint creates nothing" test ! -e "$T/raw/overrides.db" -a ! -L "$T/raw/overrides.db"
+echo human-labels >"$T/raw/overrides.db"
+ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" true >/dev/null 2>&1
+check "refuses a regular overrides.db in the data dir (70)" test $? -eq 70
+check "regular file left untouched" test "$(cat "$T/raw/overrides.db")" = human-labels
+rm -f "$T/raw/overrides.db"
+ln -s /overrides/overrides.db "$T/raw/overrides.db"
+ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" true >/dev/null 2>&1
+check "refuses a (dangling) symlink in the data dir (70)" test $? -eq 70
+check "symlink left untouched" test -L "$T/raw/overrides.db"
+rm -f "$T/raw/overrides.db"
+ln -s /nonexistent/x "$T/inv/overrides.db"
+ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" true >/dev/null 2>&1
+check "refuses a stale link in the inventory dir (70)" test $? -eq 70
+rm -f "$T/inv/overrides.db"
+ep "$T/raw" "$T/inv/inventory.db" "" true >/dev/null 2>&1
+check "refuses when VIGIE_OVERRIDES_PATH is unset (70)" test $? -eq 70
+ep "$T/raw" "$T/inv/inventory.db" "$T/raw/sub/overrides.db" true >/dev/null 2>&1
+check "refuses an overrides path inside the data dir (70)" test $? -eq 70
+ep "$T/raw" "$T/inv/inventory.db" "$T/inv/overrides.db" true >/dev/null 2>&1
+check "refuses an overrides path inside the inventory dir (70)" test $? -eq 70
+echo planted >"$T/raw/overrides.db"
+VIGIE_DATA_DIR="$T/raw" sh "$E" true >/dev/null 2>&1
+check "guard is off without VIGIE_GUARD_OVERRIDES (ingest)" test $? -eq 0
+rm -f "$T/raw/overrides.db"
 
 # ---- healthcheck.py (argument dispatch; the live TLS probe was run by hand against real servers)
 H="$DEPLOY/healthcheck.py"

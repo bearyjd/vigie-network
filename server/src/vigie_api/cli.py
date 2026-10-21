@@ -88,8 +88,10 @@ def _serve_main(argv: list[str]) -> int:
 
 def _tokens_main(argv: list[str]) -> int:
     args = _tokens_parser().parse_args(argv)
-    data_dir = Path(args.data_dir or os.environ.get("VIGIE_DATA_DIR", "/var/lib/vigie"))
-    conn = open_overrides(data_dir / "overrides.db")
+    settings = Settings.from_env()
+    if args.data_dir:  # an explicit --data-dir wins over VIGIE_OVERRIDES_PATH
+        settings = Settings(data_dir=Path(args.data_dir))
+    conn = open_overrides(settings.overrides_path)
     try:
         if args.command == "create":
             return _create_token(conn, args.token_id)

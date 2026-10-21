@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = Settings.from_env()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.inventory_path.parent.mkdir(parents=True, exist_ok=True)
     conn = open_inventory(settings.inventory_path)
     try:
         if args.cmd == "provision":

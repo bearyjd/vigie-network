@@ -39,6 +39,7 @@ class Settings:
     max_spool_age_s: int = 86400
     shard_retention_days: int = SHARD_RETENTION_DEFAULT_DAYS
     batch_retention_days: int = BATCH_RETENTION_DAYS
+    inventory_db: Path | None = None  # VIGIE_INVENTORY_PATH; None = <data_dir>/inventory.db
 
     def __post_init__(self) -> None:
         if not 1 <= self.shard_retention_days <= SHARD_RETENTION_MAX_DAYS:
@@ -56,7 +57,7 @@ class Settings:
 
     @property
     def inventory_path(self) -> Path:
-        return self.data_dir / "inventory.db"
+        return self.inventory_db or self.data_dir / "inventory.db"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -64,6 +65,9 @@ class Settings:
         return cls(
             data_dir=Path(source.get("VIGIE_DATA_DIR", "/var/lib/vigie")),
             secrets_dir=Path(source.get("VIGIE_SECRETS_DIR", "/run/secrets")),
+            inventory_db=Path(source["VIGIE_INVENTORY_PATH"])
+            if source.get("VIGIE_INVENTORY_PATH")
+            else None,
             rate_limit_ipv6_prefix=_ipv6_prefix(source.get("VIGIE_RATE_LIMIT_IPV6_PREFIX")),
             max_spool_age_s=int(source.get("VIGIE_MAX_SPOOL_AGE_S", 86400)),
             rate_limit_preauth_per_min=int(source.get("VIGIE_RATE_LIMIT_PREAUTH_PER_MIN", 120)),
