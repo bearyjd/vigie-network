@@ -126,7 +126,7 @@ mod tests {
             sets.push(s);
         }
         let mut s = BTreeSet::new();
-        assert!(!e.admit(ip(256 as u32), &mut s, "x".into()));
+        assert!(!e.admit(ip(256_u32), &mut s, "x".into()));
         assert_eq!(e.dropped, 1);
         // a known source keeps its remaining quota
         assert!(e.admit(ip(0), &mut s, "y".into()));

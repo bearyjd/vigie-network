@@ -73,6 +73,8 @@ mod tests {
         assert!(r.reuse_address().unwrap(), "SO_REUSEADDR");
         assert!(r.reuse_port().unwrap(), "SO_REUSEPORT");
         assert_eq!(s.read_timeout().unwrap(), Some(Duration::from_millis(50)));
+        // we ask for 256 KiB; the kernel clamps to rmem_max and reports double, but never ~2 KiB
+        assert!(r.recv_buffer_size().unwrap() >= 100_000, "SO_RCVBUF");
     }
 
     #[test]
@@ -94,12 +96,27 @@ mod tests {
         common(&s);
     }
 
-    /// Any interface where the v6 join works (CI sandboxes differ); None if there is none.
+    /// A plain v6 multicast join on `idx`, independent of our code: tells us whether this
+    /// environment can join at all, so a failure of `mdns_v6` is never mistaken for "no support".
+    fn baseline_join_works(idx: u32) -> bool {
+        let Ok(s) = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) else {
+            return false;
+        };
+        let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+        s.join_multicast_v6(&group, idx).is_ok()
+    }
+
+    /// The first interface where a plain join works. `mdns_v6` MUST then succeed on it.
     fn v6_socket() -> Option<(UdpSocket, u32)> {
         for e in fs::read_dir("/sys/class/net").ok()?.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if let (Ok(s), Ok(idx)) = (mdns_v6(&name), ifindex(&name)) {
-                return Some((s, idx));
+            let Ok(idx) = ifindex(&name) else { continue };
+            if !baseline_join_works(idx) {
+                continue;
+            }
+            match mdns_v6(&name) {
+                Ok(s) => return Some((s, idx)),
+                Err(e) => panic!("mdns_v6({name}) failed although a plain join works: {e}"),
             }
         }
         None
@@ -128,6 +145,7 @@ mod tests {
     fn ifindex_rejects_path_tricks() {
         assert!(ifindex("").is_err());
         assert!(ifindex("../lo").is_err());
+        assert!(ifindex("lo/../lo").is_err()); // resolves to a real file, so only the '/' check stops it
         assert!(ifindex("no-such-iface").is_err());
     }
 }

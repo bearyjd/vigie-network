@@ -134,6 +134,17 @@ mod tests {
             (s.own_packets, s.offlink_packets, s.parse_errors),
             (0, 0, 0)
         );
+        assert_eq!(s.mdns_truncated, 0);
+    }
+
+    #[test]
+    fn ssdp_falls_back_to_user_agent_and_st() {
+        let mut s = Stats::default();
+        let m = "M-SEARCH * HTTP/1.1\r\nST: ssdp:all\r\nUSER-AGENT: UA/9\r\n\r\n";
+        s.on_ssdp(&filter(), addr("192.168.1.50:1900"), m.as_bytes());
+        assert!(s.ssdp_servers.contains("UA/9"));
+        assert!(s.ssdp_nt.contains("ssdp:all"));
+        assert_eq!(s.ssdp_methods.get("M-SEARCH"), Some(&1));
     }
 
     #[test]
@@ -172,7 +183,11 @@ mod tests {
         let mut s = Stats::default();
         for i in 0..70 {
             let label = format!("h{i}");
-            s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&[&label, "local"]));
+            s.on_mdns(
+                &filter(),
+                addr("192.168.1.66:5353"),
+                &query(&[&label, "local"]),
+            );
         }
         assert_eq!(s.mdns_names.len(), 64);
         assert_eq!(s.evidence.dropped, 6);
@@ -183,15 +198,27 @@ mod tests {
         let mut s = Stats::default();
         for i in 0..64 {
             let label = format!("h{i}");
-            s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&[&label, "local"]));
+            s.on_mdns(
+                &filter(),
+                addr("192.168.1.66:5353"),
+                &query(&[&label, "local"]),
+            );
         }
         // quota exhausted: a new service type must not slip into `services` or `names`
-        s.on_mdns(&filter(), addr("192.168.1.66:5353"), &query(&["_late", "_tcp", "local"]));
+        s.on_mdns(
+            &filter(),
+            addr("192.168.1.66:5353"),
+            &query(&["_late", "_tcp", "local"]),
+        );
         assert!(s.mdns_services.is_empty(), "{:?}", s.mdns_services);
         assert_eq!(s.mdns_names.len(), 64);
         assert_eq!(s.evidence.dropped, 2); // the name and its service suffix
-        // another source is unaffected
-        s.on_mdns(&filter(), addr("192.168.1.67:5353"), &query(&["_ok", "_tcp", "local"]));
+                                           // another source is unaffected
+        s.on_mdns(
+            &filter(),
+            addr("192.168.1.67:5353"),
+            &query(&["_ok", "_tcp", "local"]),
+        );
         assert!(s.mdns_services.contains("_ok._tcp.local"));
     }
 
@@ -199,9 +226,8 @@ mod tests {
     fn ssdp_flood_is_quota_limited_across_all_three_sets() {
         let mut s = Stats::default();
         for i in 0..30 {
-            let m = format!(
-                "NOTIFY * HTTP/1.1\r\nSERVER: srv{i}\r\nNT: nt{i}\r\nUSN: usn{i}\r\n\r\n"
-            );
+            let m =
+                format!("NOTIFY * HTTP/1.1\r\nSERVER: srv{i}\r\nNT: nt{i}\r\nUSN: usn{i}\r\n\r\n");
             s.on_ssdp(&filter(), addr("192.168.1.66:1900"), m.as_bytes());
         }
         let kept = s.ssdp_servers.len() + s.ssdp_nt.len() + s.ssdp_usn.len();
@@ -222,7 +248,11 @@ mod tests {
         }
         for i in 0..8 {
             let label = format!("svc{i}");
-            s.on_mdns(&filter(), addr("192.168.1.50:5353"), &query(&["x", &label, "_tcp", "local"]));
+            s.on_mdns(
+                &filter(),
+                addr("192.168.1.50:5353"),
+                &query(&["x", &label, "_tcp", "local"]),
+            );
         }
         assert_eq!(s.evidence.dropped, 0);
     }

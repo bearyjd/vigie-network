@@ -5,7 +5,7 @@ use std::fs;
 
 use crate::filter::Filter;
 use crate::stats::Stats;
-use crate::Args;
+use crate::{Args, Notes};
 
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -44,7 +44,7 @@ fn kb_json(key: &str) -> String {
     proc_kb(key).map_or("null".to_string(), |v| v.to_string())
 }
 
-pub fn summary(args: &Args, f: &Filter, s: &Stats, m6_note: &str) -> String {
+pub fn summary(args: &Args, f: &Filter, s: &Stats, notes: &Notes) -> String {
     let methods: Vec<String> = s
         .ssdp_methods
         .iter()
@@ -53,7 +53,7 @@ pub fn summary(args: &Args, f: &Filter, s: &Stats, m6_note: &str) -> String {
     format!(
         concat!(
             "{{\"secs\":{},\"addr\":{},\"prefix\":{},\"iface\":{},",
-            "\"mdns6\":{},",
+            "\"mdns6\":{},\"ssdp_socket\":{},\"own_v6_unknown\":{},",
             "\"packets\":{{\"mdns4\":{},\"mdns6\":{},\"ssdp\":{}}},",
             "\"own_packets\":{},\"offlink_packets\":{},\"read_errors\":{},",
             "\"parse_errors\":{},\"mdns_truncated\":{},\"evidence_dropped\":{},\"own_v6_addrs\":{},",
@@ -65,7 +65,9 @@ pub fn summary(args: &Args, f: &Filter, s: &Stats, m6_note: &str) -> String {
         esc(&args.addr.to_string()),
         args.prefix,
         args.iface.as_deref().map_or("null".to_string(), esc),
-        esc(m6_note),
+        esc(&notes.mdns6),
+        esc(&notes.ssdp),
+        notes.own_v6_unknown,
         s.mdns4_packets,
         s.mdns6_packets,
         s.ssdp_packets,
@@ -115,7 +117,16 @@ mod tests {
             ..Stats::default()
         };
         st.evidence.dropped = 7;
-        let j = summary(&args, &f, &st, "x\"y");
+        let j = summary(
+            &args,
+            &f,
+            &st,
+            &Notes {
+                mdns6: "x\"y".into(),
+                ssdp: "failed: busy".into(),
+                own_v6_unknown: true,
+            },
+        );
         for want in [
             "\"own_packets\":3",
             "\"offlink_packets\":4",
@@ -124,6 +135,8 @@ mod tests {
             "\"evidence_dropped\":7",
             "\"prefix\":24",
             "\"mdns6\":\"x\\\"y\"",
+            "\"ssdp_socket\":\"failed: busy\"",
+            "\"own_v6_unknown\":true",
         ] {
             assert!(j.contains(want), "{want} missing in {j}");
         }

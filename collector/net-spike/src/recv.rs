@@ -38,6 +38,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limits_are_the_documented_values() {
+        assert_eq!(std::hint::black_box(MAX_CONSECUTIVE_ERRORS), 100);
+        assert_eq!(ERROR_BACKOFF, Duration::from_millis(50));
+    }
+
+    #[test]
     fn timeouts_are_not_errors() {
         for k in [
             ErrorKind::WouldBlock,
@@ -58,23 +64,23 @@ mod tests {
     #[test]
     fn fatal_exactly_at_the_limit() {
         let mut t = ErrTracker::default();
-        for i in 1..MAX_CONSECUTIVE_ERRORS {
+        for i in 1..100 {
             assert!(!t.on_error(), "error {i}");
         }
         assert!(t.on_error());
-        assert_eq!(t.total, u64::from(MAX_CONSECUTIVE_ERRORS));
+        assert_eq!(t.total, 100);
     }
 
     #[test]
     fn success_resets_the_run_but_not_the_total() {
         let mut t = ErrTracker::default();
-        for _ in 0..MAX_CONSECUTIVE_ERRORS - 1 {
+        for _ in 0..99 {
             t.on_error();
         }
         t.on_ok();
-        for _ in 0..MAX_CONSECUTIVE_ERRORS - 1 {
+        for _ in 0..99 {
             assert!(!t.on_error());
         }
-        assert_eq!(t.total, 2 * u64::from(MAX_CONSECUTIVE_ERRORS - 1));
+        assert_eq!(t.total, 198_u64);
     }
 }
