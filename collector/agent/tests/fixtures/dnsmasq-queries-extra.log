@@ -1,0 +1,19 @@
+Oct 20 14:00:01 dnsmasq[1234]: 1 192.168.1.50/53422 query[A] example.com from 192.168.1.50
+Oct 20 14:00:01 dnsmasq[1234]: 1 192.168.1.50/53422 forwarded example.com to 9.9.9.9
+Oct 20 14:00:01 dnsmasq[1234]: 1 192.168.1.50/53422 reply example.com is 93.184.216.34
+Oct 20 14:00:02 dnsmasq[1234]: 2 192.168.1.50/53423 query[AAAA] example.com from 192.168.1.50
+Oct 20 14:00:02 dnsmasq[1234]: 2 192.168.1.50/53423 cached example.com is 2606:2800:220:1:248:1893:25c8:1946
+Oct 20 14:00:03 dnsmasq[1234]: 3 192.168.1.51/40000 query[HTTPS] www.apple.com from 192.168.1.51
+Oct 20 14:00:03 dnsmasq[1234]: 3 192.168.1.51/40000 forwarded www.apple.com to 9.9.9.9
+Oct 20 14:00:03 dnsmasq[1234]: 3 192.168.1.51/40000 reply www.apple.com is <CNAME>
+Oct 20 14:00:03 dnsmasq[1234]: 3 192.168.1.51/40000 reply www.apple.com.edgekey.net is 23.45.67.89
+Oct 20 14:00:04 dnsmasq[1234]: 4 fe80::1c2d:3e4f:5a6b:7c8d/51515 query[A] tracker.bad.example from fe80::1c2d:3e4f:5a6b:7c8d
+Oct 20 14:00:04 dnsmasq[1234]: 4 fe80::1c2d:3e4f:5a6b:7c8d/51515 config tracker.bad.example is NXDOMAIN
+Oct 20 14:00:05 dnsmasq[1234]: 5 192.168.1.60/12345 query[PTR] 50.1.168.192.in-addr.arpa from 192.168.1.60
+Oct 20 14:00:05 dnsmasq[1234]: 5 192.168.1.60/12345 reply 192.168.1.50 is Pixel-8.lan
+Oct 20 14:00:06 dnsmasq[1234]: 6 192.168.1.99/1111 query[A] unknown.client.test from 192.168.1.99
+Oct 20 14:00:06 dnsmasq[1234]: 6 192.168.1.99/1111 reply unknown.client.test is NODATA-IPv4
+Oct 20 14:00:07 dnsmasq[1234]: started, version 2.85 cachesize 150
+Oct 20 14:00:07 dnsmasq[1234]: using nameserver 9.9.9.9#53
+this line is garbage
+Oct 20 14:00:08 dnsmasq[1234]: 7 192.168.1.50/53424 query[TXT] weird name "with" quotes.example from 192.168.1.50
