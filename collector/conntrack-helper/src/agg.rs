@@ -146,6 +146,10 @@ pub struct Aggregator {
     cfg: AggConfig,
     state: HashMap<FlowKey, Entry>,
     stubs: HashMap<u64, Stub>,
+    /// Hashes of tombstones evicted by the cap (sample stamp), to notice when one comes back.
+    forgotten: HashMap<u64, u64>,
+    /// Evicted-tombstone flows that returned (and are counted again) in the current sample.
+    tomb_recounts: usize,
     hasher: RandomState,
     stub_seq: u64,
     next_seq: u64,
@@ -159,6 +163,8 @@ impl Aggregator {
             cfg,
             state: HashMap::new(),
             stubs: HashMap::new(),
+            forgotten: HashMap::new(),
+            tomb_recounts: 0,
             hasher: RandomState::new(),
             stub_seq: 0,
             next_seq: 0,
@@ -208,6 +214,15 @@ impl Aggregator {
                 } else {
                     self.stubs.remove(&stub_key(&self.hasher, v.key()))
                 };
+                if stub.is_none()
+                    && !self.forgotten.is_empty()
+                    && self
+                        .forgotten
+                        .remove(&stub_key(&self.hasher, v.key()))
+                        .is_some()
+                {
+                    self.tomb_recounts += 1;
+                }
                 v.insert(Entry {
                     base: stub.map_or_else(Pair::default, |s| s.pair),
                     cur,
@@ -278,7 +293,8 @@ impl Aggregator {
             true
         });
         self.next_seq = next_seq;
-        let (evicted, recounted_flows) = self.enforce_cap();
+        let (evicted, dropped_stubs) = self.enforce_cap();
+        let recounted_flows = dropped_stubs + std::mem::take(&mut self.tomb_recounts);
         recs.sort_unstable_by_key(|r| (r.src, r.dst, r.dport, r.proto));
         recs.dedup_by(|b, a| {
             let same = (a.src, a.dst, a.dport, a.proto) == (b.src, b.dst, b.dport, b.proto);
@@ -327,9 +343,14 @@ impl Aggregator {
         });
         let mut evicted_live: Vec<(u64, Pair, u64)> = Vec::with_capacity(from_live);
         let hasher = &self.hasher;
+        let mut forgotten: Vec<u64> = Vec::with_capacity(from_tomb);
         self.state.retain(|key, e| {
             if e.absent > 0 {
-                return tomb_cut.is_none_or(|c| e.seq > c);
+                let keep = tomb_cut.is_none_or(|c| e.seq > c);
+                if !keep {
+                    forgotten.push(stub_key(hasher, key));
+                }
+                return keep;
             }
             match live_cut {
                 Some(c) if e.seq <= c => {
@@ -339,6 +360,15 @@ impl Aggregator {
                 _ => true,
             }
         });
+        let sample = self.sample;
+        self.forgotten
+            .extend(forgotten.into_iter().map(|k| (k, sample)));
+        let over_f = self.forgotten.len().saturating_sub(self.cfg.max_stubs);
+        if over_f > 0 {
+            let mut st: Vec<u64> = self.forgotten.values().copied().collect();
+            let cut = *st.select_nth_unstable(over_f - 1).1;
+            self.forgotten.retain(|_, s| *s > cut);
+        }
         evicted_live.sort_unstable_by_key(|(seq, ..)| *seq);
         for (_, pair, k) in evicted_live {
             self.stub_seq += 1;
@@ -937,6 +967,27 @@ mod tests {
         assert_eq!(new("10.0.0.1"), 0, "live flow kept its state");
         assert_eq!(new("10.0.0.2"), 0);
         assert_eq!(new("10.0.0.3"), 1, "the evicted tombstone returns as new");
+    }
+
+    #[test]
+    fn recounting_a_tombstone_evicted_flow_raises_table_pressure() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 3,
+            max_stubs: 10,
+            ..cfg(true)
+        });
+        let f = |p: u16, up: u64| flow("10.0.0.1", "1.1.1.1", p, 443, up, up);
+        a.ingest(&[f(1, 1000), f(2, 1000), f(3, 1000)]);
+        // flow 3 is absent (tombstone) while a 4th arrives: the tombstone is evicted.
+        let s = a.ingest(&[f(1, 1100), f(2, 1100), f(4, 70)]);
+        assert_eq!(s.evicted, 1);
+        assert!(!s.table_pressure, "nothing was recounted yet");
+        // the dump was racing churn: flow 3 is alive after all and is counted again.
+        let s = a.ingest(&[f(1, 1200), f(2, 1200), f(3, 1000), f(4, 70)]);
+        assert!(s.table_pressure);
+        assert_eq!(s.recounted_flows, 1);
+        let s = a.ingest(&[f(1, 1300), f(2, 1300), f(3, 1100), f(4, 70)]);
+        assert!(!s.table_pressure, "pressure is per sample");
     }
 
     #[test]
