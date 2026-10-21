@@ -17,6 +17,11 @@ pub const MAX_WINDOW_SIGHTINGS: usize = 4096;
 /// Distinct sightings one device may add per window (a chatty or hostile host cannot crowd out
 /// the others). Refusals are counted in `sightings_dropped`.
 pub const SIGHTINGS_PER_MAC_QUOTA: usize = 64;
+/// New distinct sightings admitted per window across all devices. Multicast source addresses are
+/// spoofable, so the per-device quota alone lets a flood spread over many neighbor-table MACs
+/// fill `MAX_WINDOW_SIGHTINGS`; this rate bounds the whole flood. Drops are counted in
+/// `sightings_dropped`.
+pub const SIGHTINGS_ADMIT_PER_WINDOW: usize = 1024;
 
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
@@ -51,6 +56,8 @@ pub struct Window {
     sightings: BTreeMap<SightingKey, Sighting>,
     dns_per_mac: HashMap<String, usize>,
     sightings_per_mac: HashMap<String, usize>,
+    /// Distinct sightings admitted this window (see `SIGHTINGS_ADMIT_PER_WINDOW`).
+    sightings_admitted: usize,
     /// Rows dropped by the caps above, by `truncated` key.
     drops: BTreeMap<String, u64>,
 }
@@ -93,10 +100,14 @@ impl Window {
             return;
         }
         let used = self.sightings_per_mac.get(&s.mac).copied().unwrap_or(0);
-        if self.sightings.len() >= MAX_WINDOW_SIGHTINGS || used >= SIGHTINGS_PER_MAC_QUOTA {
+        if self.sightings.len() >= MAX_WINDOW_SIGHTINGS
+            || self.sightings_admitted >= SIGHTINGS_ADMIT_PER_WINDOW
+            || used >= SIGHTINGS_PER_MAC_QUOTA
+        {
             self.note_drops("sightings_dropped", 1);
             return;
         }
+        self.sightings_admitted += 1;
         self.sightings_per_mac.insert(s.mac.clone(), used + 1);
         self.sightings.insert(key, s);
     }
@@ -308,14 +319,78 @@ mod tests {
     #[test]
     fn the_global_sightings_cap_holds_across_macs() {
         let mut w = Window::default();
-        for i in 0..(MAX_WINDOW_SIGHTINGS + 10) {
+        for i in 0..(SIGHTINGS_ADMIT_PER_WINDOW + 10) {
             w.add_sighting(
                 Sighting::new(&mac_n(i), SightingKind::Ssdp, Some("n"), None, None).unwrap(),
             );
         }
         let (s, drops) = w.take_with_drops();
-        assert_eq!(s.sightings.len(), MAX_WINDOW_SIGHTINGS);
+        assert_eq!(s.sightings.len(), SIGHTINGS_ADMIT_PER_WINDOW);
         assert_eq!(drops.get("sightings_dropped"), Some(&10));
+    }
+
+    #[test]
+    fn a_spoofed_source_flood_is_bounded_per_mac_and_per_window() {
+        let mut w = Window::default();
+        // Real devices announce first.
+        for m in 1..=10 {
+            w.add_sighting(
+                Sighting::new(&mac_n(m), SightingKind::Mdns, Some("real"), None, None).unwrap(),
+            );
+        }
+        // A flood of spoofed source IPs: many victim MACs, each with many distinct names.
+        for m in 100..2100 {
+            for i in 0..8 {
+                let name = format!("spoof{i}");
+                w.add_sighting(
+                    Sighting::new(&mac_n(m), SightingKind::Mdns, Some(&name), None, None).unwrap(),
+                );
+            }
+        }
+        // A victim MAC hammered with distinct names stays within its quota.
+        for i in 0..500 {
+            let name = format!("v{i}");
+            w.add_sighting(
+                Sighting::new(&mac_n(5000), SightingKind::Mdns, Some(&name), None, None).unwrap(),
+            );
+        }
+        let (s, drops) = w.take_with_drops();
+        assert!(
+            s.sightings.len() <= SIGHTINGS_ADMIT_PER_WINDOW,
+            "{} admitted",
+            s.sightings.len()
+        );
+        let of = |m: usize| s.sightings.iter().filter(|x| x.mac == mac_n(m)).count();
+        assert_eq!(
+            (1..=10).map(of).sum::<usize>(),
+            10,
+            "earlier real sightings are never evicted"
+        );
+        assert!(of(5000) <= SIGHTINGS_PER_MAC_QUOTA);
+        assert!(drops["sightings_dropped"] > 0);
+    }
+
+    #[test]
+    fn the_admission_budget_resets_each_window_and_repeats_are_free() {
+        let mut w = Window::default();
+        let add = |w: &mut Window, m: usize| {
+            w.add_sighting(
+                Sighting::new(&mac_n(m), SightingKind::Ssdp, Some("n"), None, None).unwrap(),
+            )
+        };
+        for m in 0..SIGHTINGS_ADMIT_PER_WINDOW + 5 {
+            add(&mut w, m);
+        }
+        add(&mut w, 0); // a repeat costs nothing and is not counted as dropped
+        let (s, drops) = w.take_with_drops();
+        assert_eq!(s.sightings.len(), SIGHTINGS_ADMIT_PER_WINDOW);
+        assert_eq!(drops["sightings_dropped"], 5);
+        add(&mut w, 9000);
+        assert_eq!(
+            w.take().sightings.len(),
+            1,
+            "a new window has a fresh budget"
+        );
     }
 
     #[test]

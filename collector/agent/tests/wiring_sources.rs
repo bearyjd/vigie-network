@@ -17,7 +17,7 @@ use vigie_agent::ctparse::{Kind, Record, Snapshot};
 use vigie_agent::ctsock::{CtConfig, CtReader, CtShared};
 use vigie_agent::mcast::{McConfig, McMsg, McReader, McShared, Pkt};
 use vigie_agent::model::{Health, Meta, Proto};
-use vigie_agent::window::{Window, MAX_WINDOW_SIGHTINGS, SIGHTINGS_PER_MAC_QUOTA};
+use vigie_agent::window::{Window, SIGHTINGS_ADMIT_PER_WINDOW, SIGHTINGS_PER_MAC_QUOTA};
 use vigie_agent::wiring::{flag, Sources, CT_STALE_S, MAX_MC_PER_PUMP};
 use vigie_parse::{mdns, ssdp};
 
@@ -332,10 +332,10 @@ fn the_window_sightings_cap_holds_when_many_sources_flood() {
     }
     f.sources.finish_window(&mut w, 2);
     let (sections, drops) = w.take_with_drops();
-    assert_eq!(sections.sightings.len(), MAX_WINDOW_SIGHTINGS);
+    assert_eq!(sections.sightings.len(), SIGHTINGS_ADMIT_PER_WINDOW);
     assert_eq!(
         drops.get("sightings_dropped"),
-        Some(&((macs * per - MAX_WINDOW_SIGHTINGS) as u64))
+        Some(&((macs * per - SIGHTINGS_ADMIT_PER_WINDOW) as u64))
     );
 }
 

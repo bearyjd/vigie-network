@@ -8,7 +8,7 @@ use vigie_agent::dnsmasq::{parse_line, DnsCorrelator};
 use vigie_agent::model::TAIL_RESERVE;
 use vigie_agent::model::*;
 use vigie_agent::window::{
-    Window, DNS_PER_MAC_QUOTA, MAX_WINDOW_DNS, MAX_WINDOW_SIGHTINGS, SIGHTINGS_PER_MAC_QUOTA,
+    Window, DNS_PER_MAC_QUOTA, MAX_WINDOW_DNS, SIGHTINGS_ADMIT_PER_WINDOW, SIGHTINGS_PER_MAC_QUOTA,
 };
 
 fn mac_n(n: usize) -> String {
@@ -93,7 +93,7 @@ fn window_dns_is_bounded_even_with_many_macs() {
 #[test]
 fn window_sightings_are_bounded_and_counted() {
     let mut w = Window::default();
-    for n in 0..(MAX_WINDOW_SIGHTINGS + 7) {
+    for n in 0..(SIGHTINGS_ADMIT_PER_WINDOW + 7) {
         let s = Sighting::new(
             &mac_n(n / SIGHTINGS_PER_MAC_QUOTA),
             SightingKind::Mdns,
@@ -108,7 +108,7 @@ fn window_sightings_are_bounded_and_counted() {
     let again = Sighting::new(&mac_n(0), SightingKind::Mdns, Some("h0"), None, None).unwrap();
     w.add_sighting(again);
     let (s, drops) = w.take_with_drops();
-    assert_eq!(s.sightings.len(), MAX_WINDOW_SIGHTINGS);
+    assert_eq!(s.sightings.len(), SIGHTINGS_ADMIT_PER_WINDOW);
     assert_eq!(drops["sightings_dropped"], 7);
 }
 
