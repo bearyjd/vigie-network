@@ -48,6 +48,7 @@ class Ingest:
 
     def __init__(self, tmp_path: Path) -> None:
         data, secrets = tmp_path / "data", tmp_path / "secrets"
+        self.data_dir = data
         data.mkdir()
         secrets.mkdir()
         (secrets / f"collector_key_{KEY_ID}").write_text(DEFAULT_KEY.hex())
