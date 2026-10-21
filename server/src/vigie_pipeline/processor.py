@@ -117,6 +117,7 @@ def _apply_batch(
         else:
             device_id = existing["device_id"]
             _update_observation(inv, existing, act)
+            _revive_if_retired(inv, device_id, mac, act, received)
         _touch_devices(inv, overrides, device_id, act)
         _record_hours(inv, device_id, received)
     return created
@@ -147,6 +148,28 @@ def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity, received
         (str(uuid.uuid4()), device_id, first, f"new device {mac}"),
     )
     return device_id
+
+
+def _revive_if_retired(
+    inv: sqlite3.Connection, device_id: str, mac: str, act: MacActivity, received: str
+) -> None:
+    """A retired device seen again goes back to transient with a fresh window; it must earn
+    promotion again. One device_reappeared event per revival."""
+    revived = inv.execute(
+        "UPDATE devices SET status='transient' WHERE id=? AND status='retired'", (device_id,)
+    ).rowcount
+    if not revived:
+        return
+    inv.execute(
+        "INSERT OR REPLACE INTO transient_state (device_id, since) VALUES (?,?)",
+        (device_id, received),
+    )
+    inv.execute("DELETE FROM transient_hours WHERE device_id=?", (device_id,))
+    inv.execute(
+        "INSERT INTO events (id, device_id, ts, kind, severity, summary)"
+        " VALUES (?,?,?,'device_reappeared','info',?)",
+        (str(uuid.uuid4()), device_id, iso_utc(act.last_ts), f"retired device {mac} reappeared"),
+    )
 
 
 def _update_observation(inv: sqlite3.Connection, row: sqlite3.Row, act: MacActivity) -> None:
