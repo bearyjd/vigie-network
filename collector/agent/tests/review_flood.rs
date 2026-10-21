@@ -149,6 +149,8 @@ fn all_truncated_kinds_fit_the_schema_and_the_reserve() {
         "sightings_dropped",
         "dns_pending_evicted",
         "dns_client_throttled",
+        "tail_truncated",
+        "tail_bytes_skipped",
     ] {
         drops.insert(k.into(), u64::MAX);
     }

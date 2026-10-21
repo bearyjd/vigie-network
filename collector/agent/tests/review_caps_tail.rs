@@ -39,6 +39,8 @@ fn final_bytes_never_exceed_cap_sweep() {
         "sightings_dropped",
         "dns_pending_evicted",
         "dns_client_throttled",
+        "tail_truncated",
+        "tail_bytes_skipped",
     ] {
         drops.insert(k.to_string(), u64::MAX);
     }

@@ -4,9 +4,13 @@
 //!   collector restart); a file that appears later, or a new file after rotation, is read from 0.
 //! - Rotation by rename: the old file is drained through the still-open handle, then the new
 //!   file at the path is opened (detected by inode change).
-//! - Truncation in place (the cron watchdog): detected by length < cursor, restart at 0.
+//! - Truncation in place (emergency watchdog) or truncate-and-refill: the tail remembers the 64
+//!   bytes before its cursor and compares them on every poll. A shorter file or different bytes
+//!   restart at offset 0 and drop the partial line, so a cursor that now sits inside a line
+//!   somebody else wrote is never trusted. Resets and lost bytes are counted (`take_counts`).
 //! - Bounded: lines over `MAX_LINE` bytes are dropped, at most `MAX_POLL_BYTES` read per poll.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -14,6 +18,7 @@ use std::path::PathBuf;
 
 pub const MAX_LINE: usize = 4096;
 pub const MAX_POLL_BYTES: u64 = 1024 * 1024;
+const FINGERPRINT: u64 = 64;
 
 pub struct Tail {
     path: PathBuf,
@@ -22,6 +27,10 @@ pub struct Tail {
     carry: Vec<u8>,
     skipping: bool,
     polled_once: bool,
+    /// The (up to) 64 bytes of the file just before `pos`.
+    fingerprint: Vec<u8>,
+    resets: u64,
+    skipped: u64,
 }
 
 impl Tail {
@@ -33,6 +42,9 @@ impl Tail {
             carry: Vec::new(),
             skipping: false,
             polled_once: false,
+            fingerprint: Vec::new(),
+            resets: 0,
+            skipped: 0,
         }
     }
 
@@ -57,6 +69,19 @@ impl Tail {
         Ok(out)
     }
 
+    /// Drained counters, by `truncated` key: cursor resets (`tail_truncated`) and bytes known
+    /// to be lost or discarded (`tail_bytes_skipped`: overlong lines, dropped partial lines).
+    pub fn take_counts(&mut self) -> BTreeMap<String, u64> {
+        [
+            ("tail_truncated", std::mem::take(&mut self.resets)),
+            ("tail_bytes_skipped", std::mem::take(&mut self.skipped)),
+        ]
+        .into_iter()
+        .filter(|(_, v)| *v > 0)
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
     fn open_new(&mut self, at_end: bool) -> io::Result<()> {
         self.carry.clear();
         self.skipping = false;
@@ -64,6 +89,7 @@ impl Tail {
             Ok(f) => {
                 let meta = f.metadata()?;
                 self.pos = if at_end { meta.len() } else { 0 };
+                self.fingerprint = read_before(&f, self.pos)?;
                 self.cur = Some((f, meta.ino()));
                 Ok(())
             }
@@ -93,8 +119,11 @@ impl Tail {
             return Ok(0);
         };
         let len = f.metadata()?.len();
-        if len < self.pos {
+        if len < self.pos || read_before(f, self.pos)? != self.fingerprint {
+            self.resets += 1;
+            self.skipped += self.carry.len() as u64;
             self.pos = 0;
+            self.fingerprint.clear();
             self.carry.clear();
             self.skipping = false;
         }
@@ -105,6 +134,9 @@ impl Tail {
         let mut buf = Vec::new();
         let n = f.take(budget).read_to_end(&mut buf)?;
         self.pos += n as u64;
+        self.fingerprint.extend_from_slice(&buf);
+        let keep = self.fingerprint.len().saturating_sub(FINGERPRINT as usize);
+        self.fingerprint.drain(..keep);
         self.split_lines(&buf, out);
         Ok(n as u64)
     }
@@ -119,12 +151,24 @@ impl Tail {
                 self.skipping = false;
             } else if !self.skipping {
                 if self.carry.len() >= MAX_LINE {
+                    self.skipped += self.carry.len() as u64 + 1;
                     self.carry.clear();
                     self.skipping = true;
                 } else {
                     self.carry.push(b);
                 }
+            } else if b != b'\n' {
+                self.skipped += 1;
             }
         }
     }
+}
+
+/// The (up to) `FINGERPRINT` bytes of `f` that end at `pos`; short when the file is shorter.
+fn read_before(mut f: &File, pos: u64) -> io::Result<Vec<u8>> {
+    let from = pos.saturating_sub(FINGERPRINT);
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::new();
+    f.take(pos - from).read_to_end(&mut buf)?;
+    Ok(buf)
 }

@@ -71,11 +71,43 @@ fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-pub fn parse_line(line: &str) -> Option<LogEvent> {
-    let (head, msg) = line.split_once("]: ")?;
-    if !head.contains("dnsmasq") {
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The message after the exact dnsmasq syslog prefix `<Mon> <d> hh:mm:ss dnsmasq[-dhcp][pid]: `,
+/// anchored at the start of the line. Any text before it (for instance the tail end of a line a
+/// DHCP client wrote into the log) means this is not a line dnsmasq started, so it is refused.
+fn strip_prefix(line: &str) -> Option<&str> {
+    let rest = line
+        .get(..3)
+        .filter(|m| MONTHS.contains(m))
+        .and(line.get(3..))?;
+    let rest = rest.strip_prefix(' ')?;
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    let day_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = rest.get(day_len..).filter(|_| (1..=2).contains(&day_len))?;
+    let rest = rest.strip_prefix(' ')?;
+    let t = rest.as_bytes().get(..8)?;
+    let shape = |i: usize| t[i].is_ascii_digit();
+    if !(shape(0) && shape(1) && t[2] == b':' && shape(3) && shape(4) && t[5] == b':')
+        || !(shape(6) && shape(7))
+    {
         return None;
     }
+    let rest = rest.get(8..)?.strip_prefix(' ')?;
+    let rest = rest.strip_prefix("dnsmasq")?;
+    let rest = rest.strip_prefix("-dhcp").unwrap_or(rest);
+    let rest = rest.strip_prefix('[')?;
+    let pid_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=10).contains(&pid_len) {
+        return None;
+    }
+    rest.get(pid_len..)?.strip_prefix("]: ")
+}
+
+pub fn parse_line(line: &str) -> Option<LogEvent> {
+    let msg = strip_prefix(line)?;
     let (id, rest) = msg.trim().split_once(' ')?;
     if !valid_id(id) {
         return None;

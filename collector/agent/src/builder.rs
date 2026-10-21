@@ -18,8 +18,8 @@ pub const SERVER_MAX_BODY: usize = 512 * 1024;
 pub const IDENTITY_BUDGET: usize = 96 * 1024;
 /// Conntrack is guaranteed this much (or what it needs, if less) before DNS may use the rest.
 pub const CONNTRACK_RESERVE: usize = 48 * 1024;
-/// Room kept for the `truncated` map (the schema allows 16 keys; we emit at most 12).
-pub const TRUNCATED_RESERVE: usize = 512;
+/// Room kept for the `truncated` map (the schema allows 16 keys; we emit at most 14).
+pub const TRUNCATED_RESERVE: usize = 768;
 /// Server rule: a window may span at most 24 h.
 pub const MAX_WINDOW_S: u64 = 24 * 3600;
 /// Server rule: every `dns.ts` must lie within this many seconds of the window.

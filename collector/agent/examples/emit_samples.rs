@@ -178,6 +178,8 @@ fn main() {
         "sightings_dropped",
         "dns_pending_evicted",
         "dns_client_throttled",
+        "tail_truncated",
+        "tail_bytes_skipped",
     ]
     .iter()
     .map(|k| (k.to_string(), i64::MAX as u64))

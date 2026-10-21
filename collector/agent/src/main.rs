@@ -163,7 +163,12 @@ impl Agent {
         for q in self.dns.take_ready(&self.ip_to_mac) {
             self.window.add_dns(q);
         }
-        for (kind, n) in self.dns.take_counts() {
+        for (kind, n) in self
+            .dns
+            .take_counts()
+            .into_iter()
+            .chain(self.tail.take_counts())
+        {
             self.window.note_drops(&kind, n);
         }
     }
