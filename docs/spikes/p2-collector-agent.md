@@ -172,8 +172,8 @@ asserted to stay within the server body limit (`SERVER_MAX_BODY`, 512 KiB).
 
 ## Tests
 
-72 agent tests (17 unit, 55 integration incl. 2 that run the shell scripts) plus the unchanged 91 from the
-spike crates; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
+130 agent tests (17 unit plus integration tests, including 15 that run the shell scripts and the new `review_*` files) and 91 from the
+spike crates (221 in the workspace); `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
 Cross-language: `tests/vectors/signing.json` (12 vectors from the real `vigie_ingest.auth`: empty body,
 unicode, non-UTF-8 bytes, NUL, `|` in body, int64-max seq, max sent_ts, 64-char ids, 256 KiB body) is
 asserted by `agent/tests/signing_vectors.rs`; `tests/vectors/test_rust_batches.py` runs the Rust
@@ -197,11 +197,22 @@ cap in the shift branch (equivalent: 5 << k is at most 160 there) and the tail's
 drained" guard before switching to a rotated file (redundant with the byte budget; it only matters
 for a write racing the drain, which cannot be tested deterministically).
 
+### Mutation run for the review fixes
+
+63 hand-rolled single-edit mutants, `cargo test` after each (the table of mutants lives in the commit message history
+of this branch; the harness was a throwaway script). First pass: 52 killed, 9 survived, 2 did not compile. The tests
+added for the survivors (taint stickiness independent of the ACK check, reserve and spool-accounting assertions,
+`allow_identity_push`) kill all but two: removing the `FlushPlan::Probe` early return and removing the
+`allow_identity_push` call in `main.rs` still pass, because that wiring lives in the binary and has no unit test
+(the decision functions they call are tested and their mutants die). The `BATCH_CAP` above the server limit mutant
+does not compile (a `const` assertion), which counts as killed. Not mutated: `take_counts` -> `note_drops` wiring,
+meta-before-take ordering and the immediate neighbor refresh in `main.rs` (no tests; only reviewed).
+
 ## Results (host, not the router)
 
 | Metric | Value |
 |---|---|
-| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 489,360 bytes (478 KiB); x86_64-musl about 556 KB |
+| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 500,792 bytes (489 KiB) after the review fixes (was 489,360); x86_64-musl about 556 KB before them |
 | Dependencies (runtime) | `hmac`, `sha2` (+ `digest`, `generic-array`, `typenum`, `subtle`, `block-buffer`, `crypto-common`, `cpufeatures`, `cfg-if`) and `vigie-parse`; `serde_json` is a dev-dependency only. No C code |
 | Idle RSS, x86_64-musl on the host, 5 s windows for 40 s, `ip neigh` run each 10 s, tail fed 1 line/5 s | 496 kB at start, 600 kB (VmHWM 600 kB) after 40 s; budget is 10 MB. Slow growth is the empty-batch spool |
 | Not measured | aarch64 RSS (the binary was cross-compiled but never executed; no qemu, no router), CPU, behaviour under load or over 24 h |
