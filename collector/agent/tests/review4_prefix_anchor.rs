@@ -3,7 +3,8 @@
 
 use vigie_agent::dnsmasq::{parse_line, LogEvent};
 
-const GOOD: &str = "Oct 20 14:00:00 dnsmasq-dhcp[1]: 9 DHCPACK(br-lan) 1.2.3.4 de:ad:be:ef:00:09 pwn";
+const GOOD: &str =
+    "Oct 20 14:00:00 dnsmasq-dhcp[1]: 9 DHCPACK(br-lan) 1.2.3.4 de:ad:be:ef:00:09 pwn";
 
 #[test]
 fn control_the_anchored_line_parses() {
@@ -25,7 +26,10 @@ fn a_splice_inside_a_valid_line_never_yields_the_spliced_event() {
         Some(LogEvent::DhcpAck { .. }) => panic!("spliced ack accepted"),
         Some(LogEvent::DhcpName { id, name }) => {
             assert_eq!(id, "1");
-            assert!(name.contains("DHCPACK"), "whole remainder is the name: {name}");
+            assert!(
+                name.contains("DHCPACK"),
+                "whole remainder is the name: {name}"
+            );
         }
         other => panic!("{other:?}"),
     }

@@ -17,7 +17,7 @@ fn tmp(tag: &str) -> PathBuf {
 fn unreadable_is_enforced(d: &std::path::Path) -> bool {
     let p = d.join("probe");
     fs::write(&p, "x").unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
     fs::File::open(&p).is_err()
 }
 
@@ -40,13 +40,19 @@ fn drained_lines_survive_an_unreadable_new_file_and_the_loss_is_counted() {
         .unwrap();
     fs::rename(&log, d.join("dnsmasq.log.1")).unwrap();
     fs::write(&log, "new1\n").unwrap();
-    fs::set_permissions(&log, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let lines = t.poll().expect("drained lines must be returned, not an error");
+    let lines = t
+        .poll()
+        .expect("drained lines must be returned, not an error");
     assert_eq!(lines, vec!["old1", "old2"]);
     let c = t.take_counts();
     assert_eq!(c.get("tail_open_failed"), Some(&1), "{c:?}");
-    assert_eq!(c.get("tail_bytes_skipped"), Some(&7), "partial carry: {c:?}");
+    assert_eq!(
+        c.get("tail_bytes_skipped"),
+        Some(&7),
+        "partial carry: {c:?}"
+    );
 
     // Still unreadable: nothing drained, so the failure is reported as an error, once per poll.
     assert!(t.poll().is_err());
@@ -72,6 +78,10 @@ fn a_dropped_partial_line_on_rotation_is_counted() {
     fs::rename(&log, d.join("dnsmasq.log.1")).unwrap();
     fs::write(&log, "new1\n").unwrap();
     assert_eq!(t.poll().unwrap(), vec!["old1", "new1"]);
-    assert_eq!(t.take_counts().get("tail_bytes_skipped"), Some(&11), "half-a-line");
+    assert_eq!(
+        t.take_counts().get("tail_bytes_skipped"),
+        Some(&11),
+        "half-a-line"
+    );
     fs::remove_dir_all(d).unwrap();
 }

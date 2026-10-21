@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -49,8 +49,14 @@ impl World {
             log: d.join("logs/dnsmasq.log"),
             d,
         };
-        w.stub("logger", &format!("echo \"$*\" >> '{}'", w.syslog_path().display()));
-        w.stub("chown", &format!("echo \"$*\" >> '{}'", w.chown_path().display()));
+        w.stub(
+            "logger",
+            &format!("echo \"$*\" >> '{}'", w.syslog_path().display()),
+        );
+        w.stub(
+            "chown",
+            &format!("echo \"$*\" >> '{}'", w.chown_path().display()),
+        );
         w.stub("pidof", "exit 1");
         w.stub("ubus", "exit 1");
         w
@@ -91,7 +97,14 @@ impl World {
         let (uid, gid) = me();
         let mut c = Command::new("sh");
         c.arg(script("vigie-log-watchdog.sh"))
-            .env("PATH", format!("{}:{}", self.d.join("bin").display(), std::env::var("PATH").unwrap()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.d.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
             .env("VIGIE_TEST", "1")
             .env("VIGIE_TRUSTED_UID", uid.to_string())
             .env("VIGIE_OWNER", format!("{uid}:{gid}"))
@@ -131,7 +144,10 @@ fn new_log_is_chowned_to_the_resolved_dnsmasq_uid_with_group_vigie_and_mode_0640
         "chown args: {:?}",
         w.chowned()
     );
-    assert_eq!(fs::metadata(&w.log).unwrap().permissions().mode() & 0o7777, 0o640);
+    assert_eq!(
+        fs::metadata(&w.log).unwrap().permissions().mode() & 0o7777,
+        0o640
+    );
     assert!(w.rotated());
 }
 
@@ -216,7 +232,9 @@ fn owner_stub(w: &World, uid: u32) {
     let real_stat = real("stat");
     w.stub(
         "stat",
-        &format!("case \"$*\" in \"-c %u \"*dnsmasq.log) echo {uid};; *) exec {real_stat} \"$@\";; esac"),
+        &format!(
+            "case \"$*\" in \"-c %u \"*dnsmasq.log) echo {uid};; *) exec {real_stat} \"$@\";; esac"
+        ),
     );
 }
 
@@ -327,7 +345,10 @@ fn gate_run(w: &World, extra: &[(&str, String)]) -> Output {
     let initd = w.d.join("initd");
     fs::write(&initd, "").unwrap();
     let real_id = real("id");
-    w.stub("id", &format!("[ \"$*\" = '-u' ] && echo 0 || exec {real_id} \"$@\""));
+    w.stub(
+        "id",
+        &format!("[ \"$*\" = '-u' ] && echo 0 || exec {real_id} \"$@\""),
+    );
     let mut envs = vec![("VIGIE_INITD_FILE", initd.display().to_string())];
     envs.extend(extra.iter().cloned());
     w.watchdog("true", &envs) // no log file: a permitted run exits 0
@@ -352,8 +373,14 @@ fn the_force_flag_lets_a_root_test_harness_through() {
 fn root_without_the_init_script_is_not_a_router() {
     let w = World::new();
     let real_id = real("id");
-    w.stub("id", &format!("[ \"$*\" = '-u' ] && echo 0 || exec {real_id} \"$@\""));
-    let o = w.watchdog("true", &[("VIGIE_INITD_FILE", w.d.join("absent").display().to_string())]);
+    w.stub(
+        "id",
+        &format!("[ \"$*\" = '-u' ] && echo 0 || exec {real_id} \"$@\""),
+    );
+    let o = w.watchdog(
+        "true",
+        &[("VIGIE_INITD_FILE", w.d.join("absent").display().to_string())],
+    );
     assert!(o.status.success(), "{}", err(&o));
 }
 
@@ -392,13 +419,24 @@ fn run_wrapper(w: &World, exit: i32, runs: usize) {
             .arg(script("vigie-run.sh"))
             .arg("--config")
             .arg("x")
-            .env("PATH", format!("{}:{}", w.d.join("bin").display(), std::env::var("PATH").unwrap()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    w.d.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
             .env("VIGIE_TEST", "1")
             .env("VIGIE_COLLECTOR_BIN", &fake)
             .env("VIGIE_RUN_STATE_DIR", &state)
             .output()
             .unwrap();
-        assert_eq!(o.status.code(), Some(exit), "wrapper passes the exit code through");
+        assert_eq!(
+            o.status.code(),
+            Some(exit),
+            "wrapper passes the exit code through"
+        );
     }
 }
 
@@ -408,7 +446,12 @@ fn the_wrapper_logs_giving_up_once_the_retry_limit_is_reached() {
     run_wrapper(&w, 78, 4);
     assert!(!w.syslog().contains("giving up"), "{:?}", w.syslog());
     run_wrapper(&w, 78, 1);
-    assert_eq!(w.syslog().matches("giving up").count(), 1, "{:?}", w.syslog());
+    assert_eq!(
+        w.syslog().matches("giving up").count(),
+        1,
+        "{:?}",
+        w.syslog()
+    );
 }
 
 #[test]
@@ -417,6 +460,3 @@ fn the_wrapper_stays_quiet_for_other_exit_codes() {
     run_wrapper(&w, 1, 7);
     assert!(w.syslog().is_empty(), "{:?}", w.syslog());
 }
-
-#[allow(dead_code)]
-fn _unused(_: &Path) {}

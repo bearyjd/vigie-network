@@ -93,7 +93,7 @@ noclobber (`O_EXCL`); the drop-in is written to `mktemp` inside the verified dir
 with `VIGIE_TEST=1` (tests are not root); production ignores them and pins `PATH`.
 **Assumption, not verified on the router:** dnsmasq opens its `log-facility` file as root before dropping
 privileges and `fchown`s it to its run user while keeping the group (from dnsmasq's source), so the file stays
-group-readable by `vigie`. That is why the log may be owned by uid 0, `dnsmasq` or `nobody`. Verify after the first
+group-readable by `vigie`. That is why the log may be owned by uid 0 or by the uid dnsmasq runs as (see "Fourth review fixes"; `nobody` is no longer implied). Verify after the first
 start with the checks in "Re-review fixes" (item 8). Also unverified:
 busybox `stat -c %u/%a`, `mktemp` with a path template and `install` on GL.iNet (they work with the host busybox).
 
@@ -188,6 +188,40 @@ asserted to stay within the server body limit (`SERVER_MAX_BODY`, 512 KiB).
    probe and keeps its data; `push_identity` builds nothing until a server `Date` was seen. Both wiring mutants
    from the previous run (Probe early return, `allow_identity_push`) are killed.
 
+## Fourth review fixes
+
+1. **Prefix anchor test hole.** `strip_prefix` was already anchored; no test would have noticed an unanchored
+   `split_once("dnsmasq-dhcp[")`, which forges a lease from `garbage Oct 20 14:00:00 dnsmasq-dhcp[1]: 9 DHCPACK(...)`.
+   Tests now cover text before a valid prefix and a mid-line splice; that mutant is killed.
+2. **`Tail::poll` no longer loses drained lines.** When the new file after a rotation (or a later read) fails, the lines
+   already drained from the old file are returned and the failure is counted as `tail_open_failed` (a new `truncated`
+   key, 15 of the 16 the schema allows; the cap sweeps include it). With nothing drained, the error is still returned.
+   A partial line dropped on rotation is now counted in `tail_bytes_skipped`.
+3. **euid refusal tested end to end.** `tests/review4_euid_bin.rs` runs the built binary under `unshare -Ur`: exit 77
+   without `--allow-root` even with a bad config path, 78 with it, 78 as a normal user. Skipped with a printed reason
+   when `unshare -Ur` is unavailable.
+4. **Watchdog log ownership.** The new log is no longer a copy of the old owner. The uid dnsmasq runs as is read from
+   `/proc/<pid>/status` (real and effective must agree); the new file is `uid:vigie 0640`. Uid 0 or an unresolved uid:
+   nothing is rotated, `logger` warns, exit 70 (the emergency truncation above 2x the cap still runs). After SIGUSR2 the
+   script waits up to 10 s; a still-empty new file while the old one kept growing is logged.
+5. **Allowed owners** of `dnsmasq.log` and `.1` are root and the resolved dnsmasq uid only (`nobody` is not implied).
+6. **Pid discovery** (`dnsmasq_pid` in `vigie-lib.sh`): the procd instance (`ubus call service list '{"name":"dnsmasq"}'`,
+   parsed with grep), then `/var/run/dnsmasq/dnsmasq.*.pid`, then `pidof dnsmasq`. The first source with any hit
+   decides; more than one distinct pid there is refused. Unverified on the router: the ubus output shape, the pidfile
+   location and names, and that the busybox applets used (`grep -o`, `sort -u`, `test -k`) behave like the host's.
+7. **`VIGIE_TEST` gate.** Refused as euid 0 when `/etc/init.d/vigie-collector` exists, unless the harness also sets
+   `VIGIE_TEST_FORCE_ROOT=1`. The lib also refuses when `/tmp` lacks the sticky bit.
+8. **procd respawn.** `respawn 3600 5 5` (5 retries) instead of unlimited. procd has no "gave up" hook, so the command
+   is the wrapper `vigie-run.sh`, which counts exits 77/78 in `/var/run/vigie-collector/fails` (made by the init script,
+   reset on each start) and logs once when the count reaches 5. Unverified: procd's exact retry off-by-one (the message may
+   come one failure early or never), and that `/var/run` is writable by root at start on this firmware.
+9. **Companion-line order is an assumption.** The assembler attaches `requested options:`, `vendor class:` and
+   `client provides name:` lines to the preceding DHCPREQUEST/DISCOVER/ACK by their position in the log, assuming dnsmasq
+   writes them in that order relative to those lines (from its docs, not from a capture). If real dnsmasq orders them
+   differently, fingerprints (opt55/opt60/name) silently come out empty; leases are still produced. The P0 `logging-on.sh`
+   run and a captured sample decide it. **Owner step:** capture roughly 30 lines around one DHCP exchange from the router's
+   `logread` or `/tmp/vigie/dnsmasq.log`, mask the MACs and hostnames, and add it as a fixture.
+
 ## Findings that change the PRP
 
 0. **Running as `nobody` shares the HMAC key with avahi**, which P0 shows also runs as `nobody`. The
@@ -277,14 +311,14 @@ print helper (uid in use, blind 6700), log dir mode. First pass: 41 killed, 15 s
 mutant, fixed and killed). After tests for the survivors: **52 killed, 5 survive**:
 - `attach ignores mac`, `ack keeps context`, `OFFER not parsed`, `tail len < pos dropped`: equivalent or fully redundant
   (the taint, the removed entry, `break_context` on unparsed lines and the cursor fingerprint each cover them).
-- `main: euid check removed` (the call in `main()` is replaced by `allow_root = true`): the decision function is
-  tested, the call site is not, because exercising it needs a process with euid 0. Reviewed only.
+- `main: euid check removed` (the call in `main()` is replaced by `allow_root = true`): survived this run; killed in the
+  fourth pass by running the built binary under `unshare -Ur`.
 
 ## Results (host, not the router)
 
 | Metric | Value |
 |---|---|
-| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 512,600 bytes (500.6 KiB) after the third-pass fixes (500,792 before them); x86_64-musl about 556 KB before them |
+| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 512,840 bytes (500.8 KiB) after the fourth-pass fixes (512,600 after the third pass); x86_64-musl about 556 KB before them |
 | Dependencies (runtime) | `hmac`, `sha2` (+ `digest`, `generic-array`, `typenum`, `subtle`, `block-buffer`, `crypto-common`, `cpufeatures`, `cfg-if`) and `vigie-parse`; `serde_json` is a dev-dependency only. No C code |
 | Idle RSS, x86_64-musl on the host, 5 s windows for 40 s, `ip neigh` run each 10 s, tail fed 1 line/5 s | 496 kB at start, 600 kB (VmHWM 600 kB) after 40 s; budget is 10 MB. Slow growth is the empty-batch spool |
 | Not measured | aarch64 RSS (the binary was cross-compiled but never executed; no qemu, no router), CPU, behaviour under load or over 24 h |
