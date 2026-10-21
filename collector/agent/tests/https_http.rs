@@ -95,7 +95,8 @@ fn truncated_body_is_an_error() {
 #[test]
 fn chunked_response_is_refused() {
     // Even when a Content-Length is also present (request-smuggling style framing conflict).
-    let both = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+    let both =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
     assert!(post(respond(both.to_vec())).is_err());
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\n{\"duplicate\":true}\r\n0\r\n\r\n";
     assert!(post(respond(raw.to_vec())).is_err());
@@ -110,10 +111,7 @@ fn response_without_content_length_is_refused() {
 #[test]
 fn oversized_responses_are_refused() {
     // Declared too big: refused without reading it all.
-    let declared = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-        CAP + 1
-    );
+    let declared = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", CAP + 1);
     assert!(post(respond(declared.into_bytes())).is_err());
 
     // Honest length, just over the cap in total (headers count).
