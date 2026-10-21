@@ -30,6 +30,7 @@ class Data:
         *,
         collector: str = "rtr-1",
         record: bool = True,
+        received: int | None = None,
         leases: Iterable[tuple] = (),
         neigh: Iterable[str] = (),
         sightings: Iterable[tuple] = (),
@@ -79,7 +80,7 @@ class Data:
             )
             self.inv.execute(
                 "INSERT INTO batches (collector_id, batch_id, received_at) VALUES (?,?,?)",
-                (collector, batch_id, iso_utc(ts)),
+                (collector, batch_id, iso_utc(ts if received is None else received)),
             )
         return batch_id
 

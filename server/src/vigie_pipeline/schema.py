@@ -34,15 +34,35 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
           last_batch_id TEXT NOT NULL,         -- its batch_id: detects rowid reuse after a purge
           updated_at TEXT NOT NULL
         )""",
-        # distinct hours a transient device was seen in (promotion rule); pruned on exit
+        # distinct SERVER-received hours a transient device was seen in; pruned on exit
         """CREATE TABLE IF NOT EXISTS transient_hours (
           device_id TEXT NOT NULL REFERENCES devices(id), hour TEXT NOT NULL,
           PRIMARY KEY (device_id, hour)
         )""",
     ),
+    (
+        # server-side clock only: when a device became (or re-became) transient
+        """CREATE TABLE IF NOT EXISTS transient_state (
+          device_id TEXT PRIMARY KEY REFERENCES devices(id), since TEXT NOT NULL
+        )""",
+        "INSERT OR IGNORE INTO transient_state (device_id, since)"
+        " SELECT id, first_seen FROM devices WHERE status='transient'",
+        # promotions issued per server hour (cap) and whether the rate-limit event was emitted
+        """CREATE TABLE IF NOT EXISTS promotion_log (
+          hour TEXT PRIMARY KEY, promoted INTEGER NOT NULL DEFAULT 0,
+          limited_emitted INTEGER NOT NULL DEFAULT 0
+        )""",
+    ),
 )
 
-PIPELINE_TABLES = ("events", "identity_candidates", "pipeline_cursor", "transient_hours")
+PIPELINE_TABLES = (
+    "events",
+    "identity_candidates",
+    "pipeline_cursor",
+    "transient_hours",
+    "transient_state",
+    "promotion_log",
+)
 
 
 def apply_pipeline_migrations(conn: sqlite3.Connection) -> int:

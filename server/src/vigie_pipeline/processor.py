@@ -17,7 +17,7 @@ from vigie_pipeline.sources import MacActivity, is_randomized, read_batch
 
 logger = logging.getLogger("vigie_pipeline")
 
-PROMOTE_MIN_HOURS = 2
+PROMOTE_MIN_HOURS = 2  # distinct server-received hours
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     overrides = open_overrides_ro(config.overrides_path)
     try:
         totals = _process_batches(inv, overrides, config)
-        promoted, retired = sweep_transients(inv, clock, config.transient_window_s)
+        promoted, retired = sweep_transients(inv, clock, config)
     finally:
         inv.close()
         if overrides is not None:
@@ -53,10 +53,10 @@ def _process_batches(
     totals = {"batches": 0, "macs": 0, "new_devices": 0, "skipped_macs": 0}
     collectors = [r[0] for r in inv.execute("SELECT DISTINCT collector_id FROM batches")]
     for collector in sorted(collectors):
-        for rowid, batch_id in _pending(inv, collector):
+        for rowid, batch_id, received in _pending(inv, collector):
             acts, skipped = read_batch(config.data_dir, collector, batch_id)
             with immediate(inv):
-                created = _apply_batch(inv, overrides, acts)
+                created = _apply_batch(inv, overrides, acts, received)
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)
@@ -67,7 +67,7 @@ def _process_batches(
     return totals
 
 
-def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str]]:
+def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str, str]]:
     """Recorded batches (batches.rowid order == commit order) past this collector's cursor."""
     row = inv.execute(
         "SELECT last_batch_rowid, last_batch_id FROM pipeline_cursor WHERE collector_id=?",
@@ -83,9 +83,10 @@ def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str]]:
             log(logger, logging.WARNING, "cursor_reset", collector=collector, cursor=cursor)
             cursor = 0
     return [
-        (r[0], r[1])
+        (r[0], r[1], r[2])
         for r in inv.execute(
-            "SELECT rowid, batch_id FROM batches WHERE collector_id=? AND rowid>? ORDER BY rowid",
+            "SELECT rowid, batch_id, received_at FROM batches"
+            " WHERE collector_id=? AND rowid>? ORDER BY rowid",
             (collector, cursor),
         )
     ]
@@ -102,23 +103,26 @@ def _advance_cursor(inv: sqlite3.Connection, collector: str, rowid: int, batch_i
 
 
 def _apply_batch(
-    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, acts: dict[str, MacActivity]
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    acts: dict[str, MacActivity],
+    received: str,
 ) -> int:
     created = 0
     for mac, act in sorted(acts.items()):
         existing = inv.execute("SELECT * FROM observations WHERE mac=?", (mac,)).fetchone()
         if existing is None:
-            device_id = _create_device(inv, mac, act)
+            device_id = _create_device(inv, mac, act, received)
             created += 1
         else:
             device_id = existing["device_id"]
             _update_observation(inv, existing, act)
         _touch_devices(inv, overrides, device_id, act)
-        _record_hours(inv, device_id, act)
+        _record_hours(inv, device_id, received)
     return created
 
 
-def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity) -> str:
+def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity, received: str) -> str:
     device_id = str(uuid.uuid4())
     first, last = iso_utc(act.first_ts), iso_utc(act.last_ts)
     randomized = is_randomized(mac)
@@ -126,6 +130,10 @@ def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity) -> str:
         "INSERT INTO devices (id, first_seen, last_seen, status) VALUES (?,?,?,?)",
         (device_id, first, last, "transient" if randomized else "active"),
     )
+    if randomized:
+        inv.execute(
+            "INSERT INTO transient_state (device_id, since) VALUES (?,?)", (device_id, received)
+        )
     inv.execute(
         "INSERT INTO observations (mac, device_id, is_randomized, dhcp_fingerprint, vendor_class,"
         " hostname, mdns_name, link_source, first_seen, last_seen)"
@@ -174,34 +182,68 @@ def _touch_devices(
         )
 
 
-def _record_hours(inv: sqlite3.Connection, device_id: str, act: MacActivity) -> None:
+def _record_hours(inv: sqlite3.Connection, device_id: str, received: str) -> None:
+    """Persistence is counted in server-received hours; record timestamps are collector-supplied
+    and never count toward promotion."""
     status = inv.execute("SELECT status FROM devices WHERE id=?", (device_id,)).fetchone()[0]
-    if status != "transient":
-        return
-    inv.executemany(
-        "INSERT OR IGNORE INTO transient_hours (device_id, hour) VALUES (?,?)",
-        [(device_id, iso_utc(h * 3600)[:13]) for h in act.hours],
-    )
-
-
-def sweep_transients(inv: sqlite3.Connection, now: float, window_s: int) -> tuple[int, int]:
-    """Promote transients seen on >=2 distinct hours or with a hostname; retire the rest once
-    the window has elapsed since first_seen. Devices are retired, never deleted."""
-    cutoff = iso_utc(now - window_s)
-    with immediate(inv):
-        promoted = inv.execute(
-            "UPDATE devices SET status='active' WHERE status='transient' AND ("
-            " EXISTS (SELECT 1 FROM observations o WHERE o.device_id=devices.id"
-            "         AND o.hostname IS NOT NULL AND o.hostname<>'')"
-            " OR (SELECT COUNT(*) FROM transient_hours h WHERE h.device_id=devices.id) >= ?)",
-            (PROMOTE_MIN_HOURS,),
-        ).rowcount
-        retired = inv.execute(
-            "UPDATE devices SET status='retired' WHERE status='transient' AND first_seen<=?",
-            (cutoff,),
-        ).rowcount
+    if status == "transient":
         inv.execute(
-            "DELETE FROM transient_hours WHERE device_id IN"
-            " (SELECT id FROM devices WHERE status<>'transient')"
+            "INSERT OR IGNORE INTO transient_hours (device_id, hour) VALUES (?,?)",
+            (device_id, received[:13]),
         )
+
+
+def sweep_transients(
+    inv: sqlite3.Connection, now: float, config: PipelineConfig
+) -> tuple[int, int]:
+    """Promote transients seen in >=2 server-received hours with >= min dwell between first and
+    last seen, at most `promotion_cap_per_hour` per server hour; retire the rest once the window
+    has elapsed since they became transient. Devices are retired, never deleted. A hostname is
+    attacker-controlled and is never a promotion signal."""
+    hour = iso_utc(now)[:13]
+    with immediate(inv):
+        promoted = _promote(inv, hour, iso_utc(now), config)
+        retired = inv.execute(
+            "UPDATE devices SET status='retired' WHERE status='transient' AND id IN"
+            " (SELECT device_id FROM transient_state WHERE since<=?)",
+            (iso_utc(now - config.transient_window_s),),
+        ).rowcount
+        for table in ("transient_hours", "transient_state"):
+            inv.execute(
+                f"DELETE FROM {table} WHERE device_id IN"  # noqa: S608
+                " (SELECT id FROM devices WHERE status<>'transient')"
+            )
     return promoted, retired
+
+
+def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:
+    candidates = [
+        r[0]
+        for r in inv.execute(
+            "SELECT d.id FROM devices d WHERE d.status='transient'"
+            " AND (SELECT COUNT(*) FROM transient_hours h WHERE h.device_id=d.id) >= ?"
+            " AND CAST(strftime('%s', d.last_seen) AS INTEGER)"
+            "   - CAST(strftime('%s', d.first_seen) AS INTEGER) >= ?"
+            " ORDER BY d.first_seen, d.id",
+            (PROMOTE_MIN_HOURS, config.transient_min_dwell_s),
+        )
+    ]
+    inv.execute("INSERT OR IGNORE INTO promotion_log (hour) VALUES (?)", (hour,))
+    used, emitted = inv.execute(
+        "SELECT promoted, limited_emitted FROM promotion_log WHERE hour=?", (hour,)
+    ).fetchone()
+    allowed = candidates[: max(0, config.promotion_cap_per_hour - used)]
+    for device_id in allowed:
+        inv.execute("UPDATE devices SET status='active' WHERE id=?", (device_id,))
+    held = len(candidates) - len(allowed)
+    if held and not emitted:
+        inv.execute(
+            "INSERT INTO events (id, device_id, ts, kind, severity, summary)"
+            " VALUES (?,NULL,?,'promotion_rate_limited','warn',?)",
+            (str(uuid.uuid4()), now_iso,
+             f"promotion cap {config.promotion_cap_per_hour}/hour reached; {held} held transient"),
+        )  # fmt: skip
+        inv.execute("UPDATE promotion_log SET limited_emitted=1 WHERE hour=?", (hour,))
+        log(logger, logging.WARNING, "promotion_rate_limited", held=held, hour=hour)
+    inv.execute("UPDATE promotion_log SET promoted=promoted+? WHERE hour=?", (len(allowed), hour))
+    return len(allowed)

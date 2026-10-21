@@ -252,19 +252,12 @@ def test_later_values_fill_but_null_does_not_erase(data):
 # ---- transient promotion / GC -------------------------------------------------------------
 
 
-def test_transient_promoted_with_hostname(data):
-    data.add_batch(leases=[(PHONE, "pixel", None, None)])
-    stats = run(data)
-    assert stats.promoted == 1
-    assert data.q("SELECT status FROM devices")[0]["status"] == "active"
-
-
-def test_transient_promoted_after_two_distinct_hours(data):
+def test_transient_hours_pruned_on_promotion(data):
     data.add_batch(T0, neigh=[PHONE])
     run(data)
     assert data.q("SELECT status FROM devices")[0]["status"] == "transient"
-    data.add_batch(T0 + 5, dns=[(PHONE, T0 + HOUR + 5)])  # same batch ts hour, dns in next hour
-    run(data)
+    data.add_batch(T0 + 3 * HOUR, neigh=[PHONE])
+    run(data, now=T0 + 3 * HOUR + 10)
     assert data.q("SELECT status FROM devices")[0]["status"] == "active"
     assert data.q("SELECT COUNT(*) c FROM transient_hours")[0]["c"] == 0  # pruned on exit
 
