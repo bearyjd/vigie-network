@@ -9,12 +9,17 @@ from urllib.parse import quote
 MAX_LINK_DEPTH = 32
 
 
+def overrides_uri(path: Path) -> str:
+    """Layer 1 of 2: SQLite refuses every write on a mode=ro connection."""
+    return f"file:{quote(str(path.resolve()))}?mode=ro"
+
+
 def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
     """Open overrides.db with mode=ro (URI) plus query_only; None when it does not exist yet.
     The file is never created, written, or migrated from here."""
     if not path.exists():
         return None
-    conn = sqlite3.connect(f"file:{quote(str(path.resolve()))}?mode=ro", uri=True, timeout=5.0)
+    conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     return conn

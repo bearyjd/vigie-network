@@ -34,7 +34,7 @@ class RunStats:
 def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     """Process every recorded, not-yet-processed batch, then promote/retire transients."""
     clock = time.time() if now is None else now
-    inv = open_pipeline_inventory(config.inventory_path)
+    inv = open_pipeline_inventory(config.inventory_path, config.migrate)
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
     try:

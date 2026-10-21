@@ -18,7 +18,7 @@ def tables(conn: sqlite3.Connection) -> set[str]:
 
 
 def test_fresh_database_gets_all_tables(tmp_path):
-    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     assert set(PIPELINE_TABLES) <= tables(conn)
     assert {"devices", "observations", "batches", "collectors"} <= tables(conn)
 
@@ -28,7 +28,7 @@ def test_applies_on_database_already_at_ingest_latest(tmp_path):
     ing = open_inventory(path)
     version = ing.execute("PRAGMA user_version").fetchone()[0]
     ing.close()
-    conn = open_pipeline_inventory(path)
+    conn = open_pipeline_inventory(path)  # no --migrate needed when ingest is current
     assert set(PIPELINE_TABLES) <= tables(conn)
     # pipeline never touches ingest's user_version
     assert conn.execute("PRAGMA user_version").fetchone()[0] == version
@@ -36,14 +36,14 @@ def test_applies_on_database_already_at_ingest_latest(tmp_path):
 
 def test_reapply_is_noop(tmp_path):
     path = tmp_path / "inventory.db"
-    open_pipeline_inventory(path).close()
-    conn = open_pipeline_inventory(path)
+    open_pipeline_inventory(path, migrate=True).close()
+    conn = open_pipeline_inventory(path, migrate=True)
     rows = conn.execute("SELECT version FROM pipeline_schema ORDER BY version").fetchall()
     assert [r[0] for r in rows] == [1, 2]
 
 
 def test_new_device_event_unique_per_device(tmp_path):
-    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
     conn.execute(EVENT_SQL, ("e1", "new_device"))
     with pytest.raises(sqlite3.IntegrityError):
@@ -52,14 +52,14 @@ def test_new_device_event_unique_per_device(tmp_path):
 
 
 def test_delete_trigger_blocks_device_delete(tmp_path):
-    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
     with pytest.raises(sqlite3.IntegrityError, match="never deleted"):
         conn.execute("DELETE FROM devices WHERE id='d'")
 
 
 def test_device_status_check(tmp_path):
-    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO devices (id, first_seen, last_seen, status) VALUES ('d','t','t','bogus')"
@@ -67,7 +67,7 @@ def test_device_status_check(tmp_path):
 
 
 def test_link_source_check(tmp_path):
-    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(

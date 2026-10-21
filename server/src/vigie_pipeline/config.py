@@ -17,6 +17,7 @@ class PipelineConfig:
     transient_window_s: int = TRANSIENT_WINDOW_DEFAULT_S
     transient_min_dwell_s: int = TRANSIENT_MIN_DWELL_DEFAULT_S
     promotion_cap_per_hour: int = PROMOTION_CAP_DEFAULT
+    migrate: bool = False  # let the pipeline apply ingest-owned migrations (bootstrap)
 
     def __post_init__(self) -> None:
         if self.transient_window_s < 1:

@@ -10,8 +10,9 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import quote
 
-from vigie_ingest.db import immediate, open_inventory
+from vigie_ingest.db import INVENTORY_MIGRATIONS, connect, immediate, open_inventory
 
 # Each migration is a tuple of single statements (triggers keep their BEGIN..END intact).
 PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
@@ -81,8 +82,36 @@ def apply_pipeline_migrations(conn: sqlite3.Connection) -> int:
     return len(PIPELINE_MIGRATIONS)
 
 
-def open_pipeline_inventory(path: Path) -> sqlite3.Connection:
-    """Open inventory.db rw: ingest's migrations first (fresh DB), then the pipeline's."""
-    conn = open_inventory(path)
+class SchemaVersionError(RuntimeError):
+    """ingest-owned schema is missing, behind, or newer than this build understands."""
+
+
+def _ingest_schema_version(path: Path) -> int:
+    """Read user_version without writing; 0 for a database that does not exist yet."""
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(f"file:{quote(str(path.resolve()))}?mode=ro", uri=True, timeout=5.0)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def open_pipeline_inventory(path: Path, migrate: bool = False) -> sqlite3.Connection:
+    """Open inventory.db rw. Ingest owns devices/observations/collectors/batches: by default the
+    pipeline only verifies their schema version and refuses to run ingest's migrations; pass
+    migrate=True (CLI --migrate) to bootstrap or upgrade them. A newer schema is always refused."""
+    expected = len(INVENTORY_MIGRATIONS)
+    version = _ingest_schema_version(path)
+    if version > expected:
+        raise SchemaVersionError(
+            f"inventory schema v{version} is newer than this pipeline build (v{expected})"
+        )
+    if version < expected and not migrate:
+        raise SchemaVersionError(
+            f"inventory schema is v{version}, expected v{expected}; start ingest first "
+            "or pass --migrate to let the pipeline apply ingest's migrations"
+        )
+    conn = open_inventory(path) if version < expected else connect(path)
     apply_pipeline_migrations(conn)
     return conn

@@ -21,6 +21,9 @@ logger = logging.getLogger("vigie_pipeline")
 
 MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 RANDOMIZED_DIGITS = frozenset("26ae")  # second hex digit of first octet: locally administered
+ZERO_MAC = "00:00:00:00:00:00"
+OPT55_MAX_ENTRIES = 64
+OPT55_MAX_CHARS = 256
 
 
 class ShardReadError(RuntimeError):
@@ -41,24 +44,32 @@ class MacActivity:
 def normalize_mac(raw: str | None) -> str | None:
     """Lower-case canonical MAC, or None for malformed or multicast/broadcast addresses."""
     mac = (raw or "").strip().lower()
-    if not MAC_RE.match(mac) or int(mac[1], 16) & 1:
+    if not MAC_RE.match(mac) or int(mac[1], 16) & 1 or mac == ZERO_MAC:
         return None
     return mac
 
 
 def is_randomized(mac: str) -> bool:
-    return mac[1] in RANDOMIZED_DIGITS
+    return mac.strip().lower()[1] in RANDOMIZED_DIGITS
+
+
+def _cap_opt55(entries: list[str]) -> str | None:
+    text = ",".join(entries[:OPT55_MAX_ENTRIES])
+    if len(text) > OPT55_MAX_CHARS:
+        text = text[:OPT55_MAX_CHARS].rpartition(",")[0]  # cut on an entry boundary
+    return text or None
 
 
 def opt55_string(raw: str | None) -> str | None:
+    """Canonical 'n,n,n' request-list string, bounded so one lease cannot bloat the table."""
     if not raw:
         return None
     try:
         parsed = json.loads(raw)
     except ValueError:
-        return raw.strip() or None
+        return _cap_opt55([raw.strip()]) if raw.strip() else None
     if isinstance(parsed, list):
-        return ",".join(str(int(x)) for x in parsed if isinstance(x, int)) or None
+        return _cap_opt55([str(x) for x in parsed if isinstance(x, int)])
     return None
 
 
