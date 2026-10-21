@@ -2,11 +2,13 @@
 //! Samples are streamed in with `begin`/`add`/`finish`; no per-sample flow list is kept.
 
 use crate::parse::{Counters, Flow, FlowKey};
-use std::collections::hash_map::Entry as MapEntry;
+use std::collections::hash_map::{Entry as MapEntry, RandomState};
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv4Addr};
 
-pub const DEFAULT_MAX_FLOWS: usize = 32_768;
+/// 3 x the GL-XE3000's nf_conntrack_max (16384): live flows plus two samples of tombstones.
+pub const DEFAULT_MAX_FLOWS: usize = 3 * 16_384;
 pub const DEFAULT_TOP_N: usize = 512;
 pub const DEFAULT_OTHER_K: usize = 64;
 /// Consecutive samples a tracked flow may be absent and still be remembered; it is forgotten on
@@ -19,6 +21,8 @@ pub struct AggConfig {
     pub top_n: usize,
     /// Per-src `other` records kept; the rest fold into one global remainder record.
     pub other_k: usize,
+    /// Compact stubs kept for evicted live flows (see `Aggregator`).
+    pub max_stubs: usize,
     /// First sample only records baselines (no historic bytes are reported as a delta).
     pub baseline_first: bool,
 }
@@ -29,6 +33,7 @@ impl Default for AggConfig {
             max_flows: DEFAULT_MAX_FLOWS,
             top_n: DEFAULT_TOP_N,
             other_k: DEFAULT_OTHER_K,
+            max_stubs: DEFAULT_MAX_FLOWS / 3 * 2,
             baseline_first: true,
         }
     }
@@ -58,6 +63,10 @@ pub struct Snapshot {
     pub folded: usize,
     /// Tracked flows evicted by the memory cap during this sample.
     pub evicted: usize,
+    /// Flows that lost their counters (stub table overflow) and may be counted again.
+    pub recounted_flows: usize,
+    /// The tracking tables were under pressure: some byte counts may be inflated.
+    pub table_pressure: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -109,9 +118,25 @@ struct Entry {
     fresh: bool,
 }
 
+/// What is remembered about a live flow evicted by the cap: its last committed counters, keyed
+/// by a 64-bit hash of the flow key (a collision can only mis-attribute one delta).
+#[derive(Clone, Copy)]
+struct Stub {
+    pair: Pair,
+    /// Eviction order; the smallest is dropped first when the stub table overflows.
+    seq: u64,
+}
+
+fn stub_key(h: &RandomState, key: &FlowKey) -> u64 {
+    h.hash_one(key)
+}
+
 pub struct Aggregator {
     cfg: AggConfig,
     state: HashMap<FlowKey, Entry>,
+    stubs: HashMap<u64, Stub>,
+    hasher: RandomState,
+    stub_seq: u64,
     next_seq: u64,
     sample: u64,
     primed: bool,
@@ -122,6 +147,9 @@ impl Aggregator {
         Self {
             cfg,
             state: HashMap::new(),
+            stubs: HashMap::new(),
+            hasher: RandomState::new(),
+            stub_seq: 0,
             next_seq: 0,
             sample: 0,
             primed: false,
@@ -131,6 +159,11 @@ impl Aggregator {
     /// Flows remembered, including absent ones kept as tombstones.
     pub fn tracked(&self) -> usize {
         self.state.len()
+    }
+
+    /// Compact counter stubs kept for evicted live flows.
+    pub fn stubs(&self) -> usize {
+        self.stubs.len()
     }
 
     /// Starts a new sample.
@@ -157,13 +190,20 @@ impl Aggregator {
             }
             MapEntry::Vacant(v) => {
                 self.next_seq += 1;
+                // A returning evicted flow continues from its stub (a smaller counter than the
+                // stub is a reset, decided in `finish` like for any tracked flow).
+                let stub = if self.stubs.is_empty() {
+                    None
+                } else {
+                    self.stubs.remove(&stub_key(&self.hasher, v.key()))
+                };
                 v.insert(Entry {
-                    base: Pair::default(),
+                    base: stub.map_or_else(Pair::default, |s| s.pair),
                     cur,
                     seq: self.next_seq,
                     seen: self.sample,
                     absent: 0,
-                    fresh: true,
+                    fresh: stub.is_none(),
                 });
             }
         }
@@ -227,7 +267,7 @@ impl Aggregator {
             true
         });
         self.next_seq = next_seq;
-        let evicted = evict_oldest(&mut self.state, self.cfg.max_flows);
+        let (evicted, recounted_flows) = self.enforce_cap();
         recs.sort_unstable_by_key(|r| (r.src, r.dst, r.dport, r.proto));
         recs.dedup_by(|b, a| {
             let same = (a.src, a.dst, a.dport, a.proto) == (b.src, b.dst, b.dport, b.proto);
@@ -241,7 +281,61 @@ impl Aggregator {
             records,
             folded,
             evicted,
+            recounted_flows,
+            table_pressure: recounted_flows > 0,
         }
+    }
+
+    /// Brings the table to `max_flows`: absent flows (tombstones) go first, oldest first; only
+    /// then live flows, oldest first, each leaving a stub. Stubs are capped too; dropping one
+    /// means that flow is counted again if it returns. Returns (evicted, stubs dropped).
+    fn enforce_cap(&mut self) -> (usize, usize) {
+        let over = self.state.len().saturating_sub(self.cfg.max_flows);
+        if over == 0 {
+            return (0, 0);
+        }
+        let mut tomb: Vec<u64> = (self.state.values())
+            .filter(|e| e.absent > 0)
+            .map(|e| e.seq)
+            .collect();
+        let from_tomb = over.min(tomb.len());
+        // `seq` values are unique, so the n-th smallest is an exact cut-off.
+        let tomb_cut = (from_tomb > 0).then(|| *tomb.select_nth_unstable(from_tomb - 1).1);
+        let from_live = over - from_tomb;
+        let live_cut = (from_live > 0).then(|| {
+            let mut live: Vec<u64> = (self.state.values())
+                .filter(|e| e.absent == 0)
+                .map(|e| e.seq)
+                .collect();
+            *live.select_nth_unstable(from_live - 1).1
+        });
+        let mut evicted_live: Vec<(u64, Pair, u64)> = Vec::with_capacity(from_live);
+        let hasher = &self.hasher;
+        self.state.retain(|key, e| {
+            if e.absent > 0 {
+                return tomb_cut.is_none_or(|c| e.seq > c);
+            }
+            match live_cut {
+                Some(c) if e.seq <= c => {
+                    evicted_live.push((e.seq, e.base, stub_key(hasher, key)));
+                    false
+                }
+                _ => true,
+            }
+        });
+        evicted_live.sort_unstable_by_key(|(seq, ..)| *seq);
+        for (_, pair, k) in evicted_live {
+            self.stub_seq += 1;
+            let seq = self.stub_seq;
+            self.stubs.insert(k, Stub { pair, seq });
+        }
+        let dropped = self.stubs.len().saturating_sub(self.cfg.max_stubs);
+        if dropped > 0 {
+            let mut seqs: Vec<u64> = self.stubs.values().map(|s| s.seq).collect();
+            let cut = *seqs.select_nth_unstable(dropped - 1).1;
+            self.stubs.retain(|_, s| s.seq > cut);
+        }
+        (over, dropped)
     }
 }
 
@@ -267,20 +361,6 @@ fn is_lan(ip: IpAddr) -> bool {
             a.is_loopback() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80
         }
     }
-}
-
-/// Keeps the `max` newest entries; returns how many were evicted.
-fn evict_oldest(map: &mut HashMap<FlowKey, Entry>, max: usize) -> usize {
-    if map.len() <= max {
-        return 0;
-    }
-    let evict = map.len() - max;
-    let mut seqs: Vec<u64> = map.values().map(|e| e.seq).collect();
-    // `seq` values are unique, so the evict-th smallest is an exact cut-off.
-    let (_, cut, _) = seqs.select_nth_unstable(evict - 1);
-    let cut = *cut;
-    map.retain(|_, e| e.seq > cut);
-    evict
 }
 
 fn empty_other(src: IpAddr, global: bool) -> Record {
@@ -655,9 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn cap_evicts_oldest_tracked_flows() {
+    fn cap_evicts_oldest_tracked_flows_when_no_stubs_are_allowed() {
         let mut a = Aggregator::new(AggConfig {
             max_flows: 3,
+            max_stubs: 0,
             ..cfg(true)
         });
         let f = |p: u16| flow("10.0.0.2", "1.1.1.1", p, 443, 1000, 1000);
@@ -665,9 +746,163 @@ mod tests {
         let s = a.ingest(&[f(1), f(2), f(3), f(4), f(5)]);
         assert_eq!(a.tracked(), 3);
         assert_eq!(s.evicted, 2);
-        // 1 and 2 were the oldest, so they were evicted and now look new; 3, 4, 5 are tracked.
+        // 1 and 2 were the oldest and (without stubs) were forgotten: they now look new.
         let s = a.ingest(&[f(1), f(2), f(3), f(4), f(5)]);
         assert_eq!(one(&s).new_flows, 2);
+    }
+
+    fn bytes_of(s: &Snapshot, src: &str) -> u64 {
+        s.records
+            .iter()
+            .filter(|r| r.src == ip(src))
+            .map(|r| r.bytes_up + r.bytes_down)
+            .sum()
+    }
+
+    /// Host B holds 200 long-lived flows (~10 MB lifetime each, +1000 B per sample); host A
+    /// opens `churn` fresh flows every sample. Returns B's reported bytes per sample.
+    fn churn_run(
+        max_flows: usize,
+        churn: u64,
+        samples: u64,
+    ) -> (Aggregator, Vec<u64>, Vec<Snapshot>) {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows,
+            max_stubs: 2 * max_flows / 3,
+            ..cfg(true)
+        });
+        let (mut b_bytes, mut snaps) = (Vec::new(), Vec::new());
+        for t in 0..samples {
+            let mut fl: Vec<Flow> = (0..200)
+                .map(|i| {
+                    let life = 5_000_000 + t * 500;
+                    flow("192.168.1.9", "1.1.1.1", 2000 + i, 443, life, life)
+                })
+                .collect();
+            fl.extend((0..churn).map(|i| {
+                flow(
+                    "192.168.1.7",
+                    "2.2.2.2",
+                    (10_000 + t * churn + i) as u16,
+                    80,
+                    100,
+                    100,
+                )
+            }));
+            let s = a.ingest(&fl);
+            b_bytes.push(bytes_of(&s, "192.168.1.9"));
+            snaps.push(s);
+        }
+        (a, b_bytes, snaps)
+    }
+
+    #[test]
+    fn churn_does_not_recount_other_hosts_lifetime_bytes() {
+        // The reviewer's repro: max_flows 1000, 400 new flows per sample.
+        let (_, b, _) = churn_run(1000, 400, 8);
+        assert_eq!(b[0], 0, "baseline sample");
+        for (t, got) in b.iter().enumerate().skip(1) {
+            assert_eq!(
+                *got, 200_000,
+                "sample {t}: B's delta, not its lifetime bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn live_eviction_keeps_a_stub_so_returning_flows_continue() {
+        // 1000 live churn flows per sample: tombstones alone cannot make room.
+        let (a, b, snaps) = churn_run(1000, 1000, 8);
+        for (t, got) in b.iter().enumerate().skip(1) {
+            assert_eq!(*got, 200_000, "sample {t}");
+        }
+        assert!(
+            snaps.iter().any(|s| s.evicted > 0),
+            "live flows were evicted"
+        );
+        assert!(a.stubs() > 0 && a.stubs() <= 666, "{}", a.stubs());
+        assert!(snaps
+            .iter()
+            .all(|s| !s.table_pressure && s.recounted_flows == 0));
+    }
+
+    #[test]
+    fn stub_with_smaller_counters_is_a_reset() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 1,
+            max_stubs: 10,
+            ..cfg(true)
+        });
+        let f = |p: u16, up: u64| flow("10.0.0.2", "1.1.1.1", p, 443, up, up);
+        a.ingest(&[f(1, 5000)]);
+        a.ingest(&[f(1, 6000), f(2, 100)]); // f1 oldest: evicted with a stub
+        assert_eq!(a.stubs(), 1);
+        let s = a.ingest(&[f(1, 300), f(2, 100)]); // returns below its stub: tuple reused
+        let r = one(&s);
+        assert_eq!((r.bytes_up + r.bytes_down, r.new_flows), (600, 1));
+    }
+
+    #[test]
+    fn eviction_takes_tombstones_before_live_flows() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 3,
+            max_stubs: 10,
+            ..cfg(true)
+        });
+        let f = |src: &str, p: u16, up: u64| flow(src, "1.1.1.1", p, 443, up, up);
+        a.ingest(&[
+            f("10.0.0.1", 1, 1000),
+            f("10.0.0.2", 2, 1000),
+            f("10.0.0.3", 3, 1000),
+        ]);
+        // flow 3 (newest) vanishes and becomes a tombstone; a 4th flow arrives: over the cap.
+        let s = a.ingest(&[
+            f("10.0.0.1", 1, 1100),
+            f("10.0.0.2", 2, 1100),
+            f("10.0.0.4", 4, 70),
+        ]);
+        assert_eq!(s.evicted, 1);
+        assert_eq!(
+            a.stubs(),
+            0,
+            "the tombstone went, no live flow needed a stub"
+        );
+        let s = a.ingest(&[
+            f("10.0.0.1", 1, 1200),
+            f("10.0.0.2", 2, 1200),
+            f("10.0.0.3", 3, 1000),
+            f("10.0.0.4", 4, 70),
+        ]);
+        let new = |src: &str| {
+            s.records
+                .iter()
+                .find(|r| r.src == ip(src))
+                .unwrap()
+                .new_flows
+        };
+        assert_eq!(new("10.0.0.1"), 0, "live flow kept its state");
+        assert_eq!(new("10.0.0.2"), 0);
+        assert_eq!(new("10.0.0.3"), 1, "the evicted tombstone returns as new");
+    }
+
+    #[test]
+    fn stub_overflow_sets_pressure_and_counts_recounted_flows() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 2,
+            max_stubs: 3,
+            ..cfg(true)
+        });
+        let flows: Vec<Flow> = (0..8)
+            .map(|i| flow("10.0.0.2", "1.1.1.1", i, 443, 1000, 1000))
+            .collect();
+        a.ingest(&flows[..2]);
+        let s = a.ingest(&flows); // 6 live flows over the cap of 2 -> 6 stubs wanted, 3 kept
+        assert_eq!(s.evicted, 6);
+        assert_eq!(a.stubs(), 3);
+        assert!(s.table_pressure);
+        assert_eq!(s.recounted_flows, 3);
+        let s = a.ingest(&flows[..2]);
+        assert!(!s.table_pressure, "pressure is per sample");
     }
 
     fn top_n_input() -> Vec<Flow> {

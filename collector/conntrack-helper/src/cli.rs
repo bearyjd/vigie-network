@@ -17,11 +17,12 @@ pub const USAGE: &str =
   [--top-n N] [--max-flows N] [--uid UID] [--gid GID]\n\
   --once --file PATH   aggregate one file, print the snapshot JSON, exit (no socket)\n\
   defaults: --file /proc/net/nf_conntrack --socket /tmp/vigie/conntrack.sock --interval 60\n\
-            --top-n 512 --other-k 64 --max-flows 32768 --conntrack-max-file
-            /proc/sys/net/netfilter/nf_conntrack_max
-  --uid must be a dedicated user; 0 and 65534 (nobody) need --allow-shared-uid
-  the daemon refuses to start when nf_conntrack_max exceeds --max-flows (unless --max-flows is
-  given explicitly)";
+            --top-n 512 --other-k 64 --conntrack-max-file
+            /proc/sys/net/netfilter/nf_conntrack_max --ct-recheck-samples 60
+  --max-flows defaults to 3 x nf_conntrack_max; the daemon refuses to start when that file is
+  unreadable or the cap is below 3 x it, unless --max-flows is given explicitly (then a lower
+  cap only warns loudly and sets table_pressure)
+  --uid must be a dedicated user; 0 and 65534 (nobody) need --allow-shared-uid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opts {
@@ -34,6 +35,8 @@ pub struct Opts {
     pub max_flows: usize,
     /// `--max-flows` was given, so the nf_conntrack_max startup check is the owner's call.
     pub max_flows_set: bool,
+    /// Samples between re-reads of `nf_conntrack_max` in the daemon.
+    pub ct_recheck_samples: u64,
     pub conntrack_max_file: PathBuf,
     pub allow_shared_uid: bool,
     pub uid: Option<u32>,
@@ -51,6 +54,7 @@ impl Default for Opts {
             other_k: crate::agg::DEFAULT_OTHER_K,
             max_flows: crate::agg::DEFAULT_MAX_FLOWS,
             max_flows_set: false,
+            ct_recheck_samples: crate::limits::DEFAULT_RECHECK_SAMPLES,
             conntrack_max_file: PathBuf::from(DEFAULT_CT_MAX_FILE),
             allow_shared_uid: false,
             uid: None,
@@ -100,6 +104,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
                 o.max_flows = ranged(&flag, &v, 1, usize::MAX)?;
                 o.max_flows_set = true;
             }
+            "--ct-recheck-samples" => o.ct_recheck_samples = ranged(&flag, &v, 1, 1_000_000)?,
             "--conntrack-max-file" => o.conntrack_max_file = PathBuf::from(v),
             "--uid" => o.uid = Some(ranged(&flag, &v, 0, u32::MAX)?),
             "--gid" => o.gid = Some(ranged(&flag, &v, 0, u32::MAX)?),
@@ -134,7 +139,7 @@ mod tests {
         assert_eq!(o, Opts::default());
         assert_eq!(o.interval_s, 60);
         assert_eq!(o.top_n, 512);
-        assert_eq!(o.max_flows, 32768);
+        assert_eq!(o.max_flows, 49152);
         assert!(!o.once);
         assert_eq!(o.other_k, 64);
         assert!(!o.max_flows_set && !o.allow_shared_uid);

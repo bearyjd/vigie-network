@@ -48,14 +48,16 @@ pub fn snapshot_json(meta: &Meta, snap: &Snapshot) -> String {
     let mut out = String::with_capacity(160 + snap.records.len() * 190);
     let _ = write!(
         out,
-        r#"{{"v":1,"seq":{},"ts":{},"interval_s":{},"skipped_lines":{},"acct_off":{},"folded":{},"evicted":{},"records":["#,
+        r#"{{"v":1,"seq":{},"ts":{},"interval_s":{},"skipped_lines":{},"acct_off":{},"folded":{},"evicted":{},"recounted_flows":{},"table_pressure":{},"records":["#,
         meta.seq,
         meta.ts,
         meta.interval_s,
         meta.skipped_lines,
         meta.acct_off,
         snap.folded,
-        snap.evicted
+        snap.evicted,
+        snap.recounted_flows,
+        snap.table_pressure
     );
     for (i, r) in snap.records.iter().enumerate() {
         if i > 0 {
@@ -131,6 +133,8 @@ mod tests {
             ],
             folded: 3,
             evicted: 1,
+            recounted_flows: 4,
+            table_pressure: true,
         };
         let meta = Meta {
             seq: 9,
@@ -141,7 +145,7 @@ mod tests {
         };
         let line = snapshot_json(&meta, &snap);
         let expected = concat!(
-            r#"{"v":1,"seq":9,"ts":1700000000,"interval_s":60,"skipped_lines":2,"acct_off":true,"folded":3,"evicted":1,"records":["#,
+            r#"{"v":1,"seq":9,"ts":1700000000,"interval_s":60,"skipped_lines":2,"acct_off":true,"folded":3,"evicted":1,"recounted_flows":4,"table_pressure":true,"records":["#,
             r#"{"src":"192.168.8.10","dst":"93.184.216.34","dport":443,"proto":"tcp","bytes_up":1,"bytes_down":2,"packets_up":3,"packets_down":4,"flows":5,"new_flows":6},"#,
             r#"{"src":"fd00::1","other":true,"bytes_up":7,"bytes_down":8,"packets_up":9,"packets_down":10,"flows":11,"new_flows":12},"#,
             r#"{"src":"0.0.0.0","other_global":true,"bytes_up":1,"bytes_down":1,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}"#

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vigie_conntrack::agg::{AggConfig, Aggregator, Snapshot};
 use vigie_conntrack::cli::{parse_args, Opts, USAGE};
 use vigie_conntrack::json::{snapshot_json, Meta};
-use vigie_conntrack::limits::{check_conntrack_max, CtMax};
+use vigie_conntrack::limits::{recheck_due, recheck_pressure, resolve_max_flows, stub_cap, CtMax};
 use vigie_conntrack::parse::scan_flows;
 use vigie_conntrack::sock::{bind_secure, current_ids, Outcome, Publisher};
 
@@ -34,9 +34,10 @@ fn sample(opts: &Opts, agg: &mut Aggregator) -> Result<(Snapshot, Meta), String>
     Ok((snap, meta))
 }
 
-fn agg_config(opts: &Opts, baseline_first: bool) -> AggConfig {
+fn agg_config(opts: &Opts, max_flows: usize, baseline_first: bool) -> AggConfig {
     AggConfig {
-        max_flows: opts.max_flows,
+        max_flows,
+        max_stubs: stub_cap(max_flows),
         top_n: opts.top_n,
         other_k: opts.other_k,
         baseline_first,
@@ -44,7 +45,7 @@ fn agg_config(opts: &Opts, baseline_first: bool) -> AggConfig {
 }
 
 fn run_once(opts: &Opts) -> Result<(), String> {
-    let mut agg = Aggregator::new(agg_config(opts, false));
+    let mut agg = Aggregator::new(agg_config(opts, opts.max_flows, false));
     let (snap, meta) = sample(opts, &mut agg)?;
     let meta = Meta {
         interval_s: 0,
@@ -55,22 +56,28 @@ fn run_once(opts: &Opts) -> Result<(), String> {
     Ok(())
 }
 
-fn check_table_limit(opts: &Opts) -> Result<(), String> {
-    match check_conntrack_max(&opts.conntrack_max_file, opts.max_flows, opts.max_flows_set)? {
+/// Resolves the flow cap and reports what could not be verified. The returned flag is the
+/// initial `table_pressure` state (an explicit cap below 3 x the kernel limit).
+fn check_table_limit(opts: &Opts) -> Result<(usize, bool), String> {
+    let (max_flows, ct) =
+        resolve_max_flows(&opts.conntrack_max_file, opts.max_flows, opts.max_flows_set)?;
+    match ct {
         CtMax::Unknown => eprintln!(
-            "warning: {} unreadable, cannot check the table size against --max-flows",
+            "warning: {} not found, the table size is NOT verified against --max-flows {max_flows}",
             opts.conntrack_max_file.display()
         ),
         CtMax::Known {
             max,
-            over_explicit_cap: true,
+            below_3x: true,
         } => eprintln!(
-            "warning: nf_conntrack_max {max} exceeds --max-flows {}; a full table will evict flows",
-            opts.max_flows
+            "WARNING: nf_conntrack_max {max} needs --max-flows >= {} but --max-flows is \
+             {max_flows}: a busy table will evict live flows and may count their bytes again \
+             (table_pressure is reported)",
+            max.saturating_mul(3)
         ),
         CtMax::Known { .. } => {}
     }
-    Ok(())
+    Ok((max_flows, matches!(ct, CtMax::Known { below_3x: true, .. })))
 }
 
 fn run_daemon(opts: &Opts) -> Result<(), String> {
@@ -82,18 +89,26 @@ fn run_daemon(opts: &Opts) -> Result<(), String> {
                 .to_string(),
         );
     }
-    check_table_limit(opts)?;
+    let (max_flows, mut pressure) = check_table_limit(opts)?;
     let listener = bind_secure(&opts.socket, opts.uid, opts.gid)
         .map_err(|e| format!("socket {}: {e}", opts.socket.display()))?;
     let mut publisher = Publisher::new(listener);
-    let mut agg = Aggregator::new(agg_config(opts, true));
+    let mut agg = Aggregator::new(agg_config(opts, max_flows, true));
     let interval = Duration::from_secs(opts.interval_s);
     let mut next = Instant::now();
     let mut seq = 0u64;
     loop {
         match sample(opts, &mut agg) {
-            Ok((snap, meta)) => {
+            Ok((mut snap, meta)) => {
                 seq += 1;
+                if recheck_due(seq, opts.ct_recheck_samples) {
+                    let found = recheck_pressure(&opts.conntrack_max_file, max_flows);
+                    if let Some(why) = &found {
+                        eprintln!("seq {seq}: table_pressure: {why}");
+                    }
+                    pressure = found.is_some();
+                }
+                snap.table_pressure |= pressure;
                 let meta = Meta { seq, ..meta };
                 match publisher.publish(snapshot_json(&meta, &snap)) {
                     Outcome::DroppedBusy => {

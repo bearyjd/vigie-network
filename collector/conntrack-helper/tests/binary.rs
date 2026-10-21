@@ -272,3 +272,81 @@ fn daemon_refuses_group_writable_socket_dir() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("writable"));
 }
+
+fn spawn_daemon(d: &std::path::Path, extra: &[&str], ct: &str) -> (std::process::Child, PathBuf) {
+    let sock = d.join("c.sock");
+    let child = Command::new(BIN)
+        .args(["--socket", sock.to_str().unwrap(), "--interval", "1"])
+        .args(["--conntrack-max-file", ct])
+        .args(["--file", &fixture("ipv6.txt")])
+        .args(extra)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, sock)
+}
+
+/// Reads snapshot lines until one satisfies `want` or 8 s pass.
+fn snapshot_where(sock: &std::path::Path, want: impl Fn(&str) -> bool) -> Option<String> {
+    wait_for(sock);
+    let c = UnixStream::connect(sock).ok()?;
+    c.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+    let t = Instant::now();
+    BufReader::new(c)
+        .lines()
+        .map_while(Result::ok)
+        .take_while(|_| t.elapsed() < Duration::from_secs(8))
+        .find(|l| want(l))
+}
+
+#[test]
+fn daemon_fails_closed_without_the_kernel_limit_unless_max_flows_is_explicit() {
+    let d = tmpdir("noct");
+    let missing = d.join("no-such-file");
+    let out = output_within_10s(
+        Command::new(BIN)
+            .args(["--socket", d.join("c.sock").to_str().unwrap()])
+            .args(["--conntrack-max-file", missing.to_str().unwrap()])
+            .args(["--file", &fixture("ipv6.txt")]),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--max-flows"));
+    assert!(!d.join("c.sock").exists(), "must refuse before binding");
+    let (mut child, sock) = spawn_daemon(&d, &["--max-flows", "5000"], missing.to_str().unwrap());
+    wait_for(&sock);
+    let up = sock.exists();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(up, "explicit --max-flows is the owner's decision");
+}
+
+#[test]
+fn explicit_cap_below_three_times_the_limit_warns_and_flags_table_pressure() {
+    let d = tmpdir("below3x");
+    let ct = ct_max_file(&d, "1000\n");
+    let (mut child, sock) = spawn_daemon(&d, &["--max-flows", "2000"], &ct);
+    let line = snapshot_where(&sock, |l| l.contains(r#""seq":"#));
+    let _ = child.kill();
+    let err = child.wait_with_output().unwrap();
+    let line = line.expect("no snapshot");
+    assert!(line.contains(r#""table_pressure":true"#), "{line}");
+    assert!(String::from_utf8_lossy(&err.stderr).contains("WARNING"));
+}
+
+#[test]
+fn growing_kernel_limit_is_noticed_by_the_periodic_recheck() {
+    let d = tmpdir("regrow");
+    let ct = ct_max_file(&d, "1000\n");
+    let (mut child, sock) = spawn_daemon(&d, &["--ct-recheck-samples", "3"], &ct);
+    let calm = snapshot_where(&sock, |_| true);
+    if let Some(l) = &calm {
+        assert!(l.contains(r#""table_pressure":false"#), "{l}");
+    }
+    fs::write(&ct, "4000\n").unwrap(); // above max_flows/3 = 1000
+    let hot = snapshot_where(&sock, |l| l.contains(r#""table_pressure":true"#));
+    let _ = child.kill();
+    let err = child.wait_with_output().unwrap();
+    assert!(calm.is_some(), "no snapshot before the change");
+    assert!(hot.is_some(), "table_pressure never reported");
+    assert!(String::from_utf8_lossy(&err.stderr).contains("table_pressure"));
+}
