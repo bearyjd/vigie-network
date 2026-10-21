@@ -119,7 +119,7 @@ Host: Fedora workstation, kernel 7.2, unprivileged user, real `avahi-daemon` alr
 | Packets in 10 s (mDNS v4 / v6 / SSDP) | 4 / 1 / 8 (quiet moment); an earlier run saw 14 / 10 / 4 |
 | VmRSS / VmHWM at exit | 468-476 kB / 468-476 kB |
 | Failure path (`--addr 10.9.9.9`) | exit 2, bind/join error message |
-| Binary size, aarch64-unknown-linux-musl (stripped, static) | **381,824 bytes (373 KiB)** |
+| Binary size, aarch64-unknown-linux-musl (stripped, static) | **382,064 bytes (373 KiB)** |
 | `cargo test` | 25 + 41 passed, 0 failed |
 | `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` | clean |
 
