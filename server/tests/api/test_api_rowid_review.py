@@ -21,11 +21,6 @@ def test_audit_rowids_are_not_reused_after_deleting_the_newest_row(env: Env) -> 
     assert [e["id"] for e in env.get("/events", since=cursor).json()["data"]] == ["a3"]
 
 
-@pytest.mark.xfail(
-    reason="pipeline schema (vigie_pipeline, not changed here): events needs a monotonic sequence "
-    "(INTEGER PRIMARY KEY AUTOINCREMENT) so /events cursors survive VACUUM and deletes",
-    strict=True,
-)
 def test_inventory_events_have_a_monotonic_sequence(env: Env) -> None:
     ddl = env.inv.execute("SELECT sql FROM sqlite_master WHERE name='events'").fetchone()[0]
     assert "AUTOINCREMENT" in ddl.upper()
