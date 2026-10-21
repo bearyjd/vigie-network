@@ -5,6 +5,14 @@
 #   sh deploy/tests/test_scripts.sh
 set -u
 
+# Safety: these tests must never reach a real podman (a reviewer's run once created and removed the
+# real secrets vigie_tls_cert/vigie_tls_key through distrobox-host-exec). An inherited PODMAN is
+# refused outright; the script then points PODMAN at its own stub and verifies it (guard_podman).
+if [ -n "${PODMAN+x}" ]; then
+	echo "test_scripts: refusing to run with PODMAN already set ('$PODMAN'); this script supplies its own stub" >&2
+	exit 2
+fi
+
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 DEPLOY=$(dirname "$HERE")
 T=$(mktemp -d)
@@ -26,9 +34,18 @@ mode_of() { stat -c %a "$1"; }
 is_mode() { [ "$(mode_of "$1")" = "$2" ]; }
 
 # ---- stub podman -----------------------------------------------------------------------------
+STUB_MARK='# VIGIE-TEST-STUB'
+# guard_podman CMD: succeeds only for ONE path (no whitespace, so never "distrobox-host-exec
+# podman"), inside this test's temp dir, that is executable and carries the stub marker.
+guard_podman() {
+	case $1 in '' | *[[:space:]]*) return 1 ;; esac
+	case $1 in "$T"/*) ;; *) return 1 ;; esac
+	[ -x "$1" ] && [ "$(sed -n 2p "$1")" = "$STUB_MARK" ]
+}
 mkdir "$T/bin" "$T/state"
 cat >"$T/bin/podman" <<'STUB'
 #!/bin/sh
+# VIGIE-TEST-STUB
 # argv log (this is what a process listing would show) and stdin capture
 printf '%s\n' "$*" >>"$STUB_STATE/argv.log"
 case "$1 $2" in
@@ -46,8 +63,28 @@ cat >"$T/bin/fake-admin" <<'STUB'
 printf '%s\n' "$*" >>"$STUB_STATE/admin.log"
 STUB
 chmod +x "$T/bin/fake-admin"
+# Failing, logging stand-ins for every way to reach a real container runtime; first on PATH.
+for tool in podman-compose distrobox-host-exec; do
+	printf '#!/bin/sh\necho "REAL-TOOL-INVOKED: %s $*" >>"$STUB_STATE/real-tool.log"\nexit 99\n' "$tool" >"$T/bin/$tool"
+	chmod +x "$T/bin/$tool"
+done
+PATH="$T/bin:$PATH"
 export STUB_STATE="$T/state"
 export PODMAN="$T/bin/podman"
+guard_podman "$PODMAN" || {
+	echo "test_scripts: internal error: PODMAN is not the verified stub" >&2
+	exit 2
+}
+
+# ---- stub-podman guard self-test --------------------------------------------------------------
+check "guard accepts the stub" guard_podman "$T/bin/podman"
+for bad in podman "distrobox-host-exec podman" "$T/bin/podman extra" /usr/bin/podman "" "$T/bin/fake-admin" "$T/bin/podman-compose"; do
+	if guard_podman "$bad"; then fail "guard accepted '$bad'"; else pass; fi
+done
+inherited=$(PODMAN=podman sh "$0" 2>&1)
+check "script refuses an inherited PODMAN (exit 2)" test $? -eq 2
+check "refusal names PODMAN" sh -c 'printf %s "$1" | grep -q "refusing to run with PODMAN"' _ "$inherited"
+check "guard self-test touched no tool" test ! -e "$T/state/argv.log" -a ! -e "$T/state/real-tool.log"
 
 # ---- gen-certs.sh ----------------------------------------------------------------------------
 G="$DEPLOY/gen-certs.sh"
@@ -164,5 +201,6 @@ check "healthcheck: proc mismatch is unhealthy (1)" test $? -eq 1
 python3 -I "$H" bogus >/dev/null 2>&1
 check "healthcheck: bad usage is 2" test $? -eq 2
 
+check "no real container tool was invoked" test ! -e "$T/state/real-tool.log"
 echo "$PASSES passed, $FAILS failed"
 [ "$FAILS" = 0 ]
