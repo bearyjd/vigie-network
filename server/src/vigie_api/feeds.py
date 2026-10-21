@@ -10,6 +10,7 @@ from typing import Any
 
 from vigie_api.effective import PROSE_ALLOWED_ACTIONS, decode_cursor, encode_cursor, rows
 from vigie_api.errors import ApiError
+from vigie_api.textsafe import PROSE_MAX, display_json, display_text
 
 SUGGESTION_STATES = ("pending", "accepted", "rejected", "expired")
 
@@ -47,7 +48,11 @@ def _inventory_events(inv, after, kind, severity, limit) -> list[dict[str, Any]]
     if severity:
         sql, params = sql + " AND severity = ?", [*params, severity]
     found = rows(inv, sql + " ORDER BY rowid LIMIT ?", (*params, limit))
-    return [{**dict(r), "source": "inventory"} for r in found]
+    return [
+        {**dict(r), "summary": display_text(r["summary"]), "kind": display_text(r["kind"]),
+         "source": "inventory"}
+        for r in found
+    ]  # fmt: skip
 
 
 def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
@@ -64,9 +69,9 @@ def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
             "id": r["id"],
             "device_id": r["target"],
             "ts": r["ts"],
-            "kind": r["action"],
+            "kind": display_text(r["action"]),
             "severity": "info",
-            "summary": f"{r['principal']} {r['action']} {r['target'] or ''}".strip(),
+            "summary": display_text(f"{r['principal']} {r['action']} {r['target'] or ''}".strip()),
             "source": "audit",
         }
         for r in found
@@ -117,11 +122,15 @@ def _suggestion(row: sqlite3.Row, decision: sqlite3.Row | None, now_iso: str) ->
         "id": row["id"],
         "action": row["action"],
         "device_ids": json.loads(row["device_ids"]),
-        "payload": json.loads(row["payload"]),
-        "reason_code": row["reason_code"],
+        "payload": display_json(json.loads(row["payload"])),
+        "reason_code": display_text(row["reason_code"]),
         # LLM/ML prose is shown for allowlisted actions only (PRP section 7)
-        "reason_text": row["reason_text"] if row["action"] in PROSE_ALLOWED_ACTIONS else None,
-        "basis": json.loads(row["basis"]),
+        "reason_text": (
+            display_text(row["reason_text"], PROSE_MAX)
+            if row["action"] in PROSE_ALLOWED_ACTIONS
+            else None
+        ),
+        "basis": display_json(json.loads(row["basis"])),
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "state": state,

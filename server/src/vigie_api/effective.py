@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from vigie_api.errors import ApiError
+from vigie_api.textsafe import PROSE_MAX, display_text
 
 DEVICE_TYPES = ("phone", "tv", "iot", "camera", "laptop", "console", "unknown")
 MAX_LINK_DEPTH = 32
@@ -104,8 +105,8 @@ def effective_device(
     )
     return {
         "id": device["id"],
-        "name": override["name"] if override else None,
-        "owner": override["owner"] if override else None,
+        "name": display_text(override["name"]) if override else None,
+        "owner": display_text(override["owner"]) if override else None,
         "type": etype,
         "type_provenance": provenance,
         # group comes ONLY from the human override; inferred data never assigns a group
@@ -356,21 +357,23 @@ def device_detail(
         "macs": [
             {
                 "mac": o["mac"],
-                "hostname": o["hostname"],
+                "hostname": display_text(o["hostname"]),
                 "first_seen": o["first_seen"],
                 "last_seen": o["last_seen"],
                 "current": o["last_seen"] == newest,
                 "link_source": o["link_source"],
-                "link_rule_id": o["link_rule_id"],
+                "link_rule_id": display_text(o["link_rule_id"]),
             }
             for o in obs
         ],
-        "recent_events": [dict(e) for e in events],
+        "recent_events": [{**e, "summary": display_text(e["summary"])} for e in map(dict, events)],
         "explanation": {
-            "reason_code": row["inferred_reason_code"],
+            "reason_code": display_text(row["inferred_reason_code"]),
             # informational only, and withheld while a trust-changing suggestion is pending
-            "reason_text": None if suppress else row["inferred_reason_text"],
-            "model_version": row["inferred_model_version"],
+            "reason_text": None
+            if suppress
+            else display_text(row["inferred_reason_text"], PROSE_MAX),
+            "model_version": display_text(row["inferred_model_version"]),
         },
     }
 
