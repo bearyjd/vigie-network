@@ -16,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     prov = sub.add_parser("provision", help="register a collector id with a key id")
     prov.add_argument("collector_id")
     prov.add_argument("key_id")
+    prov.add_argument("--force", action="store_true", help="re-provision a revoked collector")
     rev = sub.add_parser("revoke", help="revoke a collector")
     rev.add_argument("collector_id")
     args = parser.parse_args(argv)
@@ -25,7 +26,11 @@ def main(argv: list[str] | None = None) -> int:
     conn = open_inventory(settings.inventory_path)
     try:
         if args.cmd == "provision":
-            store.provision_collector(conn, args.collector_id, args.key_id)
+            try:
+                store.provision_collector(conn, args.collector_id, args.key_id, args.force)
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return 1
         elif not store.revoke_collector(conn, args.collector_id):
             print("unknown collector", file=sys.stderr)
             return 1

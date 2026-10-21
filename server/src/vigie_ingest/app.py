@@ -35,6 +35,10 @@ class BodyTooLarge(Exception):
     pass
 
 
+class BodyTimeout(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Envelope:
     """Signed fields, taken from headers (the body cannot be parsed before HMAC verification)."""
@@ -68,18 +72,22 @@ def _parse_envelope(headers: Mapping[str, str]) -> Envelope | None:
     return Envelope(**{name: value for name, (value, _) in values.items()})
 
 
-async def read_limited_body(request: Request, cap: int) -> bytes:
-    """Read the body, aborting as soon as it exceeds `cap` bytes."""
+async def read_limited_body(request: Request, cap: int, timeout_s: float) -> bytes:
+    """Read the body, aborting when it exceeds `cap` bytes or `timeout_s` seconds."""
     declared = request.headers.get("content-length")
     if declared is not None and (not declared.isdigit() or int(declared) > cap):
         raise BodyTooLarge
     chunks: list[bytes] = []
     total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > cap:
-            raise BodyTooLarge
-        chunks.append(chunk)
+    try:
+        async with asyncio.timeout(timeout_s):
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > cap:
+                    raise BodyTooLarge
+                chunks.append(chunk)
+    except TimeoutError as exc:
+        raise BodyTimeout from exc
     return b"".join(chunks)
 
 
@@ -97,21 +105,22 @@ def _matches_envelope(batch: Batch, env: Envelope) -> bool:
 def process_batch(
     settings: Settings, env: Envelope, body: bytes, now: float
 ) -> tuple[int, dict[str, object]]:
-    """PRP section 4 checks after size cap and rate limit. Sync; runs in a worker thread."""
+    """PRP section 4 checks after size cap and rate limit. Sync; runs in a worker thread.
+
+    The HMAC is verified before any database connection is opened, so unauthenticated
+    requests cost no database work.
+    """
+    key = auth.load_key(settings.secrets_dir, env.key_id)
+    message = auth.signing_string(
+        env.collector_id, env.key_id, env.boot_id, env.seq, env.sent_ts, env.batch_id, body
+    )
+    if not auth.verify(key, env.signature, message):
+        return 401, {"error": "unauthorized"}
+
     conn = connect(settings.inventory_path)
     try:
         collector = store.get_collector(conn, env.collector_id)
-        key = auth.load_key(settings.secrets_dir, env.key_id)
-        message = auth.signing_string(
-            env.collector_id, env.key_id, env.boot_id, env.seq, env.sent_ts, env.batch_id, body
-        )
-        signature_ok = auth.verify(key, env.signature, message)
-        if not (
-            signature_ok
-            and collector is not None
-            and collector.key_id == env.key_id
-            and not collector.revoked
-        ):
+        if collector is None or collector.key_id != env.key_id or collector.revoked:
             return 401, {"error": "unauthorized"}
 
         rejection = store.check_state(
@@ -122,7 +131,9 @@ def process_batch(
             return _rejection_response(rejection)
 
         try:
-            batch = Batch.model_validate_json(body)
+            batch = Batch.model_validate_json(
+                body, context={"max_spool_age_s": settings.max_spool_age_s}
+            )
         except (ValidationError, ValueError):
             store.record_parse_failure(conn, env.collector_id)
             return 422, {"error": "invalid_batch"}
@@ -156,7 +167,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
-        open_inventory(settings.inventory_path).close()
+        _require_keys(settings)
         task = asyncio.create_task(_maintenance_loop(settings, clock))
         try:
             yield
@@ -174,17 +185,36 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         source = request.client.host if request.client else "unknown"
         if not limiter.allow(source):
             return JSONResponse({"error": "rate_limited"}, status_code=429)
-        try:
-            body = await read_limited_body(request, settings.max_body_bytes)
-        except BodyTooLarge:
-            return JSONResponse({"error": "body_too_large"}, status_code=413)
         env = _parse_envelope(request.headers)
         if env is None:
-            return _unauthorized()
+            return _unauthorized()  # before the body is read or any other work is done
+        try:
+            body = await read_limited_body(
+                request, settings.max_body_bytes, settings.body_timeout_s
+            )
+        except BodyTooLarge:
+            return JSONResponse({"error": "body_too_large"}, status_code=413)
+        except BodyTimeout:
+            return JSONResponse({"error": "body_timeout"}, status_code=408)
         status, payload = await run_in_threadpool(process_batch, settings, env, body, clock())
         return JSONResponse(payload, status_code=status)
 
     return app
+
+
+def _require_keys(settings: Settings) -> None:
+    """Fail fast: every non-revoked collector must have a usable key file."""
+    conn = open_inventory(settings.inventory_path)
+    try:
+        missing = [
+            c.id
+            for c in store.active_collectors(conn)
+            if auth.load_key(settings.secrets_dir, c.key_id) is None
+        ]
+    finally:
+        conn.close()
+    if missing:
+        raise RuntimeError(f"no valid key file (>=32 bytes hex) for collectors: {missing}")
 
 
 async def _maintenance_loop(settings: Settings, clock: Callable[[], float]) -> None:
