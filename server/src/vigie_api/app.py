@@ -10,12 +10,14 @@ from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vigie_api import effective, feeds, tokens, writes
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
+from vigie_api.ratelimit import FailureLimiter
 from vigie_api.schema import open_inventory_ro, open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_ingest.ratelimit import RateLimiter
@@ -67,7 +69,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     )
     app.state.settings = settings
     token_limit = RateLimiter(settings.rate_limit_per_window, settings.rate_limit_window_s, clock)
-    failure_limit = RateLimiter(settings.rate_limit_per_window, settings.rate_limit_window_s, clock)
+    failure_limit = FailureLimiter(
+        settings.rate_limit_per_window, settings.rate_limit_window_s, clock
+    )
     open_overrides(settings.overrides_path).close()  # create + migrate at startup
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
 
@@ -87,8 +91,38 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         LOG.error("storage error on %s %s: %r", request.method, request.url.path, exc)
         return JSONResponse(error_envelope("internal_error", "internal error"), status_code=500)
 
+    def check_auth(request: Request, ov: sqlite3.Connection, authorization: str | None):
+        source = request.client.host if request.client else "unknown"
+        wait = failure_limit.retry_after(source)  # before any token lookup
+        if wait is not None:
+            raise ApiError(429, "rate_limited", "too many requests", {"Retry-After": str(wait)})
+        principal = tokens.verify_token(ov, _bearer(authorization))
+        if principal is None:
+            failure_limit.record(source)
+            LOG.warning("authentication failed from %s", source)  # never the credential
+            raise _unauthorized()
+        if not token_limit.allow(principal.token_id):
+            retry = {"Retry-After": str(settings.rate_limit_window_s)}
+            raise ApiError(429, "rate_limited", "too many requests", retry)
+        request.state.authenticated = True
+        return principal
+
+    def reject_if_unauthenticated(request: Request) -> None:
+        conn = open_overrides(settings.overrides_path)
+        try:
+            check_auth(request, conn, request.headers.get("authorization"))
+        finally:
+            conn.close()
+
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # A body that fails to parse is rejected before FastAPI runs the auth dependency;
+        # authenticate here so an anonymous caller always sees the uniform 401, never a 422.
+        if not getattr(request.state, "authenticated", False) and request.url.path != "/healthz":
+            try:
+                await run_in_threadpool(reject_if_unauthenticated, request)
+            except ApiError as err:
+                return await _api_error(request, err)
         detail = "; ".join(
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
         )
@@ -118,15 +152,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         ov: Ov,
         authorization: Annotated[str | None, Header()] = None,
     ) -> tokens.Principal:
-        principal = tokens.verify_token(ov, _bearer(authorization))
-        if principal is None:
-            source = request.client.host if request.client else "unknown"
-            if not failure_limit.allow(source):
-                raise ApiError(429, "rate_limited", "too many requests")
-            raise _unauthorized()
-        if not token_limit.allow(principal.token_id):
-            raise ApiError(429, "rate_limited", "too many requests")
-        return principal
+        return check_auth(request, ov, authorization)
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
 
