@@ -18,6 +18,7 @@ pub const DEFAULT_K_WAN: usize = 64;
 /// the next absence after that.
 pub const TOMBSTONE_SAMPLES: u8 = 2;
 /// Samples an eviction stub is kept; after that a returning tuple counts as a new flow.
+const MIN_SLACK: usize = 16;
 pub const DEFAULT_STUB_TTL_SAMPLES: u64 = 30;
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,9 @@ pub struct Snapshot {
     pub evicted: usize,
     /// Flows that lost their counters (stub table overflow) and may be counted again.
     pub recounted_flows: usize,
+    /// New flow keys refused during this sample because the table was already over its
+    /// in-sample ceiling (`max_flows` + a third); their bytes are not counted.
+    pub dropped_new_keys: usize,
     /// The tracking tables were under pressure: some byte counts may be inflated.
     pub table_pressure: bool,
 }
@@ -145,6 +149,12 @@ struct Stub {
     stamp: u64,
 }
 
+/// In-sample ceiling of the state table: the cap plus a third (at least `MIN_SLACK`, so tiny
+/// explicit caps still work). New keys beyond it are refused until the sample ends.
+fn ceiling(max_flows: usize) -> usize {
+    max_flows.saturating_add((max_flows / 3).max(MIN_SLACK))
+}
+
 fn stub_key(h: &RandomState, key: &FlowKey) -> u64 {
     h.hash_one(key)
 }
@@ -157,6 +167,8 @@ pub struct Aggregator {
     forgotten: HashMap<u64, u64>,
     /// Evicted-tombstone flows that returned (and are counted again) in the current sample.
     tomb_recounts: usize,
+    /// New keys refused in the current sample (table over its in-sample ceiling).
+    dropped_new: usize,
     hasher: RandomState,
     stub_seq: u64,
     next_seq: u64,
@@ -172,6 +184,7 @@ impl Aggregator {
             stubs: HashMap::new(),
             forgotten: HashMap::new(),
             tomb_recounts: 0,
+            dropped_new: 0,
             hasher: RandomState::new(),
             stub_seq: 0,
             next_seq: 0,
@@ -202,6 +215,7 @@ impl Aggregator {
             orig: f.orig,
             reply: f.reply,
         };
+        let full = self.state.len() >= ceiling(self.cfg.max_flows);
         match self.state.entry(f.key) {
             MapEntry::Occupied(mut o) => {
                 let e = o.get_mut();
@@ -212,6 +226,7 @@ impl Aggregator {
                 };
                 e.seen = self.sample;
             }
+            MapEntry::Vacant(_) if full => self.dropped_new += 1,
             MapEntry::Vacant(v) => {
                 self.next_seq += 1;
                 // A returning evicted flow continues from its stub (a smaller counter than the
@@ -302,6 +317,7 @@ impl Aggregator {
         self.next_seq = next_seq;
         self.expire_stubs();
         let (evicted, dropped_stubs) = self.enforce_cap();
+        let dropped_new_keys = std::mem::take(&mut self.dropped_new);
         let recounted_flows = dropped_stubs + std::mem::take(&mut self.tomb_recounts);
         recs.sort_unstable_by_key(|r| (r.src, r.dst, r.dport, r.proto));
         recs.dedup_by(|b, a| {
@@ -322,7 +338,8 @@ impl Aggregator {
             folded,
             evicted,
             recounted_flows,
-            table_pressure: recounted_flows > 0,
+            dropped_new_keys,
+            table_pressure: recounted_flows > 0 || dropped_new_keys > 0,
         }
     }
 
@@ -899,9 +916,11 @@ mod tests {
             "live flows were evicted"
         );
         assert!(a.stubs() > 0 && a.stubs() <= 666, "{}", a.stubs());
+        // 1200 live flows against a cap of 1000 is over contract: surplus new keys are refused
+        // (and flagged), but nothing is recounted.
         assert!(snaps
             .iter()
-            .all(|s| !s.table_pressure && s.recounted_flows == 0));
+            .all(|s| s.recounted_flows == 0 && s.table_pressure == (s.dropped_new_keys > 0)));
     }
 
     #[test]
@@ -1056,6 +1075,45 @@ mod tests {
         assert_eq!(s.recounted_flows, 1);
         let s = a.ingest(&[f(1, 1300), f(2, 1300), f(3, 1100), f(4, 70)]);
         assert!(!s.table_pressure, "pressure is per sample");
+    }
+
+    #[test]
+    fn a_huge_dump_is_capped_during_the_sample() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 100,
+            max_stubs: 66,
+            ..cfg(false)
+        });
+        a.begin();
+        for i in 0..500u16 {
+            a.add(&flow("10.0.0.2", "1.1.1.1", i, 443, 1000, 1000));
+            assert!(a.tracked() <= 133, "{} tracked after {i}", a.tracked());
+        }
+        let s = a.finish();
+        assert_eq!(s.dropped_new_keys, 500 - 133);
+        assert!(s.table_pressure);
+        assert_eq!(
+            sum_bytes(&s),
+            133 * 2000,
+            "tracked flows are counted exactly"
+        );
+        assert_eq!(a.tracked(), 100);
+    }
+
+    #[test]
+    fn no_new_keys_are_dropped_within_the_ceiling() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 100,
+            max_stubs: 66,
+            ..cfg(false)
+        });
+        a.begin();
+        for i in 0..133u16 {
+            a.add(&flow("10.0.0.2", "1.1.1.1", i, 443, 10, 10));
+        }
+        let s = a.finish();
+        assert_eq!(s.dropped_new_keys, 0);
+        assert!(!s.table_pressure);
     }
 
     #[test]
