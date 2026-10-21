@@ -136,8 +136,10 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         group: Annotated[str | None, Query(max_length=32)] = None,
         identity_state: IdentityState | None = None,
         status: DeviceStatus | None = None,
-        updated_since: Annotated[str | None, Query(max_length=32)] = None,
+        updated_since: Annotated[str | None, Query(max_length=64)] = None,
         include_transient: bool = False,
+        include_retired: bool = False,
+        include_aliases: bool = False,
         cursor: Annotated[str | None, Query(max_length=256)] = None,
         limit: Limit = 100,
     ) -> dict[str, Any]:
@@ -150,6 +152,8 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             status=status,
             updated_since=updated_since,
             include_transient=include_transient,
+            include_retired=include_retired,
+            include_aliases=include_aliases,
             cursor=cursor,
             limit=limit,
         )

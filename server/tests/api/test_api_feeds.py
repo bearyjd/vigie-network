@@ -87,7 +87,7 @@ def test_events_late_audit_row_is_not_skipped(env: Env) -> None:
 
 def test_events_page_is_display_sorted_by_ts_and_limit_is_total(env: Env) -> None:
     env.device("d1")
-    for i, when in enumerate((-10, -50, -30)):
+    for when in (-10, -50, -30):
         env.event("d1", when, "anomaly")
     page = env.get("/events", limit=3).json()["data"]
     assert [e["ts"] for e in page] == sorted(e["ts"] for e in page)

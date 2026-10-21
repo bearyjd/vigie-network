@@ -229,7 +229,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "maxLength": 32,
+                  "maxLength": 64,
                   "type": "string"
                 },
                 {
@@ -246,6 +246,26 @@
             "schema": {
               "default": false,
               "title": "Include Transient",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_retired",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Retired",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_aliases",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Aliases",
               "type": "boolean"
             }
           },

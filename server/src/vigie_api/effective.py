@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
+from datetime import datetime
 from typing import Any
 
 from vigie_api.errors import ApiError
@@ -16,6 +18,8 @@ MAX_LINK_DEPTH = 32
 RECENT_EVENTS = 20
 _MAC_RE = re.compile(r"^[0-9a-f]{12}$")
 _MAC_SEPARATORS = re.compile(r"[:.\-]")
+_ISO_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
+_STATE_RANK = {"ok": 0, "pending_confirm": 1, "conflict": 2}
 
 
 def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -81,10 +85,13 @@ def _type_and_provenance(device: sqlite3.Row, override: sqlite3.Row | None) -> t
 
 
 def effective_device(
-    device: sqlite3.Row, override: sqlite3.Row | None, links: dict[str, str]
+    device: sqlite3.Row, overrides: dict[str, sqlite3.Row], links: dict[str, str]
 ) -> dict[str, Any]:
-    etype, provenance = _type_and_provenance(device, override)
+    """The view of one device. An alias shows its CANONICAL device's override: whatever the
+    alias had before the merge is superseded, never leaked into list results."""
     canonical = resolve(links, device["id"])
+    override = overrides.get(canonical)
+    etype, provenance = _type_and_provenance(device, override)
     updated = max(
         device["last_seen"],
         override["updated_at"] if override else "",
@@ -108,25 +115,101 @@ def effective_device(
     }
 
 
+def worst_state(states: Iterable[str]) -> str:
+    """ok < pending_confirm < conflict; an unrecognised state outranks them all."""
+    return max(states, key=lambda s: _STATE_RANK.get(s, len(_STATE_RANK)), default="ok")
+
+
+def parse_updated_since(raw: str) -> str:
+    """Strict ISO-8601 UTC (`...Z`), normalised to the stored `YYYY-MM-DDTHH:MM:SSZ` form."""
+    if not _ISO_UTC_RE.fullmatch(raw):
+        raise ApiError(400, "invalid_updated_since", "updated_since must be ISO-8601 UTC (…Z)")
+    try:
+        moment = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ApiError(400, "invalid_updated_since", "updated_since is not a valid time") from exc
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _members_of(links: dict[str, str]) -> dict[str, list[str]]:
+    members: dict[str, list[str]] = {}
+    for alias in links:
+        members.setdefault(resolve(links, alias), []).append(alias)
+    return members
+
+
+def _ids_where(
+    overrides: dict[str, sqlite3.Row],
+    links: dict[str, str],
+    pred: Callable[[sqlite3.Row], bool],
+) -> str:
+    """JSON array of every device (canonical + its aliases) whose canonical override matches."""
+    members = _members_of(links)
+    found: list[str] = []
+    for device_id, row in overrides.items():
+        if resolve(links, device_id) == device_id and pred(row):
+            found += [device_id, *members.get(device_id, ())]
+    return json.dumps(found)
+
+
 def iter_devices(
     inv: sqlite3.Connection,
+    overrides: dict[str, sqlite3.Row],
+    links: dict[str, str],
     *,
     after: str,
-    status: str | None,
+    type_: str | None,
+    group: str | None,
     identity_state: str | None,
+    status: str | None,
+    updated_since: str | None,
     include_transient: bool,
+    include_retired: bool,
+    include_aliases: bool,
 ) -> Iterator[sqlite3.Row]:
-    clauses, params = ["id > ?"], [after]
+    """Filters run in SQL (override-derived ones through json_each id sets), so a flood of
+    devices costs one indexed scan, not one Python-side effective view per device."""
+    clauses, params = ["id > :after"], {"after": after}
+    in_set = "id IN (SELECT value FROM json_each(:{}))"
     if status is not None:
-        clauses.append("status = ?")
-        params.append(status)
-    elif not include_transient:
-        clauses.append("status <> 'transient'")
+        clauses.append("status = :status")
+        params["status"] = status
+    else:
+        hidden = [s for s, on in (("transient", include_transient), ("retired", include_retired))
+                  if not on]  # fmt: skip
+        clauses += [f"status <> '{s}'" for s in hidden]  # noqa: S608 - fixed literals
     if identity_state is not None:
-        clauses.append("identity_state = ?")
-        params.append(identity_state)
+        clauses.append("identity_state = :identity_state")
+        params["identity_state"] = identity_state
+    if not include_aliases:
+        clauses.append("id NOT IN (SELECT value FROM json_each(:aliases))")
+        params["aliases"] = json.dumps(list(links))
+    if type_ is not None:
+        params["type_has"] = _ids_where(overrides, links, lambda r: bool(r["type"]))
+        params["type_eq"] = _ids_where(overrides, links, lambda r: r["type"] == type_)
+        params["type"] = type_
+        clauses.append(
+            f"({in_set.format('type_eq')} OR (NOT {in_set.format('type_has')}"
+            " AND COALESCE(NULLIF(inferred_type, ''), 'unknown') = :type))"
+        )
+    if group is not None:
+        if group == "unassigned":
+            params["group_any"] = _ids_where(overrides, links, lambda r: bool(r["group_id"]))
+            clauses.append(f"NOT {in_set.format('group_any')}")
+        else:
+            params["group_eq"] = _ids_where(overrides, links, lambda r: r["group_id"] == group)
+            clauses.append(in_set.format("group_eq"))
+    if updated_since is not None:
+        params["since"] = updated_since
+        params["ov_since"] = _ids_where(
+            overrides, links, lambda r: r["updated_at"] >= updated_since
+        )
+        clauses.append(
+            "(last_seen >= :since OR COALESCE(inferred_updated_at, '') >= :since"
+            f" OR {in_set.format('ov_since')})"
+        )
     sql = f"SELECT * FROM devices WHERE {' AND '.join(clauses)} ORDER BY id"  # noqa: S608
-    yield from inv.execute(sql, tuple(params))
+    yield from inv.execute(sql, params)
 
 
 def list_devices(
@@ -139,31 +222,34 @@ def list_devices(
     status: str | None,
     updated_since: str | None,
     include_transient: bool,
+    include_retired: bool,
+    include_aliases: bool,
     cursor: str | None,
     limit: int,
 ) -> tuple[list[dict[str, Any]], str | None]:
     after = decode_cursor(cursor) if cursor else ""
+    since = parse_updated_since(updated_since) if updated_since is not None else None
     overrides, links = override_map(ov), link_map(ov)
     out: list[dict[str, Any]] = []
     more = False
     for row in iter_devices(
         inv,
+        overrides,
+        links,
         after=after,
-        status=status,
+        type_=type_,
+        group=group,
         identity_state=identity_state,
+        status=status,
+        updated_since=since,
         include_transient=include_transient,
+        include_retired=include_retired,
+        include_aliases=include_aliases,
     ):
-        item = effective_device(row, overrides.get(row["id"]), links)
-        if type_ is not None and item["type"] != type_:
-            continue
-        if group is not None and (item["group_id"] or "unassigned") != group:
-            continue
-        if updated_since is not None and item["updated_at"] < updated_since:
-            continue
         if len(out) == limit:
             more = True
             break
-        out.append(item)
+        out.append(effective_device(row, overrides, links))
     return out, (encode_cursor(out[-1]["id"]) if more else None)
 
 
@@ -178,10 +264,15 @@ def device_detail(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: st
     links = link_map(ov)
     canonical = resolve(links, device_id)
     row = _device_row(inv, canonical)
-    override = override_map(ov).get(canonical)
-    item = effective_device(row, override, links)
+    item = effective_device(row, override_map(ov), links)
     members = [canonical, *(f for f in links if f != canonical and resolve(links, f) == canonical)]
     marks = ",".join("?" * len(members))
+    states = rows(
+        inv,
+        f"SELECT identity_state FROM devices WHERE id IN ({marks})",  # noqa: S608
+        tuple(members),
+    )
+    item["identity_state"] = worst_state(r["identity_state"] for r in states)
     obs = rows(
         inv,
         f"SELECT * FROM observations WHERE device_id IN ({marks}) ORDER BY last_seen DESC, mac",  # noqa: S608
@@ -226,10 +317,12 @@ def resolve_mac(inv: sqlite3.Connection, ov: sqlite3.Connection, raw_mac: str) -
         raise ApiError(404, "not_found", "unknown MAC")
     canonical = resolve(link_map(ov), found[0]["device_id"])
     device = _device_row(inv, canonical)
+    observed = rows(inv, "SELECT identity_state FROM devices WHERE id=?", (found[0]["device_id"],))
+    states = [device["identity_state"], *(r["identity_state"] for r in observed)]
     return {
         "mac": mac,
         "device_id": canonical,
         "observed_device_id": found[0]["device_id"],
         "link_source": found[0]["link_source"],
-        "identity_state": device["identity_state"],
+        "identity_state": worst_state(states),
     }

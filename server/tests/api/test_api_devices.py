@@ -102,7 +102,9 @@ def test_alias_follows_identity_link(env: Env) -> None:
     env.mac("aa:bb:cc:00:00:01", "canon", last=-50)
     env.mac("ae:bb:cc:00:00:02", "alias", link_source="human", last=0)
     env.link("alias", "canon")
-    listing = {d["id"]: d["merged_into"] for d in env.get("/devices").json()["data"]}
+    listing = {
+        d["id"]: d["merged_into"] for d in env.get("/devices", include_aliases=1).json()["data"]
+    }
     assert listing == {"canon": None, "alias": "canon"}
     detail = env.get("/devices/alias").json()["data"]
     assert detail["id"] == "canon" and detail["merged_into"] == "canon"
