@@ -10,6 +10,9 @@ tests
 tools
 docs
 collector
-deploy/certs
+deploy/certs*
+deploy/pins.txt
+deploy/**/*.key
 deploy/.env
 deploy/collector-*
+**/key-*
