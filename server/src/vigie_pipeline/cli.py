@@ -56,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         while True:
             try:
                 run_once(config)
-            except (sqlite3.Error, ShardReadError) as exc:  # transient lock/IO trouble: log and retry next tick
+            except (sqlite3.Error, ShardReadError) as exc:  # log, retry next tick
                 log(logger, logging.ERROR, "run_failed", error=str(exc))
             time.sleep(args.loop)
     except KeyboardInterrupt:

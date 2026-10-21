@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 import time
@@ -183,9 +184,36 @@ def _revive_if_retired(
     )
 
 
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def _flag_conflict(
+    inv: sqlite3.Connection, row: sqlite3.Row, field: str, new: str, ts: str
+) -> None:
+    """Fingerprint/vendor class are the identity signature: a differing value for the same MAC
+    is kept out of the record and flagged. One event per (device, field) per day; values appear
+    only as short hashes."""
+    device_id = row["device_id"]
+    inv.execute("UPDATE devices SET identity_state='conflict' WHERE id=?", (device_id,))
+    seen = inv.execute(
+        "SELECT 1 FROM events WHERE device_id=? AND kind='identity_conflict'"
+        " AND substr(ts,1,10)=? AND summary LIKE ?",
+        (device_id, ts[:10], f"{field} changed%"),
+    ).fetchone()
+    if seen:
+        return
+    summary = f"{field} changed on {row['mac']}: {_short_hash(row[field])} -> {_short_hash(new)}"
+    inv.execute(
+        "INSERT INTO events (id, device_id, ts, kind, severity, summary)"
+        " VALUES (?,?,?,'identity_conflict','warn',?)",
+        (str(uuid.uuid4()), device_id, ts, summary),
+    )
+
+
 def _update_observation(inv: sqlite3.Connection, row: sqlite3.Row, act: MacActivity) -> None:
-    """Widen first/last seen; a value from an older batch never replaces a newer one,
-    and a missing value never erases a known one."""
+    """Widen first/last seen. Hostname/mDNS name follow the newest batch (they legitimately
+    change). Fingerprint and vendor class are first-wins; a differing value is a conflict."""
     first, last = iso_utc(act.first_ts), iso_utc(act.last_ts)
     newer = last >= row["last_seen"]
 
@@ -194,11 +222,18 @@ def _update_observation(inv: sqlite3.Connection, row: sqlite3.Row, act: MacActiv
             return old
         return new if newer or old is None else old
 
+    def first_wins(field: str, new: str | None) -> str | None:
+        old = row[field]
+        if old is None or new is None or new == old:
+            return old if old is not None else new
+        _flag_conflict(inv, row, field, new, last)
+        return old
+
     inv.execute(
         "UPDATE observations SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?),"
         " hostname=?, dhcp_fingerprint=?, vendor_class=?, mdns_name=? WHERE mac=?",
         (first, last, pick(row["hostname"], act.hostname),
-         pick(row["dhcp_fingerprint"], act.opt55), pick(row["vendor_class"], act.opt60),
+         first_wins("dhcp_fingerprint", act.opt55), first_wins("vendor_class", act.opt60),
          pick(row["mdns_name"], act.mdns_name), row["mac"]),
     )  # fmt: skip
 

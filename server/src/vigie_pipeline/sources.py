@@ -120,7 +120,10 @@ def _fold_shard(
     """Read each table independently so every failure is reported; returns failed tables."""
     failed: list[str] = []
     for table, columns, handle in _steps(acts, skipped):
-        sql = f"SELECT {columns} FROM {table} WHERE collector_id=? AND batch_id=?"  # noqa: S608
+        sql = (
+            f"SELECT {columns} FROM {table} "  # noqa: S608  (fixed names, not user input)
+            "WHERE collector_id=? AND batch_id=? ORDER BY ts, rowid"
+        )
         try:
             for row in conn.execute(sql, key):
                 handle(row)
