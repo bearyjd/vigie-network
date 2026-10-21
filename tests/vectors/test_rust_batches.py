@@ -49,7 +49,7 @@ def header(sample: dict, name: str) -> str:
 
 def test_rust_batches_validate_and_verify() -> None:
     samples = load_samples()
-    assert len(samples) == 4
+    assert len(samples) == 5
     schema = None
     try:
         import jsonschema

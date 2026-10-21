@@ -16,9 +16,9 @@ fn mac_n(n: usize) -> String {
 
 #[test]
 fn cap_is_within_the_server_limit() {
-    assert_eq!(SERVER_MAX_BODY, 512 * 1024);
-    assert!(BATCH_CAP <= 512 * 1024);
-    assert!(BATCH_CAP <= SERVER_MAX_BODY);
+    const { assert!(SERVER_MAX_BODY == 512 * 1024) };
+    const { assert!(BATCH_CAP <= 512 * 1024) };
+    const { assert!(BATCH_CAP <= SERVER_MAX_BODY) };
 }
 
 #[test]

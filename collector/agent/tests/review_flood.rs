@@ -176,7 +176,7 @@ fn all_truncated_kinds_fit_the_schema_and_the_reserve() {
         full.insert(k.into(), u64::MAX);
     }
     assert!(full.len() <= 16);
-    let sizes: usize = full.iter().map(|(k, _)| k.len() + 3 + 19 + 1).sum();
+    let sizes: usize = full.keys().map(|k| k.len() + 3 + 19 + 1).sum();
     assert!(
         sizes <= TRUNCATED_RESERVE,
         "reserve must cover the worst case: {sizes}"

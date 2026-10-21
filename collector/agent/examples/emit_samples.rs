@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use vigie_agent::builder::{build, BATCH_CAP};
+use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
 use vigie_agent::ids;
 use vigie_agent::model::*;
 use vigie_agent::sender::*;
@@ -171,6 +171,26 @@ fn main() {
         names.push((name, b.truncated.clone()));
         engine.enqueue(b.encoded);
     }
+    // Every flood/clock drop counter at its maximum: keys and sizes must satisfy the server schema.
+    let drops: BTreeMap<String, u64> = [
+        "dns_quota_dropped",
+        "dns_dropped",
+        "sightings_dropped",
+        "dns_pending_evicted",
+        "dns_client_throttled",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), i64::MAX as u64))
+    .collect();
+    let b = build_with_drops(
+        &meta(4),
+        Sections::default(),
+        &Health::default(),
+        BATCH_CAP,
+        &drops,
+    );
+    names.push(("all drop counters", b.truncated.clone()));
+    engine.enqueue(b.encoded);
     engine.spool.note_dropped(2);
     let mut cap = Capture(Vec::new());
     for i in 0..names.len() {
