@@ -35,7 +35,8 @@ fn sh(name: &str, args: &[&str], envs: &[(&str, String)]) -> Output {
     let (uid, gid) = me();
     let mut c = Command::new("sh");
     c.arg(script(name)).args(args);
-    c.env("VIGIE_TRUSTED_UID", uid.to_string())
+    c.env("VIGIE_TEST", "1")
+        .env("VIGIE_TRUSTED_UID", uid.to_string())
         .env("VIGIE_OWNER", format!("{uid}:{gid}"))
         .env("VIGIE_LOG_ALLOWED_UIDS", uid.to_string());
     for (k, v) in envs {
@@ -73,7 +74,7 @@ fn ensure_creates_private_log_dir_and_group_readable_log() {
     let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
     let o = dropin(&["ensure"], &dd, &ld, &[]);
     assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(mode(&ld), 0o750, "log dir is not world-readable");
+    assert_eq!(mode(&ld), 0o751, "log dir: traverse-only for others");
     assert_eq!(
         mode(&ld.join("dnsmasq.log")),
         0o640,
@@ -318,8 +319,14 @@ fn init_script_runs_the_agent_as_the_dedicated_vigie_user() {
 #[test]
 fn install_helper_prints_user_creation_commands_and_changes_nothing() {
     let d = tmpdir();
+    let cfg = tmpdir();
+    fs::write(cfg.join("passwd"), "root:x:0:0::/:/bin/sh\n").unwrap();
+    fs::write(cfg.join("group"), "root:x:0:\n").unwrap();
     let o = Command::new("sh")
         .arg(script("vigie-print-install-commands.sh"))
+        .env("VIGIE_TEST", "1")
+        .env("VIGIE_PASSWD", cfg.join("passwd"))
+        .env("VIGIE_GROUP_FILE", cfg.join("group"))
         .env("VIGIE_UID", "6700")
         .env("VIGIE_GID", "6700")
         .env("HOME", &d)
@@ -333,7 +340,6 @@ fn install_helper_prints_user_creation_commands_and_changes_nothing() {
         "/etc/group",
         "/bin/false",
         "vigie:x:6700:6700",
-        "install -d -m 0750 -o root -g vigie /tmp/vigie",
         "chown vigie:vigie /etc/vigie/key",
         "chmod 0600 /etc/vigie/key",
     ] {

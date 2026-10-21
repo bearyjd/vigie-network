@@ -222,6 +222,7 @@ fn dist(name: &str) -> String {
 fn trust_env() -> Vec<(&'static str, String)> {
     let m = fs::metadata("/proc/self").unwrap();
     vec![
+        ("VIGIE_TEST", "1".to_string()),
         ("VIGIE_TRUSTED_UID", m.uid().to_string()),
         ("VIGIE_OWNER", format!("{}:{}", m.uid(), m.gid())),
         ("VIGIE_LOG_ALLOWED_UIDS", m.uid().to_string()),
@@ -312,7 +313,7 @@ fn dropin_script_creates_repairs_and_reloads_only_on_change() {
 }
 
 #[test]
-fn watchdog_script_truncates_only_above_the_limit() {
+fn watchdog_script_rotates_only_above_the_limit() {
     let d = tmpdir();
     fs::set_permissions(&d, fs::Permissions::from_mode(0o750)).unwrap();
     let log = d.join("dnsmasq.log");
@@ -321,6 +322,7 @@ fn watchdog_script_truncates_only_above_the_limit() {
             .arg(dist("vigie-log-watchdog.sh"))
             .env("VIGIE_LOG_FILE", &log)
             .env("VIGIE_LOG_MAX_BYTES", limit)
+            .env("VIGIE_SIGNAL_CMD", "true")
             .envs(trust_env())
             .status()
             .unwrap()
@@ -335,10 +337,11 @@ fn watchdog_script_truncates_only_above_the_limit() {
         "at the limit: untouched"
     );
     assert_eq!(run("4999"), 0);
+    assert_eq!(fs::metadata(&log).unwrap().len(), 0, "new empty log");
     assert_eq!(
-        fs::metadata(&log).unwrap().len(),
-        0,
-        "above the limit: truncated"
+        fs::metadata(d.join("dnsmasq.log.1")).unwrap().len(),
+        5000,
+        "above the limit: renamed, nothing lost"
     );
     assert_eq!(run("1"), 0, "empty file fine");
     fs::remove_file(&log).unwrap();

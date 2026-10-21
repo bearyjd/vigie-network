@@ -18,6 +18,8 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
+	# Fail closed: without the dedicated user procd would fall back to running as root.
+	id -u vigie >/dev/null 2>&1 || { logger -t vigie 'vigie user missing'; return 1; }
 	# Recreate the tmpfs drop-in and reload dnsmasq (root).
 	/usr/libexec/vigie/vigie-dnsmasq-dropin.sh ensure || return 1
 

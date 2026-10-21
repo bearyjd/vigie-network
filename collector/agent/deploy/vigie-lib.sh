@@ -1,16 +1,28 @@
 # Shared checks for the root-run Vigie scripts (sourced, not executed). POSIX sh / busybox ash.
 #
 # /tmp is world-writable, so everything the scripts touch there is verified first: no symlinks,
-# owned by the trusted uid (root), and directories not writable by group/other. The env hooks
-# exist for tests (they run unprivileged); cron and procd start these scripts with a clean env.
+# owned by the trusted uid (root), and directories not writable by group/other.
+#
+# The VIGIE_* overrides below (and the path/command overrides in the scripts that source this)
+# exist for the unprivileged test suite and are honoured ONLY when VIGIE_TEST=1. Production
+# (cron, procd) never sets it, so an environment cannot redirect what root touches.
 #
 #   VIGIE_TRUSTED_UID        uid that must own directories and the drop-in   (default 0)
 #   VIGIE_OWNER              user:group given to directories we create       (default root:vigie)
 #   VIGIE_LOG_ALLOWED_UIDS   uids allowed to own the log file                (default: 0 and the
 #                            dnsmasq/nobody uids, because dnsmasq may chown its log to its run user)
 
-VIGIE_TRUSTED_UID="${VIGIE_TRUSTED_UID:-0}"
-VIGIE_OWNER="${VIGIE_OWNER:-root:vigie}"
+vtest() { [ "${VIGIE_TEST:-}" = 1 ]; }
+
+if vtest; then
+	VIGIE_TRUSTED_UID="${VIGIE_TRUSTED_UID:-0}"
+	VIGIE_OWNER="${VIGIE_OWNER:-root:vigie}"
+else
+	PATH=/usr/sbin:/usr/bin:/sbin:/bin
+	VIGIE_TRUSTED_UID=0
+	VIGIE_OWNER=root:vigie
+	VIGIE_LOG_ALLOWED_UIDS=
+fi
 
 if [ -z "${VIGIE_LOG_ALLOWED_UIDS:-}" ]; then
 	VIGIE_LOG_ALLOWED_UIDS="$VIGIE_TRUSTED_UID"
@@ -19,8 +31,10 @@ if [ -z "${VIGIE_LOG_ALLOWED_UIDS:-}" ]; then
 	done
 fi
 
+# Fail closed and loud: stderr for the operator, syslog for the router's log.
 refuse() {
 	echo "vigie: refusing: $*" >&2
+	logger -t vigie -p daemon.crit "refusing: $*" 2>/dev/null || true
 	exit 70
 }
 
@@ -36,14 +50,13 @@ require_dir() {
 	esac
 }
 
-# ensure_dir DIR MODE: create DIR privately if absent (mkdir fails on any existing name,
-# including a symlink), then verify it, whoever made it.
+# ensure_dir DIR MODE: create DIR privately; owner and mode are set ONLY on a directory this very
+# mkdir created (no -p, so it fails on any existing name, symlinks included). A directory that
+# already exists, or that someone else created between our check and our mkdir, is never
+# chown'ed or chmod'ed by path: it must already pass require_dir, or we refuse.
 ensure_dir() {
-	if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-		(umask 077 && mkdir "$1") 2>/dev/null || true
-		if [ -d "$1" ] && [ ! -L "$1" ]; then
-			chown "$VIGIE_OWNER" "$1" && chmod "$2" "$1" || refuse "cannot set owner/mode on $1"
-		fi
+	if (umask 077 && mkdir "$1") 2>/dev/null; then
+		chown "$VIGIE_OWNER" "$1" && chmod "$2" "$1" || refuse "cannot set owner/mode on $1"
 	fi
 	require_dir "$1"
 }
