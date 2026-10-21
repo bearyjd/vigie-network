@@ -20,8 +20,8 @@ use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
 use vigie_agent::dropin::{check_dropin, QuietDetector, DROPIN_PATH, LOG_DIR};
 use vigie_agent::ids;
 use vigie_agent::leases::parse_leases;
-use vigie_agent::model::{Health, Meta, Sections};
-use vigie_agent::neigh::ip_to_mac;
+use vigie_agent::model::{Health, Lease, Meta, Neighbor, Sections};
+use vigie_agent::neigh::{ip_to_mac, pairing_changed};
 use vigie_agent::procstat::{read_rss_kb, read_status, root_refusal};
 use vigie_agent::runtime::{random, random_u64, read_neighbors, wall_ms, wall_secs};
 use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport, TransportError};
@@ -121,6 +121,8 @@ struct Agent {
     quiet: QuietDetector,
     ip_to_mac: HashMap<String, String>,
     started: Instant,
+    /// Monotonic seconds of the current loop step (injected clock in tests).
+    mono: u64,
     sources: Sources,
     /// `read_neighbors` in production; tests substitute a fake table.
     neigh_source: fn() -> Vec<vigie_agent::model::Neighbor>,
@@ -188,22 +190,50 @@ impl Agent {
 
     fn on_dhcp(&mut self, ev: &LogEvent) {
         if let Some(lease) = self.dhcp.feed(ev) {
-            let new_mac = self.urgent.on_lease(&lease.mac, started_ms(self.started));
-            self.window.add_lease(lease);
-            if new_mac {
-                // A new device is the case where the 10 s neighbor snapshot is stale: refresh
-                // now so its first queries are attributed and its neighbor entry rides along.
-                self.refresh_neighbors();
-                self.push_identity();
-            }
+            self.on_lease(lease);
+        }
+    }
+
+    fn on_lease(&mut self, lease: Lease) {
+        let new_mac = self.urgent.on_lease(&lease.mac, started_ms(self.started));
+        // The lease states the pairing now: a table that disagrees (address moved to this MAC,
+        // or not seen yet) is stale and would bill this device's traffic to the old owner.
+        let moved = pairing_changed(&self.ip_to_mac, &lease.ip, &lease.mac);
+        self.window.add_lease(lease);
+        // A new device always refreshes (its first queries must be attributed and its neighbor
+        // entry rides along); a changed pairing refreshes at most once per `REFRESH_MIN_S`.
+        if new_mac || (moved && self.sources.refresh_due(self.mono)) {
+            self.refresh_neighbors();
+        }
+        if new_mac {
+            self.push_identity();
         }
     }
 
     fn refresh_neighbors(&mut self) {
         let all = (self.neigh_source)();
-        self.ip_to_mac = ip_to_mac(&all);
-        for n in self.delta.new_neighbors(&all) {
+        self.sources.note_refresh(self.mono);
+        self.adopt_neighbors(&all);
+    }
+
+    /// Makes `all` the attribution map and reports its entries that are new since the last read.
+    fn adopt_neighbors(&mut self, all: &[Neighbor]) {
+        self.ip_to_mac = ip_to_mac(all);
+        for n in self.delta.new_neighbors(all) {
             self.window.add_neighbor(n);
+        }
+    }
+
+    /// Drains the sources; a snapshot's table read (if any) becomes the agent's map.
+    fn pump_sources(&mut self, mono: u64) {
+        let read = self.neigh_source;
+        if let Some(all) = self.sources.pump_refreshing(
+            &mut self.window,
+            &self.ip_to_mac,
+            Some(&mut || read()),
+            mono,
+        ) {
+            self.adopt_neighbors(&all);
         }
     }
 
@@ -235,6 +265,7 @@ impl Agent {
     }
 
     fn flush_window(&mut self, now: u64, mono_s: u64) {
+        self.mono = mono_s;
         let plan = self.sync.plan(self.engine.gate.is_sane(now, mono_s));
         if plan == FlushPlan::Probe {
             self.queue_probe(now);
@@ -257,7 +288,7 @@ impl Agent {
             }
             Err(e) => eprintln!("leases file: {e}"),
         }
-        self.sources.pump(&mut self.window, &self.ip_to_mac, mono_s);
+        self.pump_sources(mono_s);
         self.sources.finish_window(&mut self.window, mono_s);
         let dropin = std::fs::read_to_string(DROPIN_PATH).ok();
         let state = check_dropin(dropin.as_deref(), LOG_DIR);
@@ -292,13 +323,14 @@ impl Agent {
         transport: &mut T,
     ) -> Tick {
         let Clock { wall, mono, jitter } = when;
+        self.mono = mono;
         let (last_flush, last_neigh) = last;
         if mono.saturating_sub(*last_neigh) >= NEIGH_REFRESH_S {
             self.refresh_neighbors();
             *last_neigh = mono;
         }
         self.poll_log(self.sync.stamp(wall, mono));
-        self.sources.pump(&mut self.window, &self.ip_to_mac, mono);
+        self.pump_sources(mono);
         if self.urgent.take_pending(started_ms(self.started)) {
             self.push_identity();
         }
@@ -376,6 +408,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         quiet: QuietDetector::default(),
         ip_to_mac: HashMap::new(),
         started: Instant::now(),
+        mono: 0,
     };
     // Leases already on the router at startup are not "new MACs": no urgent-push storm.
     if let Ok(t) = std::fs::read_to_string(&agent.cfg.leases_file) {
@@ -416,7 +449,8 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vigie_agent::model::{DnsQuery, Lease};
+    use std::cell::RefCell;
+    use vigie_agent::model::DnsQuery;
 
     const MAC: &str = "aa:bb:cc:dd:ee:01";
 
@@ -449,6 +483,7 @@ mod tests {
             quiet: QuietDetector::default(),
             ip_to_mac: HashMap::new(),
             started: Instant::now(),
+            mono: 0,
             sources: Sources::inert(),
             neigh_source: Vec::new,
         }
@@ -671,5 +706,56 @@ mod tests {
         let some = parse_args(["--allow-root".to_string()].into_iter()).unwrap();
         assert!(some.allow_root);
         assert!(parse_args(["--allow-roo".to_string()].into_iter()).is_err());
+    }
+
+    thread_local! {
+        static TL_NEIGH: RefCell<Vec<(&'static str, &'static str)>> = const { RefCell::new(Vec::new()) };
+        static TL_READS: RefCell<usize> = const { RefCell::new(0) };
+    }
+
+    fn tl_fake_neigh() -> Vec<Neighbor> {
+        TL_READS.with(|r| *r.borrow_mut() += 1);
+        TL_NEIGH.with(|n| {
+            n.borrow()
+                .iter()
+                .map(|(ip, mac)| Neighbor::new(ip, mac).unwrap())
+                .collect()
+        })
+    }
+
+    fn lease_for(mac: &str, ip: &str) -> Lease {
+        Lease::new(mac, ip, None, &[], None).unwrap()
+    }
+
+    #[test]
+    fn a_lease_that_changes_an_ip_mac_pairing_refreshes_the_neighbor_table() {
+        const B: &str = "aa:bb:cc:dd:ee:02";
+        let mut a = agent();
+        a.neigh_source = tl_fake_neigh;
+        TL_NEIGH.with(|n| *n.borrow_mut() = vec![("192.168.1.50", MAC)]);
+        TL_READS.with(|r| *r.borrow_mut() = 0);
+        // MAC is known (not a new device) and the table agrees with the lease: no read.
+        a.urgent.prime([MAC, B]);
+        a.mono = 100;
+        a.refresh_neighbors();
+        assert_eq!(TL_READS.with(|r| *r.borrow()), 1);
+        a.mono = 200;
+        a.on_lease(lease_for(MAC, "192.168.1.50"));
+        assert_eq!(
+            TL_READS.with(|r| *r.borrow()),
+            1,
+            "same pairing: no refresh"
+        );
+        // The address moves to B (known MAC): the table is stale, refresh once.
+        TL_NEIGH.with(|n| *n.borrow_mut() = vec![("192.168.1.50", B)]);
+        a.on_lease(lease_for(B, "192.168.1.50"));
+        assert_eq!(TL_READS.with(|r| *r.borrow()), 2, "moved pairing refreshes");
+        assert_eq!(a.ip_to_mac.get("192.168.1.50").map(String::as_str), Some(B));
+        // Another changed pairing within the rate-limit window does not read again.
+        a.on_lease(lease_for(MAC, "192.168.1.51"));
+        assert_eq!(TL_READS.with(|r| *r.borrow()), 2, "rate-limited");
+        a.mono = 201;
+        a.on_lease(lease_for(MAC, "192.168.1.51"));
+        assert_eq!(TL_READS.with(|r| *r.borrow()), 3);
     }
 }

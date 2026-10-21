@@ -630,3 +630,105 @@ fn injected_flood_cannot_exceed_the_per_device_quota() {
         eprintln!("NOTE: only {accepted}/{total} datagrams arrived; quota boundary not reached");
     }
 }
+
+// ---- IP -> MAC attribution freshness ----------------------------------------------------------
+
+const X: &str = "192.168.8.50";
+
+/// A scripted neighbor source: each call returns the next table and counts the call.
+struct Neigh {
+    tables: Vec<Vec<(&'static str, &'static str)>>,
+    calls: usize,
+}
+
+impl Neigh {
+    fn new(tables: Vec<Vec<(&'static str, &'static str)>>) -> Self {
+        Self { tables, calls: 0 }
+    }
+    fn read(&mut self) -> Vec<vigie_agent::model::Neighbor> {
+        let i = self.calls.min(self.tables.len() - 1);
+        self.calls += 1;
+        self.tables[i]
+            .iter()
+            .map(|(ip, mac)| vigie_agent::model::Neighbor::new(ip, mac).unwrap())
+            .collect()
+    }
+}
+
+fn bytes_of(j: &serde_json::Value, mac: &str) -> u64 {
+    j["conntrack"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["mac"] == mac)
+        .map(|r| r["bytes_up"].as_u64().unwrap() + r["bytes_down"].as_u64().unwrap())
+        .sum()
+}
+
+#[test]
+fn an_ip_that_moves_between_macs_between_snapshots_is_billed_to_the_new_owner() {
+    let mut f = fake(0);
+    let mut n = Neigh::new(vec![vec![(X, A)], vec![(X, B)]]);
+    let mut w = Window::default();
+    let stale = map(&[(X, A)]); // the agent's map from the last periodic refresh
+    f.ct_tx.send(snap(vec![rec(X, 100, 0, 1)])).unwrap();
+    let r = f
+        .sources
+        .pump_refreshing(&mut w, &stale, Some(&mut || n.read()), 100);
+    assert!(r.is_some(), "a snapshot refreshes the table");
+    // Between snapshots the address is re-assigned to B; the agent's own map still says A.
+    f.ct_tx.send(snap(vec![rec(X, 1000, 0, 1)])).unwrap();
+    f.sources
+        .pump_refreshing(&mut w, &stale, Some(&mut || n.read()), 160);
+    f.sources.finish_window(&mut w, 160);
+    let j = batch_json(&mut w);
+    assert_eq!(bytes_of(&j, A), 100, "first snapshot to A");
+    assert_eq!(bytes_of(&j, B), 1000, "second snapshot to B, not A");
+}
+
+#[test]
+fn a_source_missing_from_the_map_is_attributed_after_the_snapshot_refresh() {
+    let mut f = fake(0);
+    let mut n = Neigh::new(vec![vec![(X, A)]]);
+    let mut w = Window::default();
+    f.ct_tx.send(snap(vec![rec(X, 7, 0, 1)])).unwrap();
+    let fresh = f
+        .sources
+        .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 5)
+        .expect("refreshed");
+    assert_eq!(fresh.len(), 1);
+    f.sources.finish_window(&mut w, 5);
+    let j = batch_json(&mut w);
+    assert_eq!(bytes_of(&j, A), 7);
+    assert!(j["truncated"].get("ct_unmapped_bytes").is_none());
+}
+
+#[test]
+fn snapshot_refreshes_are_rate_limited() {
+    let mut f = fake(0);
+    let mut n = Neigh::new(vec![vec![(X, A)]]);
+    let mut w = Window::default();
+    for _ in 0..3 {
+        f.ct_tx
+            .send(snap(vec![rec("192.168.8.77", 1, 0, 1)]))
+            .unwrap();
+    }
+    // Three snapshots arrive within one second: one neighbor read, not three.
+    f.sources
+        .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 50);
+    assert_eq!(n.calls, 1);
+    // A refresh by the agent counts too: the next snapshot in the same second does not re-read.
+    f.sources.note_refresh(60);
+    f.ct_tx
+        .send(snap(vec![rec("192.168.8.77", 1, 0, 1)]))
+        .unwrap();
+    f.sources
+        .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 60);
+    assert_eq!(n.calls, 1);
+    f.ct_tx
+        .send(snap(vec![rec("192.168.8.77", 1, 0, 1)]))
+        .unwrap();
+    f.sources
+        .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 61);
+    assert_eq!(n.calls, 2);
+}

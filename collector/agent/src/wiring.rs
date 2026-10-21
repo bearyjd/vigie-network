@@ -21,6 +21,7 @@ use crate::ctfold::CtAccum;
 use crate::ctparse::Snapshot;
 use crate::ctsock::{trusted_uids, CtConfig, CtReader, CtShared};
 use crate::mcast::{McConfig, McMsg, McReader, McShared, Pkt};
+use crate::model::Neighbor;
 use crate::sightings::{from_mdns, from_ssdp};
 use crate::window::Window;
 
@@ -38,8 +39,15 @@ pub mod flag {
 
 /// A connected helper that sends nothing for this long counts as down (it sends every interval).
 pub const CT_STALE_S: u64 = 180;
+/// Least monotonic seconds between two neighbor-table reads that data (a snapshot, a lease)
+/// triggers. Bounds the cost of a hostile LAN that provokes refreshes.
+pub const REFRESH_MIN_S: u64 = 1;
 /// Multicast packets handled per `pump`, so a flood cannot stall the loop.
 pub const MAX_MC_PER_PUMP: usize = 512;
+
+fn refresh_ok(last: Option<u64>, mono_s: u64) -> bool {
+    last.is_none_or(|t| mono_s.saturating_sub(t) >= REFRESH_MIN_S)
+}
 
 enum CtSide {
     Real(CtReader),
@@ -89,6 +97,8 @@ pub struct Sources {
     /// `flag::CT_TABLE_PRESSURE`/`CT_ACCT_OFF` seen in this window.
     window_flags: u64,
     ct_last_mono: u64,
+    /// Monotonic second of the last neighbor-table read (by the agent or by `pump_refreshing`).
+    last_refresh: Option<u64>,
     ct_errors: u64,
     ct_recounted: u64,
     ct_dropped_keys: u64,
@@ -160,12 +170,48 @@ impl Sources {
         s
     }
 
-    /// Drains both queues into the window. Never blocks.
+    /// Records that the agent read the neighbor table at `mono_s`.
+    pub fn note_refresh(&mut self, mono_s: u64) {
+        self.last_refresh = Some(mono_s);
+    }
+
+    /// Whether a data-triggered neighbor read is allowed now (see `REFRESH_MIN_S`).
+    pub fn refresh_due(&self, mono_s: u64) -> bool {
+        refresh_ok(self.last_refresh, mono_s)
+    }
+
+    /// `pump_refreshing` without a neighbor source: the given map is used as is.
     pub fn pump(&mut self, w: &mut Window, ip_to_mac: &HashMap<String, String>, mono_s: u64) {
+        self.pump_refreshing(w, ip_to_mac, None, mono_s);
+    }
+
+    /// Drains both queues into the window. Never blocks.
+    ///
+    /// With `refresh`, every arriving snapshot is attributed with a table read at most
+    /// `REFRESH_MIN_S` before it (one read per snapshot at most): an address that moved to
+    /// another MAC, or is not in `ip_to_mac` yet, is billed to its current owner rather than to
+    /// the owner as of the last periodic refresh. Returns the newest table read, which the caller
+    /// must adopt as its map (and report its new entries).
+    pub fn pump_refreshing(
+        &mut self,
+        w: &mut Window,
+        ip_to_mac: &HashMap<String, String>,
+        mut refresh: Option<&mut dyn FnMut() -> Vec<Neighbor>>,
+        mono_s: u64,
+    ) -> Option<Vec<Neighbor>> {
+        let mut fresh: Option<(Vec<Neighbor>, HashMap<String, String>)> = None;
         if let Some(ct) = &self.ct {
             while let Ok(snap) = ct.rx().try_recv() {
+                if let Some(read) = refresh.as_deref_mut() {
+                    if refresh_ok(self.last_refresh, mono_s) {
+                        let all = read();
+                        self.last_refresh = Some(mono_s);
+                        fresh = Some((all.clone(), crate::neigh::ip_to_mac(&all)));
+                    }
+                }
+                let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
                 self.ct_last_mono = mono_s;
-                self.acc.add_snapshot(&snap, ip_to_mac);
+                self.acc.add_snapshot(&snap, map);
                 if snap.table_pressure {
                     self.window_flags |= flag::CT_TABLE_PRESSURE;
                 }
@@ -179,10 +225,11 @@ impl Sources {
             let lost = sh.errors.swap(0, Ordering::Relaxed) + sh.dropped.swap(0, Ordering::Relaxed);
             self.ct_errors = self.ct_errors.saturating_add(lost);
         }
+        let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
         if let Some(mc) = &self.mc {
             for _ in 0..MAX_MC_PER_PUMP {
                 let Ok(m) = mc.rx().try_recv() else { break };
-                let Some(mac) = ip_to_mac.get(&m.src.to_string()) else {
+                let Some(mac) = map.get(&m.src.to_string()) else {
                     self.mc_unmapped += 1;
                     continue;
                 };
@@ -199,6 +246,7 @@ impl Sources {
                 .mc_dropped
                 .saturating_add(mc.shared().dropped.swap(0, Ordering::Relaxed));
         }
+        fresh.map(|(all, _)| all)
     }
 
     fn ct_down(&self, mono_s: u64) -> bool {

@@ -56,3 +56,30 @@ pub fn distinct_macs(n: &[Neighbor]) -> Vec<String> {
 pub fn ip_to_mac(n: &[Neighbor]) -> HashMap<String, String> {
     n.iter().map(|x| (x.ip.clone(), x.mac.clone())).collect()
 }
+
+/// Whether `(ip, mac)` is a pairing the table `map` does not already hold: the address is unknown
+/// or maps to another MAC. A lease says the pairing is true now, so a change means the table is
+/// stale for this address.
+pub fn pairing_changed(map: &HashMap<String, String>, ip: &str, mac: &str) -> bool {
+    map.get(ip).is_none_or(|m| m != mac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_changed_detects_unknown_and_moved_addresses() {
+        let m: HashMap<String, String> =
+            [("10.0.0.1".to_string(), "aa:bb:cc:dd:ee:01".to_string())].into();
+        assert!(!pairing_changed(&m, "10.0.0.1", "aa:bb:cc:dd:ee:01"));
+        assert!(
+            pairing_changed(&m, "10.0.0.1", "aa:bb:cc:dd:ee:02"),
+            "moved"
+        );
+        assert!(
+            pairing_changed(&m, "10.0.0.2", "aa:bb:cc:dd:ee:01"),
+            "unknown"
+        );
+    }
+}
