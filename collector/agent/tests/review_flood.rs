@@ -7,7 +7,9 @@ use vigie_agent::builder::{build_with_drops, BATCH_CAP, TRUNCATED_RESERVE};
 use vigie_agent::dnsmasq::{parse_line, DnsCorrelator};
 use vigie_agent::model::TAIL_RESERVE;
 use vigie_agent::model::*;
-use vigie_agent::window::{Window, DNS_PER_MAC_QUOTA, MAX_WINDOW_DNS, MAX_WINDOW_SIGHTINGS};
+use vigie_agent::window::{
+    Window, DNS_PER_MAC_QUOTA, MAX_WINDOW_DNS, MAX_WINDOW_SIGHTINGS, SIGHTINGS_PER_MAC_QUOTA,
+};
 
 fn mac_n(n: usize) -> String {
     format!("02:00:00:00:{:02x}:{:02x}", (n >> 8) & 0xff, n & 0xff)
@@ -93,7 +95,7 @@ fn window_sightings_are_bounded_and_counted() {
     let mut w = Window::default();
     for n in 0..(MAX_WINDOW_SIGHTINGS + 7) {
         let s = Sighting::new(
-            &mac_n(1),
+            &mac_n(n / SIGHTINGS_PER_MAC_QUOTA),
             SightingKind::Mdns,
             Some(&format!("h{n}")),
             None,
@@ -103,7 +105,7 @@ fn window_sightings_are_bounded_and_counted() {
         w.add_sighting(s);
     }
     // Re-seeing an existing key is not growth.
-    let again = Sighting::new(&mac_n(1), SightingKind::Mdns, Some("h0"), None, None).unwrap();
+    let again = Sighting::new(&mac_n(0), SightingKind::Mdns, Some("h0"), None, None).unwrap();
     w.add_sighting(again);
     let (s, drops) = w.take_with_drops();
     assert_eq!(s.sightings.len(), MAX_WINDOW_SIGHTINGS);

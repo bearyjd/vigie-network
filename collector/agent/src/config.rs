@@ -14,6 +14,10 @@ pub const MIN_KEY_BYTES: usize = 32;
 const DEFAULT_KEY_FILE: &str = "/etc/vigie/key";
 const DEFAULT_DNSMASQ_LOG: &str = "/tmp/vigie/dnsmasq.log";
 const DEFAULT_LEASES_FILE: &str = "/tmp/dhcp.leases";
+const DEFAULT_CONNTRACK_SOCKET: &str = "/tmp/vigie/conntrack.sock";
+const DEFAULT_LAN_ADDR: &str = "192.168.8.1";
+const DEFAULT_LAN_PREFIX: u8 = 24;
+const DEFAULT_LAN_IFACE: &str = "br-lan";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -25,6 +29,13 @@ pub struct Config {
     pub key_file: PathBuf,
     pub dnsmasq_log: PathBuf,
     pub leases_file: PathBuf,
+    /// The root conntrack helper's unix socket.
+    pub conntrack_socket: PathBuf,
+    /// The router's own LAN address and prefix (multicast join and on-link filter) and the bridge
+    /// interface name (IPv6 mDNS).
+    pub lan_addr: std::net::Ipv4Addr,
+    pub lan_prefix: u8,
+    pub lan_iface: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +102,7 @@ fn is_pin(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-const KNOWN: [&str; 8] = [
+const KNOWN: [&str; 12] = [
     "server_url",
     "collector_id",
     "key_id",
@@ -100,6 +111,10 @@ const KNOWN: [&str; 8] = [
     "key_file",
     "dnsmasq_log",
     "leases_file",
+    "conntrack_socket",
+    "lan_addr",
+    "lan_prefix",
+    "lan_iface",
 ];
 
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
@@ -142,6 +157,11 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         )
     };
 
+    let get_or = |k: &str, default: &'static str| -> &str {
+        vals.iter()
+            .find(|(n, _)| *n == k)
+            .map_or(default, |(_, v)| *v)
+    };
     let server_url = get("server_url")?;
     if !server_url.starts_with("https://") || server_url.len() <= "https://".len() {
         return Err(ConfigError::Invalid(
@@ -164,6 +184,29 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     if p1 == p2 {
         return Err(ConfigError::Invalid("pin1 and pin2 must differ".into()));
     }
+    let lan_addr = get_or("lan_addr", DEFAULT_LAN_ADDR)
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| ConfigError::Invalid("lan_addr must be an IPv4 address".into()))?;
+    let lan_prefix = match vals.iter().find(|(n, _)| *n == "lan_prefix") {
+        None => DEFAULT_LAN_PREFIX,
+        Some((_, v)) => v
+            .parse::<u8>()
+            .ok()
+            .filter(|p| (8..=30).contains(p))
+            .ok_or_else(|| {
+                ConfigError::Invalid("lan_prefix must be a number from 8 to 30".into())
+            })?,
+    };
+    let lan_iface = get_or("lan_iface", DEFAULT_LAN_IFACE);
+    if lan_iface.is_empty() || lan_iface.len() > 15 || !is_ident(lan_iface) {
+        return Err(ConfigError::Invalid(
+            "lan_iface must be 1-15 characters of [A-Za-z0-9_.-]".into(),
+        ));
+    }
+    let conntrack_socket = opt("conntrack_socket", DEFAULT_CONNTRACK_SOCKET);
+    if conntrack_socket.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid("conntrack_socket is empty".into()));
+    }
     Ok(Config {
         server_url: server_url.into(),
         collector_id: collector_id.into(),
@@ -172,6 +215,10 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         key_file: opt("key_file", DEFAULT_KEY_FILE),
         dnsmasq_log: opt("dnsmasq_log", DEFAULT_DNSMASQ_LOG),
         leases_file: opt("leases_file", DEFAULT_LEASES_FILE),
+        conntrack_socket,
+        lan_addr,
+        lan_prefix,
+        lan_iface: lan_iface.to_string(),
     })
 }
 

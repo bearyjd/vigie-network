@@ -65,6 +65,33 @@ fn note(truncated: &mut BTreeMap<String, u64>, kind: &str, dropped: u64) {
     }
 }
 
+/// Server limit: a `truncated` map with more keys is a 422 for the whole batch.
+pub const MAX_TRUNCATED_KEYS: usize = 16;
+/// Bitmask key (not a count): never merged into the overflow key.
+pub const FLAGS_KEY: &str = "source_flags";
+pub const OTHER_KEY: &str = "truncated_other";
+
+/// At most `MAX_TRUNCATED_KEYS` keys: the largest counts keep their own key, the rest are summed
+/// into `truncated_other`. The `source_flags` bitmask is always kept verbatim.
+fn cap_truncated_keys(t: &mut BTreeMap<String, u64>) {
+    if t.len() <= MAX_TRUNCATED_KEYS {
+        return;
+    }
+    let flags = t.remove(FLAGS_KEY);
+    let mut rows: Vec<(String, u64)> = std::mem::take(t).into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let keep = MAX_TRUNCATED_KEYS - 1 - usize::from(flags.is_some());
+    let overflow = rows
+        .split_off(keep.min(rows.len()))
+        .iter()
+        .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
+    t.extend(rows);
+    t.insert(OTHER_KEY.to_string(), overflow);
+    if let Some(f) = flags {
+        t.insert(FLAGS_KEY.to_string(), f);
+    }
+}
+
 fn conntrack_size(rows: &[ConntrackSummary]) -> usize {
     rows.iter().map(|r| json_len(|o| r.write(o)) + 1).sum()
 }
@@ -207,6 +234,7 @@ pub fn build_with_drops(
     note(&mut truncated, "conntrack", folded);
     note(&mut truncated, "conntrack_lost", lost);
 
+    cap_truncated_keys(&mut truncated);
     let sections = Sections {
         leases,
         neigh,

@@ -249,14 +249,61 @@ asserted to stay within the server body limit (`SERVER_MAX_BODY`, 512 KiB).
 - **HTTPS client with SPKI pinning.** `sender::Transport` is the boundary; the binary ships a
   `NoTransport` that refuses to send, so nothing ever leaves the router in clear text. Config already
   carries and validates the two pins.
-- Root conntrack helper socket (separate task): the agent builds no conntrack rows yet, so
-  `dns_log_quiet` can only come from a missing/wrong drop-in until flows exist.
-- Wiring the multicast sockets into the main loop (`net-spike/src/sock.rs` is not a library). The
-  `sightings` mapping from the reviewed parsers is done and tested; the TTL-255 check remains the
-  P1 production item.
+- (Done in "Source wiring" below: the conntrack helper client and the multicast listener. Still open
+  there: the TTL-255 check, the P1 production item, and everything that needs the router.)
 - Urgent-push window semantics (overlapping `window_start`) are not confirmed against the server.
 - The ip-to-MAC map refreshes every 10 s; DNS queries from a client that appeared in between are
   dropped (no MAC).
+
+## Source wiring (branch feat/collector-wiring)
+
+Conntrack helper client (`ctparse`, `ctfold`, `ctsock`), multicast listener (`mcast`, over the new
+`net_spike` lib target: `sock`, `filter`, `recv`; net-spike still has its 50 tests, 14 lib + 36 bin) and
+`wiring::Sources`, driven by `Agent::step` in `main.rs`. Two reader threads (`vigie-ct`, `vigie-mc`) behind
+bounded channels (4 snapshots, 256 packets; a full queue drops the newest and counts it); the main loop only
+`try_recv`s, at most 512 multicast packets per pass. `#![forbid(unsafe_code)]` kept.
+
+- **Parser**: 1 MiB line cap (the helper allows 2 MiB; a table big enough for >1 MiB would be rejected every
+  time and the helper cap should be lowered to match), 8192 records, nesting <= 8, control bytes/NUL, invalid
+  UTF-8, duplicate or escaped keys, version != 1, trailing bytes all reject the whole snapshot. Counters
+  saturate. Unknown fields skipped.
+- **Socket checks** before every connect: parent directory not a symlink, owned by root or the agent, not
+  group/other-writable; socket not a symlink, a socket, same owner rule, not group/other-writable. A path check is not atomic with
+  `connect`; `UnixStream::peer_cred` is unstable in std, so a swap by root or the agent itself is accepted.
+- **Hostile peers**: garbage, oversize, EOF mid-line, a line not finished within 10 s of its first byte: counted
+  error, drop, reconnect with backoff 1 s doubling to 60 s (reset after a received snapshot). A silent
+  connected peer is normal (it sends every interval); silence beyond 180 s counts as down.
+- **Mapping**: `ip -> MAC` through the neighbor table (`IpAddr` normalised on both sides). Unmapped sources and the
+  helper's `other_global` record are folded into `ct_unmapped_bytes`. Mapped `other` records become the MAC's
+  `other` bucket. Bytes add across samples in a window, `flows` (a gauge per sample) takes the max.
+- **Where conditions go**: the schema's `health` is closed (4 fields) and `truncated` is the only free-form slot
+  (<= 16 keys, `[a-z_]{1,32}`). Used: `source_flags` bitmask (1 table_pressure, 2 acct_off, 4 conntrack socket
+  down, 8 multicast bind failed), counters `ct_recounted`, `ct_dropped_keys`, `ct_errors` (reader errors + queue drops),
+  `ct_unmapped_bytes`, `mcast_unmapped`, `mcast_dropped`; the per-device quota reuses `sightings_dropped`.
+  `new_flows`, packets, `folded`, `evicted`, `skipped_lines` have no slot and are not reported. The builder now caps
+  `truncated` at 16 keys (largest counts keep a key, the rest are summed into `truncated_other`, `source_flags`
+  is exempt): without it the 15 existing keys plus these would make the server reject the whole batch.
+- **Quotas**: sightings 64 distinct per MAC per window (new), 4096 per window (existing).
+- **Shutdown**: std cannot install a signal handler without `unsafe`; SIGTERM takes the default action. State is RAM
+  only by design, so nothing is lost that a clean stop would have saved.
+- **Config**: new optional keys `conntrack_socket` (default `/tmp/vigie/conntrack.sock`), `lan_addr` (192.168.8.1),
+  `lan_prefix` (24), `lan_iface` (br-lan).
+- **Dependency**: the agent now depends on `socket2` through `net-spike` (SO_REUSEPORT and IP_MULTICAST_ALL cannot be set
+  with std). Dev only: `vigie-conntrack` (tests drive the real helper serializer and `Publisher`), `socket2`.
+- **Not verified**: anything on the router; the real helper protocol only against the helper's own library
+  (round trip of `snapshot_json`, `bind_secure_with` + `Publisher`), not the running binary; IPv6 multicast was
+  not exercised (needs an interface that accepts the join; `lan_iface` path untested); multicast tests need a
+  non-loopback IPv4 route and skip with a message otherwise.
+
+Mutation (hand-run, 59 single edits over parser, socket checks, line framing, backoff, fold, flags, staleness,
+quotas, key cap, multicast): 5 survived the first run; 4 got tests (line cap +1, escaped keys, oversized line not
+dropping the peer, uncounted multicast parse errors) and now die; the fifth was an equivalent no-op mutant.
+Red-first evidence: the 16-key cap and the parser were run red (cap test failed with 25 keys; parser against a
+stub, 14/16 failed); the other new guards were checked by mutation only.
+
+Measured (host, not router): aarch64-musl release 606,824 bytes (was 512,840); x86_64-musl 690,792. Idle RSS of the main
+loop, fake helper every 5 s with 201 records, real multicast sockets, 5 s windows: 744 kB at start, 852 kB
+after 40 s (3 threads).
 
 ## Tests
 

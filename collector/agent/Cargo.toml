@@ -14,8 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 vigie-parse = { path = "../parse" }
+net-spike = { path = "../net-spike" }
 hmac = "0.12"
 sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = "1"
+vigie-conntrack = { path = "../conntrack-helper" }
+socket2 = { version = "0.5", features = ["all"] }
+vigie-parse = { path = "../parse" }

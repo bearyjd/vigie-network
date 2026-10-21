@@ -14,6 +14,9 @@ pub const MAX_WINDOW_DNS: usize = 10_000;
 pub const DNS_PER_MAC_QUOTA: usize = 1024;
 /// Most distinct sightings one window holds.
 pub const MAX_WINDOW_SIGHTINGS: usize = 4096;
+/// Distinct sightings one device may add per window (a chatty or hostile host cannot crowd out
+/// the others). Refusals are counted in `sightings_dropped`.
+pub const SIGHTINGS_PER_MAC_QUOTA: usize = 64;
 
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
@@ -47,6 +50,7 @@ pub struct Window {
     conntrack: Vec<ConntrackSummary>,
     sightings: BTreeMap<SightingKey, Sighting>,
     dns_per_mac: HashMap<String, usize>,
+    sightings_per_mac: HashMap<String, usize>,
     /// Rows dropped by the caps above, by `truncated` key.
     drops: BTreeMap<String, u64>,
 }
@@ -84,10 +88,16 @@ impl Window {
             s.service.clone(),
             s.ua.clone(),
         );
-        if self.sightings.len() >= MAX_WINDOW_SIGHTINGS && !self.sightings.contains_key(&key) {
+        // The key holds every field of a sighting, so a repeat is identical: free, no quota.
+        if self.sightings.contains_key(&key) {
+            return;
+        }
+        let used = self.sightings_per_mac.get(&s.mac).copied().unwrap_or(0);
+        if self.sightings.len() >= MAX_WINDOW_SIGHTINGS || used >= SIGHTINGS_PER_MAC_QUOTA {
             self.note_drops("sightings_dropped", 1);
             return;
         }
+        self.sightings_per_mac.insert(s.mac.clone(), used + 1);
         self.sightings.insert(key, s);
     }
 
@@ -133,6 +143,16 @@ impl Window {
 
     /// Only the identity part (leases + neighbours), for an urgent push. DNS, conntrack and
     /// sightings stay in the window for the next regular batch.
+    /// OR `bits` into the `source_flags` bitmask reported in `truncated` (see `SourceFlag`).
+    pub fn note_flags(&mut self, bits: u64) {
+        if bits != 0 {
+            *self
+                .drops
+                .entry(crate::builder::FLAGS_KEY.to_string())
+                .or_default() |= bits;
+        }
+    }
+
     pub fn take_identity(&mut self) -> Sections {
         Sections {
             leases: std::mem::take(&mut self.leases).into_values().collect(),
@@ -242,6 +262,71 @@ mod tests {
         );
         assert_eq!(t.leases[0], l2, "later lease wins");
         assert_eq!(w.take(), Sections::default());
+    }
+
+    fn mac_n(n: usize) -> String {
+        format!("02:00:00:00:{:02x}:{:02x}", (n >> 8) & 0xff, n & 0xff)
+    }
+
+    #[test]
+    fn one_mac_cannot_fill_the_sightings_table() {
+        let mut w = Window::default();
+        for i in 0..(SIGHTINGS_PER_MAC_QUOTA + 40) {
+            let name = format!("h{i}");
+            w.add_sighting(
+                Sighting::new(&mac_n(1), SightingKind::Mdns, Some(&name), None, None).unwrap(),
+            );
+        }
+        // another device is unaffected
+        w.add_sighting(
+            Sighting::new(&mac_n(2), SightingKind::Mdns, Some("x"), None, None).unwrap(),
+        );
+        let (s, drops) = w.take_with_drops();
+        assert_eq!(s.sightings.len(), SIGHTINGS_PER_MAC_QUOTA + 1);
+        assert_eq!(drops.get("sightings_dropped"), Some(&40));
+    }
+
+    #[test]
+    fn a_repeated_sighting_is_free_even_at_the_quota() {
+        let mut w = Window::default();
+        for i in 0..SIGHTINGS_PER_MAC_QUOTA {
+            let name = format!("h{i}");
+            w.add_sighting(
+                Sighting::new(&mac_n(1), SightingKind::Mdns, Some(&name), None, None).unwrap(),
+            );
+        }
+        w.add_sighting(
+            Sighting::new(&mac_n(1), SightingKind::Mdns, Some("h0"), None, None).unwrap(),
+        );
+        let (s, drops) = w.take_with_drops();
+        assert_eq!(s.sightings.len(), SIGHTINGS_PER_MAC_QUOTA);
+        assert!(drops.is_empty(), "{drops:?}");
+    }
+
+    #[test]
+    fn the_global_sightings_cap_holds_across_macs() {
+        let mut w = Window::default();
+        for i in 0..(MAX_WINDOW_SIGHTINGS + 10) {
+            w.add_sighting(
+                Sighting::new(&mac_n(i), SightingKind::Ssdp, Some("n"), None, None).unwrap(),
+            );
+        }
+        let (s, drops) = w.take_with_drops();
+        assert_eq!(s.sightings.len(), MAX_WINDOW_SIGHTINGS);
+        assert_eq!(drops.get("sightings_dropped"), Some(&10));
+    }
+
+    #[test]
+    fn flag_bits_accumulate_as_a_bitmask_not_a_sum() {
+        let mut w = Window::default();
+        w.note_flags(0b0001);
+        w.note_flags(0b0001);
+        w.note_flags(0b0100);
+        w.note_flags(0);
+        let (_, drops) = w.take_with_drops();
+        assert_eq!(drops.get("source_flags"), Some(&0b0101));
+        let (_, none) = w.take_with_drops();
+        assert!(none.is_empty(), "no flags, no key");
     }
 
     #[test]

@@ -2,9 +2,13 @@
 //! vigie-collector: unprivileged agent. Tails the dnsmasq log, reads neighbors and leases,
 //! builds a signed batch every window and pushes it through a `Transport`.
 //!
+//! The conntrack helper client and the mDNS/SSDP listener are wired in through `wiring::Sources`
+//! (reader threads behind bounded channels, drained by `Agent::step`).
+//!
 //! NOT DONE in this build: the HTTPS transport with SPKI pinning (the `NoTransport` below
-//! refuses to send, so nothing ever leaves the router in clear text), the root conntrack helper
-//! socket, and the multicast (mDNS/SSDP) listener wiring. Never run on the router yet.
+//! refuses to send, so nothing ever leaves the router in clear text). Never run on the router yet.
+//! Shutdown: std has no safe signal handler, so SIGTERM takes the default action and ends the
+//! process; all state is in RAM by design (spool, window) and the reader threads die with it.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -27,6 +31,7 @@ use vigie_agent::tail::Tail;
 use vigie_agent::transport::PinnedTransport;
 use vigie_agent::urgent::Urgent;
 use vigie_agent::window::{SnapshotDelta, Window, WindowClock};
+use vigie_agent::wiring::Sources;
 
 const BUILD_TS: u64 = parse_build_ts(env!("VIGIE_BUILD_TS"));
 const DEFAULT_CONFIG: &str = "/etc/vigie/collector.conf";
@@ -116,6 +121,9 @@ struct Agent {
     quiet: QuietDetector,
     ip_to_mac: HashMap<String, String>,
     started: Instant,
+    sources: Sources,
+    /// `read_neighbors` in production; tests substitute a fake table.
+    neigh_source: fn() -> Vec<vigie_agent::model::Neighbor>,
 }
 
 impl Agent {
@@ -192,7 +200,7 @@ impl Agent {
     }
 
     fn refresh_neighbors(&mut self) {
-        let all = read_neighbors();
+        let all = (self.neigh_source)();
         self.ip_to_mac = ip_to_mac(&all);
         for n in self.delta.new_neighbors(&all) {
             self.window.add_neighbor(n);
@@ -234,6 +242,7 @@ impl Agent {
         }
         if plan == FlushPlan::Hold {
             // No sane clock: batches would carry wrong times. Drop the window and count it.
+            self.sources.finish_window(&mut self.window, mono_s);
             drop(self.window.take());
             self.engine.spool.note_dropped(1);
             self.clock.mark_flush(mono_s);
@@ -248,6 +257,8 @@ impl Agent {
             }
             Err(e) => eprintln!("leases file: {e}"),
         }
+        self.sources.pump(&mut self.window, &self.ip_to_mac, mono_s);
+        self.sources.finish_window(&mut self.window, mono_s);
         let dropin = std::fs::read_to_string(DROPIN_PATH).ok();
         let state = check_dropin(dropin.as_deref(), LOG_DIR);
         let quiet = self
@@ -258,6 +269,48 @@ impl Agent {
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
         self.clock.mark_flush(mono_s);
         self.engine.enqueue(b.encoded);
+    }
+}
+
+/// The time inputs of one loop step (injected, so tests use a fake clock).
+#[derive(Clone, Copy)]
+struct Clock {
+    wall: u64,
+    mono: u64,
+    jitter: u64,
+}
+
+impl Agent {
+    /// One pass of the main loop: refresh neighbors, read the log and the sources, push a new
+    /// device's identity, flush the window when due, and let the send engine try the spool.
+    /// `last` holds the monotonic seconds of the last window flush and neighbor refresh.
+    fn step<T: Transport>(
+        &mut self,
+        when: Clock,
+        window_s: u64,
+        last: (&mut u64, &mut u64),
+        transport: &mut T,
+    ) -> Tick {
+        let Clock { wall, mono, jitter } = when;
+        let (last_flush, last_neigh) = last;
+        if mono.saturating_sub(*last_neigh) >= NEIGH_REFRESH_S {
+            self.refresh_neighbors();
+            *last_neigh = mono;
+        }
+        self.poll_log(self.sync.stamp(wall, mono));
+        self.sources.pump(&mut self.window, &self.ip_to_mac, mono);
+        if self.urgent.take_pending(started_ms(self.started)) {
+            self.push_identity();
+        }
+        if mono.saturating_sub(*last_flush) >= window_s {
+            self.flush_window(wall, mono);
+            *last_flush = mono;
+        }
+        let tick = self.engine.tick(transport, wall, mono, jitter);
+        if let Some(offset) = self.sync.observe(&self.engine.gate) {
+            self.window.rebase_dns(offset);
+        }
+        tick
     }
 }
 
@@ -307,6 +360,8 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
     };
     let mut agent = Agent {
         tail: Tail::new(cfg.dnsmasq_log.clone()),
+        sources: Sources::start(&cfg, 0),
+        neigh_source: read_neighbors,
         cfg,
         engine: Engine::new(id, key, BUILD_TS, SPOOL_CAP),
         boot_id,
@@ -332,25 +387,16 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
     loop {
         let mono = agent.started.elapsed().as_secs();
         let wall = wall_secs();
-        if mono.saturating_sub(last_neigh) >= NEIGH_REFRESH_S {
-            agent.refresh_neighbors();
-            last_neigh = mono;
-        }
-        agent.poll_log(agent.sync.stamp(wall, mono));
-        if agent.urgent.take_pending(started_ms(agent.started)) {
-            agent.push_identity();
-        }
-        if mono.saturating_sub(last_flush) >= args.window_s {
-            agent.flush_window(wall, mono);
-            last_flush = mono;
-        }
         // Jitter only spreads retries; if the kernel RNG is unavailable it is 0 (batch ids, which
         // must be unique, are never built without it: see `Agent::meta`).
         let jitter = random_u64().unwrap_or(0);
-        let tick = agent.engine.tick(&mut transport, wall, mono, jitter);
-        if let Some(offset) = agent.sync.observe(&agent.engine.gate) {
-            agent.window.rebase_dns(offset);
-        }
+        let when = Clock { wall, mono, jitter };
+        let tick = agent.step(
+            when,
+            args.window_s,
+            (&mut last_flush, &mut last_neigh),
+            &mut transport,
+        );
         match tick {
             Tick::Retry { status, delay_s } => {
                 eprintln!("send failed (status {status:?}); retry in {delay_s}s");
@@ -403,6 +449,8 @@ mod tests {
             quiet: QuietDetector::default(),
             ip_to_mac: HashMap::new(),
             started: Instant::now(),
+            sources: Sources::inert(),
+            neigh_source: Vec::new,
         }
     }
 
@@ -495,6 +543,125 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].opt60, None);
         std::fs::remove_file(path).ok();
+    }
+
+    struct Recorder(Vec<Vec<u8>>);
+
+    impl Transport for Recorder {
+        fn post(&mut self, _h: &Headers, body: &[u8]) -> Result<HttpReply, TransportError> {
+            self.0.push(body.to_vec());
+            Ok(HttpReply {
+                status: 200,
+                date: None,
+                body: Vec::new(),
+            })
+        }
+    }
+
+    static NEIGH: std::sync::Mutex<Vec<vigie_agent::model::Neighbor>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn fake_neighbors() -> Vec<vigie_agent::model::Neighbor> {
+        NEIGH.lock().unwrap().clone()
+    }
+
+    /// The loop with fake sources, a fake clock, a fake neighbor table and a recording transport.
+    #[test]
+    fn the_loop_flushes_on_the_sixty_second_tick_with_source_data_and_flags() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::sync_channel;
+        use vigie_agent::ctparse::{Kind, Record, Snapshot};
+        use vigie_agent::ctsock::CtShared;
+        use vigie_agent::mcast::{McMsg, McShared, Pkt};
+        use vigie_agent::model::{Neighbor, Proto};
+
+        *NEIGH.lock().unwrap() = vec![Neighbor::new("192.168.8.10", MAC).unwrap()];
+        let (ct_tx, ct_rx) = sync_channel(4);
+        let (mc_tx, mc_rx) = sync_channel(16);
+        let (ct, mc) = (
+            std::sync::Arc::new(CtShared::default()),
+            std::sync::Arc::new(McShared::default()),
+        );
+        ct.connected.store(true, Ordering::Relaxed);
+        let mut a = agent();
+        a.sources = Sources::from_parts(Some((ct_rx, ct.clone())), Some((mc_rx, mc)), 0);
+        a.neigh_source = fake_neighbors;
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+
+        let snap = Snapshot {
+            table_pressure: true,
+            records: vec![Record {
+                src: "192.168.8.10".parse().unwrap(),
+                kind: Kind::Tuple,
+                dst: Some("1.1.1.1".parse().unwrap()),
+                dport: Some(443),
+                proto: Proto::Tcp,
+                bytes_up: 11,
+                bytes_down: 22,
+                flows: 1,
+            }],
+            ..Snapshot::default()
+        };
+        ct_tx.send(snap).unwrap();
+        let ssdp = vigie_parse::ssdp::Parsed {
+            method: vigie_parse::ssdp::Method::Notify,
+            server: Some("Fake/1.0".into()),
+            usn: Some("uuid:fake".into()),
+            nt: None,
+            st: None,
+            user_agent: None,
+        };
+        mc_tx
+            .send(McMsg {
+                src: "192.168.8.10".parse().unwrap(),
+                pkt: Pkt::Ssdp(ssdp),
+            })
+            .unwrap();
+
+        let mut tr = Recorder(Vec::new());
+        let (mut last_flush, mut last_neigh) = (0u64, 0u64);
+        let mut at = |a: &mut Agent, t: u64, tr: &mut Recorder| {
+            let when = Clock {
+                wall: t0 + t,
+                mono: t,
+                jitter: 0,
+            };
+            a.step(when, 60, (&mut last_flush, &mut last_neigh), tr)
+        };
+        for t in [10, 30, 59] {
+            at(&mut a, t, &mut tr);
+            assert!(
+                tr.0.is_empty(),
+                "nothing is sent before the window ends (t={t})"
+            );
+        }
+        assert_eq!(
+            a.ip_to_mac.get("192.168.8.10").map(String::as_str),
+            Some(MAC)
+        );
+        at(&mut a, 60, &mut tr);
+        assert_eq!(tr.0.len(), 1, "one batch at the 60 s tick");
+        let j: serde_json::Value = serde_json::from_slice(&tr.0[0]).unwrap();
+        assert_eq!(j["conntrack"][0]["mac"], MAC);
+        assert_eq!(j["conntrack"][0]["bytes_down"], 22);
+        assert_eq!(j["sightings"][0]["mac"], MAC);
+        assert_eq!(
+            j["truncated"]["source_flags"], 1,
+            "table_pressure only: {j}"
+        );
+        assert!(j["health"]["dns_log_quiet"].is_boolean());
+
+        // second window: the helper goes away
+        ct.connected.store(false, Ordering::Relaxed);
+        at(&mut a, 119, &mut tr);
+        assert_eq!(tr.0.len(), 1, "no early flush");
+        at(&mut a, 120, &mut tr);
+        assert_eq!(tr.0.len(), 2);
+        let j: serde_json::Value = serde_json::from_slice(&tr.0[1]).unwrap();
+        assert_eq!(j["truncated"]["source_flags"], 4, "socket down only: {j}");
+        assert_eq!(j["conntrack"].as_array().unwrap().len(), 0);
     }
 
     #[test]

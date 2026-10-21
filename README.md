@@ -16,7 +16,7 @@ flowchart LR
   subgraph Router["GL-XE3000 (OpenWrt)"]
     CT["vigie-conntrack<br/>(root helper, reads /proc/net/nf_conntrack)"]
     AG["vigie-collector<br/>(user vigie: dnsmasq log, leases, neigh, mDNS)"]
-    CT -- "unix socket (not consumed yet)" --> AG
+    CT -- "unix socket" --> AG
   end
   AG -- "HTTPS, SPKI-pinned, HMAC-signed batches" --> IN
   subgraph Server["Server host (rootless podman)"]
