@@ -350,3 +350,42 @@ fn growing_kernel_limit_is_noticed_by_the_periodic_recheck() {
     assert!(hot.is_some(), "table_pressure never reported");
     assert!(String::from_utf8_lossy(&err.stderr).contains("table_pressure"));
 }
+
+fn v4_line(src: &str, bytes: u64) -> String {
+    format!(
+        "ipv4     2 tcp      6 100 ESTABLISHED src={src} dst=9.9.9.9 sport=1000 dport=443 packets=1 bytes={bytes} src=9.9.9.9 dst={src} sport=443 dport=1000 packets=1 bytes=1 mark=0 zone=0 use=2\n"
+    )
+}
+
+#[test]
+fn lan_cidr_changes_which_sources_get_the_lan_quota() {
+    let d = tmpdir("lancidr");
+    let table = d.join("ct");
+    let lines: String = [("8.8.8.8", 9999), ("192.168.1.2", 20), ("1.2.3.4", 30)]
+        .iter()
+        .map(|(s, b)| v4_line(s, *b))
+        .collect();
+    fs::write(&table, lines).unwrap();
+    let run = |extra: &[&str]| {
+        let out = Command::new(BIN)
+            .args(["--once", "--top-n", "1", "--k-lan", "0", "--k-wan", "1"])
+            .args(["--file", table.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let other = |t: &str, src: &str| t.contains(&format!(r#"{{"src":"{src}","other":true"#));
+    // defaults: 192.168/16 is LAN (quota 0 -> global), 1.2.3.4 takes the single WAN slot
+    let t = run(&[]);
+    assert!(other(&t, "1.2.3.4") && !other(&t, "192.168.1.2"), "{t}");
+    // explicit prefix replaces the defaults: the roles swap
+    let t = run(&["--lan-cidr", "1.2.3.0/24"]);
+    assert!(other(&t, "192.168.1.2") && !other(&t, "1.2.3.4"), "{t}");
+    assert!(t.contains(r#""other_global":true"#), "{t}");
+}
