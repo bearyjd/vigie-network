@@ -131,8 +131,12 @@ fn host_and_port_are_validated() {
 
 #[test]
 fn the_pinned_transport_does_not_implement_transport_itself() {
-    // Nothing in this build can send through it: NoTransport stays the only Transport.
-    let src =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/transport.rs")).unwrap();
-    assert!(!src.contains("impl Transport for"));
+    // `PinnedTransport` is only validated parameters: the sole way to send is `HttpsTransport`
+    // (which does SPKI-pinned TLS), reached through `transport::make`.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/");
+    let transport = std::fs::read_to_string(format!("{dir}transport.rs")).unwrap();
+    assert!(!transport.contains("impl Transport for PinnedTransport"));
+    let https = std::fs::read_to_string(format!("{dir}https.rs")).unwrap();
+    assert!(https.contains("impl Transport for HttpsTransport"));
+    assert_eq!(https.matches("impl Transport for").count(), 1);
 }

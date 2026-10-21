@@ -7,10 +7,13 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use tls_common::*;
-use vigie_agent::https::{HttpsTransport, MAX_RESPONSE_BYTES};
 use vigie_agent::httpdate::parse_imf_fixdate;
+use vigie_agent::https::HttpsTransport;
 use vigie_agent::sender::{HttpReply, Transport, TransportError};
 use vigie_agent::transport::PinnedTransport;
+
+/// The documented response cap (status line + headers + body), pinned here on purpose.
+const CAP: usize = 64 * 1024;
 
 fn post_with(
     script: Script,
@@ -91,6 +94,9 @@ fn truncated_body_is_an_error() {
 
 #[test]
 fn chunked_response_is_refused() {
+    // Even when a Content-Length is also present (request-smuggling style framing conflict).
+    let both = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+    assert!(post(respond(both.to_vec())).is_err());
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\n{\"duplicate\":true}\r\n0\r\n\r\n";
     assert!(post(respond(raw.to_vec())).is_err());
 }
@@ -106,12 +112,12 @@ fn oversized_responses_are_refused() {
     // Declared too big: refused without reading it all.
     let declared = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-        MAX_RESPONSE_BYTES + 1
+        CAP + 1
     );
     assert!(post(respond(declared.into_bytes())).is_err());
 
     // Honest length, just over the cap in total (headers count).
-    let body = vec![b'x'; MAX_RESPONSE_BYTES];
+    let body = vec![b'x'; CAP];
     let mut raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
     raw.extend_from_slice(&body);
     assert!(post(respond(raw)).is_err());
@@ -133,10 +139,10 @@ fn oversized_responses_are_refused() {
 #[test]
 fn a_response_exactly_at_the_cap_is_accepted() {
     let head = "HTTP/1.1 200 OK\r\nContent-Length: ";
-    let n = MAX_RESPONSE_BYTES - head.len() - 4 - 5; // 5 digits
+    let n = CAP - head.len() - 4 - 5; // 5 digits
     let mut raw = format!("{head}{n}\r\n\r\n").into_bytes();
     raw.extend(std::iter::repeat_n(b'x', n));
-    assert_eq!(raw.len(), MAX_RESPONSE_BYTES);
+    assert_eq!(raw.len(), CAP);
     assert_eq!(post(respond(raw)).unwrap().body.len(), n);
 }
 
@@ -155,7 +161,11 @@ fn silent_server_hits_the_deadline() {
 fn slowloris_drip_is_cut_off_by_the_overall_deadline() {
     // One byte every 100 ms never trips a per-read timeout; the overall deadline must.
     let script: Script = Box::new(|c| {
-        for b in b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nX: ".iter().cycle().take(200) {
+        for b in b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nX: "
+            .iter()
+            .cycle()
+            .take(200)
+        {
             if c.write_all(&[*b]).and_then(|()| c.flush()).is_err() {
                 return;
             }
@@ -211,6 +221,9 @@ fn urls_without_https_or_with_userinfo_cannot_become_a_transport() {
         "https://user:pw@127.0.0.1:1/v1/batch",
         "https://127.0.0.1:1%40x/v1/batch",
     ] {
-        assert!(PinnedTransport::new(bad, &[pin.clone()]).is_err(), "{bad}");
+        assert!(
+            PinnedTransport::new(bad, std::slice::from_ref(&pin)).is_err(),
+            "{bad}"
+        );
     }
 }

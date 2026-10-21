@@ -91,13 +91,19 @@ fn offers_only_tls12_13_and_modern_suites() {
         "{:x?}",
         h.versions
     );
-    assert!(h.suites.iter().all(|s| MODERN.contains(s)), "{:x?}", h.suites);
+    assert!(
+        h.suites.iter().all(|s| MODERN.contains(s)),
+        "{:x?}",
+        h.suites
+    );
 }
 
 #[test]
 fn ip_literal_sends_no_sni_but_a_dns_name_does() {
     assert!(parse(&client_hello("127.0.0.1")).sni.is_none());
     // `localhost` resolves to loopback; the hello must carry it as SNI.
-    let sni = parse(&client_hello("localhost")).sni.expect("SNI for a DNS name");
+    let sni = parse(&client_hello("localhost"))
+        .sni
+        .expect("SNI for a DNS name");
     assert!(sni.windows(9).any(|w| w == b"localhost"));
 }

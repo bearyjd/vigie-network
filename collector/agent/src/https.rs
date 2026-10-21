@@ -76,7 +76,9 @@ impl HttpsTransport {
         );
         for (name, value) in headers.pairs() {
             if value.bytes().any(|b| b < b' ' || b == 0x7f) {
-                return Err(TransportError(format!("header {name} has a control character")));
+                return Err(TransportError(format!(
+                    "header {name} has a control character"
+                )));
             }
             req.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -211,7 +213,11 @@ fn parse_head(raw: &[u8], body_start: usize) -> Result<Head, String> {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err("invalid Content-Length".into());
                 }
-                content_length = Some(value.parse::<usize>().map_err(|_| "invalid Content-Length")?);
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid Content-Length")?,
+                );
             }
             "date" if date.is_none() => date = parse_imf_fixdate(value),
             _ => {}
@@ -231,7 +237,8 @@ fn parse_status(line: &str) -> Result<u16, String> {
         .or_else(|| line.strip_prefix("HTTP/1.0 "))
         .ok_or("not an HTTP/1.x response")?;
     let code = rest.get(..3).ok_or("malformed status line")?;
-    if !code.bytes().all(|b| b.is_ascii_digit()) || rest.as_bytes().get(3).is_some_and(|&b| b != b' ')
+    if !code.bytes().all(|b| b.is_ascii_digit())
+        || rest.as_bytes().get(3).is_some_and(|&b| b != b' ')
     {
         return Err("malformed status line".into());
     }
@@ -251,7 +258,7 @@ mod tests {
 
     #[test]
     fn parses_status_date_and_body() {
-        let r = reply(b"HTTP/1.1 200 OK\r\ndate: Tue, 20 Oct 2026 21:59:38 GMT\r\nContent-Length: 17\r\n\r\n{\"duplicate\":true}")
+        let r = reply(b"HTTP/1.1 200 OK\r\ndate: Tue, 20 Oct 2026 21:59:38 GMT\r\nContent-Length: 18\r\n\r\n{\"duplicate\":true}")
             .unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.date, parse_imf_fixdate("Tue, 20 Oct 2026 21:59:38 GMT"));
@@ -263,6 +270,7 @@ mod tests {
     fn refuses_what_it_does_not_understand() {
         for raw in [
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
             b"HTTP/1.1 200 OK\r\n\r\nbody",
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",
             b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok",
@@ -278,12 +286,15 @@ mod tests {
 
     #[test]
     fn caps_the_response() {
-        let big = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_RESPONSE_BYTES);
+        let big = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RESPONSE_BYTES
+        );
         assert!(reply(big.as_bytes()).is_err());
         let mut endless = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
         endless.extend(std::iter::repeat_n(b'a', MAX_RESPONSE_BYTES * 2));
         assert!(reply(&endless).is_err());
-        let ok_len = MAX_RESPONSE_BYTES - 40;
+        let ok_len = MAX_RESPONSE_BYTES - 60;
         let mut fits = format!("HTTP/1.1 200 OK\r\nContent-Length: {ok_len}\r\n\r\n").into_bytes();
         fits.extend(std::iter::repeat_n(b'x', ok_len));
         assert_eq!(reply(&fits).unwrap().body.len(), ok_len);

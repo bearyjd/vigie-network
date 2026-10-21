@@ -29,7 +29,10 @@ fn tlv(input: &[u8], want_tag: u8) -> Option<(&[u8], &[u8], &[u8])> {
     let (len, hdr): (usize, usize) = match l0 {
         0..=0x7f => (usize::from(l0), 2),
         0x81 => (usize::from(*rest.first()?), 3),
-        0x82 => (usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?])), 4),
+        0x82 => (
+            usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?])),
+            4,
+        ),
         _ => return None,
     };
     let total = hdr.checked_add(len)?;
@@ -94,7 +97,10 @@ impl ServerCertVerifier for PinVerifier {
         let pin = spki_pin(end_entity.as_ref())
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
         // Compare against every pin without an early exit.
-        let hits = self.pins.iter().fold(0u8, |n, p| n | u8::from(ct_eq(p, &pin)));
+        let hits = self
+            .pins
+            .iter()
+            .fold(0u8, |n, p| n | u8::from(ct_eq(p, &pin)));
         if hits == 1 {
             Ok(ServerCertVerified::assertion())
         } else {

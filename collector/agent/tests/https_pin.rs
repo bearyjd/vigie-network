@@ -40,13 +40,19 @@ fn pins(a: &Ident, b: &Ident) -> Vec<String> {
 #[test]
 fn matching_first_pin_is_accepted() {
     let (srv, other) = (Ident::new(), Ident::new());
-    assert_eq!(try_post(&srv, &srv, &pins(&srv, &other), BOTH).unwrap(), 200);
+    assert_eq!(
+        try_post(&srv, &srv, &pins(&srv, &other), BOTH).unwrap(),
+        200
+    );
 }
 
 #[test]
 fn matching_second_pin_is_accepted() {
     let (srv, other) = (Ident::new(), Ident::new());
-    assert_eq!(try_post(&srv, &srv, &pins(&other, &srv), BOTH).unwrap(), 200);
+    assert_eq!(
+        try_post(&srv, &srv, &pins(&other, &srv), BOTH).unwrap(),
+        200
+    );
 }
 
 #[test]
@@ -61,7 +67,10 @@ fn reissued_cert_with_the_same_key_is_accepted() {
     let (orig, other) = (Ident::new(), Ident::new());
     let renewed = orig.reissue(987_654_321, (2026, 6, 1), (2031, 6, 1));
     assert_ne!(orig.cert, renewed.cert);
-    assert_eq!(try_post(&renewed, &renewed, &pins(&orig, &other), BOTH).unwrap(), 200);
+    assert_eq!(
+        try_post(&renewed, &renewed, &pins(&orig, &other), BOTH).unwrap(),
+        200
+    );
 }
 
 #[test]
@@ -78,17 +87,29 @@ fn expired_and_not_yet_valid_certs_are_accepted_when_the_pin_matches() {
     let (other, expired, future) = (Ident::new(), Ident::new(), Ident::new());
     let old = expired.reissue(5, (2001, 1, 1), (2002, 1, 1));
     let new = future.reissue(6, (2080, 1, 1), (2090, 1, 1));
-    assert_eq!(try_post(&old, &old, &pins(&old, &other), BOTH).unwrap(), 200);
-    assert_eq!(try_post(&new, &new, &pins(&new, &other), BOTH).unwrap(), 200);
+    assert_eq!(
+        try_post(&old, &old, &pins(&old, &other), BOTH).unwrap(),
+        200
+    );
+    assert_eq!(
+        try_post(&new, &new, &pins(&new, &other), BOTH).unwrap(),
+        200
+    );
 }
 
 #[test]
 fn handshake_signed_by_a_different_key_is_refused() {
     // The server presents the pinned certificate (public data) but cannot sign with its key.
     let (genuine, attacker) = (Ident::new(), Ident::new());
-    for v in [&[&rustls::version::TLS13][..], &[&rustls::version::TLS12][..]] {
+    for v in [
+        &[&rustls::version::TLS13][..],
+        &[&rustls::version::TLS12][..],
+    ] {
         let r = try_post(&genuine, &attacker, &pins(&genuine, &genuine), v);
-        assert!(r.is_err(), "forged handshake signature accepted ({v:?} only)");
+        assert!(
+            r.is_err(),
+            "forged handshake signature accepted ({v:?} only)"
+        );
     }
 }
 
@@ -96,18 +117,35 @@ fn handshake_signed_by_a_different_key_is_refused() {
 fn both_tls_versions_work_and_nothing_older_exists() {
     let srv = Ident::new();
     let p = pins(&srv, &srv);
-    assert_eq!(try_post(&srv, &srv, &p, &[&rustls::version::TLS13]).unwrap(), 200);
-    assert_eq!(try_post(&srv, &srv, &p, &[&rustls::version::TLS12]).unwrap(), 200);
+    assert_eq!(
+        try_post(&srv, &srv, &p, &[&rustls::version::TLS13]).unwrap(),
+        200
+    );
+    assert_eq!(
+        try_post(&srv, &srv, &p, &[&rustls::version::TLS12]).unwrap(),
+        200
+    );
 }
 
 #[test]
 fn garbage_certificate_is_refused_not_a_panic() {
     let v = verifier(&[[0u8; 32]]);
     let name = ServerName::try_from("localhost").unwrap();
-    for junk in [&b""[..], b"\x30\x00", b"\x30\x84\xff\xff\xff\xff", &[0u8; 64]] {
+    for junk in [
+        &b""[..],
+        b"\x30\x00",
+        b"\x30\x84\xff\xff\xff\xff",
+        &[0u8; 64],
+    ] {
         let cert = CertificateDer::from(junk.to_vec());
         assert!(v
-            .verify_server_cert(&cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO))
+            .verify_server_cert(
+                &cert,
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(Duration::ZERO)
+            )
             .is_err());
     }
 }
@@ -136,7 +174,11 @@ fn spki_pin_matches_independent_computation_and_openssl() {
         "openssl x509 -inform der -in {} -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -r | cut -d' ' -f1",
         crt.display()
     );
-    match std::process::Command::new("sh").arg("-c").arg(script).output() {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+    {
         Ok(o) if o.status.success() => {
             assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), id.pin_hex());
         }
@@ -152,7 +194,13 @@ fn no_pins_accepts_nothing() {
     let v = verifier(&[]);
     let name = ServerName::try_from("localhost").unwrap();
     assert!(v
-        .verify_server_cert(&srv.cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO))
+        .verify_server_cert(
+            &srv.cert,
+            &[],
+            &name,
+            &[],
+            UnixTime::since_unix_epoch(Duration::ZERO)
+        )
         .is_err());
 }
 
@@ -178,8 +226,22 @@ fn old_tls_versions_are_refused_by_openssl_server() {
         .port();
     let child = ok.then(|| {
         std::process::Command::new("openssl")
-            .args(["s_server", "-accept", &port.to_string(), "-tls1_1", "-no_tls1_2", "-no_tls1_3"])
-            .args(["-cert", &format!("{d}/c.pem"), "-key", &format!("{d}/k.pem"), "-www", "-quiet"])
+            .args([
+                "s_server",
+                "-accept",
+                &port.to_string(),
+                "-tls1_1",
+                "-no_tls1_2",
+                "-no_tls1_3",
+            ])
+            .args([
+                "-cert",
+                &format!("{d}/c.pem"),
+                "-key",
+                &format!("{d}/k.pem"),
+                "-www",
+                "-quiet",
+            ])
             .args(["-cipher", "ALL:@SECLEVEL=0"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -193,7 +255,10 @@ fn old_tls_versions_are_refused_by_openssl_server() {
             let mut t = HttpsTransport::new(pt)
                 .unwrap()
                 .with_timeout(Duration::from_secs(3));
-            assert!(t.post(&headers(), b"{}").is_err(), "TLS < 1.2 must not complete");
+            assert!(
+                t.post(&headers(), b"{}").is_err(),
+                "TLS < 1.2 must not complete"
+            );
         } else {
             eprintln!("openssl refused to start a TLS 1.1 server: skipped");
         }
