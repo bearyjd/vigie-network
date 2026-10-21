@@ -137,3 +137,37 @@ def test_filters_are_pushed_into_sql_and_bounded_in_time(
     assert len(r.json()["data"]) == 100 and len(calls) <= 101
     calls.clear()
     assert env.get("/devices", type="console").json()["data"] == [] and not calls
+
+
+def _states(env: Env, **params) -> dict[str, str]:
+    return {d["id"]: d["identity_state"] for d in env.get("/devices", **params).json()["data"]}
+
+
+def test_list_identity_state_is_worst_across_alias_members(env: Env) -> None:
+    env.device("c2", identity_state="ok")
+    env.device("a2", identity_state="conflict")
+    env.device("p2", identity_state="pending_confirm")
+    env.device("solo", identity_state="ok")
+    env.link("a2", "c2")
+    env.link("p2", "c2")
+    assert _states(env) == {"c2": "conflict", "solo": "ok"}
+    assert _states(env, include_aliases="1") == {
+        "c2": "conflict", "a2": "conflict", "p2": "conflict", "solo": "ok",
+    }  # fmt: skip
+    detail = env.get("/devices/c2").json()["data"]["identity_state"]
+    assert detail == _states(env)["c2"]
+
+
+def test_list_identity_state_filter_uses_the_worst_value(env: Env) -> None:
+    env.device("c2", identity_state="ok")
+    env.device("a2", identity_state="conflict")
+    env.device("pc", identity_state="pending_confirm")
+    env.device("pa", identity_state="ok")
+    env.device("solo", identity_state="ok")
+    env.link("a2", "c2")
+    env.link("pa", "pc")
+    assert set(_states(env, identity_state="conflict")) == {"c2"}
+    assert set(_states(env, identity_state="ok")) == {"solo"}  # c2 is no longer ok
+    assert set(_states(env, identity_state="pending_confirm")) == {"pc"}
+    both = _states(env, identity_state="conflict", include_aliases="1")
+    assert set(both) == {"c2", "a2"}

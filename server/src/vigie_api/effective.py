@@ -87,7 +87,10 @@ def _type_and_provenance(device: sqlite3.Row, override: sqlite3.Row | None) -> t
 
 
 def effective_device(
-    device: sqlite3.Row, overrides: dict[str, sqlite3.Row], links: dict[str, str]
+    device: sqlite3.Row,
+    overrides: dict[str, sqlite3.Row],
+    links: dict[str, str],
+    group_states: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """The view of one device. An alias shows its CANONICAL device's override: whatever the
     alias had before the merge is superseded, never leaked into list results."""
@@ -107,7 +110,7 @@ def effective_device(
         "type_provenance": provenance,
         # group comes ONLY from the human override; inferred data never assigns a group
         "group_id": override["group_id"] if override else None,
-        "identity_state": device["identity_state"],
+        "identity_state": (group_states or {}).get(device["id"], device["identity_state"]),
         "status": device["status"],
         "first_seen": device["first_seen"],
         "last_seen": device["last_seen"],
@@ -154,6 +157,28 @@ def _ids_where(
     return json.dumps(found)
 
 
+def group_identity_states(inv: sqlite3.Connection, links: dict[str, str]) -> dict[str, str]:
+    """Worst identity_state per merge group, keyed by every member (canonical and aliases)."""
+    groups: dict[str, list[str]] = {}
+    for alias in links:
+        groups.setdefault(resolve(links, alias), []).append(alias)
+    member_ids = [m for canonical, aliases in groups.items() for m in (canonical, *aliases)]
+    found = {
+        r["id"]: r["identity_state"]
+        for r in rows(
+            inv,
+            "SELECT id, identity_state FROM devices WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(member_ids),),
+        )
+    }
+    out: dict[str, str] = {}
+    for canonical, aliases in groups.items():
+        members = [canonical, *aliases]
+        worst = worst_state(found[m] for m in members if m in found)
+        out.update({m: worst for m in members})
+    return out
+
+
 def iter_devices(
     inv: sqlite3.Connection,
     overrides: dict[str, sqlite3.Row],
@@ -168,6 +193,7 @@ def iter_devices(
     include_transient: bool,
     include_retired: bool,
     include_aliases: bool,
+    group_states: dict[str, str],
 ) -> Iterator[sqlite3.Row]:
     """Filters run in SQL (override-derived ones through json_each id sets), so a flood of
     devices costs one indexed scan, not one Python-side effective view per device."""
@@ -181,8 +207,14 @@ def iter_devices(
                   if not on]  # fmt: skip
         clauses += [f"status <> '{s}'" for s in hidden]  # noqa: S608 - fixed literals
     if identity_state is not None:
-        clauses.append("identity_state = :identity_state")
+        # a merged group has ONE state (the worst of its members); everyone else uses their own
         params["identity_state"] = identity_state
+        params["state_eq"] = json.dumps([m for m, v in group_states.items() if v == identity_state])
+        params["state_grouped"] = json.dumps(list(group_states))
+        clauses.append(
+            f"({in_set.format('state_eq')} OR (identity_state = :identity_state"
+            f" AND NOT {in_set.format('state_grouped')}))"
+        )
     if not include_aliases:
         clauses.append("id NOT IN (SELECT value FROM json_each(:aliases))")
         params["aliases"] = json.dumps(list(links))
@@ -232,6 +264,7 @@ def list_devices(
     after = decode_cursor(cursor) if cursor else ""
     since = parse_updated_since(updated_since) if updated_since is not None else None
     overrides, links = override_map(ov), link_map(ov)
+    group_states = group_identity_states(inv, links)
     out: list[dict[str, Any]] = []
     more = False
     for row in iter_devices(
@@ -247,11 +280,12 @@ def list_devices(
         include_transient=include_transient,
         include_retired=include_retired,
         include_aliases=include_aliases,
+        group_states=group_states,
     ):
         if len(out) == limit:
             more = True
             break
-        out.append(effective_device(row, overrides, links))
+        out.append(effective_device(row, overrides, links, group_states))
     return out, (encode_cursor(out[-1]["id"]) if more else None)
 
 
