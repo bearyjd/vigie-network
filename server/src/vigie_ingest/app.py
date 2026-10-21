@@ -24,6 +24,7 @@ from vigie_ingest.retention import run_maintenance
 
 log = logging.getLogger("vigie.ingest")
 MAINTENANCE_INTERVAL_S = 3600
+TRUSTED_PEERS_PER_COLLECTOR = 4
 
 _UINT_RE = re.compile(r"^\d{1,19}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -108,12 +109,14 @@ def process_batch(
     body: bytes,
     now: float,
     collector_allow: Callable[[str], bool] | None = None,
+    on_verified: Callable[[], None] | None = None,
 ) -> tuple[int, dict[str, object]]:
     """PRP section 4 checks after size cap and rate limit. Sync; runs in a worker thread.
 
     The HMAC is verified before any database connection is opened, so unauthenticated
     requests cost no database work. `collector_allow` is the per-collector rate limiter; it is
     charged only after the HMAC verifies, so unauthenticated requests never touch its table.
+    `on_verified` runs right after the HMAC verifies (the peer allowlist hook).
     """
     key = auth.load_key(settings.secrets_dir, env.key_id)
     message = auth.signing_string(
@@ -121,6 +124,8 @@ def process_batch(
     )
     if not auth.verify(key, env.signature, message):
         return 401, {"error": "unauthorized"}
+    if on_verified is not None:
+        on_verified()
     if collector_allow is not None and not collector_allow(env.collector_id):
         return 429, {"error": "rate_limited"}
 
@@ -193,7 +198,8 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
-        _require_keys(settings)
+        active = _require_keys(settings)
+        peer_limiter.set_trusted_capacity(active * TRUSTED_PEERS_PER_COLLECTOR)
         task = asyncio.create_task(_maintenance_loop(settings, clock))
         try:
             yield
@@ -226,26 +232,32 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         except BodyTimeout:
             return JSONResponse({"error": "body_timeout"}, status_code=408)
         status, payload = await run_in_threadpool(
-            process_batch, settings, env, body, clock(), collector_limiter.allow
+            process_batch,
+            settings,
+            env,
+            body,
+            clock(),
+            collector_limiter.allow,
+            lambda: peer_limiter.mark_verified(peer),
         )
         return JSONResponse(payload, status_code=status)
 
     return app
 
 
-def _require_keys(settings: Settings) -> None:
-    """Fail fast: every non-revoked collector must have a usable key file."""
+def _require_keys(settings: Settings) -> int:
+    """Fail fast: every non-revoked collector must have a usable key file. Returns their count."""
     conn = open_inventory(settings.inventory_path)
     try:
+        active = list(store.active_collectors(conn))
         missing = [
-            c.id
-            for c in store.active_collectors(conn)
-            if auth.load_key(settings.secrets_dir, c.key_id) is None
+            c.id for c in active if auth.load_key(settings.secrets_dir, c.key_id) is None
         ]
     finally:
         conn.close()
     if missing:
         raise RuntimeError(f"no valid key file (>=32 bytes hex) for collectors: {missing}")
+    return len(active)
 
 
 async def _maintenance_loop(settings: Settings, clock: Callable[[], float]) -> None:

@@ -12,8 +12,16 @@ SHARD_RETENTION_MAX_DAYS = 30
 BATCH_RETENTION_DAYS = 7
 
 
-def _opt_int(value: str | None) -> int | None:
-    return None if value in (None, "") else int(value)
+IPV6_PREFIX_DEFAULT = 64
+
+
+def _ipv6_prefix(value: str | None) -> int | None:
+    """Unset -> 64; "0"/"none" disables grouping (full addresses)."""
+    if value in (None, ""):
+        return IPV6_PREFIX_DEFAULT
+    if value.strip().lower() in ("0", "none"):
+        return None
+    return int(value)
 
 
 @dataclass(frozen=True)
@@ -24,7 +32,7 @@ class Settings:
     rate_limit_per_window: int = 60  # per authenticated collector
     rate_limit_preauth_per_min: int = 120  # per peer address, before authentication
     rate_limit_window_s: int = 60
-    rate_limit_ipv6_prefix: int | None = None
+    rate_limit_ipv6_prefix: int | None = IPV6_PREFIX_DEFAULT
     max_clock_skew_s: int = 300
     max_shard_days: int = 3  # shard files one batch may touch (bounds time under SHARD_LOCK)
     body_timeout_s: float = 10.0
@@ -56,7 +64,7 @@ class Settings:
         return cls(
             data_dir=Path(source.get("VIGIE_DATA_DIR", "/var/lib/vigie")),
             secrets_dir=Path(source.get("VIGIE_SECRETS_DIR", "/run/secrets")),
-            rate_limit_ipv6_prefix=_opt_int(source.get("VIGIE_RATE_LIMIT_IPV6_PREFIX")),
+            rate_limit_ipv6_prefix=_ipv6_prefix(source.get("VIGIE_RATE_LIMIT_IPV6_PREFIX")),
             max_spool_age_s=int(source.get("VIGIE_MAX_SPOOL_AGE_S", 86400)),
             rate_limit_preauth_per_min=int(source.get("VIGIE_RATE_LIMIT_PREAUTH_PER_MIN", 120)),
             rate_limit_per_window=int(source.get("VIGIE_RATE_LIMIT_PER_MIN", 60)),

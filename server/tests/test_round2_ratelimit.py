@@ -24,6 +24,6 @@ def test_ipv6_is_keyed_by_full_address_unless_prefix_configured() -> None:
 
 
 def test_settings_ipv6_prefix(tmp_path) -> None:
-    assert Settings(tmp_path, tmp_path).rate_limit_ipv6_prefix is None
+    assert Settings(tmp_path, tmp_path, rate_limit_ipv6_prefix=None).rate_limit_ipv6_prefix is None
     env = {"VIGIE_RATE_LIMIT_IPV6_PREFIX": "64"}
     assert Settings.from_env(env).rate_limit_ipv6_prefix == 64
