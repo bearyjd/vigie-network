@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn rejects_short_and_oversize() {
         assert_eq!(parse(&[0; 5]), Err(ParseError::TooShort));
-        assert_eq!(parse(&vec![0; MAX_PACKET + 1]), Err(ParseError::TooLarge));
+        assert_eq!(parse(&vec![0; 9000 + 1]), Err(ParseError::TooLarge));
     }
 
     #[test]
@@ -335,10 +335,10 @@ mod tests {
     #[test]
     fn record_count_boundary_truncates_instead_of_dropping() {
         for (n, trunc, kept) in [
-            (MAX_RECORDS - 1, false, MAX_RECORDS - 1),
-            (MAX_RECORDS, false, MAX_RECORDS),
-            (MAX_RECORDS + 1, true, MAX_RECORDS),
-            (400, true, MAX_RECORDS),
+            (128 - 1, false, 128 - 1),
+            (128, false, 128),
+            (128 + 1, true, 128),
+            (400, true, 128),
         ] {
             let r = parse(&many_questions(n)).unwrap();
             assert_eq!((r.truncated, r.names.len()), (trunc, kept), "n={n}");
@@ -348,11 +348,11 @@ mod tests {
     #[test]
     fn packet_size_boundary() {
         let mut p = query(&["a", "local"]);
-        p.resize(MAX_PACKET - 1, 0);
+        p.resize(9000 - 1, 0);
         assert!(parse(&p).is_ok());
-        p.resize(MAX_PACKET, 0);
+        p.resize(9000, 0);
         assert!(parse(&p).is_ok());
-        p.resize(MAX_PACKET + 1, 0);
+        p.resize(9000 + 1, 0);
         assert_eq!(parse(&p), Err(ParseError::TooLarge));
     }
 
@@ -394,17 +394,14 @@ mod tests {
 
     #[test]
     fn jump_limit_boundary() {
-        for k in [1, MAX_JUMPS - 1, MAX_JUMPS] {
+        for k in [1, 8 - 1, 8] {
             assert_eq!(
                 parse(&jump_chain(k)).unwrap().names,
                 vec!["a.local"],
                 "k={k}"
             );
         }
-        assert_eq!(
-            parse(&jump_chain(MAX_JUMPS + 1)),
-            Err(ParseError::PointerLoop)
-        );
+        assert_eq!(parse(&jump_chain(8 + 1)), Err(ParseError::PointerLoop));
         assert_eq!(parse(&jump_chain(40)), Err(ParseError::PointerLoop));
     }
 
@@ -507,6 +504,53 @@ mod tests {
         p.extend_from_slice(&[4, b'a', 0xFF, 0x07, 0x0A]); // invalid byte, controls
         p.extend_from_slice(&[3, 0xE2, 0x80, 0xAE, 0, 0, 12, 0, 1]); // U+202E bidi override
         assert_eq!(parse(&p).unwrap().names, vec!["café.a\u{FFFD}??.?"]);
+    }
+
+    #[test]
+    fn header_length_boundary() {
+        assert_eq!(parse(&[0; 11]), Err(ParseError::TooShort));
+        assert_eq!(parse(&[0; 12]), Ok(Parsed::default()));
+    }
+
+    #[test]
+    fn opcode_and_rcode_use_full_field_width() {
+        let q = |flags: u16| {
+            let mut p = header(flags, 1, 0, 0, 0);
+            p.extend(name(&["a"]));
+            p.extend_from_slice(&[0, 12, 0, 1]);
+            parse(&p)
+        };
+        assert_eq!(q(8 << 11), Err(ParseError::BadOpcode));
+        assert_eq!(q(0x8400 | 8), Err(ParseError::BadRcode));
+        assert!(q(0x8400).is_ok());
+        assert!(q(0x4000 >> 1).is_err()); // opcode 4 (bits 14-11)
+    }
+
+    #[test]
+    fn record_budget_is_shared_between_questions_and_answers() {
+        let mut p = header(0x8400, 100, 100, 0, 0);
+        for _ in 0..100 {
+            p.extend(name(&["q"]));
+            p.extend_from_slice(&[0, 12, 0, 1]);
+        }
+        for _ in 0..100 {
+            p.extend(rr(name(&["r"]), 16, vec![]));
+        }
+        let r = parse(&p).unwrap();
+        assert!(r.truncated);
+        assert_eq!(r.names.len(), 128);
+    }
+
+    #[test]
+    fn dotted_labels_never_form_service_types() {
+        assert!(services_of(&["_x._http", "_tcp", "local"]).is_empty());
+        assert!(services_of(&["_http", "_tcp", "a.b"]).is_empty());
+        assert_eq!(services_of(&["_http", "_tcp", "ab"]), vec!["_http._tcp.ab"]);
+        // a dotted candidate is skipped, not fatal: the next genuine pair is still found
+        assert_eq!(
+            services_of(&["_a.b", "_tcp", "_real", "_udp", "local"]),
+            vec!["_real._udp.local"]
+        );
     }
 
     fn full_response() -> Vec<u8> {

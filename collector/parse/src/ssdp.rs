@@ -129,18 +129,15 @@ mod tests {
     fn rejects_non_ssdp_and_oversize() {
         assert_eq!(parse(b"GET / HTTP/1.1\r\n\r\n"), Err(ParseError::NotSsdp));
         assert_eq!(parse(b""), Err(ParseError::NotSsdp));
-        assert_eq!(
-            parse(&vec![b'N'; MAX_PACKET + 1]),
-            Err(ParseError::TooLarge)
-        );
+        assert_eq!(parse(&vec![b'N'; 2048 + 1]), Err(ParseError::TooLarge));
     }
 
     #[test]
     fn caps_value_length_and_strips_controls() {
-        let long = "x".repeat(5000.min(MAX_PACKET - 100));
+        let long = "x".repeat(5000.min(2048 - 100));
         let m = format!("NOTIFY * HTTP/1.1\r\nSERVER: {long}\r\nUSN: a\u{7}b\r\n\r\n");
         let p = parse(m.as_bytes()).unwrap();
-        assert_eq!(p.server.unwrap().len(), MAX_VALUE);
+        assert_eq!(p.server.unwrap().len(), 256);
         assert_eq!(p.usn.as_deref(), Some("a?b"));
     }
 
@@ -149,11 +146,31 @@ mod tests {
         let m = "NOTIFY * HTTP/1.1\r\nNT: a\r\n\r\nSERVER: ignored\r\n";
         assert_eq!(parse(m.as_bytes()).unwrap().server, None);
         let mut m = String::from("NOTIFY * HTTP/1.1\r\n");
-        for _ in 0..MAX_LINES {
+        for _ in 0..32 {
             m.push_str("X: y\r\n");
         }
         m.push_str("SERVER: late\r\n");
         assert_eq!(parse(m.as_bytes()).unwrap().server, None);
+    }
+
+    #[test]
+    fn first_duplicate_header_wins() {
+        let m = "NOTIFY * HTTP/1.1\r\nSERVER: first\r\nSERVER: second\r\n\r\n";
+        assert_eq!(parse(m.as_bytes()).unwrap().server.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn method_requires_following_space() {
+        assert_eq!(
+            parse(b"NOTIFYx * HTTP/1.1\r\n\r\n"),
+            Err(ParseError::NotSsdp)
+        );
+        assert_eq!(
+            parse(b"M-SEARCHx * HTTP/1.1\r\n\r\n"),
+            Err(ParseError::NotSsdp)
+        );
+        assert!(parse(b"NOTIFY * HTTP/1.1\r\n\r\n").is_ok());
+        assert!(parse(b"M-SEARCH * HTTP/1.1\r\n\r\n").is_ok());
     }
 
     fn server_after(fillers: usize) -> String {
@@ -168,11 +185,7 @@ mod tests {
     #[test]
     fn line_cap_boundary() {
         // SERVER sits at 0-based line index 1 + fillers; lines 0..MAX_LINES are kept.
-        for (fillers, kept) in [
-            (MAX_LINES - 3, true),
-            (MAX_LINES - 2, true),
-            (MAX_LINES - 1, false),
-        ] {
+        for (fillers, kept) in [(32 - 3, true), (32 - 2, true), (32 - 1, false)] {
             let p = parse(server_after(fillers).as_bytes()).unwrap();
             assert_eq!(p.server.is_some(), kept, "fillers={fillers}");
         }
@@ -190,18 +203,14 @@ mod tests {
 
     #[test]
     fn packet_size_boundary() {
-        assert!(parse(&padded(MAX_PACKET - 1)).is_ok());
-        assert!(parse(&padded(MAX_PACKET)).is_ok());
-        assert_eq!(parse(&padded(MAX_PACKET + 1)), Err(ParseError::TooLarge));
+        assert!(parse(&padded(2048 - 1)).is_ok());
+        assert!(parse(&padded(2048)).is_ok());
+        assert_eq!(parse(&padded(2048 + 1)), Err(ParseError::TooLarge));
     }
 
     #[test]
     fn value_length_boundary() {
-        for (n, want) in [
-            (MAX_VALUE - 1, MAX_VALUE - 1),
-            (MAX_VALUE, MAX_VALUE),
-            (MAX_VALUE + 1, MAX_VALUE),
-        ] {
+        for (n, want) in [(256 - 1, 256 - 1), (256, 256), (256 + 1, 256)] {
             let m = format!("NOTIFY * HTTP/1.1\r\nSERVER: {}\r\n\r\n", "x".repeat(n));
             assert_eq!(parse(m.as_bytes()).unwrap().server.unwrap().len(), want);
         }
