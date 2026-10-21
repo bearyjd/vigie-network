@@ -61,8 +61,10 @@ secrets are podman secrets created by the scripts.
 cd deploy
 cp .env.example .env && $EDITOR .env            # set VIGIE_LAN_ADDR (required)
 
-# 1. Self-signed certificate (ECDSA P-256) and podman secrets. Note the printed pin.
+# 1. Self-signed certificates (ECDSA P-256) and podman secrets: one for ingest (collectors pin it,
+#    note the printed pin) and a SEPARATE one for the API, so ingest never holds the API's key.
 VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --create-secrets
+VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --role api --create-secrets
 
 # 2. Build the image (one image, three services)
 podman build -f Containerfile -t localhost/vigie-server:dev ..
@@ -72,7 +74,8 @@ podman build -f Containerfile -t localhost/vigie-server:dev ..
 
 # 4. Start
 podman-compose up -d
-podman-compose ps                       # all three "healthy" after ~30 s
+podman-compose ps                       # healthy after up to ~2-3 minutes: the pipeline has a 120 s
+                                        # grace period and needs the collector from step 3 first
 ```
 
 `provision-collector.sh` registers the collector only when `compose.yaml` already lists
@@ -90,18 +93,18 @@ Call the API (responses use the envelope `{ok, data, error, page}`):
 
 ```sh
 TOKEN=vgt_...   # the token printed above
-curl --cacert deploy/certs/server.crt -H "Authorization: Bearer $TOKEN" \
+curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   "https://192.168.1.10:8444/devices?include_transient=1"
 # {"ok":true,"data":[...],"error":null,"page":{"next_cursor":null}}
 
-curl --cacert deploy/certs/server.crt https://192.168.1.10:8444/healthz       # unauthenticated
-curl --cacert deploy/certs/server.crt -H "Authorization: Bearer $TOKEN" \
+curl --cacert deploy/certs-api/server.crt https://192.168.1.10:8444/healthz       # unauthenticated
+curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   "https://192.168.1.10:8444/events?since=0"
-curl --cacert deploy/certs/server.crt -H "Authorization: Bearer $TOKEN" \
+curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   https://192.168.1.10:8444/macs/aa:bb:cc:dd:ee:ff            # 404 = unknown MAC = unassigned
 
 # Writes need If-Match with the device's current ETag (428 if absent, 412 on mismatch):
-curl --cacert deploy/certs/server.crt -H "Authorization: Bearer $TOKEN" \
+curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   -H 'If-Match: "0"' -H 'Content-Type: application/json' -X PATCH \
   -d '{"name":"Kitchen speaker","group_id":"kids"}' https://192.168.1.10:8444/devices/<device-id>
 ```
@@ -112,23 +115,37 @@ format is `"<override version>"`; read it from a prior `GET /devices/<id>`.) The
 
 Design notes that affect operation:
 
-- **Ingest must be a single worker.** It holds an exclusive `flock` on `<data dir>/.ingest.lock`
-  and refuses `--workers` above 1. **The data volume must be on a local filesystem** (no NFS/SMB:
+- **Ingest must be a single worker.** It holds an exclusive `flock` on `<raw dir>/.ingest.lock`
+  and refuses `--workers` above 1. **The volumes must be on a local filesystem** (no NFS/SMB:
   `flock` and SQLite WAL both need it).
-- **Read-only boundaries are enforced in code, not by mount flags.** Both `inventory.db` and
-  `overrides.db` are SQLite WAL files; a reader on a read-only mount fails with "attempt to write
-  a readonly database" whenever no writer has the file open. So api and pipeline mount their
-  volumes read-write and open the databases `mode=ro` + `query_only` in code. Ingest never mounts the
-  overrides volume (that isolation is structural). Details in `deploy/compose.yaml` and
-  `docs/deploy.md`.
+- **Three volumes, PRP section 5 ownership.** `vigie-raw` (ingest rw, pipeline ro), `vigie-inv`
+  (ingest and pipeline rw, api ro), `vigie-overrides` (api rw, pipeline ro, ingest not mounted). The
+  read-only mounts work because each writer keeps one SQLite connection open (a "keeper"); readers
+  fail closed when it is gone. The exact table and the writable paths per service are in
+  `docs/deploy.md`; none of this has run in a real container yet.
 - Ports are published on `VIGIE_LAN_ADDR` only; compose refuses to start when it is unset.
-- Restrict the ingest port to the router on the **server host's** firewall (traffic between two
-  LAN hosts does not pass through the router's firewall). Firewalld example (assumes the router's
-  LAN address is 192.168.8.1; flagged assumption):
-  `sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.168.8.1 port port=8443 protocol=tcp accept'`
-  with that port not otherwise opened in the zone. Rootless networking may rewrite the peer
-  address the ingest rate limiter sees; check `podman info --format '{{.Host.RootlessNetworkCmd}}'`
-  (pasta should preserve it, slirp4netns may not).
+- **Restrict who can reach the ingest (8443) and API (8444) ports on the server host.** Traffic
+  between two hosts on the router's LAN bridge never passes the router's firewall, and Fedora-family
+  default zones (for example `FedoraWorkstation`) may already open ports 1025-65535, so merely
+  "not opening" a port is not enough: add an explicit reject for every other source. Assumptions
+  (flagged): rootless podman, so the published ports terminate in a host process that firewalld's
+  input rules see; the router is `192.168.8.1`; the control app host is `192.168.8.50`; the zone is
+  the default zone. Rich rules are evaluated reject/drop first, then accept, so use the
+  `source not address` form (a reject that never matches the allowed source) rather than a blanket
+  reject:
+  ```sh
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.8.1" port port="8443" protocol="tcp" accept'
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source not address="192.168.8.1" port port="8443" protocol="tcp" reject'
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.8.50" port port="8444" protocol="tcp" accept'
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source not address="192.168.8.50" port port="8444" protocol="tcp" reject'
+  sudo firewall-cmd --reload
+  sudo firewall-cmd --list-rich-rules
+  ```
+  Verify from a SECOND host that is not allowed (`nc -vz 192.168.1.10 8443` must be refused, and the
+  same for 8444) and from the router or control app that it still connects. Undo: run the same four
+  commands with `--remove-rich-rule` instead of `--add-rich-rule`, then `--reload`.
+  Rootless networking may rewrite the peer address the ingest rate limiter sees; check
+  `podman info --format '{{.Host.RootlessNetworkCmd}}'` (pasta should preserve it, slirp4netns may not).
 
 Local development without containers: `cd server && uv sync && uv run pytest`
 (see [`server/README.md`](server/README.md)).
@@ -145,27 +162,35 @@ Assumptions: router LAN address `192.168.8.1` (GL.iNet default; PRP examples use
 yours), SSH as root works, and the files come from the branches named below.
 
 1. **Build** on your workstation (needs a Rust toolchain and the musl target; rustls additionally
-   needs a C cross compiler, see the p2 spike):
+   needs a C cross compiler, see the p2 spike). The two binaries live on different branches, so use
+   one checkout per branch; a branch already checked out in another worktree cannot be checked out
+   again (see `git worktree list`). From the repository root:
    ```sh
-   git checkout feat/collector && cd collector
-   cargo build --release --target aarch64-unknown-linux-musl -p vigie-collector
-   git checkout feat/conntrack-helper && cd collector
-   cargo build --release --target aarch64-unknown-linux-musl -p vigie-conntrack
+   git worktree add ../vigie-collector-src feat/collector
+   git worktree add ../vigie-conntrack-src feat/conntrack-helper
+   (cd ../vigie-collector-src/collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-collector)
+   (cd ../vigie-conntrack-src/collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-conntrack)
    ```
+   Without worktrees, `git archive feat/collector collector | tar -x -C "$(mktemp -d)"` gives a
+   clean source tree per branch instead. The binaries land in each tree's `target/` directory (the
+   cargo workspace root; check with `find ../vigie-*-src -name vigie-collector -o -name vigie-conntrack`);
+   adjust the `scp` paths in step 3 to match. Remove the trees later with `git worktree remove`.
    Only **two** binaries run on the router: `vigie-collector` and `vigie-conntrack`. (`net-spike`
    is a test tool, not a deployable.) The deploy scripts live in `collector/agent/deploy/` on
-   `feat/collector`.
+   `feat/collector`, so below, run them from `../vigie-collector-src`.
 2. **Create the `vigie` user.** Run the printer locally; it executes nothing:
-   `sh collector/agent/deploy/vigie-print-install-commands.sh`. Review the output and run it on the
+   `(cd ../vigie-collector-src && sh collector/agent/deploy/vigie-print-install-commands.sh)`. Review the output and run it on the
    router. It picks a free uid in 6700-6799. **Use that uid** for the conntrack helper
    (`--uid N --gid N`); the conntrack spike's `10001` is only an example.
    Validate: `id vigie` shows the printed uid; `ps | grep vigie-collector` later shows it is
    not root or nobody.
 3. **Copy the files** (`scp -O`, the legacy protocol, because OpenWrt has no sftp-server):
    ```sh
-   scp -O target/aarch64-unknown-linux-musl/release/vigie-collector \
-          target/aarch64-unknown-linux-musl/release/vigie-conntrack root@192.168.8.1:/tmp/
-   scp -O collector/agent/deploy/* root@192.168.8.1:/tmp/vigie-deploy/   # mkdir it first
+   ssh root@192.168.8.1 mkdir -p /tmp/vigie-deploy
+   scp -O ../vigie-collector-src/collector/target/aarch64-unknown-linux-musl/release/vigie-collector \
+          ../vigie-conntrack-src/collector/target/aarch64-unknown-linux-musl/release/vigie-conntrack \
+          root@192.168.8.1:/tmp/
+   scp -O ../vigie-collector-src/collector/agent/deploy/* root@192.168.8.1:/tmp/vigie-deploy/
    ```
    Then on the router install them root-owned, as listed in the printer's step 2:
    `/usr/bin/vigie-collector`, `/usr/bin/vigie-conntrack`, the scripts in `/usr/libexec/vigie/`,
@@ -195,23 +220,50 @@ yours), SSH as root works, and the files come from the branches named below.
    both want `/tmp/vigie` (drop-in script: `root:vigie 0751`; helper: creates `0755` root if absent and
    refuses a wrong one). **Whether they accept each other's directory is unverified**; start the
    collector service first and run `ls -ld /tmp/vigie` after the helper starts.
-7. **Force DNS through dnsmasq and block DoH/DoT bypass** (PRP section 9). Without this, devices
-   using DoH/DoT are invisible to the DNS log. Example iptables (OpenWrt 21.02 has iptables, no
-   `nft`), put the lines in `/etc/firewall.user` so fw3 reapplies them (GL.iNet's firewall UI may
-   rewrite rules; unverified on firmware 4.8.3):
+7. **Force DNS through dnsmasq and block DoT bypass** (PRP section 9). Without this, devices
+   using DoH/DoT are invisible to the DNS log. OpenWrt 21.02 uses fw3 over iptables. Use UCI
+   `redirect`/`rule` sections (named, so they can be deleted exactly; GL.iNet's firewall UI may still
+   rewrite them, unverified on firmware 4.8.3). On the router, as root:
    ```sh
-   LAN_IP=192.168.8.1
-   iptables -t nat -I PREROUTING -i br-lan -p udp --dport 53 ! -d $LAN_IP -j DNAT --to-destination $LAN_IP:53
-   iptables -t nat -I PREROUTING -i br-lan -p tcp --dport 53 ! -d $LAN_IP -j DNAT --to-destination $LAN_IP:53
-   iptables -I FORWARD -i br-lan -p tcp --dport 853 -j REJECT          # DoT
-   # Known DoH resolvers (examples; the list is yours to maintain, generic CDN DoH is not catchable):
-   iptables -I FORWARD -i br-lan -p tcp -d 1.1.1.1 --dport 443 -j REJECT
-   iptables -I FORWARD -i br-lan -p tcp -d 8.8.8.8 --dport 443 -j REJECT
+   LAN_IP=$(uci get network.lan.ipaddr)        # do not hard-code it
+   for proto in udp tcp; do
+     uci set firewall.vigie_dns_$proto=redirect
+     uci set firewall.vigie_dns_$proto.name="vigie-dns-$proto"
+     uci set firewall.vigie_dns_$proto.src=lan
+     uci set firewall.vigie_dns_$proto.src_dport=53
+     uci set firewall.vigie_dns_$proto.src_dip="!$LAN_IP"   # only queries aimed elsewhere
+     uci set firewall.vigie_dns_$proto.proto=$proto
+     uci set firewall.vigie_dns_$proto.dest_ip="$LAN_IP"
+     uci set firewall.vigie_dns_$proto.dest_port=53
+     uci set firewall.vigie_dns_$proto.target=DNAT
+   done
+   uci set firewall.vigie_dot=rule              # DNS-over-TLS has no redirect: reject it
+   uci set firewall.vigie_dot.name=vigie-block-dot
+   uci set firewall.vigie_dot.src=lan
+   uci set firewall.vigie_dot.dest=wan
+   uci set firewall.vigie_dot.proto=tcp
+   uci set firewall.vigie_dot.dest_port=853
+   uci set firewall.vigie_dot.target=REJECT
+   uci commit firewall && /etc/init.d/firewall reload
    ```
+   **Rollback of this step** (exact): `uci delete firewall.vigie_dns_udp; uci delete
+   firewall.vigie_dns_tcp; uci delete firewall.vigie_dot; uci commit firewall;
+   /etc/init.d/firewall reload`. If you prefer raw iptables in `/etc/firewall.user` instead, the
+   equivalents are `iptables -t nat -I PREROUTING -i br-lan -p udp --dport 53 ! -d $LAN_IP -j DNAT
+   --to-destination $LAN_IP:53` (and `-p tcp`) plus `iptables -I FORWARD -i br-lan -p tcp --dport 853
+   -j REJECT`; undo each with the same line using `-D` instead of `-I`, then `/etc/init.d/firewall
+   restart`.
+   **Known gaps**: this is IPv4 only (fw3 on 21.02 has no IPv6 DNAT), so a client that resolves over
+   IPv6 to an external resolver is not redirected: add `config rule` REJECT entries with `option
+   family 'ipv6'` for destination ports 53 and 853 to force it back to IPv4/dnsmasq (unverified).
+   Only the `lan` zone is covered; a guest network or other bridge needs its own `redirect` with
+   its own `src` zone. DoH on port 443 cannot be caught by address: the earlier idea of rejecting
+   `1.1.1.1:443` and `8.8.8.8:443` is not used here because it also breaks ordinary HTTPS to those
+   hosts (both serve websites). Blocking known DoH hostnames needs a maintained list and is yours.
    Validate: from a LAN host `dig @9.9.9.9 example.com` still answers (it was redirected) and the
-   query appears in `/tmp/vigie/dnsmasq.log`; `iptables -t nat -S PREROUTING | grep 'dport 53'`.
-   Also check the WAN side: from outside, port 53 on the WAN address must be dropped (PRP section 9;
-   probably already so, never tested from outside).
+   query appears in `/tmp/vigie/dnsmasq.log`; `uci show firewall | grep vigie`. Also check the WAN
+   side: from outside, port 53 on the WAN address must be dropped (PRP section 9; probably already
+   so, never tested from outside).
 8. **Firewall for the collector's own traffic.** The collector opens no listener, so the router needs
    no inbound rule for Vigie. The rule that limits who can reach the ingest port is on the server
    host (see above).
@@ -226,9 +278,14 @@ rm -rf /usr/libexec/vigie /etc/vigie /var/run/vigie-collector /tmp/vigie /tmp/vi
 rm -f /tmp/dnsmasq.d/vigie.conf && /etc/init.d/dnsmasq restart
 sed -i '/vigie-dnsmasq-dropin.sh/d' /etc/crontabs/root && /etc/init.d/cron restart
 sed -i '/^vigie:/d' /etc/passwd /etc/group /etc/shadow
-# remove the iptables lines from /etc/firewall.user, then:
-/etc/init.d/firewall restart
+# the firewall entries from step 7 (UCI form):
+uci delete firewall.vigie_dns_udp; uci delete firewall.vigie_dns_tcp; uci delete firewall.vigie_dot
+uci commit firewall && /etc/init.d/firewall reload
+# (raw iptables lines in /etc/firewall.user: delete them, then /etc/init.d/firewall restart)
 ```
+
+Server side: `docs/deploy.md`, section "Server-side rollback" (`podman-compose down -v`, `podman secret
+rm`, firewalld rule removal).
 
 A reboot reverts everything under `/tmp` (the drop-in, logs, helper socket) but not the flash
 files above. A firmware upgrade removes `/etc/vigie` including the key (not in the default

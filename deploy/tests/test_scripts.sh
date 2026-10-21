@@ -291,6 +291,21 @@ VIGIE_DATA_DIR="$T/raw" sh "$E" true >/dev/null 2>&1
 check "guard is off without VIGIE_GUARD_OVERRIDES (ingest)" test $? -eq 0
 rm -f "$T/raw/overrides.db"
 
+# ---- .gitignore ------------------------------------------------------------------------------
+REPO=$(dirname "$DEPLOY")
+ign() { git -C "$REPO" check-ignore --no-index -q "$1"; }
+if command -v git >/dev/null 2>&1 && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+	for f in deploy/certs-next/server.key collector-rtr-1/key-k2 certs-next/server.key \
+		deploy/collector-rtr-1/key-k2 deploy/certs/pins.txt deploy/certs-api/server.crt \
+		some/dir/token.secret deploy/other.key; do
+		check ".gitignore ignores $f" ign "$f"
+	done
+	for f in deploy/compose.yaml deploy/gen-certs.sh deploy/tests/test_scripts.sh .gitignore; do
+		check ".gitignore does not ignore $f" sh -c '! git -C "$1" check-ignore --no-index -q "$2"' _ "$REPO" "$f"
+	done
+	check "no tracked file is ignored" test -z "$(git -C "$REPO" ls-files | git -C "$REPO" check-ignore --no-index --stdin)"
+fi
+
 # ---- healthcheck.py (argument dispatch; the live TLS probe was run by hand against real servers)
 H="$DEPLOY/healthcheck.py"
 python3 -I "$H" http 1 /healthz >/dev/null 2>&1
