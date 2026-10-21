@@ -105,7 +105,9 @@ impl Window {
         self.dns.len()
     }
     pub fn flow_count(&self) -> u64 {
-        self.conntrack.iter().map(|c| c.flows).sum()
+        self.conntrack
+            .iter()
+            .fold(0u64, |a, c| a.saturating_add(c.flows))
     }
 
     /// Everything collected so far, leaving the window empty.
@@ -327,6 +329,23 @@ mod tests {
         assert_eq!(drops.get("source_flags"), Some(&0b0101));
         let (_, none) = w.take_with_drops();
         assert!(none.is_empty(), "no flags, no key");
+    }
+
+    #[test]
+    fn flow_count_saturates_instead_of_overflowing() {
+        let mut w = Window::default();
+        for i in 0..2 {
+            w.add_conntrack(ConntrackSummary {
+                mac: mac_n(i),
+                dst_ip: None,
+                dst_port: None,
+                proto: crate::model::Proto::Other,
+                bytes_up: 0,
+                bytes_down: 0,
+                flows: u64::MAX,
+            });
+        }
+        assert_eq!(w.flow_count(), u64::MAX);
     }
 
     #[test]
