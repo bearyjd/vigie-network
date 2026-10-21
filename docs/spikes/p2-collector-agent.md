@@ -226,8 +226,8 @@ asserted to stay within the server body limit (`SERVER_MAX_BODY`, 512 KiB).
 
 ## Tests
 
-130 agent tests (17 unit plus integration tests, including 15 that run the shell scripts and the new `review_*` files) and 91 from the
-spike crates (221 in the workspace); `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
+174 agent tests (17 library unit tests, 5 in `main.rs`, the rest integration tests; the `review_deploy_*` and `config_key` files run the
+shell scripts) and 91 from the spike crates (265 in the workspace); `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.
 Cross-language: `tests/vectors/signing.json` (12 vectors from the real `vigie_ingest.auth`: empty body,
 unicode, non-UTF-8 bytes, NUL, `|` in body, int64-max seq, max sent_ts, 64-char ids, 256 KiB body) is
 asserted by `agent/tests/signing_vectors.rs`; `tests/vectors/test_rust_batches.py` runs the Rust
@@ -236,7 +236,8 @@ builder and send engine, validates every emitted body with `vigie_ingest.models.
 (`VIGIE_INGEST_SRC=<server/src> VIGIE_SCHEMA=<batch.schema.json> uv run --python 3.12 --with pydantic
 --with jsonschema python -I tests/vectors/test_rust_batches.py`).
 
-TDD honesty: signing, builder, spool, backoff, time gate, urgent, engine, parsers, tail and config
+TDD honesty (third pass: each new security test was run red first against the old code or a no-op stub, then the fix
+was written; the wall-clock rebase test is red only as a compile error because the fix is an API change): signing, builder, spool, backoff, time gate, urgent, engine, parsers, tail and config
 were each run red first (assertion failures against stubs; for config the shell-script tests failed
 because the scripts did not exist yet). The batch model, `json`, `mac`, `ids`, `sightings`, `window`,
 `httpdate` and `procstat` were written with their tests, green on the first run.
@@ -263,11 +264,27 @@ added for the survivors (taint stickiness independent of the ACK check, reserve 
 does not compile (a `const` assertion), which counts as killed. Not mutated: `take_counts` -> `note_drops` wiring,
 meta-before-take ordering and the immediate neighbor refresh in `main.rs` (no tests; only reviewed).
 
+### Mutation run for the third-pass fixes
+
+57 single-edit mutants over a copy of the workspace, full `cargo test --workspace` after each (throwaway script, not
+committed): sequential-context attach (xid, mac, taint, boundary, DNS line, break, no context), poison/boundary verbs
+(INFORM, RELEASE, DECLINE, NAK, OFFER), options replace, DISCOVER reset, anchored prefix (loose match, month, time
+shape, day, pid, `-dhcp`), cursor fingerprint (compare, advance, trim, initial), tail counters (reset, carry, overlong,
+skipping, merge into `truncated` in `main`), `ensure_dir` (adopt, no `require_dir`, no syslog), `VIGIE_TEST` gate, init
+`id -u` guard (and its log), euid refusal (root accepted, `--allow-root` ignored, fail-open, real instead of effective
+uid), server-time rebase, both wiring gates, watchdog (SIGUSR2, mode, emergency threshold, `.1` bound, `.1` symlink),
+print helper (uid in use, blind 6700), log dir mode. First pass: 41 killed, 15 survived, 1 did not compile (my bad
+mutant, fixed and killed). After tests for the survivors: **52 killed, 5 survive**:
+- `attach ignores mac`, `ack keeps context`, `OFFER not parsed`, `tail len < pos dropped`: equivalent or fully redundant
+  (the taint, the removed entry, `break_context` on unparsed lines and the cursor fingerprint each cover them).
+- `main: euid check removed` (the call in `main()` is replaced by `allow_root = true`): the decision function is
+  tested, the call site is not, because exercising it needs a process with euid 0. Reviewed only.
+
 ## Results (host, not the router)
 
 | Metric | Value |
 |---|---|
-| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 500,792 bytes (489 KiB) after the review fixes (was 489,360); x86_64-musl about 556 KB before them |
+| aarch64-unknown-linux-musl release binary (stripped, static, rust-lld) | 512,600 bytes (500.6 KiB) after the third-pass fixes (500,792 before them); x86_64-musl about 556 KB before them |
 | Dependencies (runtime) | `hmac`, `sha2` (+ `digest`, `generic-array`, `typenum`, `subtle`, `block-buffer`, `crypto-common`, `cpufeatures`, `cfg-if`) and `vigie-parse`; `serde_json` is a dev-dependency only. No C code |
 | Idle RSS, x86_64-musl on the host, 5 s windows for 40 s, `ip neigh` run each 10 s, tail fed 1 line/5 s | 496 kB at start, 600 kB (VmHWM 600 kB) after 40 s; budget is 10 MB. Slow growth is the empty-batch spool |
 | Not measured | aarch64 RSS (the binary was cross-compiled but never executed; no qemu, no router), CPU, behaviour under load or over 24 h |
