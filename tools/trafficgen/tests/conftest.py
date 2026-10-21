@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,7 +12,7 @@ from vigie_ingest.app import create_app
 from vigie_ingest.config import Settings
 from vigie_ingest.db import open_inventory
 
-from trafficgen import DEFAULT_KEY, Emission, Scenario, generate
+from trafficgen import DEFAULT_KEY, Emission, Scenario, cli, generate
 from trafficgen.transport import Result, run
 
 REPO = Path(__file__).resolve().parents[3]
@@ -76,3 +77,47 @@ def ingest(tmp_path: Path):
     app = Ingest(tmp_path)
     yield app
     app.client.__exit__(None, None, None)
+
+
+T0 = 1_900_000_000.0
+
+
+class FakeTime:
+    """Fake wall clock: sleep() advances it. The ingest app's clock follows it."""
+
+    def __init__(self, ingest) -> None:
+        self.now = T0
+        self.ingest = ingest
+        self.slept = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, s: float) -> None:
+        self.slept += s
+        self.now += s
+
+
+class _Closable:
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def fake(monkeypatch, ingest):
+    ft = FakeTime(ingest)
+    monkeypatch.setattr(cli, "time", SimpleNamespace(time=ft.time, sleep=ft.sleep))
+
+    def post(body, headers):
+        ingest.clock[0] = ft.now
+        return ingest.post(body, headers)
+
+    monkeypatch.setattr(cli, "http_post", lambda url, **kw: (post, _Closable()))
+    return ft
+
+
+@pytest.fixture
+def keyfile(tmp_path):
+    p = tmp_path / "k"
+    p.write_text(DEFAULT_KEY.hex())
+    return p

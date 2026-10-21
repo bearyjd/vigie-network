@@ -10,6 +10,9 @@ dependencies = [
   "httpx>=0.27",
 ]
 
+[project.scripts]
+trafficgen = "trafficgen.cli:main"
+
 [dependency-groups]
 dev = [
   "pytest>=8",
@@ -43,6 +46,6 @@ target-version = "py312"
 select = ["E", "F", "I", "B", "UP", "S"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106"]
+"tests/*" = ["S101", "S105", "S106", "S603", "S607"]
 # Synthetic data generation: a seeded, non-cryptographic PRNG is the point.
 "src/trafficgen/*" = ["S311"]

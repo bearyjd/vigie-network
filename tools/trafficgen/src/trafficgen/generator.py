@@ -177,6 +177,7 @@ def generate(
     boot_id: str = "boot-a",
     roll_interval_s: int | None = None,
     batch_cap_bytes: int = PRP_BATCH_CAP_BYTES,
+    variant: str | None = None,
 ) -> Scenario:
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; choose from {', '.join(PROFILES)}")

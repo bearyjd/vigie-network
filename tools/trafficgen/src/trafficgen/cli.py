@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from .generator import generate
 from .model import DEFAULT_START, PRP_BATCH_CAP_BYTES, Emission, shift_emission
 from .model import emissions_to_jsonl as to_jsonl
 from .roster import PROFILES
+from .tls import PIN_RE, TlsError
 from .transport import http_post, run
 
 # Committed fixtures under tests/fixtures/synthetic/ are regenerated from exactly these.
@@ -42,9 +44,36 @@ def _write(out: Path, name: str, emissions: list[Emission], manifest: dict[str, 
     (out / f"{name}.manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
 
 
+KEY_ENV = "VIGIE_TRAFFICGEN_KEY"
+_MIN_KEY_BYTES = 32  # same floor as vigie_ingest.auth
+_MAX_KEY_CHARS = 1024
+
+
+class KeyInputError(Exception):
+    """The key could not be read or is malformed. Messages never contain key material."""
+
+
 def _read_key(args: argparse.Namespace) -> bytes:
-    raw = args.key_hex or Path(args.key_file).read_text().strip()
-    return bytes.fromhex(raw)
+    """Key from --key-file, --key-stdin or $VIGIE_TRAFFICGEN_KEY (never from argv)."""
+    if args.key_file:
+        try:
+            with Path(args.key_file).open("rb") as fh:
+                raw = fh.read(_MAX_KEY_CHARS + 1).decode("ascii")
+        except OSError as exc:
+            raise KeyInputError(f"cannot read key file {args.key_file}: {exc.strerror}") from exc
+        except UnicodeDecodeError as exc:
+            raise KeyInputError("invalid key: key file is not ASCII hex") from exc
+    elif args.key_stdin:
+        raw = sys.stdin.readline(_MAX_KEY_CHARS + 1)
+    else:
+        raw = os.environ.get(KEY_ENV, "")
+    try:
+        key = bytes.fromhex(raw.strip())
+    except ValueError:
+        raise KeyInputError("invalid key: not valid hex") from None
+    if len(key) < _MIN_KEY_BYTES:
+        raise KeyInputError(f"invalid key: need at least {_MIN_KEY_BYTES} bytes (64 hex chars)")
+    return key
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -55,6 +84,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         start=args.start,
         roll_interval_s=args.roll_interval,
         batch_cap_bytes=args.batch_cap_bytes,
+        variant=args.variant,
     )
     _write(Path(args.out), args.profile, sc.emissions, sc.manifest)
     print(f"wrote {len(sc.emissions)} batches + manifest for {args.profile} to {args.out}")
@@ -70,7 +100,11 @@ def _cmd_fixtures(args: argparse.Namespace) -> int:
 
 
 def _cmd_post(args: argparse.Namespace) -> int:
-    key = _read_key(args)
+    try:
+        key = _read_key(args)
+    except KeyInputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     sc = generate(
         args.profile,
         seed=args.seed,
@@ -78,25 +112,37 @@ def _cmd_post(args: argparse.Namespace) -> int:
         start=args.start,
         roll_interval_s=args.roll_interval,
         batch_cap_bytes=args.batch_cap_bytes,
+        variant=args.variant,
     )
     now = int(time.time())
     first, last = sc.emissions[0].arrival_ts, sc.emissions[-1].arrival_ts
+    span = last - first
+    if not args.pace and span > args.max_skew_s and not args.no_pace_check:
+        print(
+            f"error: unpaced span is {span} s, over --max-skew-s {args.max_skew_s}: the server "
+            "rejects batches whose sent_ts is far from its clock. Use the default real-time "
+            "pacing, raise --max-skew-s, or pass --no-pace-check to send anyway.",
+            file=sys.stderr,
+        )
+        return 2
     # Map the synthetic timeline onto wall clock: the server judges sent_ts against its own clock.
     delta = (now - first) if args.pace else (now - last)
     emissions = [shift_emission(e, delta) for e in sc.emissions]
-    if not args.pace and last - first > 240:
-        print(
-            "warning: span > 4 min without --pace; early batches may be rejected as stale",
-            file=sys.stderr,
-        )
 
     def wait(ts: int) -> None:
         if args.pace:
             time.sleep(max(0.0, ts - time.time()))
 
-    post, client = http_post(args.url)
+    try:
+        post, client = http_post(args.url, ca_file=args.ca_file, pin_sha256=args.pin_sha256)
+    except TlsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     try:
         results = run(emissions, key, post, on_arrival=wait)
+    except TlsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except httpx.HTTPError as exc:
         print(f"error: cannot reach {args.url}: {exc}", file=sys.stderr)
         return 2
@@ -117,6 +163,18 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--start", type=int, default=DEFAULT_START)
     p.add_argument("--roll-interval", type=int, default=None, help="seconds between MAC rolls")
     p.add_argument("--batch-cap-bytes", type=int, default=PRP_BATCH_CAP_BYTES)
+    p.add_argument("--variant", default=None, help="profile variant (see README); default varies")
+
+
+def _check_post_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.key_file and args.key_stdin:
+        parser.error("give the key by exactly one of --key-file / --key-stdin / $" + KEY_ENV)
+    if not (args.key_file or args.key_stdin or os.environ.get(KEY_ENV)):
+        parser.error(f"post needs a key: --key-file, --key-stdin or ${KEY_ENV}")
+    if args.pin_sha256 and not PIN_RE.fullmatch(args.pin_sha256):
+        parser.error("--pin-sha256 must be 64 hex characters")
+    if (args.ca_file or args.pin_sha256) and not args.url.lower().startswith("https://"):
+        parser.error("--ca-file/--pin-sha256 need an https:// --url")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,12 +191,23 @@ def main(argv: list[str] | None = None) -> int:
     _common(post)
     post.add_argument("--url", required=True)
     post.add_argument("--key-file", help="file holding the collector key as hex")
-    post.add_argument("--key-hex")
-    post.add_argument("--pace", action="store_true", help="sleep to real time between batches")
+    post.add_argument("--key-stdin", action="store_true", help="read the hex key from stdin")
+    post.add_argument(
+        "--pace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="replay on a real-time schedule (default); --no-pace sends back to back",
+    )
+    post.add_argument(
+        "--max-skew-s", type=int, default=240, help="unpaced span limit (default 240)"
+    )
+    post.add_argument("--no-pace-check", action="store_true", help="skip the unpaced span check")
+    post.add_argument("--ca-file", help="PEM CA or self-signed server cert to trust (https)")
+    post.add_argument("--pin-sha256", help="SPKI SHA-256 pin, 64 hex chars (gen-certs.sh output)")
     post.set_defaults(fn=_cmd_post)
     args = parser.parse_args(argv)
-    if args.cmd == "post" and not (args.key_file or args.key_hex):
-        parser.error("post requires --key-file or --key-hex")
+    if args.cmd == "post":
+        _check_post_args(parser, args)
     return args.fn(args)
 
 

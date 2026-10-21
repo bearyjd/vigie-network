@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import httpx
 from vigie_ingest import auth
 
+from . import tls
 from .model import Emission
 
 PostFn = Callable[[bytes, dict[str, str]], tuple[int, dict[str, Any]]]
@@ -66,9 +68,22 @@ def run(
     return results
 
 
-def http_post(url: str, timeout: float = 10.0) -> tuple[PostFn, httpx.Client]:
-    """POST callable for a live server (caller closes the returned client)."""
-    client = httpx.Client(base_url=url, timeout=timeout)
+def http_post(
+    url: str,
+    timeout: float = 10.0,
+    ca_file: str | None = None,
+    pin_sha256: str | None = None,
+) -> tuple[PostFn, httpx.Client]:
+    """POST callable for a live server (caller closes the returned client).
+
+    TLS verification is always on. `ca_file` replaces the trust anchors; `pin_sha256` additionally
+    pins the server's SPKI (checked on every new connection, before any request is sent). Raises
+    tls.TlsError on any TLS problem.
+    """
+    verify: ssl.SSLContext | bool = True
+    if url.lower().startswith("https://"):
+        verify = tls.make_context(ca_file, pin_sha256)
+    client = httpx.Client(base_url=url, timeout=timeout, verify=verify)
 
     def post(body: bytes, headers: dict[str, str]) -> tuple[int, dict[str, Any]]:
         resp = client.post("/v1/batch", content=body, headers=headers)

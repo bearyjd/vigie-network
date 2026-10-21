@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import time
+from types import SimpleNamespace
 
 import pytest
-from conftest import FIXTURES
+from conftest import FIXTURES, T0, _Closable
 
-from trafficgen import DEFAULT_KEY, cli
+from trafficgen import cli
 from trafficgen.cli import FIXTURE_SPECS, main
 from trafficgen.generator import emissions_to_jsonl, generate
 
@@ -38,7 +38,8 @@ def test_unknown_profile_rejected(tmp_path):
         main(["generate", "--profile", "nope", "--out", str(tmp_path)])
 
 
-def test_post_requires_key(capsys):
+def test_post_requires_key(capsys, monkeypatch):
+    monkeypatch.delenv("VIGIE_TRAFFICGEN_KEY", raising=False)
     with pytest.raises(SystemExit):
         main(["post", "--profile", "baseline", "--url", "http://127.0.0.1:1"])
 
@@ -71,55 +72,19 @@ def test_committed_fixtures_match_generator(name):
     assert json.loads((FIXTURES / f"{name}.manifest.json").read_text()) == sc.manifest
 
 
-class _Closable:
-    def close(self) -> None:
-        pass
-
-
 @pytest.mark.parametrize("profile,rc", [("baseline", 0), ("stale_ts", 0), ("replay", 0)])
-def test_post_end_to_end_against_wall_clock(monkeypatch, ingest, tmp_path, capsys, profile, rc):
-    """`post` maps the synthetic timeline onto the wall clock, so a real-time server accepts it."""
-
-    def post(body, headers):
-        ingest.clock[0] = time.time()
-        return ingest.post(body, headers)
-
-    monkeypatch.setattr(cli, "http_post", lambda url: (post, _Closable()))
-    key = tmp_path / "k"
-    key.write_text(DEFAULT_KEY.hex())
-    argv = [
-        "post",
-        "--profile",
-        profile,
-        "--windows",
-        "4",
-        "--seed",
-        "2",
-        "--url",
-        "http://x",
-        "--key-file",
-        str(key),
-    ]
+def test_post_end_to_end_paced_fake_clock(fake, keyfile, capsys, profile, rc):
+    """`post` maps the synthetic timeline onto the (fake) wall clock; a real-time server accepts."""
+    argv = ["post", "--profile", profile, "--windows", "4", "--seed", "2", "--url", "http://x",
+            "--key-file", str(keyfile)]  # fmt: skip
     assert main(argv) == rc
     assert "UNEXPECTED" not in capsys.readouterr().out
 
 
-def test_post_flags_unexpected_status(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(cli, "http_post", lambda url: (lambda b, h: (500, {}), _Closable()))
-    assert (
-        main(
-            [
-                "post",
-                "--profile",
-                "baseline",
-                "--windows",
-                "4",
-                "--url",
-                "http://x",
-                "--key-hex",
-                DEFAULT_KEY.hex(),
-            ]
-        )
-        == 1
-    )
+def test_post_flags_unexpected_status(monkeypatch, keyfile, capsys):
+    monkeypatch.setattr(cli, "time", SimpleNamespace(time=lambda: T0, sleep=lambda s: None))
+    monkeypatch.setattr(cli, "http_post", lambda url, **kw: (lambda b, h: (500, {}), _Closable()))
+    argv = ["post", "--profile", "baseline", "--windows", "4", "--url", "http://x",
+            "--key-file", str(keyfile)]  # fmt: skip
+    assert main(argv) == 1
     assert "UNEXPECTED" in capsys.readouterr().out
