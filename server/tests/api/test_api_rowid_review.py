@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from api_helpers import Env, env, ts  # noqa: F401
 
 
