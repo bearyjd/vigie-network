@@ -131,6 +131,12 @@ class Env:
     def inventory(self):
         return open_inventory(self.settings.inventory_path)
 
+    def add_collector(self, collector_id: str, key_id: str, key: bytes) -> None:
+        (self.settings.secrets_dir / f"collector_key_{key_id}").write_text(key.hex())
+        conn = self.inventory()
+        store.provision_collector(conn, collector_id, key_id)
+        conn.close()
+
 
 @pytest.fixture
 def make_env(tmp_path: Path) -> Callable[..., Env]:
@@ -143,13 +149,13 @@ def make_env(tmp_path: Path) -> Callable[..., Env]:
         secrets.mkdir(exist_ok=True)
         (secrets / f"collector_key_{KEY_ID}").write_text(KEY.hex())
         settings = Settings(data_dir=data, secrets_dir=secrets, **settings_overrides)
+        conn = open_inventory(settings.inventory_path)
+        store.provision_collector(conn, COLLECTOR, KEY_ID)
+        conn.close()
         clock = [NOW]
         client = TestClient(create_app(settings, clock=lambda: clock[0]))
         client.__enter__()
         clients.append(client)
-        conn = open_inventory(settings.inventory_path)
-        store.provision_collector(conn, COLLECTOR, KEY_ID)
-        conn.close()
         return Env(settings, client, clock)
 
     yield factory

@@ -39,12 +39,17 @@ def test_inventory_schema_has_prp_tables(tmp_path: Path) -> None:
 
 
 def test_migrations_are_idempotent_and_incremental(tmp_path: Path) -> None:
+    n = len(INVENTORY_MIGRATIONS)
     conn = connect(tmp_path / "x.db")
-    assert migrate(conn, INVENTORY_MIGRATIONS[:1]) == 1
+    assert migrate(conn, INVENTORY_MIGRATIONS[:2]) == 2
     conn.execute("INSERT INTO collectors (id, key_id) VALUES ('c','k')")
-    assert migrate(conn, INVENTORY_MIGRATIONS) == 2
-    assert migrate(conn, INVENTORY_MIGRATIONS) == 2
-    assert conn.execute("SELECT parse_failures FROM collectors").fetchone()[0] == 0
+    conn.execute("INSERT INTO batches VALUES ('b1','c','2026-10-20T00:00:00Z')")
+    assert migrate(conn, INVENTORY_MIGRATIONS) == n
+    assert migrate(conn, INVENTORY_MIGRATIONS) == n
+    row = conn.execute("SELECT parse_failures, last_sent_ts FROM collectors").fetchone()
+    assert tuple(row) == (0, 0)
+    kept = conn.execute("SELECT collector_id, batch_id, dropped_batches FROM batches").fetchone()
+    assert tuple(kept) == ("c", "b1", 0)  # v3 table rebuild preserved rows
 
 
 def test_newer_schema_is_refused(tmp_path: Path) -> None:
@@ -157,7 +162,8 @@ def test_purge_batches_older_than_seven_days(tmp_path: Path) -> None:
     conn = open_inventory(tmp_path / "inventory.db")
     for bid, age_days in (("old", 8), ("edge", 6), ("new", 0)):
         conn.execute(
-            "INSERT INTO batches VALUES (?,?,?)", (bid, "c", iso_utc(NOW - age_days * 86400))
+            "INSERT INTO batches (collector_id, batch_id, received_at) VALUES ('c',?,?)",
+            (bid, iso_utc(NOW - age_days * 86400)),
         )
     assert purge_batches(conn, NOW, 7) == 1
     left = {r[0] for r in conn.execute("SELECT batch_id FROM batches")}
@@ -167,7 +173,10 @@ def test_purge_batches_older_than_seven_days(tmp_path: Path) -> None:
 def test_run_maintenance(tmp_path: Path) -> None:
     settings = Settings(tmp_path, tmp_path)
     conn = open_inventory(settings.inventory_path)
-    conn.execute("INSERT INTO batches VALUES ('b','c',?)", (iso_utc(NOW - 9 * 86400),))
+    conn.execute(
+        "INSERT INTO batches (collector_id, batch_id, received_at) VALUES ('c','b',?)",
+        (iso_utc(NOW - 9 * 86400),),
+    )
     conn.close()
     old = make_shard(tmp_path, datetime.fromtimestamp(NOW, tz=UTC) - timedelta(days=9))
     removed, purged = run_maintenance(settings, NOW)

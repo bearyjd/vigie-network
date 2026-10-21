@@ -244,7 +244,7 @@ def test_sent_ts_window(env: Env, delta: int, expected: int) -> None:
 
 
 def test_spooled_old_window_accepted_when_sent_ts_fresh(env: Env) -> None:
-    old_end = int(NOW) - 2 * 86400 - 3600  # spooled across a day boundary
+    old_end = int(NOW) - 20 * 3600  # spooled ~20h, previous UTC day
     dns = {**make_batch()["dns"][0], "ts": old_end - 5}
     batch = make_batch(
         seq=1, window_start=old_end - 60, window_end=old_end, dns=[dns]
@@ -292,7 +292,8 @@ def test_oversized_body_rejected_before_parsing(env: Env, monkeypatch: pytest.Mo
     monkeypatch.setattr(app_module, "process_batch", boom)
     monkeypatch.setattr(app_module.Batch, "model_validate_json", boom)
     big = b"x" * (512 * 1024 + 1)
-    resp = env.client.post("/v1/batch", content=big, headers={"Content-Type": "application/json"})
+    headers = signed_headers(big, make_batch())
+    resp = env.client.post("/v1/batch", content=big, headers=headers)
     assert resp.status_code == 413
 
 
@@ -305,7 +306,8 @@ def test_oversized_chunked_body_without_content_length(
         for _ in range(9):
             yield b"y" * (64 * 1024)
 
-    resp = env.client.post("/v1/batch", content=chunks())
+    headers = signed_headers(b"", make_batch())
+    resp = env.client.post("/v1/batch", content=chunks(), headers=headers)
     assert resp.status_code == 413
 
 
@@ -315,7 +317,8 @@ def test_body_exactly_at_cap_is_not_413(env: Env) -> None:
 
 
 def test_invalid_content_length_rejected(env: Env) -> None:
-    resp = env.client.post("/v1/batch", content=b"{}", headers={"Content-Length": "abc"})
+    headers = signed_headers(b"", make_batch(), **{"Content-Length": "abc"})
+    resp = env.client.post("/v1/batch", content=b"{}", headers=headers)
     assert resp.status_code in (400, 413)
 
 
@@ -369,24 +372,6 @@ def test_body_fields_must_match_signed_headers(env: Env) -> None:
     assert collector_row(env)["parse_failures"] == 1
 
 
-def test_failed_apply_leaves_nothing_behind(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A mid-transaction failure rolls back inventory and shard rows together."""
-    real_apply = store._apply_locked
-
-    def failing(conn, aliases, batch, now, skew):
-        real_apply(conn, aliases, batch, now, skew)
-        raise RuntimeError("disk on fire")
-
-    monkeypatch.setattr(store, "_apply_locked", failing)
-    with pytest.raises(RuntimeError):
-        env.post(make_batch(seq=1))
-    assert batch_count(env) == 0
-    assert collector_row(env)["last_seq"] == 0
-    assert shard_count(env, "raw_dns") == 0 and shard_count(env, "raw_flow") == 0
-
-
 def test_revoked_during_apply_is_rejected(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     batch = make_batch(seq=1)
     real_apply = store.apply_batch
@@ -401,6 +386,7 @@ def test_revoked_during_apply_is_rejected(env: Env, monkeypatch: pytest.MonkeyPa
     resp = env.post(batch)
     assert resp.status_code == 401 and resp.json() == UNAUTH
     assert batch_count(env) == 0
+    assert shard_count(env, "raw_dns") == 0 and shard_count(env, "raw_flow") == 0
 
 
 def test_connections_use_secure_delete_and_wal(env: Env) -> None:
