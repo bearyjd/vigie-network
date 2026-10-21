@@ -18,7 +18,7 @@ use vigie_agent::ids;
 use vigie_agent::leases::parse_leases;
 use vigie_agent::model::{Health, Meta, Sections};
 use vigie_agent::neigh::ip_to_mac;
-use vigie_agent::procstat::read_rss_kb;
+use vigie_agent::procstat::{read_rss_kb, read_status, root_refusal};
 use vigie_agent::runtime::{random, random_u64, read_neighbors, wall_ms, wall_secs};
 use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport, TransportError};
 use vigie_agent::spool::SPOOL_CAP;
@@ -34,6 +34,7 @@ const POLL: Duration = Duration::from_secs(2);
 const NEIGH_REFRESH_S: u64 = 10;
 const EXIT_CONFIG: u8 = 78;
 const EXIT_NO_RANDOM: u8 = 71;
+const EXIT_NO_PERM: u8 = 77;
 
 const fn parse_build_ts(s: &str) -> u64 {
     let b = s.as_bytes();
@@ -59,6 +60,8 @@ impl Transport for NoTransport {
 struct Args {
     config: String,
     check_only: bool,
+    /// Test hook: run even as root. Production never passes it.
+    allow_root: bool,
     window_s: u64,
 }
 
@@ -66,12 +69,14 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args {
         config: DEFAULT_CONFIG.into(),
         check_only: false,
+        allow_root: false,
         window_s: 60,
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" => a.config = it.next().ok_or("--config needs a path")?,
             "--check" => a.check_only = true,
+            "--allow-root" => a.allow_root = true,
             // Test hook: shorter window for soak/RSS measurements.
             "--window-s" => {
                 let v = it.next().ok_or("--window-s needs a number")?;
@@ -268,6 +273,10 @@ fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
+    if let Some(why) = root_refusal(read_status().as_deref(), args.allow_root) {
+        eprintln!("vigie-collector: {why}");
+        return ExitCode::from(EXIT_NO_PERM);
+    }
     let (cfg, mut key) = match load(&args) {
         Ok(v) => v,
         Err(e) => {
@@ -355,5 +364,101 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
             Tick::Idle | Tick::Held | Tick::Waiting | Tick::Sent { .. } => {}
         }
         std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vigie_agent::model::{DnsQuery, Lease};
+
+    const MAC: &str = "aa:bb:cc:dd:ee:01";
+
+    fn agent() -> Agent {
+        let cfg = parse_config(&format!(
+            "server_url=https://vigie.example.lan:8443/v1/batch\ncollector_id=router-1\n\
+             key_id=k1\npin1={}\npin2={}\n",
+            "0".repeat(64),
+            "1".repeat(64)
+        ))
+        .expect("test config");
+        let id = Identity {
+            collector_id: cfg.collector_id.clone(),
+            key_id: cfg.key_id.clone(),
+            boot_id: "boot1".into(),
+        };
+        Agent {
+            tail: Tail::new(cfg.dnsmasq_log.clone()),
+            cfg,
+            engine: Engine::new(id, vec![7; 32], BUILD_TS, SPOOL_CAP),
+            boot_id: "boot1".into(),
+            seq: 0,
+            window: Window::default(),
+            clock: WindowClock::new(0),
+            sync: SyncState::new(),
+            dhcp: DhcpAssembler::default(),
+            dns: DnsCorrelator::default(),
+            delta: SnapshotDelta::default(),
+            urgent: Urgent::new(),
+            quiet: QuietDetector::default(),
+            ip_to_mac: HashMap::new(),
+            started: Instant::now(),
+        }
+    }
+
+    fn add_row(a: &mut Agent) {
+        a.window
+            .add_dns(DnsQuery::new(5, MAC, "a.example.com", "A", None).unwrap());
+        a.window
+            .add_lease(Lease::new(MAC, "192.168.1.50", Some("Pixel"), &[1, 3], None).unwrap());
+    }
+
+    #[test]
+    fn unsynced_flush_queues_exactly_one_empty_probe_and_keeps_the_data() {
+        let mut a = agent();
+        add_row(&mut a);
+        let now = BUILD_TS + 100;
+        a.flush_window(now, 61);
+        assert_eq!(a.engine.spool.len(), 1, "one probe");
+        assert_eq!(
+            a.window.dns_count(),
+            1,
+            "window data kept, not built or dropped"
+        );
+        a.flush_window(now + 60, 121);
+        assert_eq!(
+            a.engine.spool.len(),
+            1,
+            "no second probe while one is queued"
+        );
+        assert_eq!(a.window.dns_count(), 1);
+        let kept = a.window.take_identity();
+        assert_eq!(kept.leases.len(), 1, "lease kept too");
+    }
+
+    #[test]
+    fn identity_push_builds_nothing_until_a_server_date_was_seen() {
+        let mut a = agent();
+        add_row(&mut a);
+        assert!(!a.engine.gate.has_server_date());
+        a.push_identity();
+        assert!(
+            a.engine.spool.is_empty(),
+            "nothing queued before the first Date"
+        );
+        assert_eq!(
+            a.window.take_identity().leases.len(),
+            1,
+            "identity kept for later"
+        );
+    }
+
+    #[test]
+    fn parse_args_takes_allow_root_only_when_given() {
+        let none = parse_args(["--config".to_string(), "/x".to_string()].into_iter()).unwrap();
+        assert!(!none.allow_root);
+        let some = parse_args(["--allow-root".to_string()].into_iter()).unwrap();
+        assert!(some.allow_root);
+        assert!(parse_args(["--allow-roo".to_string()].into_iter()).is_err());
     }
 }

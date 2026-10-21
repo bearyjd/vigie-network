@@ -235,11 +235,7 @@ pub fn parse_key_hex(text: &str) -> Result<Vec<u8>, KeyError> {
 fn current_euid() -> Result<u32, KeyError> {
     let status =
         fs::read_to_string("/proc/self/status").map_err(|e| KeyError::Io(e.to_string()))?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))
-        .and_then(|rest| rest.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    crate::procstat::parse_euid(&status)
         .ok_or_else(|| KeyError::Io("cannot determine effective uid".into()))
 }
 
