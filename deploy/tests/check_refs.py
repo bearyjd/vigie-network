@@ -97,6 +97,16 @@ def docs_matrix(text: str) -> dict[str, dict[str, str]]:
     return matrix
 
 
+def docs_table_for(doc: dict) -> str:
+    """The docs table a compose file would need (used by the self-test to isolate each check)."""
+    actual = mounts_of(doc)
+    rows = [
+        "| " + vol + " | " + " | ".join(actual[svc].get(vol, "-") for svc in ("ingest", "pipeline", "api")) + " |"
+        for vol in VOLUMES
+    ]
+    return "\n".join(rows)
+
+
 def check_mounts(doc: dict, deploy_md: str) -> None:
     actual = mounts_of(doc)
     if actual != EXPECTED_MOUNTS:
@@ -289,7 +299,7 @@ def check_firewall(readme: str) -> None:
         reject = rf'source not address="[^"]+" port port="{port}" protocol="tcp" reject'
         if not re.search(accept, readme) or not re.search(reject, readme):
             err(f"README: firewalld recipe lacks accept + 'source not address' reject for {port}")
-    for needle in ("--reload", "--remove-rich-rule", "nc -vz"):
+    for needle in ("firewall-cmd --reload", "--remove-rich-rule", "nc -vz"):
         if needle not in readme:
             err(f"README: firewalld recipe lacks {needle}")
 
@@ -327,8 +337,9 @@ def self_test() -> None:
     _fails("firewalld recipe without the 8444 rule", check_firewall, readme.replace('port="8444"', 'port="9"'))
     _fails("a path that does not exist", check_paths_in, "bogus.md", BOGUS_PATH_DOC)
     _fails("a flag nobody defines", check_flags_in, "bogus.md", BOGUS_FLAG_DOC, "--real-flag")
-    _fails("api inventory mounted rw", check_mounts, wrong_mount, deploy_md)
-    _fails("ingest mounting overrides", check_mounts, ingest_sees_overrides, deploy_md)
+    # the docs table is made to AGREE with the bad compose, so only the PRP-matrix check can fire
+    _fails("api inventory mounted rw", check_mounts, wrong_mount, docs_table_for(wrong_mount))
+    _fails("ingest mounting overrides", check_mounts, ingest_sees_overrides, docs_table_for(ingest_sees_overrides))
     _fails("docs table out of step with compose", check_mounts, good, deploy_md.replace("| rw |", "| ro |"))
     _fails("api sharing ingest's TLS secrets", check_services, shared_cert)
     _fails("an unpinned base image under --release", check_images, "ARG PYTHON_IMAGE=python:3.12\nARG UV_IMAGE=uv:1", True)

@@ -185,6 +185,25 @@ secrets:
   collector_key_k10:
     external: true
 Y
+# listed under the prefix-sharing name only, but defined under the exact one (and the reverse)
+cat >"$T/compose-decoy2.yaml" <<'Y'
+services:
+  ingest:
+    secrets:
+      - source: collector_key_k10
+secrets:
+  collector_key_k1:
+    external: true
+Y
+cat >"$T/compose-decoy3.yaml" <<'Y'
+services:
+  ingest:
+    secrets:
+      - source: collector_key_k1
+secrets:
+  collector_key_k10:
+    external: true
+Y
 cat >"$T/compose-nodef.yaml" <<'Y'
 services:
   ingest:
@@ -222,6 +241,10 @@ check "rotated key file still 0600" is_mode "$PO/key-k1" 600
 rm -f "$T/state/admin.log"
 VIGIE_COMPOSE_FILE="$T/compose-decoy.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
 check "decoy secret names do not count as listed" test ! -e "$T/state/admin.log"
+VIGIE_COMPOSE_FILE="$T/compose-decoy2.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
+check "listing a longer name does not count" test ! -e "$T/state/admin.log"
+VIGIE_COMPOSE_FILE="$T/compose-decoy3.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
+check "defining only a longer name does not count" test ! -e "$T/state/admin.log"
 VIGIE_COMPOSE_FILE="$T/compose-nodef.yaml" sh "$P" --force --out "$PO" rtr-1 k1 >/dev/null 2>&1
 check "a secret not defined at top level does not count" test ! -e "$T/state/admin.log"
 reg_out=$(VIGIE_COMPOSE_FILE="$T/compose-yes.yaml" sh "$P" --force --out "$PO" rtr-1 k1 2>&1)
