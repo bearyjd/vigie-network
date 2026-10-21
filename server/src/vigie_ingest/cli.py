@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import fcntl
 import os
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 
 import uvicorn
 
 from vigie_ingest.app import create_app
 from vigie_ingest.config import Settings
+from vigie_ingest.lock import LockHeld, exclusive_data_dir
 
 DEFAULT_LIMIT_CONCURRENCY = 64
 DEFAULT_KEEPALIVE_S = 5
-LOCK_NAME = ".ingest.lock"
-
-
-class LockHeld(Exception):
-    pass
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,26 +35,6 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-@contextlib.contextmanager
-def _exclusive_data_dir(data_dir: Path) -> Iterator[None]:
-    """Hold an exclusive flock on <data_dir>/.ingest.lock for the life of the process."""
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        handle = (data_dir / LOCK_NAME).open("a")
-    except OSError as exc:
-        raise LockHeld(f"cannot open {data_dir / LOCK_NAME}: {exc}") from exc
-    try:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise LockHeld(
-                f"{data_dir / LOCK_NAME} is held: another vigie-ingest uses this data dir"
-            ) from exc
-        yield
-    finally:
-        handle.close()  # also releases the flock
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.tls_cert or args.tls_key:
@@ -76,9 +49,9 @@ def main(argv: list[str] | None = None) -> int:
         return _refuse("--workers must be 1: the shard lock and rate limits are per process")
     settings = Settings.from_env()
     try:
-        with _exclusive_data_dir(settings.data_dir):
+        with exclusive_data_dir(settings.data_dir):
             uvicorn.run(
-                create_app(settings),
+                create_app(settings, lock_data_dir=False),
                 host=args.host,
                 port=args.port,
                 limit_concurrency=args.limit_concurrency,

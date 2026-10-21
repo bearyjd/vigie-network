@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from vigie_ingest import auth, store
 from vigie_ingest.config import Settings
 from vigie_ingest.db import connect, open_inventory
+from vigie_ingest.lock import exclusive_data_dir
 from vigie_ingest.models import Batch
 from vigie_ingest.ratelimit import RateLimiter
 from vigie_ingest.retention import run_maintenance
@@ -182,7 +183,12 @@ def _rejection_response(rejection: store.Rejection) -> tuple[int, dict[str, obje
     return 409, {"error": "seq_regression"}
 
 
-def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> FastAPI:
+def create_app(
+    settings: Settings,
+    clock: Callable[[], float] = time.time,
+    lock_data_dir: bool = True,
+) -> FastAPI:
+    """`lock_data_dir=False` only for a caller (the CLI) that already holds the data-dir flock."""
     # Pre-auth: keyed by peer address only (a CPU guard; the claimed collector id is untrusted).
     peer_limiter = RateLimiter(
         settings.rate_limit_preauth_per_min,
@@ -197,16 +203,19 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
-        active = _require_keys(settings)
-        peer_limiter.set_trusted_capacity(active * TRUSTED_PEERS_PER_COLLECTOR)
-        task = asyncio.create_task(_maintenance_loop(settings, clock))
-        try:
-            yield
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        with contextlib.ExitStack() as stack:
+            if lock_data_dir:
+                stack.enter_context(exclusive_data_dir(settings.data_dir))
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            active = _require_keys(settings)
+            peer_limiter.set_trusted_capacity(active * TRUSTED_PEERS_PER_COLLECTOR)
+            task = asyncio.create_task(_maintenance_loop(settings, clock))
+            try:
+                yield
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(
         title="vigie-ingest", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
@@ -250,9 +259,7 @@ def _require_keys(settings: Settings) -> int:
     conn = open_inventory(settings.inventory_path)
     try:
         active = list(store.active_collectors(conn))
-        missing = [
-            c.id for c in active if auth.load_key(settings.secrets_dir, c.key_id) is None
-        ]
+        missing = [c.id for c in active if auth.load_key(settings.secrets_dir, c.key_id) is None]
     finally:
         conn.close()
     if missing:

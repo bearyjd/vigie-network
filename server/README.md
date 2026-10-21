@@ -55,7 +55,7 @@ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
 
 Configure two pins (current and next) on the collector to allow certificate rotation.
 
-**Rate limiting and proxies.** The pre-auth limiter keys on the direct TCP peer (IPv6 by /64) and
+**Rate limiting and proxies.** The pre-auth limiter keys on the direct TCP peer (IPv6 by /64 by default) and
 ignores `X-Forwarded-For`. If a reverse proxy is ever put in front, every client would share
 the proxy's budget; then run uvicorn with `--proxy-headers --forwarded-allow-ips=<proxy-ip>` so
 only that trusted proxy may set the client address, and raise the limit accordingly.
@@ -113,14 +113,37 @@ after the upgrade skips the boot_id-rollback guard (the 5-minute `sent_ts` skew 
 applies).
 
 Rate limiting has two stages. Before authentication the bucket is the peer address only
-(`VIGIE_RATE_LIMIT_PREAUTH_PER_MIN`, default 120/min; IPv6 by full address, set
-`VIGIE_RATE_LIMIT_IPV6_PREFIX=64` to group by /64), a generous CPU guard. The claimed
-`X-Vigie-Collector-Id` is never used there, so a LAN host cannot spend a victim's budget by
-claiming its id. After the HMAC verifies, a per-collector limiter (`VIGIE_RATE_LIMIT_PER_MIN`,
-default 60/min) is charged; unauthenticated requests never create or spend its entries. When
-the peer table is full, new addresses share one overflow bucket. Remaining caveat: a LAN host
-sharing a victim's peer address (or /64 when grouped, or behind the same proxy) shares its
-pre-auth budget; the 120/min default leaves headroom over one collector's normal rate.
+(`VIGIE_RATE_LIMIT_PREAUTH_PER_MIN`, default 120/min), a generous CPU guard. IPv6 peers are
+grouped by /64 by default (`VIGIE_RATE_LIMIT_IPV6_PREFIX`, default 64; `0` or `none` uses full
+addresses). The claimed `X-Vigie-Collector-Id` is never used there, so a LAN host cannot spend a
+victim's budget by claiming its id. After the HMAC verifies, a per-collector limiter
+(`VIGIE_RATE_LIMIT_PER_MIN`, default 60/min) is charged; unauthenticated requests never create or
+spend its entries.
+
+The peer table is bounded (4096). When full, stale entries are swept, then the oldest entry is
+evicted if idle for over 30 s; otherwise new addresses share one overflow bucket. Peers whose
+request passed HMAC verification are remembered in a small allowlist (at most 4 per provisioned
+collector, counted at startup, LRU, dropped after 1 hour without a verified request). An
+allowlisted peer never uses the overflow bucket (it still counts against its own bucket), so a
+host spraying thousands of source addresses cannot lock a known collector out.
+
+Design limit: a host that shares the collector's NAT or peer address (or its /64) shares its
+pre-auth budget and can exhaust it, because the peer address is the only identity before the HMAC
+is checked. Give each collector its own address. The real defence is at the network level:
+restrict the listener to the collector addresses with a firewall rule. Homelab examples (collector
+at 192.168.8.2, listener on 8443):
+
+```
+# nftables
+nft add rule inet filter input tcp dport 8443 ip saddr != { 192.168.8.2 } drop
+# iptables
+iptables -A INPUT -p tcp --dport 8443 -s 192.168.8.2 -j ACCEPT
+iptables -A INPUT -p tcp --dport 8443 -j DROP
+```
+
+Single instance: the process holds an exclusive flock on `<data dir>/.ingest.lock` (taken by the
+CLI and, for `uvicorn --factory`/gunicorn, by the app lifespan). A second instance on the same
+data dir fails to start; so does a filesystem without flock support (exit 2 from the CLI).
 
 Revocation: a batch that was applied and is retried after its collector is revoked gets 401 over
 HTTP (authentication runs first), not `200 duplicate`. Nothing is deleted: the stored rows and

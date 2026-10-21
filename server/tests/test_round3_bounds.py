@@ -13,6 +13,7 @@ from test_review import inv, rows
 from test_round2 import _parsed
 
 from vigie_ingest import db, store
+from vigie_ingest.config import Settings
 
 MIDNIGHT = (int(NOW) // 86400) * 86400  # start of NOW's UTC day
 
@@ -41,7 +42,7 @@ def test_f1_cap_is_inclusive_and_defaults_to_three(make_env: Callable[..., Env])
     two = make_env(rate_limit_per_window=1000, max_shard_days=2)
     assert two.post(_two_day_batch()).status_code == 200
     assert two.settings.max_shard_days == 2
-    assert make_env(rate_limit_per_window=1000).settings.max_shard_days == 3
+    assert Settings(two.settings.data_dir, two.settings.secrets_dir).max_shard_days == 3
 
 
 def test_f1_locked_connections_use_a_short_busy_timeout(env: Env) -> None:
