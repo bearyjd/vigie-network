@@ -1,6 +1,6 @@
 # PRP-001: Vigie — LAN device characterization service
 
-Status: **REVISION 2 — revised after adversarial review (§15). Awaiting owner review. No implementation until approved.**
+Status: **REVISION 3 — implementation under way; revised after the design review (§15) and the per-component implementation reviews (§17). Owner approved building P0/P1 (2026-10-20).**
 License: AGPL-3.0-or-later. Branch: `docs/prp-initial`.
 
 ## 1. Goal and non-goals
@@ -70,18 +70,18 @@ flowchart LR
 ## 4. Collector (router side)
 
 **Process and privilege (privilege separation; `ujail` is not installed on this firmware).** Two processes under procd:
-- `vigie-conntrack` (root): reads `/proc/net/nf_conntrack` (root-only) and does nothing else. It parses only kernel-generated text, aggregates per `(src_mac, dst_ip, dst_port, proto)`, and writes the result to a unix socket owned by the unprivileged user. It has no network access and parses no LAN-supplied data.
-- `vigie-collector` (unprivileged user, e.g. `nobody`): everything that touches attacker-influenced data (mDNS/SSDP multicast, dnsmasq log, DHCP-log lines, neighbor tables) plus the HTTPS push. mDNS needs no root (port 5353 > 1024). The dnsmasq log is world-readable by design (mode 0644).
+- `vigie-conntrack` (root): reads `/proc/net/nf_conntrack` (root-only) and does nothing else. Conntrack carries IPs, not MACs, so it aggregates deltas per `(src_ip, dst_ip, dst_port, proto)`; the collector maps source IPs to MACs through the neighbor table. The text is kernel-generated but its IPs and ports are attacker-influenced (including spoofed WAN sources), so the helper is hardened for that: bounded output (top-K plus one global remainder record), duplicate/vanish-safe deltas, a hardened unix socket (private staging directory, `lchown`, no group/other-writable parent, refuses `nobody`). It has no network access.
+- `vigie-collector` (**dedicated `vigie` user**, never `nobody`, which avahi shares): everything that touches attacker-influenced data (mDNS/SSDP multicast, dnsmasq log, DHCP-log lines, neighbor tables) plus the HTTPS push. mDNS needs no root (port 5353 > 1024). The dnsmasq log and its directory are `root:vigie` mode 0640/0750, not world-readable, because they hold every client's DNS history.
 - No TCP listener and no inbound management port. Parsers are fuzz targets; `#![forbid(unsafe_code)]` outside a small socket shim. Installing `procd-ujail` via opkg is an optional hardening step, not a dependency.
 
 **Sources and logging.**
 - dnsmasq: `log-queries=extra`, `log-dhcp`, `log-facility=/tmp/vigie/dnsmasq.log`, delivered as a drop-in in dnsmasq's `conf-dir` (`/tmp/dnsmasq.d`, **verified on this router**). That directory is tmpfs, so the collector's init script recreates the drop-in at every start and reloads dnsmasq. The UCI options `logqueries`/`logdhcp`/`logfacility` exist but `logqueries` yields plain `log-queries` (no `extra`), so the drop-in is used. Whether GL.iNet reloads clear the drop-in is a P0 check; the collector verifies it periodically and re-creates it.
 - **IPv4 and IPv6 attribution.** The router's neighbor table carries several IPv6 addresses per host (privacy addresses rotate too), plus stale/failed entries. Mapping flows and DNS queries to MACs uses both families' neighbor entries, only entries with a link-layer address, deduplicated by MAC.
 - **AdGuard Home guard.** GL.iNet can enable AdGuard Home from its UI; dnsmasq would then stop seeing client queries. The collector reports a `dns_log_quiet` condition when the log has no queries while flows exist, and Vigie raises an event.
-- **Bounded log file:** dnsmasq never rotates its facility file, so a stopped collector could fill router RAM. Mechanism: the collector rotates (rename, then `SIGUSR2` to dnsmasq to reopen); an **independent cron watchdog** (every 5 min, not part of the collector) truncates the file if it exceeds 8 MB. P0 test: kill the collector for 24 h and confirm RAM stays flat.
+- **Bounded log file:** dnsmasq never rotates its facility file, so a stopped collector could fill router RAM. Mechanism: the unprivileged collector cannot rotate or signal dnsmasq, so a small **root watchdog script** (procd service or cron, every 5 min, independent of the collector) rotates (rename, then `SIGUSR2` to dnsmasq to reopen), truncates the file if it exceeds 8 MB, and re-creates the dnsmasq drop-in if GL.iNet removed it. The script runs as root in a world-writable `/tmp`, so it refuses symlinks and any directory or file not owned by root, and writes through `mktemp` inside a verified directory. P0 test: kill the collector for 24 h and confirm RAM stays flat.
 - Lease file + `log-dhcp` lines (opt-55 request list, opt-60 vendor class — **verify fields present**); `ip neigh`; conntrack summary; multicast join on 224.0.0.251:5353 (`SO_REUSEPORT` beside avahi) and 239.255.255.250:1900, parsing names/service types/UA strings with hard length caps.
 
-**Batching.** Every 60 s, deltas only. conntrack is aggregated on the router per `(src_mac, dst_ip, dst_port, proto)` with byte/pkt deltas and flow counts; raw flows never leave the router.
+**Batching.** Every 60 s, deltas only. conntrack is aggregated on the router by the root helper per `(src_ip, dst_ip, dst_port, proto)` and mapped to MACs by the collector, with byte/pkt deltas and flow counts; raw flows never leave the router. Buffers are bounded: per-MAC DNS quota, capped sightings, and every drop is counted in `truncated`. The collector builds no windows until it has seen a server `Date` header (the router has no RTC; build-date plausibility alone is not trusted), and DHCP fingerprint fields are attached only to a lease whose MAC matches the DHCP transaction's requesting MAC (a LAN host can otherwise reuse a victim's xid).
 - Batch cap 256 KB. **Truncation order** (to stop a flood from evicting evidence): leases/neigh/mDNS first; then DNS; then conntrack top-N by bytes; remainder folded into one `other` bucket per MAC with counters. A `truncated{kind:count}` field is always sent.
 - Budgets (tested): RSS < 10 MB; average CPU < 2 %; spool ≤ 1 MB in RAM only, drop-oldest, with a `dropped_batches` counter reported on the next success. Nothing is written to flash.
 
@@ -97,7 +97,7 @@ flowchart LR
 - TLS with the server certificate **pinned by SPKI hash**; the collector accepts **two pins** to allow rotation. Rotation procedure is documented (push new pin, then rotate cert).
 - Key storage: `/etc/vigie/key` on the overlay (flash; written once at install). Verified: the default sysupgrade keep list on this router does not include `/etc/vigie`, so a firmware upgrade removes the binary, init script, and key; the install guide covers re-provisioning, and warns that adding `/etc/vigie` to `/etc/sysupgrade.conf` puts the key into config backups.
 
-**Server-side ingest checks (order matters):** cap body size (512 KB) and per-source rate **before** reading the body → verify HMAC → duplicate `batch_id` ⇒ `200 duplicate:true` → `|sent_ts − now| ≤ 5 min` → `seq > last_seq` within `boot_id` (gaps allowed; new `boot_id` resets) → parse/validate against schema. Parse failures after auth are counted, never partially applied.
+**Server-side ingest checks (order matters):** per-peer-address rate limit (IPv6 grouped by /64; never keyed on anything the client merely claims) and body size cap (512 KB) **before** reading the body → verify HMAC → duplicate `batch_id` ⇒ `200 duplicate:true` → `|sent_ts − now| ≤ 5 min` → `seq > last_seq` within `boot_id` (gaps allowed; new `boot_id` resets) → a separate per-collector rate limit, charged only after the HMAC verified → parse/validate against schema. Parse failures after auth are counted, never partially applied. Raw shard rows are committed before the inventory row, so a crash leaves orphan shard rows that readers ignore by joining against `batches`; the apply is serialized by an in-process lock plus a data-directory `flock`, so ingest runs as a single worker. The listener should additionally be firewalled to the collector's address (the in-app limits cannot stop a flood from a host sharing the collector's address).
 
 ## 5. Data model
 
@@ -239,7 +239,7 @@ CREATE TABLE batches (batch_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, rec
 | GET | `/macs/{mac}` | resolves a MAC to its canonical `device_id`, `link_source`, `identity_state` (what the control app calls when programming the router); unknown MAC ⇒ 404 ⇒ unassigned |
 | GET/POST/DELETE | `/identity/rules` | list, approve (from an accepted suggestion), revoke standing rules |
 | PATCH | `/devices/{id}` | `If-Match: <override.version>` **required**; sets name/owner/type/group; `null` clears a field |
-| GET | `/events` | `since` cursor, `kind`, `severity`; union of inventory events and human-action events from `audit_log`; optional SSE. Kinds include `mac_attached` (a rolled MAC joined a device: carries old/new MAC so the app can update router rules) and `mac_detached` |
+| GET | `/events` | `since` cursor, `kind`, `severity`; union of inventory events and human-action events from `audit_log`; optional SSE. Kinds include `mac_attached` (a rolled MAC joined a device: carries old/new MAC so the app can update router rules) and `mac_detached`. **The cursor pages on per-source insertion order (`seq`/`rowid`), not `ts`**, because late batches carry older timestamps and would otherwise be skipped; `ts` is display only. Token lifecycle audit rows are not exposed to the app token |
 | GET | `/suggestions` | effective state = decision if present, else `expired` if past `expires_at`, else `pending` (computed on read, no write race) |
 | POST | `/suggestions/{id}/accept` | see §7; body carries `If-Match` versions for every involved device |
 | POST | `/suggestions/{id}/reject` | |
@@ -247,7 +247,7 @@ CREATE TABLE batches (batch_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, rec
 | GET | `/healthz` | unauthenticated, returns `ok` only |
 | GET | `/metrics` | token-protected or loopback-only |
 
-Envelope: `{ "ok", "data", "error": {code,message}|null, "page": {next_cursor}|null }`. TLS on the app API (compose ships a Caddy or self-signed cert). `api` and `ingest` bind the LAN interface only; no CORS. Principals: `collector` (ingest only) and `app` (API only), with disjoint scopes. All writes are recorded in `audit_log`.
+Envelope: `{ "ok", "data", "error": {code,message}|null, "page": {next_cursor}|null }`. Behavior notes from review: aliases (merged-away devices) are hidden from the default list and always report the canonical device's override and the **worst** `identity_state` across members; every attacker-influenced string (hostnames, event summaries, names, prose) is sanitised on read and documented as untrusted plain text; LLM/ML prose (`reason_text`) is returned only for `label` suggestions and withheld while any action suggestion is pending; authentication runs before body validation (uniform 401); the failure limiter counts failed authentications only and never blocks a valid token. TLS on the app API (compose ships a Caddy or self-signed cert). `api` and `ingest` bind the LAN interface only; no CORS. Principals: `collector` (ingest only) and `app` (API only), with disjoint scopes. All writes are recorded in `audit_log`.
 
 ## 7. Suggestion and enforcement flow
 
@@ -396,3 +396,18 @@ Residual risk accepted: a cloned real MAC can still present as a trusted device 
 6. **Is this a separate service worth building** versus Fingerbank + ntopng + a script? The justification is the human-override inventory API and the privacy/ownership guarantees; if the control app needs only MAC→label, this is over-engineered.
 7. **Suggestion fatigue.** Two household approvers will start rubber-stamping. Rate-limit, batch, expire, and keep reasoning structured so approvals stay meaningful.
 8. **Three processes and three database file classes add operational complexity** (compose, effective-view joins in the API, schema migrations across files). They buy structurally enforced ownership and trivial retention; if that proves too heavy for a household deployment, collapsing to one process with the same file split is the fallback.
+
+## 17. Implementation review log (P0/P1)
+
+Every component was built by one agent, then attacked by a separate reviewer who also mutated guards to see whether the tests noticed. Summary of what changed the design:
+
+| Component | Result | Design consequences |
+|---|---|---|
+| Collector network spike | 2 review rounds | Group-address binds, `IP_MULTICAST_ALL` cleared, on-link source filter; TTL=255 check remains a P1 production item |
+| Ingest service | 4 review rounds, no auth bypass | Shard-first commit with orphan-safe reads; TLS required; peer-keyed pre-auth limiter and post-HMAC per-collector limiter (an earlier claim-keyed design let a LAN host burn a collector's quota); single worker with data-dir `flock`; known-collector peer allowlist |
+| Pipeline core | review + fixes | Transient promotion by server-side time and cap (hostnames cannot promote); retired devices revive; read errors never advance the cursor; first-wins fingerprints with conflict events; `events.seq` AUTOINCREMENT; `suggestions` table created |
+| App API | 2 review rounds | Rowid/seq cursors; canonical-override aliases; worst-state identity; sanitise-on-read; auth before validation; failure limiter fixes |
+| Collector agent | review + fixes | Xid/MAC taint for DHCP fingerprints; dedicated `vigie` user; root-owned drop-in with symlink refusal; caps and counted drops; clock gate on server `Date` |
+| Conntrack helper | review + fixes | Per-source-IP deltas; bounded output; dup/vanish-safe deltas; hardened socket; dedicated uid |
+
+Accepted residuals: a host sharing the collector's network address can exhaust the pre-auth quota (firewall the listener); a copied DHCP fingerprint plus hostname can inherit a rolled-MAC device's group under an approved rule until overlap veto or behavioral demotion fires; the router-side TLS client, TTL=255 mDNS check, and conntrack format assumptions are unverified until run on the router.
