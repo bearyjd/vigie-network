@@ -269,3 +269,72 @@ fn old_tls_versions_are_refused_by_openssl_server() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DER header length and content length of the element at the start of `d` (long forms up to 0x82).
+fn der_lens(d: &[u8]) -> (usize, usize) {
+    match d[1] {
+        l @ 0..=0x7f => (2, usize::from(l)),
+        0x81 => (3, usize::from(d[2])),
+        0x82 => (4, usize::from(u16::from_be_bytes([d[2], d[3]]))),
+        l => panic!("unexpected DER length form {l:#x}"),
+    }
+}
+
+/// `SEQUENCE { content }` with a minimal definite length.
+fn der_seq(content: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x30];
+    match content.len() {
+        n @ 0..=0x7f => out.push(n as u8),
+        n @ 0x80..=0xff => out.extend([0x81, n as u8]),
+        n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// The certificate with its outer signatureAlgorithm and/or signatureValue removed. The old
+/// hand-written walker only read as far as the SPKI, so it still pinned such a certificate;
+/// webpki (the parser the handshake signature check uses anyway) refuses it.
+fn without_outer_signature(cert: &[u8], keep_alg: bool) -> Vec<u8> {
+    let (h, _) = der_lens(cert);
+    let body = &cert[h..];
+    let (th, tl) = der_lens(body);
+    let tbs = &body[..th + tl];
+    let rest = &body[th + tl..];
+    let (ah, al) = der_lens(rest);
+    let mut inner = tbs.to_vec();
+    if keep_alg {
+        inner.extend_from_slice(&rest[..ah + al]);
+    }
+    der_seq(&inner)
+}
+
+#[test]
+fn certificate_webpki_rejects_is_never_pinned() {
+    let id = Ident::new();
+    for keep_alg in [false, true] {
+        let bad = without_outer_signature(id.cert.as_ref(), keep_alg);
+        assert_ne!(bad, id.cert.to_vec());
+        assert_eq!(spki_pin(&bad), None, "keep_alg={keep_alg}");
+        let v = verifier(&[id.pin()]);
+        let r = v.verify_server_cert(
+            &CertificateDer::from(bad),
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(r.is_err(), "keep_alg={keep_alg}: pinned a malformed cert");
+    }
+}
+
+#[test]
+fn handshake_with_a_malformed_certificate_fails_cleanly() {
+    let id = Ident::new();
+    let bad = Ident {
+        key: rcgen::KeyPair::try_from(id.key.serialize_der().as_slice()).unwrap(),
+        cert: CertificateDer::from(without_outer_signature(id.cert.as_ref(), false)),
+    };
+    let e = try_post(&bad, &id, &[id.pin_hex()], BOTH).unwrap_err();
+    assert!(e.0.contains("receive") || e.0.contains("send") || e.0.contains("tls"), "{e:?}");
+}

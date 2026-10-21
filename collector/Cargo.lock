@@ -582,6 +582,7 @@ dependencies = [
  "hmac",
  "rcgen",
  "rustls",
+ "rustls-webpki",
  "serde_json",
  "sha2",
  "vigie-parse",

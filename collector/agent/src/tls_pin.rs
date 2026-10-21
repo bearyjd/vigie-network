@@ -16,53 +16,17 @@ use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
 use sha2::{Digest, Sha256};
+use webpki::EndEntityCert;
 
 use crate::transport::Pin;
 
-/// One DER TLV: (content, whole element, bytes after it). Lengths above 64 KiB are refused.
-fn tlv(input: &[u8], want_tag: u8) -> Option<(&[u8], &[u8], &[u8])> {
-    let (&tag, rest) = input.split_first()?;
-    if tag != want_tag {
-        return None;
-    }
-    let (&l0, rest) = rest.split_first()?;
-    let (len, hdr): (usize, usize) = match l0 {
-        0..=0x7f => (usize::from(l0), 2),
-        0x81 => (usize::from(*rest.first()?), 3),
-        0x82 => (
-            usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?])),
-            4,
-        ),
-        _ => return None,
-    };
-    let total = hdr.checked_add(len)?;
-    if input.len() < total {
-        return None;
-    }
-    Some((&input[hdr..total], &input[..total], &input[total..]))
-}
-
-/// The whole SubjectPublicKeyInfo element (tag and length included) of an X.509 certificate.
-/// Strict about structure: no trailing bytes, fields in RFC 5280 order.
-pub fn spki_der(cert: &[u8]) -> Option<&[u8]> {
-    let (cert_body, _, trailing) = tlv(cert, 0x30)?;
-    if !trailing.is_empty() {
-        return None;
-    }
-    let (mut f, _, _) = tlv(cert_body, 0x30)?; // tbsCertificate
-    if f.first() == Some(&0xa0) {
-        f = tlv(f, 0xa0)?.2; // [0] version
-    }
-    f = tlv(f, 0x02)?.2; // serialNumber
-    for tag in [0x30, 0x30, 0x30, 0x30] {
-        f = tlv(f, tag)?.2; // signature, issuer, validity, subject
-    }
-    Some(tlv(f, 0x30)?.1)
-}
-
-/// SHA-256 of the SPKI DER: the value `deploy/gen-certs.sh` prints and the config file holds.
+/// SHA-256 of the certificate's SubjectPublicKeyInfo DER (tag and length included): the value
+/// `deploy/gen-certs.sh` prints and the config file holds. The certificate is parsed by webpki (the
+/// same parser the handshake signature check uses), so anything it refuses has no pin.
 pub fn spki_pin(cert: &[u8]) -> Option<Pin> {
-    spki_der(cert).map(|s| Sha256::digest(s).into())
+    let der = CertificateDer::from(cert);
+    let cert = EndEntityCert::try_from(&der).ok()?;
+    Some(Sha256::digest(cert.subject_public_key_info().as_ref()).into())
 }
 
 /// Equal-length byte comparison that does not stop at the first difference.
