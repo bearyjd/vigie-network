@@ -41,6 +41,7 @@ fn final_bytes_never_exceed_cap_sweep() {
         "dns_client_throttled",
         "tail_truncated",
         "tail_bytes_skipped",
+        "tail_open_failed",
     ] {
         drops.insert(k.to_string(), u64::MAX);
     }

@@ -31,6 +31,7 @@ pub struct Tail {
     fingerprint: Vec<u8>,
     resets: u64,
     skipped: u64,
+    open_failed: u64,
 }
 
 impl Tail {
@@ -45,6 +46,7 @@ impl Tail {
             fingerprint: Vec::new(),
             resets: 0,
             skipped: 0,
+            open_failed: 0,
         }
     }
 
@@ -57,24 +59,39 @@ impl Tail {
             self.polled_once = true;
         }
         loop {
-            budget = budget.saturating_sub(self.drain_current(budget, &mut out)?);
-            if !self.rotated()? || budget == 0 {
-                break;
-            }
-            self.open_new(false)?;
-            if self.cur.is_none() {
-                break;
+            match self.step(&mut budget, &mut out) {
+                Ok(true) => {}
+                Ok(false) => break,
+                // Lines already drained are returned; the failure is counted, and the next poll
+                // retries (and reports the error itself when it has nothing to return).
+                Err(_) if !out.is_empty() => {
+                    self.open_failed += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
     }
 
+    /// One drain-then-maybe-rotate step; `Ok(true)` when the loop should go on.
+    fn step(&mut self, budget: &mut u64, out: &mut Vec<String>) -> io::Result<bool> {
+        *budget = budget.saturating_sub(self.drain_current(*budget, out)?);
+        if !self.rotated()? || *budget == 0 {
+            return Ok(false);
+        }
+        self.open_new(false)?;
+        Ok(self.cur.is_some())
+    }
+
     /// Drained counters, by `truncated` key: cursor resets (`tail_truncated`) and bytes known
-    /// to be lost or discarded (`tail_bytes_skipped`: overlong lines, dropped partial lines).
+    /// to be lost or discarded (`tail_bytes_skipped`: overlong lines, dropped partial lines) and failed opens/reads that
+    /// cost a poll its follow-up (`tail_open_failed`).
     pub fn take_counts(&mut self) -> BTreeMap<String, u64> {
         [
             ("tail_truncated", std::mem::take(&mut self.resets)),
             ("tail_bytes_skipped", std::mem::take(&mut self.skipped)),
+            ("tail_open_failed", std::mem::take(&mut self.open_failed)),
         ]
         .into_iter()
         .filter(|(_, v)| *v > 0)
@@ -83,6 +100,7 @@ impl Tail {
     }
 
     fn open_new(&mut self, at_end: bool) -> io::Result<()> {
+        self.skipped += self.carry.len() as u64;
         self.carry.clear();
         self.skipping = false;
         match File::open(&self.path) {
