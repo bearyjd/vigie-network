@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn caps_value_length_and_strips_controls() {
-        let long = "x".repeat(5000.min(2048 - 100));
+        let long = "x".repeat(2048 - 100);
         let m = format!("NOTIFY * HTTP/1.1\r\nSERVER: {long}\r\nUSN: a\u{7}b\r\n\r\n");
         let p = parse(m.as_bytes()).unwrap();
         assert_eq!(p.server.unwrap().len(), 256);
