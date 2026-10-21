@@ -22,7 +22,7 @@ fn post_with(
 ) -> (Result<HttpReply, TransportError>, Option<Vec<u8>>, Duration) {
     let id = Ident::new();
     let srv = spawn(server_config(&id.cert, &id.key, BOTH), script);
-    let pt = PinnedTransport::new(&srv.url(), &[id.pin_hex(), id.pin_hex()]).unwrap();
+    let pt = PinnedTransport::new(&srv.url(), &[id.pin_hex()]).unwrap();
     let mut t = HttpsTransport::new(pt).unwrap().with_timeout(timeout);
     let start = Instant::now();
     let r = t.post(&headers(), body);

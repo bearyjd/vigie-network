@@ -101,14 +101,46 @@ fn the_hex_pins_of_the_config_file_are_accepted_too() {
     let t = ok(URL, &[HEX_PIN]);
     assert_eq!(t.pins()[0][0], 0x01);
     assert_eq!(t.pins()[0][1], 0x23);
-    assert!(
-        PinnedTransport::new(
-            URL,
-            &["0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"]
-        )
-        .is_err(),
-        "uppercase hex is not the config format"
-    );
+}
+
+#[test]
+fn uppercase_and_mixed_case_hex_pins_are_accepted_and_equal_to_lowercase() {
+    let lower = ok(URL, &[HEX_PIN]);
+    for variant in [
+        HEX_PIN.to_ascii_uppercase(),
+        "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+    ] {
+        assert_eq!(ok(URL, &[variant.as_str()]).pins(), lower.pins(), "{variant}");
+    }
+    // Still strict about everything else: non-hex and wrong lengths stay refused.
+    let g = HEX_PIN.replacen('0', "G", 1);
+    assert!(matches!(
+        PinnedTransport::new(URL, &[g.as_str()]),
+        Err(PinError::BadPin(0))
+    ));
+}
+
+#[test]
+fn identical_pins_are_refused_whatever_their_spelling() {
+    let upper = HEX_PIN.to_ascii_uppercase();
+    // PIN_A is base64 of 0..32, which is HEX_PIN's first 32 bytes only by construction below.
+    let hex_a: String = (0u8..32).map(|b| format!("{b:02x}")).collect();
+    for (pins, dup) in [
+        (vec![PIN_A, PIN_A], 1),
+        (vec![HEX_PIN, HEX_PIN], 1),
+        (vec![HEX_PIN, upper.as_str()], 1),
+        (vec![PIN_A, PIN_B, hex_a.as_str()], 2),
+        (vec![PIN_B, PIN_A, PIN_B], 2),
+    ] {
+        match PinnedTransport::new(URL, &pins) {
+            Err(PinError::DuplicatePin(i)) => assert_eq!(i, dup, "{pins:?}"),
+            other => panic!("{pins:?}: {other:?}"),
+        }
+    }
+    let msg = PinnedTransport::new(URL, &[PIN_A, PIN_A]).unwrap_err().to_string();
+    assert!(msg.contains("pin 2") && msg.contains("same"), "{msg}");
+    // Distinct pins still work.
+    assert_eq!(ok(URL, &[PIN_A, PIN_B, HEX_PIN]).pins().len(), 3);
 }
 
 #[test]

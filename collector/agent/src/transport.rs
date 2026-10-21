@@ -47,6 +47,8 @@ pub enum PinError {
     Port,
     NoPins,
     BadPin(usize),
+    /// Pin at this (0-based) index equals an earlier pin.
+    DuplicatePin(usize),
 }
 
 impl fmt::Display for PinError {
@@ -58,6 +60,7 @@ impl fmt::Display for PinError {
             Self::Port => f.write_str("server URL has an invalid port"),
             Self::NoPins => f.write_str("at least one SPKI pin is required"),
             Self::BadPin(i) => write!(f, "pin {} is not a 32-byte SHA-256 (base64 or hex)", i + 1),
+            Self::DuplicatePin(i) => write!(f, "pin {} is the same key as an earlier pin", i + 1),
         }
     }
 }
@@ -71,8 +74,9 @@ pub struct PinnedTransport {
 }
 
 impl PinnedTransport {
-    /// `pins`: each a standard-base64 SHA-256 (44 chars) or the lowercase hex (64 chars) the
-    /// config file uses; the two lengths cannot be confused.
+    /// `pins`: each a standard-base64 SHA-256 (44 chars) or hex (64 chars, either case); the two
+    /// lengths cannot be confused. Two pins that decode to the same digest, however spelled, are
+    /// refused (`DuplicatePin`): a repeated pin is a config mistake, not a rotation.
     pub fn new<S: AsRef<str>>(url: &str, pins: &[S]) -> Result<Self, PinError> {
         let (host, port, path) = parse_url(url)?;
         if pins.is_empty() {
@@ -83,6 +87,9 @@ impl PinnedTransport {
             .enumerate()
             .map(|(i, p)| parse_pin(p.as_ref()).ok_or(PinError::BadPin(i)))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(i) = (1..pins.len()).find(|&i| pins[..i].contains(&pins[i])) {
+            return Err(PinError::DuplicatePin(i));
+        }
         Ok(Self {
             host,
             port,
@@ -187,7 +194,7 @@ fn decode_hex(s: &str) -> Option<Pin> {
         let pair = s.get(2 * i..2 * i + 2)?;
         if !pair
             .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            .all(|c| c.is_ascii_hexdigit())
         {
             return None;
         }
