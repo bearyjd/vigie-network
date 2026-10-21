@@ -19,7 +19,11 @@ def test_events_union_inventory_and_human_actions_in_time_order(env: Env) -> Non
     assert kinds(r) == ["new_device", "anomaly", "device.patch"]
     assert [e["source"] for e in r.json()["data"]] == ["inventory", "inventory", "audit"]
     audit = r.json()["data"][2]
-    assert audit["device_id"] == "d1" and "app:test" in audit["summary"]
+    assert (
+        audit["device_id"] == "d1"
+        and audit["summary"].startswith("app ")
+        and "test" not in audit["summary"]
+    )
 
 
 def test_events_filters(env: Env) -> None:
@@ -79,7 +83,7 @@ def test_events_late_audit_row_is_not_skipped(env: Env) -> None:
     cursor = env.get("/events").json()["page"]["next_cursor"]
     env.ov.execute(
         "INSERT INTO audit_log (id, ts, principal, action, target) VALUES ('late',?,?,?,?)",
-        (ts(-500), "cli", "token.create", None),
+        (ts(-500), "app:other", "device.patch", None),
     )
     got = env.get("/events", since=cursor).json()["data"]
     assert [e["id"] for e in got] == ["late"]
@@ -188,3 +192,40 @@ def test_missing_suggestions_and_events_tables_read_as_empty(env: Env) -> None:
     env.inv.execute("DROP TABLE events")
     assert env.get("/suggestions").json()["data"] == []
     assert env.get("/events").json()["data"] == []
+
+
+def _audit_rows(env: Env, count: int, action: str = "device.patch") -> None:
+    for i in range(count):
+        env.ov.execute(
+            "INSERT INTO audit_log (id, ts, principal, action, target) VALUES (?,?,?,?,?)",
+            (f"a{i:03d}", ts(i), "app:test", action, "d1"),
+        )
+
+
+def test_audit_only_paging_beyond_limit_has_no_duplicates_or_skips(env: Env) -> None:
+    _audit_rows(env, 7)
+    seen: list[str] = []
+    cursor = None
+    for _ in range(10):
+        params = {"limit": 3, **({"since": cursor} if cursor else {})}
+        page = env.get("/events", **params).json()
+        if not page["data"]:
+            break
+        seen += [e["id"] for e in page["data"]]
+        cursor = page["page"]["next_cursor"]
+    assert seen == [f"a{i:03d}" for i in range(7)]
+
+
+def test_token_lifecycle_events_and_token_ids_are_not_in_the_feed(env: Env) -> None:
+    env.device("d1")
+    env.ov.execute(
+        "INSERT INTO audit_log (id, ts, principal, action, target) VALUES"
+        " ('t1',?,'cli','token.create','secret-id'), ('t2',?,'cli','token.revoke','secret-id')",
+        (ts(1), ts(2)),
+    )
+    _audit_rows(env, 1)
+    got = env.get("/events").json()["data"]
+    assert [e["id"] for e in got] == ["a000"]
+    assert got[0]["summary"].startswith("app ") and "test" not in got[0]["summary"]
+    assert env.get("/events", kind="token.create").json()["data"] == []
+    assert "secret-id" not in env.get("/events").text

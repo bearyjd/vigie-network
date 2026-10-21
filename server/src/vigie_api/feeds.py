@@ -55,10 +55,18 @@ def _inventory_events(inv, after, kind, severity, limit) -> list[dict[str, Any]]
     ]  # fmt: skip
 
 
+def _actor(principal: str) -> str:
+    """The app principal is shown as `app`; its token id is never exposed."""
+    return "app" if principal.startswith("app:") else principal
+
+
 def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
     if severity not in (None, "info"):  # human actions are always informational
         return []
-    sql = "SELECT rowid AS rid, id, target, ts, principal, action FROM audit_log WHERE rowid > ?"
+    sql = (
+        "SELECT rowid AS rid, id, target, ts, principal, action FROM audit_log"
+        " WHERE rowid > ? AND action NOT LIKE 'token.%'"  # token lifecycle is not app-visible
+    )
     params: list[Any] = [after]
     if kind:
         sql, params = sql + " AND action = ?", [*params, kind]
@@ -71,7 +79,9 @@ def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
             "ts": r["ts"],
             "kind": display_text(r["action"]),
             "severity": "info",
-            "summary": display_text(f"{r['principal']} {r['action']} {r['target'] or ''}".strip()),
+            "summary": display_text(
+                f"{_actor(r['principal'])} {r['action']} {r['target'] or ''}".strip()
+            ),
             "source": "audit",
         }
         for r in found
