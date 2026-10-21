@@ -9,6 +9,8 @@ pub struct Meta {
     pub ts: u64,
     pub interval_s: u64,
     pub skipped_lines: usize,
+    /// Some parsed lines had no `bytes=`: kernel accounting is off, so their counters are zeros.
+    pub acct_off: bool,
 }
 
 pub fn proto_name(p: u8) -> String {
@@ -31,6 +33,7 @@ fn push_record(out: &mut String, r: &Record) {
                 proto_name(proto)
             );
         }
+        _ if r.global => out.push_str(r#""other_global":true,"#),
         _ => out.push_str(r#""other":true,"#),
     }
     let _ = write!(
@@ -45,8 +48,14 @@ pub fn snapshot_json(meta: &Meta, snap: &Snapshot) -> String {
     let mut out = String::with_capacity(160 + snap.records.len() * 190);
     let _ = write!(
         out,
-        r#"{{"v":1,"seq":{},"ts":{},"interval_s":{},"skipped_lines":{},"folded":{},"evicted":{},"records":["#,
-        meta.seq, meta.ts, meta.interval_s, meta.skipped_lines, snap.folded, snap.evicted
+        r#"{{"v":1,"seq":{},"ts":{},"interval_s":{},"skipped_lines":{},"acct_off":{},"folded":{},"evicted":{},"records":["#,
+        meta.seq,
+        meta.ts,
+        meta.interval_s,
+        meta.skipped_lines,
+        meta.acct_off,
+        snap.folded,
+        snap.evicted
     );
     for (i, r) in snap.records.iter().enumerate() {
         if i > 0 {
@@ -91,6 +100,7 @@ mod tests {
                     packets_down: 4,
                     flows: 5,
                     new_flows: 6,
+                    global: false,
                 },
                 Record {
                     src: ip("fd00::1"),
@@ -103,6 +113,20 @@ mod tests {
                     packets_down: 10,
                     flows: 11,
                     new_flows: 12,
+                    global: false,
+                },
+                Record {
+                    src: ip("0.0.0.0"),
+                    dst: None,
+                    dport: None,
+                    proto: None,
+                    bytes_up: 1,
+                    bytes_down: 1,
+                    packets_up: 1,
+                    packets_down: 1,
+                    flows: 1,
+                    new_flows: 0,
+                    global: true,
                 },
             ],
             folded: 3,
@@ -113,12 +137,14 @@ mod tests {
             ts: 1_700_000_000,
             interval_s: 60,
             skipped_lines: 2,
+            acct_off: true,
         };
         let line = snapshot_json(&meta, &snap);
         let expected = concat!(
-            r#"{"v":1,"seq":9,"ts":1700000000,"interval_s":60,"skipped_lines":2,"folded":3,"evicted":1,"records":["#,
+            r#"{"v":1,"seq":9,"ts":1700000000,"interval_s":60,"skipped_lines":2,"acct_off":true,"folded":3,"evicted":1,"records":["#,
             r#"{"src":"192.168.8.10","dst":"93.184.216.34","dport":443,"proto":"tcp","bytes_up":1,"bytes_down":2,"packets_up":3,"packets_down":4,"flows":5,"new_flows":6},"#,
-            r#"{"src":"fd00::1","other":true,"bytes_up":7,"bytes_down":8,"packets_up":9,"packets_down":10,"flows":11,"new_flows":12}]}"#
+            r#"{"src":"fd00::1","other":true,"bytes_up":7,"bytes_down":8,"packets_up":9,"packets_down":10,"flows":11,"new_flows":12},"#,
+            r#"{"src":"0.0.0.0","other_global":true,"bytes_up":1,"bytes_down":1,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}"#
         );
         assert_eq!(line, expected);
     }
@@ -130,6 +156,7 @@ mod tests {
             ts: 0,
             interval_s: 1,
             skipped_lines: 0,
+            acct_off: false,
         };
         let line = snapshot_json(&meta, &Snapshot::default());
         assert!(line.ends_with(r#""records":[]}"#), "{line}");

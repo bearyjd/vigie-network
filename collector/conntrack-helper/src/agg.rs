@@ -1,16 +1,24 @@
 //! Per-flow delta tracking (bounded) and aggregation per (src_ip, dst_ip, dst_port, proto).
+//! Samples are streamed in with `begin`/`add`/`finish`; no per-sample flow list is kept.
 
 use crate::parse::{Counters, Flow, FlowKey};
+use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 pub const DEFAULT_MAX_FLOWS: usize = 32_768;
 pub const DEFAULT_TOP_N: usize = 512;
+pub const DEFAULT_OTHER_K: usize = 64;
+/// Consecutive samples a tracked flow may be absent and still be remembered; it is forgotten on
+/// the next absence after that.
+pub const TOMBSTONE_SAMPLES: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AggConfig {
     pub max_flows: usize,
     pub top_n: usize,
+    /// Per-src `other` records kept; the rest fold into one global remainder record.
+    pub other_k: usize,
     /// First sample only records baselines (no historic bytes are reported as a delta).
     pub baseline_first: bool,
 }
@@ -20,13 +28,14 @@ impl Default for AggConfig {
         Self {
             max_flows: DEFAULT_MAX_FLOWS,
             top_n: DEFAULT_TOP_N,
+            other_k: DEFAULT_OTHER_K,
             baseline_first: true,
         }
     }
 }
 
-/// One output record. `dst`, `dport` and `proto` are `None` on the per-src `other` record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One output record. `dst`, `dport` and `proto` are `None` on `other` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record {
     pub src: IpAddr,
     pub dst: Option<IpAddr>,
@@ -38,6 +47,8 @@ pub struct Record {
     pub packets_down: u64,
     pub flows: u64,
     pub new_flows: u64,
+    /// The single global remainder record: `src` is unspecified (`0.0.0.0`).
+    pub global: bool,
 }
 
 #[derive(Debug, Default)]
@@ -49,38 +60,31 @@ pub struct Snapshot {
     pub evicted: usize,
 }
 
-#[derive(Clone, Copy)]
-struct Entry {
+#[derive(Clone, Copy, Default)]
+struct Pair {
     orig: Counters,
     reply: Counters,
-    /// Insertion order (first seen); eviction removes the smallest.
-    seq: u64,
 }
 
-type AggKey = (IpAddr, IpAddr, u16, u8);
+impl Pair {
+    fn max(self, o: Pair) -> Pair {
+        let m = |a: Counters, b: Counters| Counters {
+            packets: a.packets.max(b.packets),
+            bytes: a.bytes.max(b.bytes),
+        };
+        Pair {
+            orig: m(self.orig, o.orig),
+            reply: m(self.reply, o.reply),
+        }
+    }
 
-pub struct Aggregator {
-    cfg: AggConfig,
-    state: HashMap<FlowKey, Entry>,
-    next_seq: u64,
-    primed: bool,
-}
-
-/// Counters moved backwards in either direction: the tuple was reused by a new flow.
-fn is_reset(prev: &Entry, orig: &Counters, reply: &Counters) -> bool {
-    orig.bytes < prev.orig.bytes
-        || orig.packets < prev.orig.packets
-        || reply.bytes < prev.reply.bytes
-        || reply.packets < prev.reply.packets
-}
-
-fn bump(rec: &mut Record, up: Counters, down: Counters, new: bool) {
-    rec.bytes_up = rec.bytes_up.saturating_add(up.bytes);
-    rec.bytes_down = rec.bytes_down.saturating_add(down.bytes);
-    rec.packets_up = rec.packets_up.saturating_add(up.packets);
-    rec.packets_down = rec.packets_down.saturating_add(down.packets);
-    rec.flows += 1;
-    rec.new_flows += u64::from(new);
+    /// Counters moved backwards in either direction: the tuple was reused by a new flow.
+    fn is_reset_from(&self, prev: &Pair) -> bool {
+        self.orig.bytes < prev.orig.bytes
+            || self.orig.packets < prev.orig.packets
+            || self.reply.bytes < prev.reply.bytes
+            || self.reply.packets < prev.reply.packets
+    }
 }
 
 fn sub(a: Counters, b: Counters) -> Counters {
@@ -90,8 +94,27 @@ fn sub(a: Counters, b: Counters) -> Counters {
     }
 }
 
-fn total(r: &Record) -> u64 {
-    r.bytes_up.saturating_add(r.bytes_down)
+struct Entry {
+    /// Counters committed at the end of the previous sample the flow was seen in.
+    base: Pair,
+    /// Counters seen so far in the current sample (max over duplicate lines).
+    cur: Pair,
+    /// Insertion order (first seen); eviction removes the smallest.
+    seq: u64,
+    /// Sample number this entry was last seen in.
+    seen: u64,
+    /// Consecutive samples the flow has been absent.
+    absent: u8,
+    /// No committed `base` yet.
+    fresh: bool,
+}
+
+pub struct Aggregator {
+    cfg: AggConfig,
+    state: HashMap<FlowKey, Entry>,
+    next_seq: u64,
+    sample: u64,
+    primed: bool,
 }
 
 impl Aggregator {
@@ -100,71 +123,148 @@ impl Aggregator {
             cfg,
             state: HashMap::new(),
             next_seq: 0,
+            sample: 0,
             primed: false,
         }
     }
 
+    /// Flows remembered, including absent ones kept as tombstones.
     pub fn tracked(&self) -> usize {
         self.state.len()
     }
 
-    /// Folds one full conntrack sample into per-flow state and returns the aggregated deltas.
-    /// Flows absent from the sample have ended and are forgotten.
+    /// Starts a new sample.
+    pub fn begin(&mut self) {
+        self.sample += 1;
+    }
+
+    /// Folds one flow line of the current sample in. Duplicate keys within a sample merge by
+    /// taking the larger value per counter (a duplicate line is not extra traffic).
+    pub fn add(&mut self, f: &Flow) {
+        let cur = Pair {
+            orig: f.orig,
+            reply: f.reply,
+        };
+        match self.state.entry(f.key) {
+            MapEntry::Occupied(mut o) => {
+                let e = o.get_mut();
+                e.cur = if e.seen == self.sample {
+                    e.cur.max(cur)
+                } else {
+                    cur
+                };
+                e.seen = self.sample;
+            }
+            MapEntry::Vacant(v) => {
+                self.next_seq += 1;
+                v.insert(Entry {
+                    base: Pair::default(),
+                    cur,
+                    seq: self.next_seq,
+                    seen: self.sample,
+                    absent: 0,
+                    fresh: true,
+                });
+            }
+        }
+    }
+
+    /// Convenience: a whole sample at once.
     pub fn ingest(&mut self, flows: &[Flow]) -> Snapshot {
+        self.begin();
+        for f in flows {
+            self.add(f);
+        }
+        self.finish()
+    }
+
+    /// Ends the sample: computes deltas, forgets flows absent for too long, enforces the cap
+    /// and returns the aggregated records.
+    pub fn finish(&mut self) -> Snapshot {
         let baseline = self.cfg.baseline_first && !self.primed;
         self.primed = true;
-        let mut next: HashMap<FlowKey, Entry> = HashMap::with_capacity(flows.len());
-        for f in flows {
-            let e = next.entry(f.key.clone()).or_insert(Entry {
-                orig: Counters::default(),
-                reply: Counters::default(),
-                seq: 0,
-            });
-            e.orig.packets = e.orig.packets.saturating_add(f.orig.packets);
-            e.orig.bytes = e.orig.bytes.saturating_add(f.orig.bytes);
-            e.reply.packets = e.reply.packets.saturating_add(f.reply.packets);
-            e.reply.bytes = e.reply.bytes.saturating_add(f.reply.bytes);
-        }
-        let mut agg: HashMap<AggKey, Record> = HashMap::new();
-        for (key, entry) in next.iter_mut() {
-            let (orig, reply) = (entry.orig, entry.reply);
-            let prev = self.state.get(key).filter(|p| !is_reset(p, &orig, &reply));
-            let (d_up, d_down, new, seq) = match prev {
-                Some(p) => (sub(orig, p.orig), sub(reply, p.reply), false, p.seq),
-                None => {
-                    self.next_seq += 1;
-                    (orig, reply, !baseline, self.next_seq)
-                }
+        let (sample, mut next_seq) = (self.sample, self.next_seq);
+        let mut recs: Vec<Record> = Vec::with_capacity(self.state.len());
+        self.state.retain(|key, e| {
+            if e.seen != sample {
+                e.absent += 1;
+                return e.absent <= TOMBSTONE_SAMPLES;
+            }
+            e.absent = 0;
+            let (d, new) = if e.fresh || e.cur.is_reset_from(&e.base) {
+                next_seq += 1;
+                e.seq = next_seq;
+                (e.cur, !baseline)
+            } else {
+                (
+                    Pair {
+                        orig: sub(e.cur.orig, e.base.orig),
+                        reply: sub(e.cur.reply, e.base.reply),
+                    },
+                    false,
+                )
             };
-            entry.seq = seq;
-            let (d_up, d_down) = if baseline {
+            e.base = e.cur;
+            e.fresh = false;
+            let (up, down) = if baseline {
                 (Counters::default(), Counters::default())
             } else {
-                (d_up, d_down)
+                (d.orig, d.reply)
             };
-            let rec = agg
-                .entry((key.src, key.dst, key.dport, key.proto))
-                .or_insert_with(|| Record {
-                    src: key.src,
-                    dst: Some(key.dst),
-                    dport: Some(key.dport),
-                    proto: Some(key.proto),
-                    bytes_up: 0,
-                    bytes_down: 0,
-                    packets_up: 0,
-                    packets_down: 0,
-                    flows: 0,
-                    new_flows: 0,
-                });
-            bump(rec, d_up, d_down, new);
-        }
-        let evicted = evict_oldest(&mut next, self.cfg.max_flows);
-        self.state = next;
-        let (records, folded) = top_n_fold(agg.into_values().collect(), self.cfg.top_n);
+            recs.push(Record {
+                src: key.src,
+                dst: Some(key.dst),
+                dport: Some(key.dport),
+                proto: Some(key.proto),
+                bytes_up: up.bytes,
+                bytes_down: down.bytes,
+                packets_up: up.packets,
+                packets_down: down.packets,
+                flows: 1,
+                new_flows: u64::from(new),
+                global: false,
+            });
+            true
+        });
+        self.next_seq = next_seq;
+        let evicted = evict_oldest(&mut self.state, self.cfg.max_flows);
+        recs.sort_unstable_by_key(|r| (r.src, r.dst, r.dport, r.proto));
+        recs.dedup_by(|b, a| {
+            let same = (a.src, a.dst, a.dport, a.proto) == (b.src, b.dst, b.dport, b.proto);
+            if same {
+                merge(a, b);
+            }
+            same
+        });
+        let (records, folded) = top_n_fold(recs, self.cfg.top_n, self.cfg.other_k);
         Snapshot {
             records,
             folded,
             evicted,
+        }
+    }
+}
+
+fn merge(a: &mut Record, b: &Record) {
+    a.bytes_up = a.bytes_up.saturating_add(b.bytes_up);
+    a.bytes_down = a.bytes_down.saturating_add(b.bytes_down);
+    a.packets_up = a.packets_up.saturating_add(b.packets_up);
+    a.packets_down = a.packets_down.saturating_add(b.packets_down);
+    a.flows = a.flows.saturating_add(b.flows);
+    a.new_flows = a.new_flows.saturating_add(b.new_flows);
+}
+
+fn total(r: &Record) -> u64 {
+    r.bytes_up.saturating_add(r.bytes_down)
+}
+
+/// Private, link-local, loopback and unique-local sources: the router's own LAN.
+fn is_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_private() || a.is_link_local() || a.is_loopback(),
+        IpAddr::V6(a) => {
+            let s0 = a.segments()[0];
+            a.is_loopback() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80
         }
     }
 }
@@ -183,10 +283,28 @@ fn evict_oldest(map: &mut HashMap<FlowKey, Entry>, max: usize) -> usize {
     evict
 }
 
-/// Keeps the `n` records with the most bytes (ties broken by key for determinism) and folds the
-/// rest into one `other` record per src. Returns (records, number of records folded).
-fn top_n_fold(mut recs: Vec<Record>, n: usize) -> (Vec<Record>, usize) {
-    recs.sort_by(|a, b| {
+fn empty_other(src: IpAddr, global: bool) -> Record {
+    Record {
+        src,
+        dst: None,
+        dport: None,
+        proto: None,
+        bytes_up: 0,
+        bytes_down: 0,
+        packets_up: 0,
+        packets_down: 0,
+        flows: 0,
+        new_flows: 0,
+        global,
+    }
+}
+
+/// Keeps the `n` records with the most bytes (ties broken by key for determinism), folds the
+/// rest into one `other` record per src, keeps the `k` best of those (most bytes; LAN sources
+/// first among equals) and folds all remaining ones into ONE global record. In place, so peak
+/// memory stays one record vector. Returns (records, number of records folded).
+fn top_n_fold(mut recs: Vec<Record>, n: usize, k: usize) -> (Vec<Record>, usize) {
+    recs.sort_unstable_by(|a, b| {
         total(b)
             .cmp(&total(a))
             .then_with(|| (a.src, a.dst, a.dport, a.proto).cmp(&(b.src, b.dst, b.dport, b.proto)))
@@ -194,32 +312,35 @@ fn top_n_fold(mut recs: Vec<Record>, n: usize) -> (Vec<Record>, usize) {
     if recs.len() <= n {
         return (recs, 0);
     }
-    let rest = recs.split_off(n);
-    let folded = rest.len();
-    let mut others: HashMap<IpAddr, Record> = HashMap::new();
-    for r in rest {
-        let o = others.entry(r.src).or_insert_with(|| Record {
-            src: r.src,
-            dst: None,
-            dport: None,
-            proto: None,
-            bytes_up: 0,
-            bytes_down: 0,
-            packets_up: 0,
-            packets_down: 0,
-            flows: 0,
-            new_flows: 0,
-        });
-        o.bytes_up = o.bytes_up.saturating_add(r.bytes_up);
-        o.bytes_down = o.bytes_down.saturating_add(r.bytes_down);
-        o.packets_up = o.packets_up.saturating_add(r.packets_up);
-        o.packets_down = o.packets_down.saturating_add(r.packets_down);
-        o.flows += r.flows;
-        o.new_flows += r.new_flows;
+    let folded = recs.len() - n;
+    recs[n..].sort_unstable_by_key(|r| r.src);
+    let mut w = n; // recs[n..w] are the per-src others built so far
+    for r in n..recs.len() {
+        let rec = recs[r];
+        if w > n && recs[w - 1].src == rec.src {
+            merge(&mut recs[w - 1], &rec);
+        } else {
+            let mut o = empty_other(rec.src, false);
+            merge(&mut o, &rec);
+            recs[w] = o;
+            w += 1;
+        }
     }
-    let mut others: Vec<Record> = others.into_values().collect();
-    others.sort_by_key(|r| r.src);
-    recs.extend(others);
+    recs.truncate(w);
+    recs[n..].sort_unstable_by(|a, b| {
+        total(b)
+            .cmp(&total(a))
+            .then_with(|| is_lan(b.src).cmp(&is_lan(a.src)))
+            .then_with(|| a.src.cmp(&b.src))
+    });
+    if recs.len() > n + k {
+        let mut g = empty_other(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true);
+        for r in &recs[n + k..] {
+            merge(&mut g, r);
+        }
+        recs.truncate(n + k);
+        recs.push(g);
+    }
     (recs, folded)
 }
 
@@ -240,6 +361,7 @@ mod tests {
                 dst: ip(dst),
                 sport,
                 dport,
+                zone: 0,
             },
             orig: Counters {
                 packets: up / 100,
@@ -249,9 +371,7 @@ mod tests {
                 packets: down / 100,
                 bytes: down,
             },
-            state: None,
-            unreplied: false,
-            assured: false,
+            acct: true,
         }
     }
 
@@ -362,15 +482,62 @@ mod tests {
     }
 
     #[test]
-    fn vanished_flow_is_forgotten_and_reappears_as_new() {
+    fn flow_absent_three_samples_is_forgotten_and_reappears_as_new() {
         let mut a = Aggregator::new(cfg(true));
         let f = flow("10.0.0.2", "1.1.1.1", 5000, 443, 1000, 9000);
         a.ingest(std::slice::from_ref(&f));
         assert_eq!(a.tracked(), 1);
         a.ingest(&[]);
-        assert_eq!(a.tracked(), 0);
+        a.ingest(&[]);
+        assert_eq!(a.tracked(), 1, "two absences keep the tombstone");
+        a.ingest(&[]);
+        assert_eq!(a.tracked(), 0, "third consecutive absence forgets it");
         let s = a.ingest(&[f]);
-        assert_eq!(one(&s).new_flows, 1);
+        assert_eq!((one(&s).new_flows, one(&s).bytes_up), (1, 1000));
+    }
+
+    #[test]
+    fn flow_vanishing_one_sample_and_returning_is_not_recounted() {
+        let mut a = Aggregator::new(cfg(true));
+        let f = flow("10.0.0.2", "1.1.1.1", 5000, 443, 1000, 9000);
+        a.ingest(std::slice::from_ref(&f));
+        let s = a.ingest(&[]);
+        assert!(s.records.is_empty(), "absent flows are not active");
+        let s = a.ingest(std::slice::from_ref(&f));
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.bytes_down, r.new_flows), (0, 0, 0));
+        // continuation after two absences too, and only the growth is reported
+        a.ingest(&[]);
+        a.ingest(&[]);
+        let g = flow("10.0.0.2", "1.1.1.1", 5000, 443, 1300, 9100);
+        let s = a.ingest(&[g]);
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.bytes_down, r.new_flows), (300, 100, 0));
+    }
+
+    #[test]
+    fn returning_flow_with_smaller_counters_is_a_reset() {
+        let mut a = Aggregator::new(cfg(true));
+        a.ingest(&[flow("10.0.0.2", "1.1.1.1", 5000, 443, 1000, 9000)]);
+        a.ingest(&[]);
+        let s = a.ingest(&[flow("10.0.0.2", "1.1.1.1", 5000, 443, 400, 500)]);
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.bytes_down, r.new_flows), (400, 500, 1));
+    }
+
+    #[test]
+    fn same_tuple_in_two_zones_is_two_flows() {
+        let mut a = Aggregator::new(cfg(true));
+        let mut z1 = flow("10.0.0.2", "1.1.1.1", 5000, 443, 1000, 9000);
+        z1.key.zone = 1;
+        let z0 = flow("10.0.0.2", "1.1.1.1", 5000, 443, 50, 60);
+        a.ingest(&[z0.clone(), z1.clone()]);
+        assert_eq!(a.tracked(), 2);
+        let mut z1b = z1;
+        z1b.orig.bytes = 1100;
+        let s = a.ingest(&[z0, z1b]);
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.flows, r.new_flows), (100, 2, 0));
     }
 
     #[test]
@@ -392,14 +559,99 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_keys_in_one_sample_are_summed() {
+    fn duplicate_keys_in_one_sample_merge_by_max_not_sum() {
         let mut a = Aggregator::new(cfg(false));
         let s = a.ingest(&[
             flow("10.0.0.2", "1.1.1.1", 5000, 443, 100, 200),
-            flow("10.0.0.2", "1.1.1.1", 5000, 443, 10, 20),
+            flow("10.0.0.2", "1.1.1.1", 5000, 443, 10, 400),
         ]);
-        assert_eq!(one(&s).bytes_up, 110);
-        assert_eq!(one(&s).flows, 1);
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.bytes_down), (100, 400), "per-counter max");
+        assert_eq!((r.packets_up, r.packets_down), (1, 4));
+        assert_eq!(r.flows, 1);
+    }
+
+    #[test]
+    fn duplicate_line_in_one_sample_does_not_change_the_next_delta() {
+        let mut a = Aggregator::new(cfg(true));
+        let f = flow("10.0.0.2", "1.1.1.1", 5000, 443, 1000, 9000);
+        a.ingest(&[f.clone(), f]);
+        let s = a.ingest(&[flow("10.0.0.2", "1.1.1.1", 5000, 443, 1500, 9700)]);
+        let r = one(&s);
+        assert_eq!((r.bytes_up, r.bytes_down, r.new_flows), (500, 700, 0));
+    }
+
+    fn v6(i: usize) -> String {
+        format!("2001:db8:{:x}:{:x}::1", i >> 8, i & 255)
+    }
+
+    fn sum_bytes(s: &Snapshot) -> u64 {
+        s.records.iter().map(|r| r.bytes_up + r.bytes_down).sum()
+    }
+
+    #[test]
+    fn spoofed_source_flood_is_capped_and_totals_are_preserved() {
+        let mut a = Aggregator::new(cfg(false));
+        let flows: Vec<Flow> = (0..16_384)
+            .map(|i| flow(&v6(i), "fd00::1", 1000, 443, 10 + i as u64, 5))
+            .collect();
+        let want: u64 = flows.iter().map(|f| f.orig.bytes + f.reply.bytes).sum();
+        let s = a.ingest(&flows);
+        assert!(
+            s.records.len() <= DEFAULT_TOP_N + DEFAULT_OTHER_K + 1,
+            "{} records",
+            s.records.len()
+        );
+        assert_eq!(sum_bytes(&s), want);
+        let globals: Vec<_> = s.records.iter().filter(|r| r.global).collect();
+        assert_eq!(globals.len(), 1);
+        assert!(globals[0].src.is_unspecified() && globals[0].dst.is_none());
+        let others = s
+            .records
+            .iter()
+            .filter(|r| r.dst.is_none() && !r.global)
+            .count();
+        assert_eq!(others, DEFAULT_OTHER_K);
+        assert_eq!(s.records.iter().map(|r| r.flows).sum::<u64>(), 16_384);
+    }
+
+    #[test]
+    fn other_records_keep_lan_sources_first_among_equals() {
+        let mut a = Aggregator::new(AggConfig {
+            top_n: 1,
+            other_k: 2,
+            ..cfg(false)
+        });
+        let mut fl = vec![flow("8.8.4.4", "9.9.9.9", 1, 1, 9999, 9999)];
+        for (i, src) in ["203.0.113.1", "203.0.113.2", "203.0.113.3"]
+            .iter()
+            .enumerate()
+        {
+            fl.push(flow(src, "9.9.9.9", i as u16, 443, 10, 10));
+        }
+        fl.push(flow("192.168.8.50", "9.9.9.9", 7, 443, 10, 10));
+        fl.push(flow("fd12::7", "9.9.9.9", 8, 443, 10, 10));
+        let s = a.ingest(&fl);
+        let mut kept: Vec<String> = s
+            .records
+            .iter()
+            .filter(|r| r.dst.is_none() && !r.global)
+            .map(|r| r.src.to_string())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["192.168.8.50", "fd12::7"]);
+        let g = s.records.iter().find(|r| r.global).unwrap();
+        assert_eq!((g.bytes_up, g.bytes_down, g.flows), (30, 30, 3));
+    }
+
+    #[test]
+    fn no_global_record_when_other_records_fit() {
+        let mut a = Aggregator::new(AggConfig {
+            top_n: 2,
+            ..cfg(false)
+        });
+        let s = a.ingest(&top_n_input());
+        assert!(s.records.iter().all(|r| !r.global));
     }
 
     #[test]
