@@ -853,6 +853,34 @@ mod tests {
     }
 
     #[test]
+    fn stubs_of_flows_sharing_a_sport_keep_separate_baselines() {
+        let mut a = Aggregator::new(AggConfig {
+            max_flows: 2,
+            max_stubs: 10,
+            ..cfg(true)
+        });
+        let fa = |n: u64| flow("10.0.0.2", "1.1.1.1", 5, 443, n, n);
+        let fb = |n: u64| flow("10.0.0.3", "2.2.2.2", 5, 80, n, n);
+        let fill = |p: u16| flow("10.0.0.9", "3.3.3.3", p, 53, 10, 10);
+        a.ingest(&[fa(1000), fb(5000)]);
+        a.ingest(&[fa(1000), fb(5000), fill(1), fill(2)]); // A and B evicted to stubs
+        assert_eq!(a.stubs(), 2);
+        let s = a.ingest(&[fa(1100), fb(5200), fill(1), fill(2)]);
+        assert_eq!(
+            bytes_of(&s, "10.0.0.2"),
+            200,
+            "A continues from its own stub"
+        );
+        assert_eq!(
+            bytes_of(&s, "10.0.0.3"),
+            400,
+            "B continues from its own stub"
+        );
+        let new: u64 = s.records.iter().map(|r| r.new_flows).sum();
+        assert_eq!(new, 0);
+    }
+
+    #[test]
     fn stub_with_smaller_counters_is_a_reset() {
         let mut a = Aggregator::new(AggConfig {
             max_flows: 1,
