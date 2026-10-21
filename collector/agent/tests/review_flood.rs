@@ -178,6 +178,16 @@ fn all_truncated_kinds_fit_the_schema_and_the_reserve() {
     }
     assert!(full.len() <= 16);
     let sizes: usize = full.keys().map(|k| k.len() + 3 + 19 + 1).sum();
+    // Real wire tail: whatever `body(MAX_EPOCH, u64::MAX)` adds beyond the stored head.
+    let empty = build_with_drops(
+        &meta(),
+        Sections::default(),
+        &Health::default(),
+        BATCH_CAP,
+        &BTreeMap::new(),
+    );
+    let tail = empty.encoded.body(MAX_EPOCH, u64::MAX).len() - (empty.encoded.len() - TAIL_RESERVE);
+    let sizes = sizes + tail;
     assert!(
         sizes <= TRUNCATED_RESERVE,
         "reserve must cover the worst case: {sizes}"

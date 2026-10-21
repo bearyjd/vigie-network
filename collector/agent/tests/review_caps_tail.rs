@@ -111,12 +111,20 @@ fn final_bytes_never_exceed_cap_sweep() {
             let b = build_with_drops(&meta, input, &health, BATCH_CAP, &drops);
             let n = b.encoded.body(MAX_EPOCH, u64::MAX).len();
             assert!(
+                n > BATCH_CAP * 3 / 4,
+                "the sweep must press on the cap, got {n}"
+            );
+            assert!(
                 n <= BATCH_CAP,
                 "name_len={name_len} host_len={host_len}: {n} > {BATCH_CAP}"
             );
             assert!(
                 b.encoded.len() <= BATCH_CAP,
                 "spool accounting also within the cap"
+            );
+            assert!(
+                b.encoded.len() >= n,
+                "spool accounting covers the real wire size"
             );
         }
     }
