@@ -132,6 +132,10 @@ fn snapshot_rows_and_flags_reach_the_batch_per_mac() {
         t["ct_unmapped_bytes"], 10,
         "the unmapped host's bytes are counted, not lost"
     );
+    assert_eq!(
+        t["ct_unmapped_flows"], 1,
+        "and so are its flows (summed over the window's samples)"
+    );
     assert!(j["truncated"].as_object().unwrap().len() <= 16);
 }
 

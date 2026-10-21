@@ -221,7 +221,7 @@ impl Sources {
     /// Moves the window's conntrack rows, counters and flags into `w`; call right before the
     /// batch is built (after a final `pump`). Resets the per-window state.
     pub fn finish_window(&mut self, w: &mut Window, mono_s: u64) {
-        let (rows, unmapped_bytes, _) = self.acc.take();
+        let (rows, unmapped_bytes, unmapped_flows) = self.acc.take();
         for r in rows {
             w.add_conntrack(r);
         }
@@ -238,6 +238,7 @@ impl Sources {
             ("ct_recounted", std::mem::take(&mut self.ct_recounted)),
             ("ct_dropped_keys", std::mem::take(&mut self.ct_dropped_keys)),
             ("ct_unmapped_bytes", unmapped_bytes),
+            ("ct_unmapped_flows", unmapped_flows),
             ("mcast_unmapped", std::mem::take(&mut self.mc_unmapped)),
             ("mcast_dropped", std::mem::take(&mut self.mc_dropped)),
         ];

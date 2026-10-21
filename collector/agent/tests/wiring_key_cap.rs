@@ -81,3 +81,29 @@ fn exactly_sixteen_keys_is_left_alone() {
     let d = drops(16);
     assert_eq!(build(&d).truncated, d);
 }
+
+#[test]
+fn ct_unmapped_flows_is_reported_when_there_is_room() {
+    let mut d = drops(5);
+    d.insert("ct_unmapped_flows".into(), 3);
+    assert_eq!(build(&d).truncated, d);
+}
+
+#[test]
+fn ct_unmapped_flows_is_the_first_key_merged_even_when_it_is_the_largest() {
+    // 14 other keys plus source_flags, ct_unmapped_bytes and ct_unmapped_flows: 17 keys, so two
+    // rows must merge. Flows is the companion of ct_unmapped_bytes, so it yields before any other
+    // key whatever its count; the second is then the smallest count (drop_a = 1).
+    let mut d = drops(14);
+    d.insert("source_flags".into(), 5);
+    d.insert("ct_unmapped_bytes".into(), 2);
+    d.insert("ct_unmapped_flows".into(), 1_000_000);
+    let b = build(&d);
+    assert_eq!(b.truncated.len(), 16, "{:?}", b.truncated);
+    assert!(!b.truncated.contains_key("ct_unmapped_flows"));
+    assert!(!b.truncated.contains_key("drop_a"));
+    assert_eq!(b.truncated.get("ct_unmapped_bytes"), Some(&2), "bytes kept");
+    assert_eq!(b.truncated.get("drop_b"), Some(&2));
+    assert_eq!(b.truncated.get("source_flags"), Some(&5));
+    assert_eq!(b.truncated["truncated_other"], 1_000_001);
+}
