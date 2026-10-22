@@ -93,7 +93,7 @@ def build_starve(inv: Inv, burners: int = 12, pool: int = 40):
         inv.mac(f"B{k}", "victim", None, "self", f"2026-02-01T00:00:{k:02d}Z",
                 [(NOW - 7000, NOW - 6000)])  # fmt: skip
     for k in range(pool):  # same opt55/opt60, own mDNS name, 64 isolated intervals each
-        inv.mac(f"P{k}", None, f"p{k}", "self", "2026-03-01T00:00:00Z",
+        inv.mac(f"P{k}", None, f"p{k}", "self", "2026-02-01T00:00:30Z",
                 [(NOW - 500000 + i * 1000 + k % 7,) * 2 for i in range(64)])  # fmt: skip
     inv.mac("L0", "legit", None, "self", "2026-04-01T00:00:00Z", [(NOW - 90000, NOW - 89000)])
     inv.mac("L1", "legit", None, "self", "2026-04-02T00:00:00Z", [(NOW - 50000, NOW - 49000)])
@@ -153,8 +153,8 @@ def test_pool_larger_than_a_signature_bucket_is_flooded_for_rule_attach(inv, mon
     monkeypatch.setattr(stitch_mod, "MAX_SIGNATURE_BUCKET", 3)
     inv.mac("D", "victim", None, "self", "2026-01-01T00:00:00Z", [(NOW - 90000, NOW - 80000)],
             rand=0)  # fmt: skip
-    for k in range(5):  # five live MACs with the victim's opt55/opt60 and their own names
-        inv.mac(f"P{k}", None, f"p{k}", "self", "2026-03-01T00:00:00Z",
+    for k in range(5):  # five live MACs with their own names, first seen within a gap of B
+        inv.mac(f"P{k}", None, f"p{k}", "self", f"2026-02-01T00:00:{k + 1:02d}Z",
                 [(NOW - 3600 * (k + 1),) * 2])  # fmt: skip
     b = inv.mac("B", "victim", None, "self", "2026-02-01T00:00:00Z", [(NOW - 70000, NOW - 69000)])
     st = inv.stitch(RULE_SNAP)
@@ -162,6 +162,18 @@ def test_pool_larger_than_a_signature_bucket_is_flooded_for_rule_attach(inv, mon
     assert row[0] == "self" and st.attached == 0 and st.suggestions == 0
     assert inv.db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
     assert inv.count("signature_flood") == 1 and st.flooded >= 1
+
+
+def test_junk_named_macs_first_seen_long_before_or_after_are_not_a_flood(inv, monkeypatch):
+    monkeypatch.setattr(stitch_mod, "MAX_SIGNATURE_BUCKET", 3)
+    inv.mac("D", "victim", None, "self", "2026-01-01T00:00:00Z", [(NOW - 90000, NOW - 80000)],
+            rand=0)  # fmt: skip
+    for k in range(5):  # a name nobody else uses and no closeness in time: not a compatible peer
+        inv.mac(f"P{k}", None, f"p{k}", "self", "2026-03-01T00:00:00Z",
+                [(NOW - 3600 * (k + 1),) * 2])  # fmt: skip
+    b = inv.mac("B", "victim", None, "self", "2026-02-01T00:00:00Z", [(NOW - 70000, NOW - 69000)])
+    st = inv.stitch(RULE_SNAP)
+    assert st.attached == 1 and inv.count("signature_flood") == 0, b
 
 
 def test_vetoed_pair_is_not_re_evaluated_and_stays_vetoed(inv, monkeypatch):
@@ -310,8 +322,9 @@ def attached(inv: Inv, host="victim", mdns=None, dev="D", src="rule"):
 
 def test_recheck_flags_overlap_with_a_compatible_mdns_only_peer(inv):
     attached(inv)
-    inv.mac("V", None, "Dave", "self", "2026-01-03T00:00:00Z", [(NOW - 5000, NOW)])
-    assert inv.stitch(RULE_SNAP).suspect == 1  # only compatible_peers can see V
+    inv.mac("V", None, "Dave", "self", "2026-01-02T00:01:00Z", [(NOW - 5000, NOW)])
+    assert inv.stitch(RULE_SNAP).suspect == 1  # only compatible_peers can see V (first seen
+    # within a gap of the attached MAC)
 
 
 def test_recheck_flags_overlap_with_a_same_name_rule_attached_mac_of_another_device(inv):
@@ -321,7 +334,7 @@ def test_recheck_flags_overlap_with_a_same_name_rule_attached_mac_of_another_dev
     inv.mac("E", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 5000, NOW)],
             newdev=False)  # fmt: skip
     # not a live self MAC (so not compatible) and another canonical device: only name_peers
-    assert inv.stitch(RULE_SNAP).suspect >= 1
+    assert inv.stitch(RULE_SNAP).suspect == 2  # each of the two flags the other
 
 
 def test_recheck_stays_quiet_for_a_clean_attach(inv):

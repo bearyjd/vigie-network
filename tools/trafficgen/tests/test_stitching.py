@@ -142,18 +142,20 @@ def test_overlap_veto_fixture_short_overlap_stitches_and_sustained_overlap_is_ve
     assert w.count("identity_overlap_veto") == 1
 
 
-def test_fingerprint_copy_victim_present_is_vetoed(ingest):
+def test_fingerprint_copy_victim_present_is_vetoed_and_a_short_roll_stays_provisional(ingest):
     w = World(ingest, "rolling_fingerprint_copy_present")
     first, r1, r2, r3, r4 = w.macs["dev-08"]
     attacker = w.macs["dev-09"][0]
-    # exact outcomes: the copy is vetoed; so is roll r3, which lived wholly inside the copy's
-    # presence (indistinguishable from it, a human decides); the other rolls are suggested
+    # exact outcomes: the copy is mature and vetoed. Roll r3 lived wholly inside the copy's
+    # presence (indistinguishable from it, a human decides) but under the 10 min grace: too
+    # little trusted history, so its overlap is provisional ('open', no veto event, no
+    # suggestion), never a permanent veto. The other rolls are suggested.
     assert w.edges() == {
-        (r1, first): "suggested", (r2, first): "suggested", (r3, first): "vetoed",
+        (r1, first): "suggested", (r2, first): "suggested", (r3, first): "open",
         (r4, first): "suggested", (attacker, first): "vetoed",
     }  # fmt: skip
     assert w.suggested() == {(m, first, "fingerprint_match") for m in (r1, r2, r4)}
-    assert w.count("identity_overlap_veto") == 2
+    assert w.count("identity_overlap_veto") == 1
 
 
 def test_fingerprint_copy_victim_away_yields_a_suggestion_the_human_decides(ingest):
@@ -204,8 +206,15 @@ def test_victim_present_rule_never_attaches_the_overlapping_copy(ingest):
     assert rule_attached == {r1}
     assert w.link_source(attacker) == "self" and w.device(attacker) != w.device(first)
     into_first = {a for (a, b), st in w.edges().items() if b == first and st == "vetoed"}
-    assert into_first == {r2, r3, r4, attacker}
-    assert w.edges()[(attacker, first)] == "vetoed"
+    assert into_first == {r2, r3, attacker}
+    # r4 first reached the server within the grace of this run: too little trusted history for a
+    # rule attach or a permanent veto, so the candidate pass only marks it ambiguous ...
+    assert w.edges()[(r4, first)] == "ambiguous"
+    # ... and once the server has known it for longer than the grace, the overlap is a veto
+    w.now += RULE_GRACE_S + 1
+    w.run()
+    assert w.edges()[(r4, first)] == "vetoed"
+    assert w.link_source(attacker) == "self" and w.link_source(r4) == "self"
 
 
 def test_victim_present_with_default_grace_defers_every_short_lived_roll(ingest):
@@ -223,11 +232,19 @@ def test_hostname_only_spoof_is_never_a_candidate(ingest):
     assert w.edges() == {} and w.suggested() == set()
 
 
-def test_full_fingerprint_spoof_inside_grace_but_wholly_covered_is_vetoed(ingest):
-    """The fixture runs 6 min: concurrent for 300 s, inside the default 10 min grace, but the
-    copy is wholly inside the victim's presence (overlap == its covered time), so it is vetoed."""
+def test_full_fingerprint_spoof_inside_grace_is_provisional_then_vetoed_once_mature(ingest):
+    """The fixture runs 6 min: concurrent for 300 s, inside the default 10 min grace, and the copy
+    is wholly inside the victim's presence. It has too little trusted history (under the grace) to
+    be vetoed permanently: provisional 'open', no suggestion. With a grace below its covered time
+    and after the server has known it for longer than that, the same overlap is a veto."""
     w = World(ingest, "hostname_spoof_full_fingerprint")
-    assert len(w.edges()) == 1 and set(w.edges().values()) == {"vetoed"}
+    assert len(w.edges()) == 1 and set(w.edges().values()) == {"open"}
+    assert w.count("identity_overlap_veto") == 0
+    assert w.suggested() == set()
+    w.cfg["overlap_grace_s"] = RULE_GRACE_S
+    w.now += RULE_GRACE_S + 1
+    w.run()
+    assert set(w.edges().values()) == {"vetoed"}
     assert w.count("identity_overlap_veto") == 1
     assert w.suggested() == set()
 

@@ -30,6 +30,10 @@ ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
 # cannot be back-filled for a brand-new MAC, so a forged old stamp cannot mature it.
 ACTIVITY_NEW_MAC_LOOKBACK_S = 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
+# Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
+# SERVER time it was first received (mac_first_received): older stamps are back-fill and count
+# neither toward maturity nor toward the time apart from a peer.
+ACTIVITY_MAX_REPORT_LAG_S = 3600
 SUGGESTION_TTL_DEFAULT_S = 7 * 86400
 # Flood bounds (docs/stitching.md section 12): a signature (opt55, opt60) shared by more MACs than
 # this is skipped for the pass; at most this many candidate/suggestion rows are written per pass.
@@ -41,6 +45,9 @@ MAX_ROWS_PER_PASS = 200
 # candidates (the rest resume next pass) and emits one stitch_budget_exhausted event per UTC day.
 MAX_INTERVALS_PER_MAC = 64
 MAX_OVERLAP_OPS_PER_PASS = 20000
+# The stitching transaction holds the inventory write lock: after this many seconds it stops at the
+# next safe point (before the write of the decision in flight) and emits stitch_budget_exhausted.
+STITCH_MAX_TXN_SECONDS = 3
 # At most this many signature_flood events per pass; further new floods get one daily summary.
 MAX_FLOOD_EVENTS_PER_PASS = 20
 

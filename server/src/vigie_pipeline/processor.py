@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -40,12 +41,18 @@ class RunStats:
 def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     """Process every recorded, not-yet-processed batch, then promote/retire transients."""
     clock = time.time() if now is None else now
+    live = time.time if now is None else None  # injected `now` pins every clock read (tests)
     inv = open_pipeline_inventory(config.inventory_path, config.migrate)
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
     try:
-        totals = _process_batches(inv, overrides, config, failures)
-        stitched = _stitch(inv, overrides, config, clock)
+        # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
+        # no identity links for the batches, no stitching, cursor progress is kept
+        usable = _overrides_readable(overrides, config, clock)
+        totals = _process_batches(inv, overrides if usable else None, config, failures)
+        stitched = (
+            _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
+        )
         promoted, retired = sweep_transients(inv, clock, config)
         purge_activity(inv, clock, config.activity_retention_s)
     finally:
@@ -65,18 +72,14 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     return stats
 
 
-def _stitch(
-    inv: sqlite3.Connection,
-    overrides: sqlite3.Connection | None,
-    config: PipelineConfig,
-    now: float,
-) -> StitchStats:
-    """Run identity stitching. overrides.db missing entirely => no rules, basis versions 0.
-    Present but unreadable => fail closed: skip stitching, log, and let the run go on."""
-    snap: Snapshot = EMPTY
+def _overrides_readable(
+    overrides: sqlite3.Connection | None, config: PipelineConfig, now: float
+) -> bool:
+    """overrides.db missing entirely => readable (no rules, basis versions 0). Present but
+    unreadable or malformed => fail closed: log `stitching_skipped` and report False."""
     try:
         if overrides is not None:
-            snap = load_snapshot(overrides, now)
+            load_snapshot(overrides, now)
         elif config.overrides_path.exists():
             raise OverridesUnreadable("overrides.db exists but could not be opened")
     except OverridesUnreadable as exc:
@@ -87,8 +90,29 @@ def _stitch(
             reason="overrides_unreadable",
             error=str(exc),
         )
+        return False
+    return True
+
+
+def _stitch(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    clock: Callable[[], float],
+) -> StitchStats:
+    """Run identity stitching on a snapshot read NOW (after the batches, so rule expiry is judged
+    against the current time, not the start of the run). A snapshot that turns unreadable between
+    the early check and now also skips stitching."""
+    now = clock()
+    snap: Snapshot = EMPTY
+    try:
+        if overrides is not None:
+            snap = load_snapshot(overrides, now)
+    except OverridesUnreadable as exc:
+        log(logger, logging.ERROR, "stitching_skipped", reason="overrides_unreadable",
+            error=str(exc))  # fmt: skip
         return StitchStats()
-    return stitch(inv, snap, config, now)
+    return stitch(inv, snap, config, now, clock)
 
 
 def _process_batches(

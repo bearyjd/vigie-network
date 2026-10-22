@@ -54,6 +54,9 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc):  # api has not created the schema yet
                 return device_id
+            if "no such column" in str(exc):  # malformed: no links, never an aborted run
+                logger.error("overrides_unreadable error=%s: ignoring identity links", exc)
+                return device_id
             raise
         if row is None or row["into_device"] in seen:
             return current

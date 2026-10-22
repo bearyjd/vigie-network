@@ -69,9 +69,19 @@ def test_covered_time_exactly_at_grace_is_deferred(data):
     ov.close()
 
 
-def test_candidate_wholly_inside_another_device_is_vetoed(data):
+def test_immature_candidate_wholly_inside_another_device_is_only_provisional(data):
     appear(data, 1, 0, 300)
     appear(data, 2, 150, 150)  # one stamp, widened to [0, 300]: overlap == covered time
+    run(data)
+    assert suggestions(data) == []
+    # 300 s covered is not mature: the overlap is provisional (round 5), never a permanent veto
+    assert [c["state"] for c in candidates(data)] == ["open"]
+    assert kinds(data, "identity_overlap_veto") == []
+
+
+def test_mature_candidate_wholly_inside_another_device_is_vetoed(data):
+    appear(data, 1, 0, 3000)
+    appear(data, 2, 1000, 2000)  # 1000 s covered (mature), wholly inside the peer
     run(data)
     assert suggestions(data) == []
     assert [c["state"] for c in candidates(data)] == ["vetoed"]
@@ -178,7 +188,7 @@ def test_attached_macs_do_not_count_toward_the_flood_cap(data):
     for i in range(70):  # one legitimate roll per pass for much longer than the cap
         start = 1000 + i * 800
         b = appear(data, 2 + i, start, start + 700)
-        run(data)
+        run(data, now=T0 + start + 700 + 3600)  # the server clock is after each receipt
         assert source_of(data, b) == "rule", f"roll {i} not attached"
     assert kinds(data, "signature_flood") == []
     assert len(kinds(data, "mac_attached")) == 70
@@ -282,12 +292,12 @@ def test_populated_v4_database_migrates_to_v5(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 5
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 6
     rows = conn.execute("SELECT id, dedup FROM events ORDER BY seq").fetchall()
     assert [tuple(r) for r in rows] == [("e1", None), ("e2", None)]  # NULL dedup stays NULL
     assert conn.execute("SELECT COUNT(*) FROM mac_activity").fetchone()[0] == 1
-    assert apply_pipeline_migrations(conn) == 5  # re-apply is a no-op
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 5
+    assert apply_pipeline_migrations(conn) == 6  # re-apply is a no-op
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 6
     conn.execute(ins, ("e3",))  # NULLs never collide on the partial unique index
 
 

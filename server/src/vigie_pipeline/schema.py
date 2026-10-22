@@ -97,6 +97,42 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
         " WHERE dedup IS NOT NULL",
     ),
+    (
+        # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity
+        # anchor. Legacy rows fall back to their earliest stored stamp.
+        "CREATE TABLE IF NOT EXISTS mac_first_received ("
+        "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
+        "INSERT OR IGNORE INTO mac_first_received (mac, received)"
+        " SELECT mac, MIN(start) FROM mac_activity GROUP BY mac",
+        # small key/value state of the stitcher (re-check cursor)
+        "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        # suggestion look-ups are by (action, device_ids): no table scan inside the write lock
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_pair"
+        " ON suggestions(action, device_ids, expires_at)",
+        # Migration 5 added events.dedup but left it NULL on rows written before it: give the
+        # recognised stitching events their token (same format as the emit_once call sites) so the
+        # once-only guard keeps holding. UPDATE OR IGNORE: a legacy duplicate that would break the
+        # unique index keeps NULL (nothing is deleted).
+        "UPDATE OR IGNORE events SET dedup = substr(summary, length('identity overlap veto ') + 1)"
+        " WHERE dedup IS NULL AND kind = 'identity_overlap_veto'"
+        " AND summary LIKE 'identity overlap veto %'",
+        "UPDATE OR IGNORE events SET dedup = device_id"
+        " WHERE dedup IS NULL AND kind = 'identity_candidate_ambiguous' AND device_id IS NOT NULL",
+        "UPDATE OR IGNORE events SET dedup = substr(summary, length('identity candidate ') + 1,"
+        " instr(summary, ' score ') - length('identity candidate ') - 1)"
+        " WHERE dedup IS NULL AND kind = 'identity_candidate'"
+        " AND summary LIKE 'identity candidate % score %'",
+        "UPDATE OR IGNORE events SET dedup = substr(summary, length('rule attach suspect ') + 1, 8)"
+        " || '~' || device_id WHERE dedup IS NULL AND kind = 'rule_attach_suspect'"
+        " AND device_id IS NOT NULL AND summary LIKE 'rule attach suspect %'",
+        "UPDATE OR IGNORE events SET dedup = substr(summary, length('signature flood ') + 1, 8)"
+        " || ':' || substr(ts, 1, 10) WHERE dedup IS NULL AND kind = 'signature_flood'"
+        " AND summary LIKE 'signature flood %'",
+        "UPDATE OR IGNORE events SET dedup = substr(ts, 1, 10)"
+        " WHERE dedup IS NULL AND kind = 'stitch_budget_exhausted'",
+        "UPDATE OR IGNORE events SET dedup = 'summary:' || substr(ts, 1, 10)"
+        " WHERE dedup IS NULL AND kind = 'signature_flood_summary'",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -108,6 +144,8 @@ PIPELINE_TABLES = (
     "promotion_log",
     "suggestions",
     "mac_activity",
+    "mac_first_received",
+    "stitch_state",
 )
 
 

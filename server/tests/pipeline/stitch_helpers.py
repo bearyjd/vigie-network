@@ -51,8 +51,8 @@ def device_of(data: Data, mac_addr: str) -> str:
     return data.q("SELECT device_id FROM observations WHERE mac=?", mac_addr)[0][0]
 
 
-def run(data: Data, **kw) -> RunStats:
-    return run_once(PipelineConfig(data_dir=data.root, **kw), now=NOW)
+def run(data: Data, now: float = NOW, **kw) -> RunStats:
+    return run_once(PipelineConfig(data_dir=data.root, **kw), now=now)
 
 
 def dump(data: Data, *tables: str) -> list[list[sqlite3.Row]]:

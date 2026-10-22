@@ -28,6 +28,7 @@ class Rule:
     opt60: str
     hostname: str | None
     mdns_name: str | None
+    expires_at: float | None = None  # epoch s; re-checked when the rule is about to be applied
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,21 @@ def parse_rule(row: sqlite3.Row) -> Rule | None:
     host, mdns = _text(sig.get("hostname")), _text(sig.get("mdns_name"))
     if not (opt55 and opt60 and (host or mdns)):
         return None
-    return Rule(row["id"], row["device_id"], opt55, opt60, host, mdns)
+    return Rule(row["id"], row["device_id"], opt55, opt60, host, mdns, _expiry(row["expires_at"]))
+
+
+def _expiry(value: object) -> float | None:
+    """Epoch seconds of an expires_at value, or None for NULL (never expires) / unparseable."""
+    expiry = _text(value)
+    if not expiry:
+        return None
+    try:
+        expires = datetime.fromisoformat(expiry)
+    except ValueError:
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires.timestamp()
 
 
 def _active(row: sqlite3.Row, now: float) -> bool:
@@ -89,16 +104,8 @@ def _active(row: sqlite3.Row, now: float) -> bool:
         return False
     if row["expires_at"] is None:
         return True
-    expiry = _text(row["expires_at"])
-    if not expiry:
-        return False
-    try:
-        expires = datetime.fromisoformat(expiry)
-    except ValueError:
-        return False
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=UTC)
-    return expires.timestamp() > now
+    expires = _expiry(row["expires_at"])
+    return expires is not None and expires > now
 
 
 def _rows(conn: sqlite3.Connection, sql: str, *, required: bool = False) -> list[sqlite3.Row]:

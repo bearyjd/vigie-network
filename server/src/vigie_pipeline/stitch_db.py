@@ -29,6 +29,13 @@ def emit_once(
     )
 
 
+def event_exists(inv: sqlite3.Connection, kind: str, token: str) -> bool:
+    return (
+        inv.execute("SELECT 1 FROM events WHERE kind=? AND dedup=?", (kind, token)).fetchone()
+        is not None
+    )
+
+
 def emit_event(
     inv: sqlite3.Connection, device_id: str, kind: str, severity: str, summary: str, now: float
 ) -> None:
@@ -38,15 +45,43 @@ def emit_event(
     )
 
 
+def _candidate_row(inv: sqlite3.Connection, a: str, b: str) -> sqlite3.Row | None:
+    return inv.execute(
+        "SELECT id, score, evidence, state FROM identity_candidates"
+        " WHERE device_a=? AND device_b=?",
+        (a, b),
+    ).fetchone()
+
+
+def _row_write_needed(row: sqlite3.Row | None, score: float, text: str, state: str) -> bool:
+    if row is None:
+        return True
+    if row["state"] == "dismissed" or (row["state"] == "vetoed" and state != "vetoed"):
+        return False  # dismissed and vetoed are sticky
+    return (row["score"], row["evidence"], row["state"]) != (score, text, state)
+
+
+def candidate_state(inv: sqlite3.Connection, a: str, b: str) -> str | None:
+    row = _candidate_row(inv, a, b)
+    return row["state"] if row else None
+
+
+def candidate_write_needed(
+    inv: sqlite3.Connection, a: str, b: str, score: float, evidence: dict, state: str
+) -> bool:
+    """Would upsert_candidate write this row? (An identical or sticky row is not written.)"""
+    text = json.dumps(evidence, sort_keys=True)
+    return _row_write_needed(_candidate_row(inv, a, b), score, text, state)
+
+
 def upsert_candidate(
     inv: sqlite3.Connection, a: str, b: str, score: float, evidence: dict, state: str, now: float
 ) -> tuple[str, bool]:
-    """One row per (from, into). Returns (id, state_changed_or_new). 'dismissed' and 'vetoed' are
-    sticky: no later evidence, stitcher view or capped window rewrites them."""
+    """One row per (from, into). Returns (id, row_written). 'dismissed' and 'vetoed' are sticky
+    (no later evidence, stitcher view or capped window rewrites them) and an identical row is not
+    rewritten, so the write is the unit the per-pass cap charges."""
     text = json.dumps(evidence, sort_keys=True)
-    row = inv.execute(
-        "SELECT id, state FROM identity_candidates WHERE device_a=? AND device_b=?", (a, b)
-    ).fetchone()
+    row = _candidate_row(inv, a, b)
     if row is None:
         cid = str(uuid.uuid4())
         inv.execute(
@@ -55,13 +90,13 @@ def upsert_candidate(
             (cid, a, b, score, text, state, iso_utc(now)),
         )
         return cid, True
-    if row["state"] == "dismissed" or (row["state"] == "vetoed" and state != "vetoed"):
-        return row["id"], False  # dismissed and vetoed are sticky
+    if not _row_write_needed(row, score, text, state):
+        return row["id"], False
     inv.execute(
         "UPDATE identity_candidates SET score=?, evidence=?, state=? WHERE id=?",
         (score, text, state, row["id"]),
     )
-    return row["id"], row["state"] != state
+    return row["id"], True
 
 
 def withdraw_open_suggestions(
@@ -87,29 +122,32 @@ def withdraw_open_suggestions(
 
 @dataclass(frozen=True)
 class SuggestionOutcome:
-    status: str  # created | open | rejected | accepted
+    status: str  # open | rejected | accepted (a decision or an open suggestion already exists)
     suggestion_id: str | None = None
 
 
-def ensure_merge_suggestion(
-    inv: sqlite3.Connection, snap: Snapshot, frm: str, into: str, *, score: float,
-    reason_code: str, evidence_summary: dict, now: float, ttl_s: int,
-) -> SuggestionOutcome:  # fmt: skip
-    """Create the immutable merge_identity suggestion for (frm -> into) unless a human decision
-    exists for the pair or one is still open (not expired). basis = current override versions."""
-    pair = json.dumps([frm, into])
-    now_iso = iso_utc(now)
+def find_merge_suggestion(
+    inv: sqlite3.Connection, snap: Snapshot, frm: str, into: str, now: float
+) -> SuggestionOutcome | None:
+    """The human decision on, or the still-open (unexpired) suggestion of, the pair; None when a
+    new one may be created. One indexed look-up (idx_suggestions_pair)."""
     open_id = None
+    now_iso = iso_utc(now)
     for row in inv.execute(
         "SELECT id, expires_at FROM suggestions WHERE action='merge_identity' AND device_ids=?",
-        (pair,),
+        (json.dumps([frm, into]),),
     ):
         if row["id"] in snap.decisions:
             return SuggestionOutcome(snap.decisions[row["id"]], row["id"])
         if row["expires_at"] > now_iso:
             open_id = row["id"]
-    if open_id:
-        return SuggestionOutcome("open", open_id)
+    return SuggestionOutcome("open", open_id) if open_id else None
+
+
+def create_merge_suggestion(
+    inv: sqlite3.Connection, snap: Snapshot, frm: str, into: str, *, score: float,
+    reason_code: str, evidence_summary: dict, now: float, ttl_s: int,
+) -> str:  # fmt: skip
     sid = str(uuid.uuid4())
     payload = {"from_device": frm, "into_device": into, "score": score,
                "evidence_summary": evidence_summary}  # fmt: skip
@@ -117,7 +155,19 @@ def ensure_merge_suggestion(
     inv.execute(
         "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, reason_text,"
         " basis, created_at, expires_at) VALUES (?,?,?,?,?,NULL,?,?,?)",
-        (sid, "merge_identity", pair, json.dumps(payload, sort_keys=True), reason_code,
-         json.dumps(basis, sort_keys=True), now_iso, iso_utc(now + ttl_s)),
+        (sid, "merge_identity", json.dumps([frm, into]), json.dumps(payload, sort_keys=True),
+         reason_code, json.dumps(basis, sort_keys=True), iso_utc(now), iso_utc(now + ttl_s)),
     )  # fmt: skip
-    return SuggestionOutcome("created", sid)
+    return sid
+
+
+def state_get(inv: sqlite3.Connection, key: str) -> str | None:
+    row = inv.execute("SELECT value FROM stitch_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def state_set(inv: sqlite3.Connection, key: str, value: str | None) -> None:
+    if value is None:
+        inv.execute("DELETE FROM stitch_state WHERE key=?", (key,))
+    else:
+        inv.execute("INSERT OR REPLACE INTO stitch_state (key, value) VALUES (?,?)", (key, value))
