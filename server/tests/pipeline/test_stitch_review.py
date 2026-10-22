@@ -38,7 +38,9 @@ from vigie_pipeline.stitch import Obs, Stitcher
 RULE = "11111111-rule"
 
 
-def seeded(data: Data, *, a_end: int = 300, group: str | None = None, rule_sig: dict | None = None):
+def seeded(
+    data: Data, *, a_end: int = 300, group: str | None = "iot", rule_sig: dict | None = None
+):
     a = appear(data, 1, 0, a_end)
     run(data)
     ov = Overrides(data.root)
@@ -132,8 +134,8 @@ def test_flood_of_one_signature_is_bounded_and_fast(data):
     assert elapsed < 2.0, elapsed
     assert len(candidates(data)) == 0 and len(suggestions(data)) == 0
     assert len(kinds(data, "signature_flood")) == 1
-    run(data)  # one event per pass per signature
-    assert len(kinds(data, "signature_flood")) == 2
+    run(data)  # one event per signature per UTC day, not per pass
+    assert len(kinds(data, "signature_flood")) == 1
 
 
 def test_flooded_signature_never_rule_attaches(data):
@@ -192,7 +194,7 @@ def test_opt_match_but_mdns_name_differs_does_not_attach(data):
     b = appear(data, 2, 400, 1200, mdns="Other Name")
     run(data)
     assert source_of(data, b) == "self" and kinds(data, "mac_attached") == []
-    c = appear(data, 3, 400, 1200)  # control: the same rule does attach on a matching mDNS name
+    c = appear(data, 3, 1500, 2300)  # control (not beside b): a matching mDNS name does attach
     run(data)
     assert source_of(data, c) == "rule"
     ov.close()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterable, Mapping
 
+from vigie_pipeline.config import ACTIVITY_SKEW_S
 from vigie_pipeline.sources import MacActivity
 
 Interval = tuple[int, int]
@@ -38,11 +39,22 @@ def overlap_seconds(a: list[Interval], b: list[Interval]) -> int:
     return total
 
 
-def record_activity(inv: sqlite3.Connection, acts: Mapping[str, MacActivity], gap_s: int) -> None:
+def record_activity(
+    inv: sqlite3.Connection,
+    acts: Mapping[str, MacActivity],
+    gap_s: int,
+    received_ts: float,
+    retention_s: int,
+) -> None:
     """Fold a batch's row timestamps into mac_activity. Idempotent: re-folding the same stamps
-    changes nothing, and out-of-order batches coalesce with neighbouring intervals."""
+    changes nothing, and out-of-order batches coalesce with neighbouring intervals.
+
+    Row timestamps are collector-supplied and untrusted: a stamp outside
+    [received - retention, received + ACTIVITY_SKEW_S] (epoch-zero from a clock without an RTC, or
+    far in the future) is ignored, because it could otherwise fake observed history."""
+    lo_ok, hi_ok = int(received_ts) - retention_s, int(received_ts) + ACTIVITY_SKEW_S
     for mac, act in acts.items():
-        stamps = sorted(t for t in act.stamps if t >= 0)
+        stamps = sorted(t for t in act.stamps if lo_ok <= t <= hi_ok)
         if not stamps:
             continue
         fresh = merge_intervals(((t, t) for t in stamps), gap_s)

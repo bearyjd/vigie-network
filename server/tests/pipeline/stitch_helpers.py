@@ -39,6 +39,7 @@ def appear(
     m = mac(n)
     data.add_batch(
         T0 + start,
+        received=T0 + end,  # a batch is received after the rows it carries
         leases=[(m, host, opt55, opt60)],
         sightings=[(m, "mdns", mdns)] if mdns else (),
         dns=[(m, T0 + t) for t in range(start, end + 1, step)],

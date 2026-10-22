@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
@@ -108,7 +109,9 @@ def _process_batches(
                 break
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
-                record_activity(inv, acts, config.activity_gap_s)
+                record_activity(
+                    inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
+                )
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)
@@ -117,6 +120,10 @@ def _process_batches(
             log(logger, logging.DEBUG, "batch_processed", collector=collector, batch_id=batch_id,
                 macs=len(acts), new_devices=created)  # fmt: skip
     return totals
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).timestamp()
 
 
 def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str, str]]:

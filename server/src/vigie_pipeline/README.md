@@ -38,28 +38,33 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
 
 - **Activity.** Row timestamps (leases, neighbours, DNS, flows) are folded per MAC into
   `mac_activity (mac, start, end)` intervals (a silence over 5 min splits an interval; 7 d
-  retention; pipeline schema v4). Derived data; safe to drop.
+  retention; pipeline schema v4). Stamps outside [received - 7 d, received + 300 s] are ignored.
+  Derived data; safe to drop.
 - **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
   opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a
   candidate, so a hostname alone never is. Rows go to `identity_candidates`
   (`open|suggested|ambiguous|vetoed|dismissed`); full values only in its `evidence` column.
 - **Ambiguity / veto.** Two matching devices that were active together beyond the grace window
-  (default 600 s) make the signature `ambiguous`; a candidate whose own sustained overlap with the
-  matching devices exceeds the grace is `vetoed`. Neither produces a suggestion.
+  (default 600 s) make the signature `ambiguous`; a candidate whose overlap with the matching
+  devices exceeds the grace, or covers all of its own observed time, is `vetoed`. A rule attach also
+  needs more than the grace of covered activity time (sum of intervals, not first-to-last span). Neither produces a suggestion.
 - **Suggestions.** A unique, non-vetoed candidate scoring >= 0.8 gets one immutable
   `merge_identity` suggestion (`fingerprint_match`, basis = current override versions from
   overrides.db). Nothing is merged: a human accepts via the API (next round).
 - **Standing rules.** `identity_rules` (read-only) attach a randomized self MAC to the rule's
   canonical device (`link_source='rule'`, `mac_attached` event, orphan device retired) only if
-  exactly one device's active rule matches, there is no sustained overlap, and the device's group
-  has `auto_inherit=1` or it has no group. `auto_inherit=0` raises a `rule_hit_needs_confirm`
-  suggestion instead. Revoking or expiring a rule never detaches an existing attachment.
+  exactly one device's active rule matches, there is no sustained overlap, and the device has an
+  explicit group with `auto_inherit=1`. An unassigned device or `auto_inherit=0` raises a
+  `rule_hit_needs_confirm` suggestion instead. The pipeline enforces only "active rule with a
+  non-blank creator in overrides.db"; that the creator is a human is enforced by the API alone,
+  which MUST be the sole writer of `identity_rules` and reject non-human principals (rule API not
+  built yet). Revoking or expiring a rule never detaches an existing attachment.
 - **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable (also: a
   missing column, a non-integer `auto_inherit`/`version`, or active rules without a
   `device_overrides` table): stitching is skipped for that run (`stitching_skipped` at ERROR) and
   the rest of the run goes on.
-- **Flood bounds.** A signature shared by more than 64 MACs is skipped for the pass (one
-  `signature_flood` event per pass per signature); at most 200 candidate/suggestion rows are
+- **Flood bounds.** A name group (opt55, opt60, one name) with more than 64 live self-linked MACs
+  is skipped (one `signature_flood` event per group per UTC day); at most 200 candidate/suggestion rows are
   written per pass (`MAX_SIGNATURE_BUCKET`, `MAX_ROWS_PER_PASS` in `config.py`).
 - **Config.** `VIGIE_STITCH_THRESHOLD` (0.8), `VIGIE_OVERLAP_GRACE_S` (600), `VIGIE_ACTIVITY_GAP_S`
   (300); weights are the constants `SIGNAL_WEIGHTS` in `config.py`.

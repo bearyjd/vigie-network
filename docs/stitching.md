@@ -4,10 +4,17 @@ Implements PRP-001 section 8 in `server/src/vigie_pipeline/` (`stitch.py`, `stit
 `activity.py`, `snapshot.py`). It runs at the end of every `run_once`, after observations are
 updated, in a single `inventory.db` transaction. There are no API changes in this round.
 
-The design rule is unchanged: the pipeline can **continue** an identity only under a rule a human
-approved; everything else is a **suggestion** a human decides. The pipeline never writes
+The design rule is unchanged: the pipeline can **continue** an identity only under an active rule
+read from `overrides.db`; everything else is a **suggestion** a human decides. The pipeline never writes
 `overrides.db`, never creates a group or a trust level, and never produces an attachment without a
-matching active human rule.
+matching active, non-blank-creator rule.
+
+**Trust boundary (what is and is not enforced here).** The pipeline enforces exactly: "the rule is
+an active row of `overrides.db` (not revoked, not expired) with a non-blank `created_by`". Whether
+the creator is a *human* is **not** checkable in the pipeline (`created_by` is only a principal
+name). That is enforced by the API alone: the rule-creation API (not yet built) MUST be the sole
+writer of `identity_rules` and MUST reject non-human principals (service tokens). Heuristics only
+ever suggest; the pipeline never writes `overrides.db`.
 
 ## 1. Inputs
 
@@ -24,6 +31,13 @@ is quoted because it is an SQL keyword). A silence **longer than** `VIGIE_ACTIVI
 (default 300 s) starts a new interval. Folding is idempotent and order independent (late batches
 coalesce with neighbours). Rows whose `end` is older than 7 days are purged at the end of each run.
 The table is derived and can be dropped.
+
+Row timestamps come from the collector and are untrusted. When a batch is folded, a stamp outside
+`[batch received_at - 7 d (activity retention), batch received_at + 300 s]` is **ignored** (not
+clamped, not stored): a router without an RTC emits epoch-near stamps and a hostile or broken
+collector could send far-future ones, either of which would fake observed history and mature a MAC
+instantly. The 300 s allows for ordinary clock skew (`ACTIVITY_SKEW_S`). The ingest wire contract is
+unchanged.
 
 When the intervals are loaded for a pass, any interval shorter than `VIGIE_ACTIVITY_GAP_S` is widened
 symmetrically to that width (a stamp means "present around then"). A single stamp, or a burst of
@@ -79,14 +93,23 @@ per unordered pair, and there is no suggestion. A rolling device that briefly ho
 rolling device presents as a chain of MACs: an impostor beside it overlaps the chain, not one MAC.
 A device linked by `identity_links` contributes all of its MACs.
 
+The veto also fires when the overlap covers the candidate's **whole** covered time
+(`overlap >= OVERLAP_COVER_RATIO * covered`, ratio 1.0, overlap > 0), even if it is below the grace.
+A ratio of 0.5 was tried and rejected: it vetoes the legitimate `rolling_mac` fixture, whose
+middle MACs hand over to both neighbours (widened to 300 s, 2 x 120 s overlap = 0.8) and every
+ratio below 1.0 fails it. At 1.0 only MACs wholly inside another matching device's presence are
+vetoed (the `hostname_spoof_full_fingerprint` copy, and a roll that lived entirely inside an
+attacker's presence in `rolling_fingerprint_copy_present`: indistinguishable, so a human decides).
+
 **Maturity.** The veto only works on observed history, so a MAC is not eligible for a rule attach
-until its observed activity span (first start to last end, after widening) is **strictly longer than**
-the grace window. Until then it is deferred silently (no attach, no event; it may still get a
-fingerprint suggestion, which is withdrawn if the pair later becomes vetoed). With a span longer
-than the grace, a copy that is present the whole time overlaps by at least its span and is vetoed;
-with `>=` an overlap of exactly the grace would slip through. Consequence: a device that rolls its
-MAC more often than every grace window (default 10 min) is not covered by rule attach and stays a
-human decision.
+until its **covered time** (the sum of its activity intervals after widening, not the first-to-last
+span) is **strictly longer than** the grace window. Sparse stamps therefore cannot mature a MAC
+cheaply: two stamps 700 s apart cover only 2 x 300 s. Until then it is deferred silently (no attach,
+no event; it may still get a fingerprint suggestion, which is withdrawn if the pair later becomes
+vetoed). With covered time longer than the grace, a copy that is present the whole time overlaps by
+at least its covered time and is vetoed; with `>=` an overlap of exactly the grace would slip
+through. Consequence: a device that rolls its MAC more often than every grace window (default
+10 min) is not covered by rule attach and stays a human decision.
 
 When a pair becomes `vetoed` or `ambiguous`, its open (undecided, unexpired) suggestion is
 withdrawn: `suggestions.expires_at` is set to just before now, so every consumer sees it as
@@ -94,7 +117,8 @@ expired. Decided suggestions are never touched and `overrides.db` is not involve
 
 ## 5. Suggestions
 For a unique, non-vetoed candidate with `score >= threshold` the pipeline inserts one row in
-`suggestions` (never updated afterwards):
+`suggestions`. Suggestions are immutable, with one exception: withdrawal (section 4) rewrites
+`expires_at` of an undecided suggestion to just before now; nothing else is ever updated:
 
 | Field | Value |
 |---|---|
@@ -120,19 +144,22 @@ principals cannot be rejected here; that distinction has to come from the rule-c
 (opt55 as a `"1,2,3"` string or a list of ints); every field the rule names must equal the MAC's.
 For a randomized self MAC:
 
-0. The MAC is mature (section 4) and its signature is not flooded (section 12).
+0. The MAC is mature (section 4) and its name group is not flooded (section 12).
 1. The set of **distinct canonical devices** (following `identity_links`) whose active rules match
    must have exactly one member. Two or more devices: nothing attaches, the candidate is
    `ambiguous`, one `identity_candidate_ambiguous` event. Several rules for one device are fine.
-2. No sustained overlap (as section 4) between the MAC and the rule device's MACs plus every other
-   MAC that matches **any** matched rule; otherwise `vetoed`.
+2. No sustained overlap (as section 4) between the MAC and the rule device's MACs plus **every other
+   MAC with the same opt55, opt60 and an agreeing hostname or mDNS name** (candidate-style match, not
+   the rule's stricter one: the victim's own new MAC, e.g. before its mDNS name is seen, is a peer
+   too); otherwise `vetoed`. The veto is evaluated before the attach, in the same pass.
 3. Group gate: both the rule device and the MAC's own device must have `identity_state='ok'`
-   (`conflict` / `pending_confirm` go to the confirm suggestion). Then the rule device's `device_overrides.group_id` is NULL or absent (unassigned) or its
-   group has `auto_inherit=1` (defaults: `iot`, `guest`) -> **attach**. An `auto_inherit=0` group,
-   or a group row that cannot be found, -> no attach; a `merge_identity` suggestion with
-   `reason_code='rule_hit_needs_confirm'` is created instead and the MAC stays unassigned until a
-   human accepts it. If a `fingerprint_match` suggestion for the pair is already open it is kept
-   (one open suggestion per pair).
+   (`conflict` / `pending_confirm` go to the confirm suggestion). Then the rule device must have an
+   explicit group (`device_overrides.group_id` set) whose group has `auto_inherit=1` (defaults:
+   `iot`, `guest`) -> **attach**. A device with **no group** (unassigned, no `device_overrides`
+   row or a NULL group), an `auto_inherit=0` group, or a group row that cannot be found -> no
+   attach; a `merge_identity` suggestion with `reason_code='rule_hit_needs_confirm'` is created
+   instead and the MAC stays unassigned until a human accepts it. If a `fingerprint_match`
+   suggestion for the pair is already open it is kept (one open suggestion per pair).
 
 **Attach** sets `observations.device_id` to the canonical rule device with `link_source='rule'`,
 `link_rule_id`, `link_score` (the rule's score), widens that device's `first_seen`/`last_seen`,
@@ -143,7 +170,7 @@ new MAC only.
 
 Revoking or expiring a rule **never detaches** an existing attachment in this round (no
 `mac_detached` yet). **Attachments are also not re-gated when the group changes**: a MAC attached
-while the device was unassigned or in an `auto_inherit=1` group stays attached after the device is
+while the device was in an `auto_inherit=1` group stays attached after the device is
 moved to an `auto_inherit=0` group, and a later group change does not re-run the gate. Applying a
 rule twice changes nothing. After each attach the canonical map is refreshed for the next MAC.
 
@@ -156,10 +183,11 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
 - The snapshot is read in one `BEGIN`/`COMMIT` read transaction. Anything unexpected fails closed
   (`OverridesUnreadable`, run goes on without stitching): a missing column, a non-integer
   `auto_inherit` or `version`, or live rules while the `device_overrides` table is missing (that
-  would read as "unassigned", which attaches).
+  would read as "unassigned", which now only suggests; still fail closed).
 - Missing `overrides.db`: no rules, basis 0. Present but unreadable: stitching is skipped for the
   run and logged (`stitching_skipped`, ERROR); nothing is created. Other missing tables are read as empty.
-- No attachment without a matching active human rule; no group or trust is created.
+- No attachment without a matching active, non-blank-creator rule (human-ness is the API's job,
+  see the trust boundary above); no group or trust is created.
 - Hostile hostnames/mDNS names never appear in logs, events or suggestion payloads (hashes only;
   values are already control-character-stripped at ingest). They are present in the `evidence`
   column of `identity_candidates`, which consumers must treat as untrusted text.
@@ -173,7 +201,7 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
 - **Fingerprint copy while the victim is present** is vetoed once the overlap exceeds the grace.
   A short-lived impostor (under the grace) is not vetoed.
 - **Short fixtures:** `hostname_spoof_full_fingerprint` has only 300 s of concurrency, inside the
-  default 600 s grace, so by default it is a suggestion; a grace of 240 s vetoes it.
+  default 600 s grace, but the copy is wholly inside the victim's presence, so it is vetoed.
 
 ## 9. Fixture limitation: iOS sends no opt60
 The committed iPhone archetype (and real iOS) sends no DHCP option 60. Since a candidate requires
@@ -196,11 +224,19 @@ seeded `overrides.db` is built with the API's own migrations in `stitch_helpers.
 ingest app and `run_once`).
 
 ## 12. Flood bounds
-All matching is done inside the `(opt55, opt60)` bucket of the MAC, never against every observation.
-- A bucket with more than `MAX_SIGNATURE_BUCKET` (64) MACs is **flooded**: none of its MACs is
-  rule-attached or compared in that pass, and one `signature_flood` event (warn, short hash of the
-  signature and the MAC count) is written per pass per signature. Fail closed: a legitimate device
-  with that many MACs needs a human.
+All matching is done inside **name groups**: MACs with the same opt55, opt60 and one agreeing
+hostname (or mDNS name), never against every observation.
+- A name group with more than `MAX_SIGNATURE_BUCKET` (64) **live** MACs is **flooded**. Live = still
+  `link_source='self'` AND active inside the 7 d activity retention window, so MACs that were
+  attached by a rule, retired or have gone silent do not count (a device that legitimately rolls
+  once per pass never floods itself). MACs with other names never share the group, so a swarm of
+  junk-hostname MACs does not touch the victim's group. A MAC with any flooded group is neither
+  rule-attached nor compared. One `signature_flood` event (warn, short hash of the group and the
+  count) is written per group per **UTC day** (`events.dedup` token), not per pass. Fail closed, and
+  deliberately **without a suggestion**: a flooded group creates no attach and no candidate.
+  Residual: an attacker who sends 65 live MACs with the victim's exact opt55, opt60 and hostname
+  blocks that victim's rule attach until those MACs go silent; this is a denial of service on
+  convenience, never an attach, and is visible as the flood event.
 - At most `MAX_ROWS_PER_PASS` (200) new or changed `identity_candidates` plus created `suggestions` rows
   are written per pass; the rest wait for later passes (existing rows are unaffected).
 - Once-only events (`identity_overlap_veto`, `identity_candidate_ambiguous`, `identity_candidate`) use

@@ -25,7 +25,7 @@ from vigie_pipeline.overrides import open_overrides_ro
 RULE = "11111111-rule"
 
 
-def seeded(data: Data, *, group: str | None = None, rule_kw: dict | None = None, a_end: int = 300):
+def seeded(data: Data, *, group: str | None = "iot", rule_kw: dict | None = None, a_end: int = 300):
     """Device A exists (mac 1), a human rule says its signature is A, optionally in `group`."""
     a = appear(data, 1, 0, a_end)
     run(data)
@@ -48,7 +48,7 @@ def digest(ov: Overrides) -> str:
     return hashlib.sha256(ov.path.read_bytes()).hexdigest()
 
 
-def test_rule_attaches_unassigned_device_and_retires_the_orphan(data):
+def test_rule_attaches_auto_inherit_device_and_retires_the_orphan(data):
     ov, dev = seeded(data)
     b = appear(data, 2, 400, 1100)
     run(data)
@@ -75,7 +75,7 @@ def test_attach_is_idempotent_and_overrides_stay_byte_identical(data):
     assert digest(ov) == before
     groups = ov.conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
     assert (
-        groups == 5 and ov.conn.execute("SELECT COUNT(*) FROM device_overrides").fetchone()[0] == 0
+        groups == 5 and ov.conn.execute("SELECT COUNT(*) FROM device_overrides").fetchone()[0] == 1
     )
     ov.close()
 
@@ -211,6 +211,7 @@ def test_attach_follows_identity_links_to_the_canonical_device(data):
     z = appear(data, 6, 0, 100, opt55="[9]")
     run(data)
     ov.link(dev, device_of(data, z))
+    ov.override(device_of(data, z), "iot", version=1)  # the canonical device decides the gate
     b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["device_id"] == device_of(data, z)
@@ -255,7 +256,7 @@ def test_pipeline_connection_to_overrides_is_read_only(data):
 
 
 def test_group_row_that_cannot_be_found_fails_closed(data):
-    ov, dev = seeded(data)
+    ov, dev = seeded(data, group=None)
     ov.conn.execute("PRAGMA foreign_keys=OFF")  # a dangling group reference
     ov.override(dev, "ghost-group")
     b = appear(data, 2, 400, 1100)

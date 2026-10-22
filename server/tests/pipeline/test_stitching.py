@@ -216,7 +216,7 @@ def test_overlap_grace_is_configurable(data):
 
 def test_overlap_exactly_at_grace_is_tolerated(data):
     appear(data, 1, 0, 600)
-    appear(data, 2, 0, 600, mdns=MDNS)
+    appear(data, 2, 0, 1260, mdns=MDNS)  # overlap 600; covered 1260, so below the half-covered rule
     run(data, overlap_grace_s=600)
     assert [c["state"] for c in candidates(data)] == ["suggested"]  # vetoed only when > grace
 

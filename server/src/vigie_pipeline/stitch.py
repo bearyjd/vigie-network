@@ -1,8 +1,11 @@
 """Identity stitching (PRP section 8; docs/stitching.md): candidates, ambiguity, overlap veto,
 immutable merge suggestions, and application of human-approved standing rules.
 
-The pipeline never writes overrides.db and never creates trust. A rule is applied only when a
-human approved it; everything else stays a suggestion for a human to accept.
+The pipeline never writes overrides.db and never creates trust. It applies a rule only when it
+is an active, non-blank-creator rule read from overrides.db. That the creator is a human is NOT
+checkable here (created_by is just a principal name): it is enforced by the API, which must be the
+sole writer of identity_rules and must reject non-human principals. Everything else stays a
+suggestion for a human to accept.
 """
 
 from __future__ import annotations
@@ -13,12 +16,14 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from vigie_ingest.db import immediate
 from vigie_pipeline.activity import Interval, load_activity, merge_intervals, overlap_seconds
 from vigie_pipeline.config import (
     MAX_ROWS_PER_PASS,
     MAX_SIGNATURE_BUCKET,
+    OVERLAP_COVER_RATIO,
     SIGNAL_WEIGHTS,
     PipelineConfig,
 )
@@ -59,6 +64,17 @@ class StitchStats:
     ambiguous: int = 0
     flooded: int = 0
     capped: int = 0
+
+
+GroupKey = tuple[str, str, str, str]
+
+
+def group_keys(o: Obs) -> list[GroupKey]:
+    """Name groups of a MAC: (opt55, opt60, kind, casefolded name) per available name."""
+    if not (o.opt55 and o.opt60):
+        return []
+    return [(o.opt55, o.opt60, kind, name.casefold())
+            for kind, name in (("h", o.hostname), ("m", o.mdns)) if name]  # fmt: skip
 
 
 def short_hash(value: str) -> str:
@@ -124,18 +140,18 @@ class Stitcher:
         self.act = load_activity(inv, cfg.activity_gap_s)
         self.stats = StitchStats()
         self.handled: set[str] = set()
-        self.flooded_keys: set[tuple[str, str]] = set()
+        self.flooded_keys: set[GroupKey] = set()
         self.writes = 0  # candidate/suggestion rows written this pass
         self.reload()
 
     def reload(self) -> None:
         self.obs = _load_obs(self.inv, self.snap)
         self.by_canon: dict[str, list[Obs]] = defaultdict(list)
-        self.buckets: dict[tuple[str, str], list[Obs]] = defaultdict(list)
+        self.groups: dict[GroupKey, list[Obs]] = defaultdict(list)
         for o in self.obs:
             self.by_canon[o.canon].append(o)
-            if o.opt55 and o.opt60:
-                self.buckets[(o.opt55, o.opt60)].append(o)
+            for key in group_keys(o):
+                self.groups[key].append(o)
         self._canon_ivs: dict[str, list[Interval]] = {}
 
     # ---- activity helpers -------------------------------------------------------------------
@@ -151,15 +167,34 @@ class Stitcher:
             self._canon_ivs[canon] = self._union(o.mac for o in self.by_canon.get(canon, []))
         return self._canon_ivs[canon]
 
-    def span(self, mac: str) -> int:
-        """Observed activity span: first start to last end (after minimum-width widening)."""
-        ivs = self.act.get(mac)
-        return ivs[-1][1] - ivs[0][0] if ivs else 0
+    def covered(self, mac: str) -> int:
+        """Seconds of observed activity (sum of the widened intervals): sparse stamps count only
+        for the time they cover, not for the span between them."""
+        return sum(end - start for start, end in self.act.get(mac, ()))
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
-        """Concurrent activity longer than the grace window (intersection, not just touching)."""
+        """Concurrent activity that rules out a rolling twin: longer than the grace window, or at
+        least half of everything this MAC was ever seen doing (so covered time that barely
+        exceeds the grace cannot hide an overlap equal to it)."""
         overlap = overlap_seconds(self.act.get(mac, []), self._union(others))
-        return overlap > self.cfg.overlap_grace_s
+        return overlap > self.cfg.overlap_grace_s or (
+            overlap > 0 and overlap >= OVERLAP_COVER_RATIO * self.covered(mac)
+        )
+
+    def _live(self, o: Obs) -> bool:
+        """Still a self device and active inside the activity retention window."""
+        ivs = self.act.get(o.mac)
+        return (
+            o.source == "self"
+            and bool(ivs)
+            and ivs[-1][1] >= self.now - self.cfg.activity_retention_s
+        )
+
+    def name_peers(self, c: Obs) -> list[Obs]:
+        """Every other MAC with c's opt55 and opt60 and an agreeing hostname or mDNS name: the
+        candidate-style match, whatever other fields a rule may additionally name."""
+        found = {o.mac: o for key in group_keys(c) for o in self.groups[key] if o.mac != c.mac}
+        return list(found.values())
 
     def eligible(self, o: Obs) -> bool:
         return bool(
@@ -168,20 +203,26 @@ class Stitcher:
         )  # fmt: skip
 
     def _flooded(self, o: Obs) -> bool:
-        """A signature shared by too many MACs is skipped for the pass (one event per pass)."""
-        key = (o.opt55 or "", o.opt60 or "")
-        size = len(self.buckets.get(key, ()))
-        if size <= MAX_SIGNATURE_BUCKET:
-            return False
-        if key not in self.flooded_keys:
-            self.flooded_keys.add(key)
+        """A name group (opt55, opt60 and one hostname or mDNS name) with more than
+        MAX_SIGNATURE_BUCKET live MACs is skipped: attached, retired or silent MACs do not count,
+        and MACs with other names never share the group. One event per group per UTC day."""
+        over = [
+            (key, size)
+            for key in group_keys(o)
+            if (size := sum(1 for p in self.groups[key] if self._live(p))) > MAX_SIGNATURE_BUCKET
+        ]
+        fresh = [(key, size) for key, size in over if key not in self.flooded_keys]
+        if fresh:  # one event for the whole flooded population, however many names it shares
+            key, size = fresh[0]
+            token = short_hash("|".join(key))
+            day = datetime.fromtimestamp(self.now, tz=UTC).strftime("%Y-%m-%d")
+            emit_once(self.inv, o.device_id, "signature_flood", "warn",
+                      f"signature flood {token}: {size} MACs skipped", f"{token}:{day}",
+                      self.now)  # fmt: skip
+            log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
             self.stats.flooded += 1
-            emit_event(self.inv, o.device_id, "signature_flood", "warn",
-                       f"signature flood {short_hash('|'.join(key))}: {size} MACs skipped",
-                       self.now)  # fmt: skip
-            log(logger, logging.WARNING, "signature_flood", signature=short_hash("|".join(key)),
-                macs=size)  # fmt: skip
-        return True
+        self.flooded_keys.update(key for key, _ in over)
+        return bool(over)
 
     def _eligible_sorted(self) -> list[Obs]:
         return sorted(
@@ -272,7 +313,7 @@ class Stitcher:
         return bool(row) and row[0] == "ok"
 
     def _apply_rule(self, c: Obs) -> None:
-        if self.span(c.mac) <= self.cfg.overlap_grace_s:
+        if self.covered(c.mac) <= self.cfg.overlap_grace_s:
             return  # too little observed history to rule out an overlapping twin: defer quietly
         matched = [r for r in self.snap.rules if rule_matches(r, c)]
         targets = sorted({self.snap.canonical(r.device_id) for r in matched})
@@ -290,20 +331,17 @@ class Stitcher:
         self.handled.add(c.mac)
         rule = min((r for r in matched), key=lambda r: r.id)
         score = rule_score(rule)
-        peers = self._canon_macs([target]) | {
-            o.mac
-            for r in matched
-            for o in self.buckets.get((r.opt55, r.opt60), ())
-            if o.mac != c.mac and rule_matches(r, o)
-        }
+        # peers: the target's MACs plus every MAC that agrees with c on opt55, opt60 and a name,
+        # even one a stricter rule would not match (the victim's own new, partial MAC)
+        peers = self._canon_macs([target]) | {o.mac for o in self.name_peers(c)}
         if self.sustained(c.mac, peers - {c.mac}):
             self._veto(c, target, score, evidence)
             return
         group = self.snap.overrides.get(target, (0, None))[1]
         trusted_state = self._state_ok(target) and self._state_ok(c.device_id)
-        if trusted_state and (group is None or self.snap.group_auto_inherit.get(group) == 1):
+        if trusted_state and group is not None and self.snap.group_auto_inherit.get(group) == 1:
             self._attach(c, target, rule, score)
-        else:  # auto_inherit=0, unknown group or identity_state != 'ok': a human must confirm
+        else:  # unassigned, auto_inherit=0, unknown group or identity_state != 'ok': human confirms
             found = ["opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n))]
             self._suggest(c, target, score, evidence, "rule_hit_needs_confirm", found)
 
@@ -356,8 +394,7 @@ class Stitcher:
         return not self.eligible(p) or p.mac < c.mac  # tie: only one direction per pair
 
     def _candidate(self, c: Obs) -> None:
-        bucket = self.buckets.get((c.opt55 or "", c.opt60 or ""), ())
-        peers = [(o, f) for o in bucket if o.mac != c.mac and o.canon != c.canon
+        peers = [(o, f) for o in self.name_peers(c) if o.canon != c.canon
                  if is_candidate_match(f := signals(c, o))]  # fmt: skip
         older = [(o, f) for o, f in peers if self._older(o, c)]
         if not older:

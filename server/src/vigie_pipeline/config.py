@@ -20,9 +20,11 @@ SIGNAL_WEIGHTS: dict[str, float] = {
     "hostname": 0.2,
 }
 SUGGEST_THRESHOLD_DEFAULT = 0.8
+OVERLAP_COVER_RATIO = 1.0  # lower breaks the rolling_mac fixture (docs/stitching.md section 4)
 OVERLAP_GRACE_DEFAULT_S = 600
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
+ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 SUGGESTION_TTL_DEFAULT_S = 7 * 86400
 # Flood bounds (docs/stitching.md section 12): a signature (opt55, opt60) shared by more MACs than
 # this is skipped for the pass; at most this many candidate/suggestion rows are written per pass.
