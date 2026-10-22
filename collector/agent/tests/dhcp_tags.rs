@@ -95,11 +95,47 @@ fn tags_alone_creates_no_context() {
 }
 
 #[test]
-fn overlong_or_control_tags_line_is_unparsed_and_breaks_context() {
-    let long = l(&format!("7 tags: {}", "a".repeat(500)));
+fn tags_after_a_dns_line_does_not_reopen_a_context() {
+    let dns = l("7 192.168.1.9/5353 query[A] x.test from 192.168.1.9");
+    let lines = [req(7), dns, tags(7), opts(7), vendor(7), ack(7)];
+    assert_empty(&one(&lines));
+}
+
+#[test]
+fn tags_after_an_unparsed_line_does_not_reopen_a_context() {
+    let junk = l("7 some unknown line");
+    let lines = [req(7), junk, tags(7), opts(7), vendor(7), ack(7)];
+    assert_empty(&one(&lines));
+}
+
+#[test]
+fn tags_value_length_and_charset_do_not_matter() {
+    // The tag value is never used, so a router with many or non-ASCII tags keeps its fingerprints.
+    for value in [
+        "a".repeat(500),
+        "a".repeat(1024),
+        "br-lan caf\u{e9} \u{4e2d}\u{6587}".into(),
+    ] {
+        let t = l(&format!("7 tags: {value}"));
+        assert_full(&one(&[req(7), t, opts(7), vendor(7), ack(7)]));
+    }
+    // a long tags line of ANOTHER xid still breaks the context
+    let other = l(&format!("8 tags: {}", "a".repeat(500)));
+    assert_empty(&one(&[req(7), other, opts(7), vendor(7), ack(7)]));
+}
+
+#[test]
+fn control_char_or_over_1024_char_tags_line_is_unparsed_and_breaks_context() {
+    let long = l(&format!("7 tags: {}", "a".repeat(1025)));
     assert_empty(&one(&[req(7), long, opts(7), vendor(7), ack(7)]));
-    let ctl = l("7 tags: br\u{1b}[0m");
-    assert_empty(&one(&[req(7), ctl, opts(7), vendor(7), ack(7)]));
+    for ctl in [
+        "7 tags: br\u{1b}[0m",
+        "7 tags: br\u{7f}",
+        "7 tags: a\tb",
+        "7 tags: a\u{85}b",
+    ] {
+        assert_empty(&one(&[req(7), l(ctl), opts(7), vendor(7), ack(7)]));
+    }
 }
 
 #[test]

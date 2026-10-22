@@ -69,7 +69,8 @@ that contains dnsmasq's `tags:` line.** `raw_lease.opt55` was `[]` and `opt60` N
 Cause: `parse_dhcp` did not recognise `<id> tags: br-lan`, `poll_log` treats an unparsed line as
 `break_context()`, and the assembler attaches `requested options:` / `vendor class:` only to the packet
 line directly before them. Fix (`dnsmasq.rs`): `LogEvent::DhcpTags`, parsed from the exact prefix
-`tags:` with a bounded (64) printable value, is NEUTRAL: it keeps the attach context only when its xid
+`tags:` for the current xid with any value (it is never used) of at most 1024 characters and no control
+characters, is NEUTRAL: it keeps the attach context only when its xid
 equals the context's xid, drops it otherwise, and never opens one. The sequential-stream security
 properties are unchanged (boundary verbs taint and break, unparsed/DNS lines break, xid must match,
 interleaved MACs give empty fingerprints). Tests: `collector/agent/tests/dhcp_tags.rs` (including the
@@ -87,13 +88,15 @@ design, not a regression. The chain can only assert "hidden by default, visible 
 
 **F3 (LOW, collector) FIXED. Lease-file rows carried no fingerprint** and could shadow one captured from
 the log. `Window::add_lease` now never overwrites a non-empty opt55/opt60 with an empty one, within the
-window and across windows (a bounded per-MAC memory of 1024 MACs that survives `take`). A new non-empty
-value still replaces the old. The server-side first-wins rule is unchanged (not reviewed here).
+window and across windows (a bounded per-MAC memory of 1024 MACs that survives `take`; the oldest MAC is
+evicted when full). The pair (opt55, opt60) is one unit: a lease with any non-empty field replaces the
+stored pair as received (no hybrid of new opt55 and old opt60). The server-side first-wins rule is unchanged (not reviewed here).
 
 **F4 (INFO, collector) FIXED. `dns_log_quiet` was always true outside a router.** `dropin_path` and
 `log_dir` are now `Config` options (defaults: the old constants `/tmp/dnsmasq.d/vigie.conf`,
 `/tmp/vigie`), used by the periodic drop-in check. `run_e2e.sh` sets both and writes a matching drop-in,
-and `assert_ingest.py` requires `dns_log_quiet` false on every batch.
+and `assert_ingest.py` requires `dns_log_quiet` false on every batch. Both must be clean absolute paths, and
+`dnsmasq_log` must equal `<log_dir>/dnsmasq.log` unless `allow_custom_log_path=1`.
 
 **F5 (LOW) first conntrack snapshot is unmapped.** The helper's first snapshot arrived before the
 neighbor table knew the hosts: `batches.truncated = {"ct_unmapped_bytes":54800,"ct_unmapped_flows":3}`.

@@ -71,10 +71,15 @@ def main() -> int:
     people = [(LAPTOP, "laptop", False), (CAMERA, "camera", True)]
     people += [(m, "phone " + m[-2:], True) for m in PHONE]
     for mac, label, want_class in people:
-        mine = [r for r in rows["raw_lease"] if r[3] == mac]
-        check(any(r[6] not in ("[]", None, "") for r in mine), f"{label}: non-empty opt55 in raw_lease")
-        if want_class:
-            check(any(r[7] not in (None, "") for r in mine), f"{label}: non-empty opt60 in raw_lease")
+        # A fingerprint, once seen for a device, never goes empty again within the run (F3).
+        mine = sorted((r for r in rows["raw_lease"] if r[3] == mac), key=lambda r: r[2])
+        fields = [(6, "opt55")] + ([(7, "opt60")] if want_class else [])
+        for col, name in fields:
+            filled = [r[col] not in ("[]", None, "") for r in mine]
+            first = filled.index(True) if True in filled else None
+            check(first is not None, f"{label}: non-empty {name} in raw_lease")
+            check(first is not None and all(filled[first:]),
+                  f"{label}: {name} never empty again after its first non-empty row")
     check(any(r[7] == "android-dhcp-14" for r in rows["raw_lease"] if r[3] in PHONE),
           "phone vendor class android-dhcp-14")
     check(any(r[7] == "udhcp 1.31.1" for r in rows["raw_lease"] if r[3] == CAMERA),

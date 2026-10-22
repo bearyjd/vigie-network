@@ -125,10 +125,10 @@ lan_addr=127.0.0.1
 lan_prefix=8
 lan_iface=lo
 dropin_path=$RUN/dnsmasq-dropin.conf
-log_dir=$RUN/vigie-log
+log_dir=$RUN
 EOF
 	# the drop-in the root script would write (F4)
-	printf 'log-queries=extra\nlog-dhcp\nlog-facility=%s/dnsmasq.log\n' "$RUN/vigie-log" >"$RUN/dnsmasq-dropin.conf"
+	printf 'log-queries=extra\nlog-dhcp\nlog-facility=%s/dnsmasq.log\n' "$RUN" >"$RUN/dnsmasq-dropin.conf"
 }
 
 s_collector_check() {

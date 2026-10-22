@@ -85,3 +85,69 @@ fn bad_source_options_are_startup_errors() {
     let dup = format!("{}lan_prefix=24\nlan_prefix=16\n", base());
     assert!(parse_config(&dup).is_err(), "duplicates stay errors");
 }
+
+#[test]
+fn dropin_path_and_log_dir_must_be_clean_absolute_paths() {
+    for bad in [
+        "log_dir=relative/dir",
+        "dropin_path=relative.conf",
+        "log_dir=/run/../etc",
+        "dropin_path=/run/../etc/x.conf",
+        "log_dir=/run/vl/",
+        "dropin_path=/run/d.conf/",
+        "log_dir=/",
+        "log_dir=/run/v\0l",
+        "dropin_path=/run/d\0.conf",
+    ] {
+        assert!(
+            parse_config(&format!("{}{bad}\n", base())).is_err(),
+            "{bad:?}"
+        );
+    }
+    let ok = format!("{}dropin_path=/run/d..x.conf\nlog_dir=/run/vl\n", base());
+    assert!(
+        parse_config(&ok).is_ok(),
+        "`..` inside a name is not a component"
+    );
+}
+
+#[test]
+fn dnsmasq_log_must_be_under_log_dir_unless_explicitly_allowed() {
+    // default follows log_dir (the root scripts write the drop-in's log-facility there)
+    let c = parse_config(&format!("{}log_dir=/run/vl\n", base())).unwrap();
+    assert_eq!(c.dnsmasq_log.to_str(), Some("/run/vl/dnsmasq.log"));
+    let same = format!(
+        "{}log_dir=/run/vl\ndnsmasq_log=/run/vl/dnsmasq.log\n",
+        base()
+    );
+    assert!(parse_config(&same).is_ok());
+    for bad in [
+        "dnsmasq_log=/var/log/other.log",
+        "log_dir=/run/vl\ndnsmasq_log=/tmp/vigie/dnsmasq.log",
+        "dnsmasq_log=/tmp/vigie/other.log",
+    ] {
+        assert!(
+            parse_config(&format!("{}{bad}\n", base())).is_err(),
+            "{bad}"
+        );
+    }
+    let custom = format!(
+        "{}dnsmasq_log=/var/log/other.log\nallow_custom_log_path=1\n",
+        base()
+    );
+    let c = parse_config(&custom).unwrap();
+    assert_eq!(c.dnsmasq_log.to_str(), Some("/var/log/other.log"));
+    for bad in [
+        "allow_custom_log_path=yes",
+        "allow_custom_log_path=",
+        "allow_custom_log_path=2",
+    ] {
+        let t = format!("{}dnsmasq_log=/var/log/other.log\n{bad}\n", base());
+        assert!(parse_config(&t).is_err(), "{bad}");
+    }
+    let off = format!(
+        "{}dnsmasq_log=/var/log/other.log\nallow_custom_log_path=0\n",
+        base()
+    );
+    assert!(parse_config(&off).is_err());
+}

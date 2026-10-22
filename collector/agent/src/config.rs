@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 pub const MAX_KEY_FILE_BYTES: usize = 1024;
 pub const MIN_KEY_BYTES: usize = 32;
 const DEFAULT_KEY_FILE: &str = "/etc/vigie/key";
-const DEFAULT_DNSMASQ_LOG: &str = "/tmp/vigie/dnsmasq.log";
 const DEFAULT_LEASES_FILE: &str = "/tmp/dhcp.leases";
 const DEFAULT_CONNTRACK_SOCKET: &str = "/tmp/vigie/conntrack.sock";
 const DEFAULT_LAN_ADDR: &str = "192.168.8.1";
@@ -105,7 +104,7 @@ fn is_pin(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-const KNOWN: [&str; 14] = [
+const KNOWN: [&str; 15] = [
     "server_url",
     "collector_id",
     "key_id",
@@ -116,11 +115,31 @@ const KNOWN: [&str; 14] = [
     "leases_file",
     "dropin_path",
     "log_dir",
+    "allow_custom_log_path",
     "conntrack_socket",
     "lan_addr",
     "lan_prefix",
     "lan_iface",
 ];
+
+/// Absolute, no `..` component, no trailing slash, no NUL.
+fn check_clean_abs_path(name: &str, p: &std::path::Path) -> Result<(), ConfigError> {
+    let text = p.to_string_lossy();
+    let clean = p.is_absolute()
+        && text.len() > 1
+        && !text.ends_with('/')
+        && !text.contains('\0')
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if clean {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "{name} must be an absolute path without `..`, trailing slash or NUL"
+        )))
+    }
+}
 
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     let mut vals: Vec<(&str, &str)> = Vec::new();
@@ -216,10 +235,28 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         opt("dropin_path", crate::dropin::DROPIN_PATH),
         opt("log_dir", crate::dropin::LOG_DIR),
     );
-    if dropin_path.as_os_str().is_empty() || log_dir.as_os_str().is_empty() {
-        return Err(ConfigError::Invalid(
-            "dropin_path or log_dir is empty".into(),
-        ));
+    check_clean_abs_path("dropin_path", &dropin_path)?;
+    check_clean_abs_path("log_dir", &log_dir)?;
+    // The root scripts hardcode /tmp/vigie and /tmp/dnsmasq.d, and dnsmasq writes the log to
+    // `<log_dir>/dnsmasq.log` (the drop-in's log-facility). A different `dnsmasq_log` would make
+    // the agent tail a file nothing writes (or one an attacker controls), so it needs an explicit
+    // opt-in.
+    let default_log = log_dir.join("dnsmasq.log");
+    let dnsmasq_log = opt("dnsmasq_log", &default_log.to_string_lossy());
+    let allow_custom = match get_or("allow_custom_log_path", "0") {
+        "0" => false,
+        "1" => true,
+        _ => {
+            return Err(ConfigError::Invalid(
+                "allow_custom_log_path must be 0 or 1".into(),
+            ))
+        }
+    };
+    if !allow_custom && dnsmasq_log != default_log {
+        return Err(ConfigError::Invalid(format!(
+            "dnsmasq_log must be {} (log_dir/dnsmasq.log) unless allow_custom_log_path=1",
+            default_log.display()
+        )));
     }
     Ok(Config {
         server_url: server_url.into(),
@@ -227,7 +264,7 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         key_id: key_id.into(),
         pins: [p1.into(), p2.into()],
         key_file: opt("key_file", DEFAULT_KEY_FILE),
-        dnsmasq_log: opt("dnsmasq_log", DEFAULT_DNSMASQ_LOG),
+        dnsmasq_log,
         leases_file: opt("leases_file", DEFAULT_LEASES_FILE),
         dropin_path,
         log_dir,
