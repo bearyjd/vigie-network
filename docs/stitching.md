@@ -93,13 +93,18 @@ per unordered pair, and there is no suggestion. A rolling device that briefly ho
 rolling device presents as a chain of MACs: an impostor beside it overlaps the chain, not one MAC.
 A device linked by `identity_links` contributes all of its MACs.
 
-The veto also fires when the overlap covers the candidate's **whole** covered time
-(`overlap >= OVERLAP_COVER_RATIO * covered`, ratio 1.0, overlap > 0), even if it is below the grace.
-A ratio of 0.5 was tried and rejected: it vetoes the legitimate `rolling_mac` fixture, whose
-middle MACs hand over to both neighbours (widened to 300 s, 2 x 120 s overlap = 0.8) and every
-ratio below 1.0 fails it. At 1.0 only MACs wholly inside another matching device's presence are
-vetoed (the `hostname_spoof_full_fingerprint` copy, and a roll that lived entirely inside an
-attacker's presence in `rolling_fingerprint_copy_present`: indistinguishable, so a human decides).
+**Peer presence tail and own-time lead.** A silent peer is not gone until a full activity gap
+(`VIGIE_ACTIVITY_GAP_S`, 300 s) has passed, so an *established* peer interval (longer than
+`PEER_TAIL_MIN_GRACE_MULT` = 2 grace windows) is extended by one gap past its last stamp before the
+overlap is computed. Short bursts (the minutes-long MACs of a fast roller) get no tail, otherwise
+every hand-over of the `rolling_mac` fixtures would count as concurrent. Even below the grace, the
+veto fires when the overlap covers **all** of the candidate's covered time, or, for a MAC observed
+longer than the grace, when it leaves **less than half a gap** (150 s) of the MAC's own time. This
+closes the "tail lead" bypass (an attacker present for 610 s beside a victim that stamps sparsely,
+whose last stamp is 10 s earlier, used to slip under the old ratio test). Half a gap, not a whole
+one: a lone stamp is widened by that much on each side, so a legitimate roll that overlaps its
+neighbour by a few minutes always has up to a gap less own time than it seems. A ratio of 0.5 was
+tried and rejected (it vetoes the legitimate `rolling_mac` fixture); `OVERLAP_COVER_RATIO` is gone.
 
 **Maturity.** The veto only works on observed history, so a MAC is not eligible for a rule attach
 until its **covered time** (the sum of its activity intervals after widening, not the first-to-last
@@ -168,6 +173,13 @@ candidates become `dismissed`; an already open suggestion for it simply expires)
 `mac_attached` on the target device. The event summary carries 8-hex hashes of the previous and
 new MAC only.
 
+**Peers.** The overlap veto compares the MAC with the union of: the target device's MACs, its
+name peers (same opt55, opt60 and an agreeing hostname or mDNS name) and its *compatible peers*:
+live self MACs with the same opt55 and opt60 whose hostname and mDNS name do not contradict its
+own (a missing name is not a contradiction). The last set catches the victim's new MAC that has
+shown only an mDNS name, or no hostname yet, beside a twin that copied the hostname. A device with
+a different name never counts. Rule-attached MACs are re-checked every pass (section 8).
+
 Revoking or expiring a rule **never detaches** an existing attachment in this round (no
 `mac_detached` yet). **Attachments are also not re-gated when the group changes**: a MAC attached
 while the device was in an `auto_inherit=1` group stays attached after the device is
@@ -198,8 +210,21 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
   to veto. Without a rule it is a suggestion the human sees; with an approved rule in an
   `auto_inherit` group the copy **is attached**. Only behavioural demotion (not built) or the
   human can catch it. Owner mitigation: keep `trusted`/`kids` at `auto_inherit=0`.
-- **Fingerprint copy while the victim is present** is vetoed once the overlap exceeds the grace.
-  A short-lived impostor (under the grace) is not vetoed.
+- **Fingerprint copy while the victim is present** is vetoed once the overlap exceeds the grace,
+  or sooner when it leaves less than half a gap of own time (section 4). A short-lived impostor
+  (under the grace) is not vetoed.
+- **Post-attach squatting and lockout.** The veto sees only activity observed so far. A MAC that
+  was attached while the victim looked absent (stamps are sparse, or the victim's new MAC had not
+  yet shown a name) stays attached even if the victim then turns out to have been present. The
+  attacker then owns a rule-attached MAC in the victim's device and the victim's later rolls
+  overlap it, so they are vetoed (a lockout that only a human can undo). Detection, not repair:
+  every pass re-checks each rule-attached MAC against its device's peers (the device's other
+  MACs, its name peers and the compatible peers of section 6) and, on sustained overlap, emits one
+  `rule_attach_suspect` event (warn, on the target device, once per MAC). The pipeline does **not**
+  detach (it must not rewrite trust) and creates **no suggestion**: the suggestion kinds
+  (`label`, `move_group`, `quarantine`, `merge_identity`) have no "review this attachment"
+  action, `merge_identity` points the wrong way and `quarantine` would quarantine the victim's
+  whole device. The event is the human's cue; detaching waits for the API (`mac_detached`).
 - **Short fixtures:** `hostname_spoof_full_fingerprint` has only 300 s of concurrency, inside the
   default 600 s grace, but the copy is wholly inside the victim's presence, so it is vetoed.
 
@@ -218,7 +243,7 @@ must be supported, the signature needs a different second factor (decision for t
 - Pruning of candidate rows.
 
 ## 11. Tests
-`server/tests/pipeline/test_stitching.py`, `test_stitch_rules.py`, `test_stitch_review.py` (unit and rule harness; the
+`server/tests/pipeline/test_stitching.py`, `test_stitch_rules.py`, `test_stitch_review.py`, `test_stitch_review3.py`, `test_stitch_perf.py` (unit and rule harness; the
 seeded `overrides.db` is built with the API's own migrations in `stitch_helpers.py`) and
 `tools/trafficgen/tests/test_stitching.py` (every relevant committed fixture through the real
 ingest app and `run_once`).
@@ -242,3 +267,22 @@ hostname (or mDNS name), never against every observation.
 - Once-only events (`identity_overlap_veto`, `identity_candidate_ambiguous`, `identity_candidate`) use
   the indexed column `events.dedup` with a unique index on `(kind, dedup)` (pipeline schema v5)
   instead of an `instr()` scan over all summaries.
+
+### CPU bounds (review 3)
+Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
+- Live group sizes are computed once per reload, not per member. Concurrent device pairs of a name
+  group are found by one sweep per pass (cached), not pairwise per candidate.
+- Only each MAC's `MAX_INTERVALS_PER_MAC` (64) most recent activity intervals are compared.
+- A global budget of `MAX_OVERLAP_OPS_PER_PASS` (20000 units, about 64 interval comparisons each)
+  applies per pass. When it runs out the pass stops stitching new candidates (the decision in
+  flight is abandoned before any write, so nothing is half-decided) and emits one
+  `stitch_budget_exhausted` event per UTC day. Candidates without a candidate row are processed
+  first, so repeated exhaustion still makes progress. The measured worst cases (16 groups x 64 MACs
+  x 50 intervals, 1 x 64 x 200) finish in well under a second.
+- The candidate loop stops as soon as `MAX_ROWS_PER_PASS` is reached.
+- At most `MAX_FLOOD_EVENTS_PER_PASS` (20) new `signature_flood` events are written per pass; any
+  further flooded groups that pass are counted in one `signature_flood_summary` event per UTC day
+  and reported by their own events on later passes.
+- Activity lower bound: stamps of a MAC with no stored activity older than 24 h
+  (`ACTIVITY_NEW_MAC_LOOKBACK_S`) before the batch receipt are ignored, so a brand-new MAC cannot
+  back-fill days of history; a known MAC keeps the 7 d retention window.

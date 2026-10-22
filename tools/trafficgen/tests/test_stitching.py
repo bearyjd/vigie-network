@@ -144,16 +144,16 @@ def test_overlap_veto_fixture_short_overlap_stitches_and_sustained_overlap_is_ve
 
 def test_fingerprint_copy_victim_present_is_vetoed(ingest):
     w = World(ingest, "rolling_fingerprint_copy_present")
-    first, *later = w.macs["dev-08"]
+    first, r1, r2, r3, r4 = w.macs["dev-08"]
     attacker = w.macs["dev-09"][0]
-    assert w.edges()[(attacker, first)] == "vetoed"
-    assert all(a != attacker for a, _, _ in w.suggested())
-    # a roll that lived wholly inside the attacker's presence is indistinguishable: vetoed too
-    suggested = {s[:2] for s in w.suggested()}
-    vetoed = {k for k, v in w.edges().items() if v == "vetoed"}
-    assert {(m, first) for m in later} == suggested | (vetoed - {(attacker, first)})
-    assert len(suggested) >= 2
-    assert w.count("identity_overlap_veto") == 1 + len(vetoed - {(attacker, first)})
+    # exact outcomes: the copy is vetoed; so is roll r3, which lived wholly inside the copy's
+    # presence (indistinguishable from it, a human decides); the other rolls are suggested
+    assert w.edges() == {
+        (r1, first): "suggested", (r2, first): "suggested", (r3, first): "vetoed",
+        (r4, first): "suggested", (attacker, first): "vetoed",
+    }  # fmt: skip
+    assert w.suggested() == {(m, first, "fingerprint_match") for m in (r1, r2, r4)}
+    assert w.count("identity_overlap_veto") == 2
 
 
 def test_fingerprint_copy_victim_away_yields_a_suggestion_the_human_decides(ingest):
@@ -193,16 +193,19 @@ def test_copy_away_into_a_confirm_group_attaches_nothing(ingest):
 
 
 def test_victim_present_rule_never_attaches_the_overlapping_copy(ingest):
-    """With a low grace the fast rollers overlap the copy too, so they are vetoed as well (a
-    signature shared by concurrent MACs is not trusted, though one short roll may slip
-    through); the copy must never attach."""
+    """With a low grace the fast rollers overlap the copy too: only one short roll (r1, which
+    overlaps nothing beyond the grace) attaches; every other roll and the copy are vetoed or
+    ambiguous. The copy must never attach."""
     w = World(ingest, "rolling_fingerprint_copy_present", overlap_grace_s=RULE_GRACE_S)
-    first = w.macs["dev-08"][0]
+    first, r1, r2, r3, r4 = w.macs["dev-08"]
     attacker = w.macs["dev-09"][0]
     w.seed_rule(first, ROLLER_SIG, group="iot")
-    assert w.link_source(attacker) == "self"
+    rule_attached = {m for m in [*w.macs["dev-08"], attacker] if w.link_source(m) == "rule"}
+    assert rule_attached == {r1}
+    assert w.link_source(attacker) == "self" and w.device(attacker) != w.device(first)
+    into_first = {a for (a, b), st in w.edges().items() if b == first and st == "vetoed"}
+    assert into_first == {r2, r3, r4, attacker}
     assert w.edges()[(attacker, first)] == "vetoed"
-    assert w.device(attacker) != w.device(first)
 
 
 def test_victim_present_with_default_grace_defers_every_short_lived_roll(ingest):
@@ -220,7 +223,7 @@ def test_hostname_only_spoof_is_never_a_candidate(ingest):
     assert w.edges() == {} and w.suggested() == set()
 
 
-def test_full_fingerprint_spoof_concurrent_beyond_grace_is_vetoed(ingest):
+def test_full_fingerprint_spoof_inside_grace_but_wholly_covered_is_vetoed(ingest):
     """The fixture runs 6 min: concurrent for 300 s, inside the default 10 min grace, but the
     copy is wholly inside the victim's presence (overlap == its covered time), so it is vetoed."""
     w = World(ingest, "hostname_spoof_full_fingerprint")

@@ -127,9 +127,13 @@ def test_activity_window_boundaries(pinv):
     assert _fold(pinv, {rec + 300}, rec) == [rec + 300]  # small clock skew accepted
     pinv.execute("DELETE FROM mac_activity")
     assert _fold(pinv, {rec + 301}, rec) == []
-    assert _fold(pinv, {rec - week}, rec) == [rec - week]  # exactly the retention edge
+    # a MAC with stored activity keeps the whole retention window (a brand-new one only gets 24 h:
+    # test_stitch_review3.test_new_mac_stamps_older_than_a_day_are_ignored_known_mac_keeps_the_week)
+    assert _fold(pinv, {rec - week}, rec) == []  # new MAC: the retention edge is too old
     pinv.execute("DELETE FROM mac_activity")
-    assert _fold(pinv, {rec - week - 1}, rec) == []
+    _fold(pinv, {rec}, rec)  # now known
+    assert _fold(pinv, {rec - week}, rec) == [rec - week, rec]  # exactly the retention edge
+    assert _fold(pinv, {rec - week - 1}, rec) == [rec - week, rec]
 
 
 # ---- H3: the victim's own partial-signature MAC is a veto peer ----------------------------------

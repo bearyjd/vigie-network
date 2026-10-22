@@ -21,9 +21,12 @@ from datetime import UTC, datetime
 from vigie_ingest.db import immediate
 from vigie_pipeline.activity import Interval, load_activity, merge_intervals, overlap_seconds
 from vigie_pipeline.config import (
+    MAX_FLOOD_EVENTS_PER_PASS,
+    MAX_INTERVALS_PER_MAC,
+    MAX_OVERLAP_OPS_PER_PASS,
     MAX_ROWS_PER_PASS,
     MAX_SIGNATURE_BUCKET,
-    OVERLAP_COVER_RATIO,
+    PEER_TAIL_MIN_GRACE_MULT,
     SIGNAL_WEIGHTS,
     PipelineConfig,
 )
@@ -64,9 +67,14 @@ class StitchStats:
     ambiguous: int = 0
     flooded: int = 0
     capped: int = 0
+    suspect: int = 0
 
 
 GroupKey = tuple[str, str, str, str]
+
+
+class BudgetExhaustedError(Exception):
+    """The per-pass overlap-computation budget is spent: stop stitching new candidates."""
 
 
 def group_keys(o: Obs) -> list[GroupKey]:
@@ -137,7 +145,14 @@ def _load_obs(inv: sqlite3.Connection, snap: Snapshot) -> list[Obs]:
 class Stitcher:
     def __init__(self, inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float):
         self.inv, self.snap, self.cfg, self.now = inv, snap, cfg, now
-        self.act = load_activity(inv, cfg.activity_gap_s)
+        self.act = {  # only the most recent intervals of a MAC are compared
+            m: ivs[-MAX_INTERVALS_PER_MAC:]
+            for m, ivs in load_activity(inv, cfg.activity_gap_s).items()
+        }
+        self.ops = 0  # overlap-computation budget spent this pass
+        self.exhausted = False
+        self.flood_events = 0
+        self.flood_suppressed = 0
         self.stats = StitchStats()
         self.handled: set[str] = set()
         self.flooded_keys: set[GroupKey] = set()
@@ -153,11 +168,23 @@ class Stitcher:
             for key in group_keys(o):
                 self.groups[key].append(o)
         self._canon_ivs: dict[str, list[Interval]] = {}
+        self._bad_pairs_cache: dict[tuple[GroupKey, ...], set[frozenset[str]]] = {}
+        self._live_sizes: dict[GroupKey, int] | None = None
+        self._by_fp: dict[tuple[str | None, str | None], list[Obs]] | None = None
+
+    def _charge(self, units: int = 1) -> None:
+        self.ops += units
+        if self.ops > MAX_OVERLAP_OPS_PER_PASS:
+            raise BudgetExhaustedError
 
     # ---- activity helpers -------------------------------------------------------------------
 
-    def _union(self, macs: Iterable[str]) -> list[Interval]:
-        return merge_intervals(iv for m in set(macs) for iv in self.act.get(m, []))
+    def _union(self, macs: Iterable[str], tail: int = 0) -> list[Interval]:
+        """Merged activity of several MACs; `tail` extends every interval end (presence presumed
+        until a full gap passes silently)."""
+        ivs = [(s, e + tail) for m in set(macs) for s, e in self.act.get(m, ())]
+        self._charge(1 + len(ivs) // 256)
+        return merge_intervals(ivs)
 
     def _canon_macs(self, canons: Iterable[str]) -> set[str]:
         return {o.mac for c in canons for o in self.by_canon.get(c, [])}
@@ -173,12 +200,25 @@ class Stitcher:
         return sum(end - start for start, end in self.act.get(mac, ()))
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
-        """Concurrent activity that rules out a rolling twin: longer than the grace window, or at
-        least half of everything this MAC was ever seen doing (so covered time that barely
-        exceeds the grace cannot hide an overlap equal to it)."""
-        overlap = overlap_seconds(self.act.get(mac, []), self._union(others))
-        return overlap > self.cfg.overlap_grace_s or (
-            overlap > 0 and overlap >= OVERLAP_COVER_RATIO * self.covered(mac)
+        """Concurrent activity that rules out a rolling twin. Sustained = overlap longer than the
+        grace window; OR any overlap covering all of this MAC's time; OR, for a MAC observed longer
+        than the grace, any overlap leaving it less than half an activity gap of time of its own
+        (a "tail lead" of seconds of attacker-only time must not defeat the veto; half a gap
+        because a lone stamp is widened by that much on each side). An established peer interval
+        (longer than PEER_TAIL_MIN_GRACE_MULT grace windows) is presumed present for one gap past
+        its last stamp, since it is only gone after a full gap of silence; short bursts, like
+        the minutes-long MACs of a fast roller, get no such tail."""
+        grace, gap = self.cfg.overlap_grace_s, self.cfg.activity_gap_s
+        ivs = [
+            (s, e + (gap if e - s > PEER_TAIL_MIN_GRACE_MULT * grace else 0))
+            for m in set(others) for s, e in self.act.get(m, ())
+        ]  # fmt: skip
+        self._charge(2 + len(ivs) // 256)
+        overlap = overlap_seconds(self.act.get(mac, []), merge_intervals(ivs))
+        covered = self.covered(mac)
+        lead = covered - overlap
+        return overlap > grace or (
+            overlap > 0 and (lead <= 0 or (covered > grace and lead < gap // 2))
         )
 
     def _live(self, o: Obs) -> bool:
@@ -196,38 +236,80 @@ class Stitcher:
         found = {o.mac: o for key in group_keys(c) for o in self.groups[key] if o.mac != c.mac}
         return list(found.values())
 
+    def compatible_peers(self, c: Obs) -> set[str]:
+        """Live self MACs with c's opt55 and opt60 whose hostname and mDNS name do not contradict
+        c's (a missing name cannot be told apart): the victim's new MAC that has only revealed an
+        mDNS name, or no hostname yet, is still a peer of a hostname-copying twin."""
+        if self._by_fp is None:
+            self._by_fp = defaultdict(list)
+            for o in self.obs:
+                if self._live(o):
+                    self._by_fp[(o.opt55, o.opt60)].append(o)
+        pool = self._by_fp.get((c.opt55, c.opt60), [])
+        self._charge(1 + len(pool) // 64)
+        return {
+            o.mac for o in pool
+            if o.mac != c.mac and not (
+                (o.hostname and c.hostname and not _same(o.hostname, c.hostname))
+                or (o.mdns and c.mdns and not _same(o.mdns, c.mdns))
+            )
+        }  # fmt: skip
+
     def eligible(self, o: Obs) -> bool:
         return bool(
             o.source == "self" and o.randomized and o.canon == o.device_id
             and o.opt55 and o.opt60 and (o.hostname or o.mdns) and self.act.get(o.mac)
         )  # fmt: skip
 
+    def _live_size(self, key: GroupKey) -> int:
+        if self._live_sizes is None:  # once per reload, not once per member
+            sizes: dict[GroupKey, int] = defaultdict(int)
+            for o in self.obs:
+                if self._live(o):
+                    for k in group_keys(o):
+                        sizes[k] += 1
+            self._live_sizes = sizes
+        return self._live_sizes.get(key, 0)
+
     def _flooded(self, o: Obs) -> bool:
         """A name group (opt55, opt60 and one hostname or mDNS name) with more than
         MAX_SIGNATURE_BUCKET live MACs is skipped: attached, retired or silent MACs do not count,
-        and MACs with other names never share the group. One event per group per UTC day."""
+        and MACs with other names never share the group. One event per group per UTC day; at most
+        MAX_FLOOD_EVENTS_PER_PASS new events per pass, the rest are counted in one daily summary."""
         over = [
             (key, size)
             for key in group_keys(o)
-            if (size := sum(1 for p in self.groups[key] if self._live(p))) > MAX_SIGNATURE_BUCKET
+            if (size := self._live_size(key)) > MAX_SIGNATURE_BUCKET
         ]
         fresh = [(key, size) for key, size in over if key not in self.flooded_keys]
         if fresh:  # one event for the whole flooded population, however many names it shares
             key, size = fresh[0]
-            token = short_hash("|".join(key))
-            day = datetime.fromtimestamp(self.now, tz=UTC).strftime("%Y-%m-%d")
-            emit_once(self.inv, o.device_id, "signature_flood", "warn",
-                      f"signature flood {token}: {size} MACs skipped", f"{token}:{day}",
-                      self.now)  # fmt: skip
-            log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
-            self.stats.flooded += 1
+            if self.flood_events >= MAX_FLOOD_EVENTS_PER_PASS:
+                self.flood_suppressed += 1
+            else:
+                token = short_hash("|".join(key))
+                if emit_once(self.inv, o.device_id, "signature_flood", "warn",
+                             f"signature flood {token}: {size} MACs skipped",
+                             f"{token}:{self._day()}", self.now):  # fmt: skip
+                    self.flood_events += 1
+                log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
+                self.stats.flooded += 1
         self.flooded_keys.update(key for key, _ in over)
         return bool(over)
 
-    def _eligible_sorted(self) -> list[Obs]:
+    def _day(self) -> str:
+        return datetime.fromtimestamp(self.now, tz=UTC).strftime("%Y-%m-%d")
+
+    def _eligible_sorted(self, undecided_first: bool = False) -> list[Obs]:
+        """Eligible, unflooded MACs by age. With undecided_first, MACs that have no candidate row
+        yet go first, so a pass that runs out of budget still makes progress on new ones."""
+        decided = (
+            {r[0] for r in self.inv.execute("SELECT DISTINCT device_a FROM identity_candidates")}
+            if undecided_first else set()
+        )  # fmt: skip
         return sorted(
             (o for o in self.obs if self.eligible(o) and not self._flooded(o)),
-            key=lambda o: (o.first_seen, o.mac),
+            key=lambda o: (o.device_id in decided, o.first_seen, o.mac),
         )
 
     def _full(self) -> bool:
@@ -300,11 +382,47 @@ class Stitcher:
 
     # ---- pass 1: standing rules --------------------------------------------------------------
 
+    def run(self) -> None:
+        for step in (self.apply_rules, self.stitch_candidates):
+            if self.exhausted:
+                break
+            try:
+                step()
+            except BudgetExhaustedError:  # raised before any write of the interrupted decision
+                self.exhausted = True
+                emit_once(self.inv, None, "stitch_budget_exhausted", "warn",
+                          "stitching overlap budget exhausted: remaining candidates resume next"
+                          " pass", self._day(), self.now)  # fmt: skip
+                log(logger, logging.WARNING, "stitch_budget_exhausted", ops=self.ops)
+        if self.flood_suppressed:
+            emit_once(self.inv, None, "signature_flood_summary", "warn",
+                      f"{self.flood_suppressed} further signature floods not reported this pass",
+                      f"summary:{self._day()}", self.now)  # fmt: skip
+
     def apply_rules(self) -> None:
-        if not self.snap.rules:
-            return
-        for c in self._eligible_sorted():
-            self._apply_rule(c)
+        if self.snap.rules:
+            for c in self._eligible_sorted():
+                self._apply_rule(c)
+        self._recheck_rule_attached()
+
+    def _recheck_rule_attached(self) -> None:
+        """A rule-attached MAC found to overlap its peers beyond the veto limit is only flagged:
+        the pipeline never rewrites trust (no detach). One rule_attach_suspect event per MAC."""
+        for o in self.obs:
+            if o.source != "rule" or not self.act.get(o.mac):
+                continue
+            peers = (
+                self._canon_macs([o.canon]) | {p.mac for p in self.name_peers(o)}
+                | self.compatible_peers(o)
+            ) - {o.mac}  # fmt: skip
+            if not self.sustained(o.mac, peers):
+                continue
+            token = f"{short_hash(o.mac)}~{o.canon}"
+            if emit_once(self.inv, o.canon, "rule_attach_suspect", "warn",
+                         f"rule attach suspect {short_hash(o.mac)}: sustained overlap with peers",
+                         token, self.now):  # fmt: skip
+                self.stats.suspect += 1
+                log(logger, logging.WARNING, "rule_attach_suspect", mac=short_hash(o.mac))
 
     def _state_ok(self, device_id: str) -> bool:
         row = self.inv.execute(
@@ -331,9 +449,13 @@ class Stitcher:
         self.handled.add(c.mac)
         rule = min((r for r in matched), key=lambda r: r.id)
         score = rule_score(rule)
-        # peers: the target's MACs plus every MAC that agrees with c on opt55, opt60 and a name,
-        # even one a stricter rule would not match (the victim's own new, partial MAC)
-        peers = self._canon_macs([target]) | {o.mac for o in self.name_peers(c)}
+        # peers: the target's MACs, every MAC that agrees with c on opt55, opt60 and a name (even
+        # one a stricter rule would not match) and every live MAC with the same opt55 and opt60
+        # whose names do not contradict c's (the victim's own new MAC that has only an mDNS name)
+        peers = (
+            self._canon_macs([target]) | {o.mac for o in self.name_peers(c)}
+            | self.compatible_peers(c)
+        )  # fmt: skip
         if self.sustained(c.mac, peers - {c.mac}):
             self._veto(c, target, score, evidence)
             return
@@ -384,7 +506,9 @@ class Stitcher:
     # ---- pass 2: fingerprint candidates ----------------------------------------------------------
 
     def stitch_candidates(self) -> None:
-        for c in self._eligible_sorted():
+        for c in self._eligible_sorted(undecided_first=True):
+            if self._full():
+                break
             if c.mac not in self.handled:
                 self._candidate(c)
 
@@ -408,7 +532,7 @@ class Stitcher:
         score = score_of(best_f)
         evidence = {**_evidence(c), "into_mac": best_o.mac, "signals": best_f}
         canons = sorted(by_dev)
-        if self._has_concurrent_pair(canons):
+        if self._has_concurrent_pair(c, canons):
             self._ambiguous(c, canons, score, evidence)
         elif self.sustained(c.mac, self._canon_macs(canons)):
             self._veto(c, into, score, evidence)
@@ -417,14 +541,38 @@ class Stitcher:
         else:
             self._record(c, into, score, evidence, "open")
 
-    def _has_concurrent_pair(self, canons: list[str]) -> bool:
+    def _has_concurrent_pair(self, c: Obs, canons: list[str]) -> bool:
         """Two matching devices that were active together beyond the grace window are provably
-        distinct: the signature then names more than one device."""
-        return any(
-            overlap_seconds(self._canon_union(a), self._canon_union(b)) > self.cfg.overlap_grace_s
-            for i, a in enumerate(canons)
-            for b in canons[i + 1 :]
-        )
+        distinct: the signature then names more than one device. The concurrent pairs of c's name
+        groups are computed once per pass (a sweep) and short-circuit on the first hit."""
+        bad = self._concurrent_pairs(tuple(sorted(group_keys(c))))
+        have = set(canons)
+        return any(pair <= have for pair in bad)
+
+    def _concurrent_pairs(self, keys: tuple[GroupKey, ...]) -> set[frozenset[str]]:
+        if keys in self._bad_pairs_cache:
+            return self._bad_pairs_cache[keys]
+        canons = {o.canon for k in keys for o in self.groups[k]}
+        events = sorted((s, e, c) for c in canons for s, e in self._canon_union(c))
+        grace, bad = self.cfg.overlap_grace_s, set()
+        acc: dict[frozenset[str], int] = defaultdict(int)
+        active: list[tuple[int, str]] = []  # (end, canon) of intervals still open at the sweep
+        steps = 0
+        for start, end, canon in events:
+            active = [a for a in active if a[0] > start]
+            steps += 1 + len(active)
+            if steps >= 64:  # one budget unit per 64 comparisons
+                self._charge(steps // 64)
+                steps %= 64
+            for a_end, a_canon in active:
+                pair = frozenset((a_canon, canon))
+                if pair not in bad:
+                    acc[pair] += min(a_end, end) - start
+                    if acc[pair] > grace:
+                        bad.add(pair)
+            active.append((end, canon))
+        self._bad_pairs_cache[keys] = bad
+        return bad
 
 
 HASHED = ("opt55", "opt60", "hostname", "mdns_name")
@@ -440,7 +588,6 @@ def stitch(inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: fl
     """One stitching pass over inventory.db (a single transaction)."""
     with immediate(inv):
         stitcher = Stitcher(inv, snap, cfg, now)
-        stitcher.apply_rules()
-        stitcher.stitch_candidates()
+        stitcher.run()
     log(logger, logging.INFO, "stitch_complete", **stitcher.stats.__dict__)
     return stitcher.stats

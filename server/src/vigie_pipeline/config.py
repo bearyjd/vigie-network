@@ -20,16 +20,29 @@ SIGNAL_WEIGHTS: dict[str, float] = {
     "hostname": 0.2,
 }
 SUGGEST_THRESHOLD_DEFAULT = 0.8
-OVERLAP_COVER_RATIO = 1.0  # lower breaks the rolling_mac fixture (docs/stitching.md section 4)
 OVERLAP_GRACE_DEFAULT_S = 600
+# A peer's interval is presumed to last one activity gap past its last stamp only when it is an
+# established presence: longer than this many grace windows (so minutes-long rollers are not).
+PEER_TAIL_MIN_GRACE_MULT = 2
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
+# A MAC with no stored activity only gets stamps this recent (relative to batch receipt): history
+# cannot be back-filled for a brand-new MAC, so a forged old stamp cannot mature it.
+ACTIVITY_NEW_MAC_LOOKBACK_S = 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 SUGGESTION_TTL_DEFAULT_S = 7 * 86400
 # Flood bounds (docs/stitching.md section 12): a signature (opt55, opt60) shared by more MACs than
 # this is skipped for the pass; at most this many candidate/suggestion rows are written per pass.
 MAX_SIGNATURE_BUCKET = 64
 MAX_ROWS_PER_PASS = 200
+# CPU bounds inside the stitching transaction (docs/stitching.md section 12): at most this many
+# most-recent activity intervals are considered per MAC, and at most this many interval-overlap
+# computations are charged per pass; when the budget runs out the pass stops stitching new
+# candidates (the rest resume next pass) and emits one stitch_budget_exhausted event per UTC day.
+MAX_INTERVALS_PER_MAC = 64
+MAX_OVERLAP_OPS_PER_PASS = 20000
+# At most this many signature_flood events per pass; further new floods get one daily summary.
+MAX_FLOOD_EVENTS_PER_PASS = 20
 
 
 def _opt_path(value: str | None) -> Path | None:
