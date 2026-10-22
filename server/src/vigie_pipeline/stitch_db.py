@@ -41,7 +41,8 @@ def emit_event(
 def upsert_candidate(
     inv: sqlite3.Connection, a: str, b: str, score: float, evidence: dict, state: str, now: float
 ) -> tuple[str, bool]:
-    """One row per (from, into). Returns (id, state_changed_or_new). 'dismissed' is sticky."""
+    """One row per (from, into). Returns (id, state_changed_or_new). 'dismissed' and 'vetoed' are
+    sticky: no later evidence, stitcher view or capped window rewrites them."""
     text = json.dumps(evidence, sort_keys=True)
     row = inv.execute(
         "SELECT id, state FROM identity_candidates WHERE device_a=? AND device_b=?", (a, b)
@@ -54,8 +55,8 @@ def upsert_candidate(
             (cid, a, b, score, text, state, iso_utc(now)),
         )
         return cid, True
-    if row["state"] == "dismissed":
-        return row["id"], False
+    if row["state"] == "dismissed" or (row["state"] == "vetoed" and state != "vetoed"):
+        return row["id"], False  # dismissed and vetoed are sticky
     inv.execute(
         "UPDATE identity_candidates SET score=?, evidence=?, state=? WHERE id=?",
         (score, text, state, row["id"]),

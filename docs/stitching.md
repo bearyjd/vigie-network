@@ -176,7 +176,9 @@ new MAC only.
 **Peers.** The overlap veto compares the MAC with the union of: the target device's MACs, its
 name peers (same opt55, opt60 and an agreeing hostname or mDNS name) and its *compatible peers*:
 live self MACs with the same opt55 and opt60 whose hostname and mDNS name do not contradict its
-own (a missing name is not a contradiction). The last set catches the victim's new MAC that has
+own (a missing name is not a contradiction), except that a MAC with no name at all counts only
+when first seen within one activity gap of the candidate's first sighting; more than
+`MAX_SIGNATURE_BUCKET` such peers is a flood and attaches nothing. The last set catches the victim's new MAC that has
 shown only an mDNS name, or no hostname yet, beside a twin that copied the hostname. A device with
 a different name never counts. Rule-attached MACs are re-checked every pass (section 8).
 
@@ -225,6 +227,25 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
   (`label`, `move_group`, `quarantine`, `merge_identity`) have no "review this attachment"
   action, `merge_identity` points the wrong way and `quarantine` would quarantine the victim's
   whole device. The event is the human's cue; detaching waits for the API (`mac_detached`).
+- **Nameless MACs are not compatible peers.** A MAC with neither hostname nor mDNS name that
+  merely shares the public opt55/opt60 used to veto every legitimate roll and to flag legitimate
+  MACs as suspect. Now a nameless MAC counts as a compatible peer (section 6) only when its first
+  sighting is within one activity gap of the candidate's own; otherwise it is ignored. Residual: an
+  attacker who starts a nameless MAC at the same moment as the victim's new MAC can still veto
+  that one roll (denial of an attach, never an attach). A compatible-peer set larger than
+  `MAX_SIGNATURE_BUCKET` is a flood: no attach, no suggestion, one `signature_flood` event (the
+  re-check then ignores the pool and relies on the device's MACs and name peers).
+- **Vetoes are sticky; copy-before-victim.** A vetoed (candidate, target) pair is never
+  re-evaluated or rewritten by later passes (a `vetoed` row is only replaced by a human
+  `dismissed`), so neither the `MAX_INTERVALS_PER_MAC` window nor fresh lone stamps can launder the
+  overlap that justified it. The cap keeps the *newest* intervals; the residual is that an
+  overlap is only ever detected within the newest 64 intervals of each side at the time of the
+  first evaluation. Recipe at a high level: an attacker whose MAC appears *before* the victim's
+  new MAC, with 64 or more separate intervals of its own, while the victim looks absent, is first
+  evaluated with no overlap on record and can be attached; the victim's later roll then overlaps
+  it and is itself vetoed. That is the squatting case above and is only flagged (`rule_attach_suspect`).
+- **Budget exhaustion is visible, not silent.** `stitch_budget_exhausted` (warn, once per UTC day)
+  marks that some work resumes next pass; under a standing flood a phase can run out every pass.
 - **Short fixtures:** `hostname_spoof_full_fingerprint` has only 300 s of concurrency, inside the
   default 600 s grace, but the copy is wholly inside the victim's presence, so it is vetoed.
 
@@ -273,16 +294,29 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
 - Live group sizes are computed once per reload, not per member. Concurrent device pairs of a name
   group are found by one sweep per pass (cached), not pairwise per candidate.
 - Only each MAC's `MAX_INTERVALS_PER_MAC` (64) most recent activity intervals are compared.
-- A global budget of `MAX_OVERLAP_OPS_PER_PASS` (20000 units, about 64 interval comparisons each)
-  applies per pass. When it runs out the pass stops stitching new candidates (the decision in
-  flight is abandoned before any write, so nothing is half-decided) and emits one
-  `stitch_budget_exhausted` event per UTC day. Candidates without a candidate row are processed
-  first, so repeated exhaustion still makes progress. The measured worst cases (16 groups x 64 MACs
-  x 50 intervals, 1 x 64 x 200) finish in well under a second.
+- Budgets are **per phase**: each pass runs three phases, in this order, each with its own
+  `MAX_OVERLAP_OPS_PER_PASS` (20000 units, about 64 interval comparisons each) that is reset
+  before and after the phase: (1) the post-attach re-check of rule-attached MACs
+  (`rule_attach_suspect`), (2) standing rules, (3) fingerprint candidates. A phase that runs out
+  stops (the decision in flight is abandoned before any write, nothing is half-decided) but never
+  starves the others, and the pass emits one `stitch_budget_exhausted` event per UTC day however
+  many phases or passes ran out. Within the rule and candidate loops MACs without a candidate
+  row are processed first, so repeated exhaustion of a phase still makes progress on new MACs;
+  decided MACs wait. What is *not* guaranteed: the re-check has no ordering of its own, so a
+  budget stop there leaves the later rule-attached MACs unchecked until a cheaper pass; and a
+  vetoed (candidate, target) pair is skipped without any overlap work (section 8).
+- Not charged to any budget: `load_activity` (reads and widens every interval of every MAC before
+  the cap is applied) and the `sustained` work on a single peer set beyond one unit per 256
+  intervals. Measured at 640k stored intervals: about 3.1 s per pass inside `BEGIN IMMEDIATE`,
+  which holds the inventory write lock against a 5 s `busy_timeout`; a writer can therefore wait
+  that long, and a larger backlog would exceed it (bounded in practice by 7 d retention and the
+  collector rate limits). The earlier worst cases (16 groups x 64 MACs x 50 intervals, 1 x 64 x
+  200) finish in well under a second, but they do not include a large `mac_activity` table.
 - The candidate loop stops as soon as `MAX_ROWS_PER_PASS` is reached.
 - At most `MAX_FLOOD_EVENTS_PER_PASS` (20) new `signature_flood` events are written per pass; any
   further flooded groups that pass are counted in one `signature_flood_summary` event per UTC day
   and reported by their own events on later passes.
-- Activity lower bound: stamps of a MAC with no stored activity older than 24 h
-  (`ACTIVITY_NEW_MAC_LOOKBACK_S`) before the batch receipt are ignored, so a brand-new MAC cannot
-  back-fill days of history; a known MAC keeps the 7 d retention window.
+- Activity lower bound: stamps older than 24 h (`ACTIVITY_NEW_MAC_LOOKBACK_S`) before the batch
+  receipt are ignored **only in a MAC's first batch** (the MAC has no stored activity yet), so a
+  brand-new MAC cannot back-fill days of history; once a MAC has any stored activity every later
+  batch may carry stamps back to the 7 d retention window.
