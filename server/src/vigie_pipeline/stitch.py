@@ -38,11 +38,13 @@ from vigie_pipeline.config import (
     PEER_TAIL_MIN_GRACE_MULT,
     SIGNAL_WEIGHTS,
     STITCH_MAX_TXN_SECONDS,
+    STITCH_SETUP_MAX_SECONDS,
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
-from vigie_pipeline.snapshot import Rule, Snapshot
+from vigie_pipeline.snapshot import OverridesUnreadable, Rule, Snapshot, load_snapshot
 from vigie_pipeline.stitch_db import (
+    Attachment,
     candidate_state,
     candidate_write_needed,
     create_merge_suggestion,
@@ -50,9 +52,13 @@ from vigie_pipeline.stitch_db import (
     emit_once,
     event_exists,
     find_merge_suggestion,
+    load_attachments,
+    save_attachment,
     state_get,
     state_set,
     upsert_candidate,
+    vetoed_between,
+    widen_linked_devices,
     withdraw_open_suggestions,
 )
 
@@ -149,29 +155,36 @@ def rule_score(rule: Rule) -> float:
     return score_of(["opt55", "opt60", *named])
 
 
-def _load_obs(inv: sqlite3.Connection, snap: Snapshot) -> list[Obs]:
-    return [
-        Obs(r["mac"], r["device_id"], snap.canonical(r["device_id"]), bool(r["is_randomized"]),
-            r["link_source"], r["dhcp_fingerprint"] or None, r["vendor_class"] or None,
-            r["hostname"] or None, r["mdns_name"] or None, r["first_seen"],
-            r["status"] == "retired", r["link_rule_id"])
-        for r in inv.execute(
-            "SELECT o.mac, o.device_id, o.is_randomized, o.dhcp_fingerprint, o.vendor_class,"
-            " o.hostname, o.mdns_name, o.link_source, o.first_seen, o.link_rule_id, d.status"
-            " FROM observations o JOIN devices d ON d.id = o.device_id"
-            " ORDER BY o.first_seen, o.mac"
-        )
-    ]  # fmt: skip
+def _load_obs(inv: sqlite3.Connection, snap: Snapshot, tick: Callable[[], None]) -> list[Obs]:
+    """Every observation; `tick` is called every few thousand rows so that a huge inventory
+    cannot hold the write lock for long (it raises BudgetExhaustedError)."""
+    out = []
+    for i, r in enumerate(inv.execute(
+        "SELECT o.mac, o.device_id, o.is_randomized, o.dhcp_fingerprint, o.vendor_class,"
+        " o.hostname, o.mdns_name, o.link_source, o.first_seen, o.link_rule_id, d.status"
+        " FROM observations o JOIN devices d ON d.id = o.device_id"
+        " ORDER BY o.first_seen, o.mac"
+    )):  # fmt: skip
+        if not i % 4096:
+            tick()
+        out.append(
+            Obs(r["mac"], r["device_id"], snap.canonical(r["device_id"]), bool(r["is_randomized"]),
+                r["link_source"], r["dhcp_fingerprint"] or None, r["vendor_class"] or None,
+                r["hostname"] or None, r["mdns_name"] or None, r["first_seen"],
+                r["status"] == "retired", r["link_rule_id"])
+        )  # fmt: skip
+    return out
 
 
 class Stitcher:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
-        clock: Callable[[], float] | None = None,
+        clock: Callable[[], float] | None = None, overrides: sqlite3.Connection | None = None,
     ):  # fmt: skip
         self.inv, self.snap, self.cfg, self.now = inv, snap, cfg, now
         self.clock = clock or (lambda: now)  # rule expiry is re-checked against this
-        self.deadline = time.monotonic() + STITCH_MAX_TXN_SECONDS
+        self.overrides = overrides  # re-read under the lock before an attach
+        self.deadline = time.monotonic() + STITCH_SETUP_MAX_SECONDS  # setup only; see run()
         self.first_recv = load_first_received(inv)  # SERVER time each MAC was first received
         self.act = {  # only the most recent intervals of a MAC are compared
             m: ivs[-MAX_INTERVALS_PER_MAC:]
@@ -187,10 +200,20 @@ class Stitcher:
         self.handled: set[str] = set()
         self.flooded_keys: set[GroupKey] = set()
         self.writes = 0  # candidate/suggestion rows written this pass
+        self.attachments = load_attachments(inv)  # immutable evidence of each rule attach
+        members: dict[str, set[str]] = defaultdict(set)
+        for device in snap.links:  # every device merged (transitively) into a canonical one
+            members[snap.canonical(device)].add(device)
+        self.members = members
         self.reload()
 
+    def alias_ids(self, device_id: str) -> set[str]:
+        """The device id, its canonical device and every device merged into that one."""
+        canon = self.snap.canonical(device_id)
+        return {device_id, canon, *self.members.get(canon, ())}
+
     def reload(self) -> None:
-        self.obs = _load_obs(self.inv, self.snap)
+        self.obs = _load_obs(self.inv, self.snap, self._check_time)
         self.by_mac = {o.mac: o for o in self.obs}
         self.by_canon: dict[str, list[Obs]] = defaultdict(list)
         self.groups: dict[GroupKey, list[Obs]] = defaultdict(list)
@@ -202,6 +225,10 @@ class Stitcher:
         self._bad_pairs_cache: dict[tuple[GroupKey, ...], set[frozenset[str]]] = {}
         self._live_sizes: dict[GroupKey, int] | None = None
         self._by_fp: dict[tuple[str | None, str | None], list[Obs]] | None = None
+
+    def _check_time(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise BudgetExhaustedError
 
     def _charge(self, units: int = 1) -> None:
         """Spend work units; raises (before the decision in flight writes anything) when the
@@ -238,8 +265,8 @@ class Stitcher:
         first received by the server more than the grace window ago (the server clock, not a
         collector stamp)."""
         grace = self.cfg.overlap_grace_s
-        first = self.first_recv.get(mac)
-        return self.covered(mac) > grace and (first is None or self.now - first > grace)
+        first = self.first_recv.get(mac)  # no anchor: unknown age, so not mature (fail closed)
+        return self.covered(mac) > grace and first is not None and self.now - first > grace
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
         """Concurrent activity that rules out a rolling twin. Sustained = overlap longer than the
@@ -406,13 +433,13 @@ class Stitcher:
                 token = short_hash("|".join(key))
                 if emit_once(self.inv, device_id, "signature_flood", "warn",
                              f"signature flood {token}: {size} MACs skipped",
-                             f"{token}:{self._day()}", self.now):  # fmt: skip
+                             f"{token}:{self.day()}", self.now):  # fmt: skip
                     self.flood_events += 1
                 log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
                 self.stats.flooded += 1
         self.flooded_keys.update(key for key, _ in over)
 
-    def _day(self) -> str:
+    def day(self) -> str:
         return datetime.fromtimestamp(self.now, tz=UTC).strftime("%Y-%m-%d")
 
     def _eligible_sorted(self, undecided_first: bool = False) -> list[Obs]:
@@ -435,6 +462,14 @@ class Stitcher:
 
     # ---- recording -------------------------------------------------------------------------
 
+    def _reserve(self, rows: int) -> bool:
+        """Does a whole decision of `rows` row writes fit under MAX_ROWS_PER_PASS? If not, nothing
+        of it is written (counted as capped) and it waits for the next pass."""
+        if rows and self.writes + rows > MAX_ROWS_PER_PASS:
+            self.stats.capped += 1
+            return False
+        return True
+
     def _record(
         self, c: Obs, into: str, score: float, evidence: dict, state: str, extra: int = 0
     ) -> str | None:
@@ -442,8 +477,7 @@ class Stitcher:
         reserved too: the whole decision fits under MAX_ROWS_PER_PASS or none of it is written. An
         identical or sticky row needs no write and is never refused."""
         need = int(candidate_write_needed(self.inv, c.device_id, into, score, evidence, state))
-        if need + extra and self.writes + need + extra > MAX_ROWS_PER_PASS:
-            self.stats.capped += 1
+        if not self._reserve(need + extra):
             return None
         cid, wrote = upsert_candidate(self.inv, c.device_id, into, score, evidence, state, self.now)
         self.stats.candidates += wrote
@@ -452,15 +486,20 @@ class Stitcher:
 
     def _withdraw(self, c: Obs, canons: Iterable[str]) -> None:
         """Safety update of existing suggestion rows: bounded by the open suggestions of the pairs
-        evaluated, charged to the work budget, not to the row cap."""
+        evaluated. The whole work is charged BEFORE the first update, so a stop never leaves a
+        decision half-withdrawn; it is charged to the work budget, not to the row cap."""
+        canons = list(canons)
+        self._charge(len(canons))
         for canon in canons:
-            self._charge(1)
             withdraw_open_suggestions(self.inv, self.snap, c.device_id, canon, self.now)
 
     def _veto(self, c: Obs, into: str, score: float, evidence: dict) -> None:
+        need = int(candidate_write_needed(self.inv, c.device_id, into, score, evidence, "vetoed"))
+        self._charge(1)
+        if not self._reserve(need):
+            return  # no withdrawal either: the pair is retried whole next pass
         self._withdraw(c, [into])
-        if self._record(c, into, score, evidence, "vetoed") is None:
-            return
+        self._record(c, into, score, evidence, "vetoed")
         token = "~".join(sorted((c.device_id, into)))
         if emit_once(self.inv, c.device_id, "identity_overlap_veto", "warn",
                      f"identity overlap veto {token}", token, self.now):  # fmt: skip
@@ -468,10 +507,16 @@ class Stitcher:
             log(logger, logging.INFO, "identity_overlap_veto", mac=short_hash(c.mac))
 
     def _ambiguous(self, c: Obs, canons: list[str], score: float, evidence: dict) -> None:
+        need = sum(
+            candidate_write_needed(self.inv, c.device_id, canon, score, evidence, "ambiguous")
+            for canon in canons
+        )
+        self._charge(len(canons))
+        if not self._reserve(need):
+            return  # the whole multi-target decision waits: never a partial set of rows
         self._withdraw(c, canons)
         for canon in canons:
-            if self._record(c, canon, score, evidence, "ambiguous") is None:
-                return
+            self._record(c, canon, score, evidence, "ambiguous")
         if emit_once(self.inv, c.device_id, "identity_candidate_ambiguous", "warn",
                      f"identity candidate ambiguous: {len(canons)} devices match {c.device_id}",
                      c.device_id, self.now):  # fmt: skip
@@ -512,23 +557,25 @@ class Stitcher:
         the next: the post-attach re-check first (it is the only guard on trust already given),
         then standing rules, then fingerprint candidates."""
         for phase in (self._recheck_rule_attached, self.apply_rules, self.stitch_candidates):
-            self.ops = 0
+            self.ops = 0  # each phase also gets an equal slice of the transaction time-box,
+            self.deadline = time.monotonic() + STITCH_MAX_TXN_SECONDS / 3  # after setup
             try:
                 phase()
             except BudgetExhaustedError:  # raised before any write of the interrupted decision
                 emit_once(self.inv, None, "stitch_budget_exhausted", "warn",
                           "stitching work budget or time-box exhausted in "
                           f"{phase.__name__.strip('_')}: remaining work resumes next pass",
-                          self._day(), self.now)  # fmt: skip
+                          self.day(), self.now)  # fmt: skip
                 log(logger, logging.WARNING, "stitch_budget_exhausted",
                     phase=phase.__name__, ops=self.ops)  # fmt: skip
         self.ops = 0
         if self.flood_suppressed:
             emit_once(self.inv, None, "signature_flood_summary", "warn",
                       f"{self.flood_suppressed} further signature floods not reported this pass",
-                      f"summary:{self._day()}", self.now)  # fmt: skip
+                      f"summary:{self.day()}", self.now)  # fmt: skip
 
     def apply_rules(self) -> None:
+        self._settle_attached()
         if self.snap.rules:
             for c in self._eligible_sorted(undecided_first=True):
                 self._charge(0)  # time-box check
@@ -539,19 +586,22 @@ class Stitcher:
         the pipeline never rewrites trust (no detach). One rule_attach_suspect event per MAC.
         MACs are checked in mac order starting after a persisted cursor (written only when the
         phase runs out of budget, cleared when it completes), so every rule-attached MAC is
-        eventually checked however often the budget runs out."""
+        eventually checked however often the budget runs out. If the phase stops before finishing
+        even one MAC the cursor moves past that head MAC, so a single slow one cannot pin it."""
         macs = sorted(o.mac for o in self.obs if o.source == "rule" and self.act.get(o.mac))
         cursor = state_get(self.inv, RECHECK_CURSOR)
         start = bisect_right(macs, cursor) if cursor else 0
-        last = None
+        order = macs[start:] + macs[:start]
+        done = None
         try:
-            for mac in macs[start:] + macs[:start]:
+            for mac in order:
                 self._charge(0)
                 self._recheck(self.by_mac[mac])
-                last = mac
+                done = mac
         except BudgetExhaustedError:
-            if last is not None:
-                state_set(self.inv, RECHECK_CURSOR, last)
+            moved = done or (order[0] if order else None)
+            if moved is not None:
+                state_set(self.inv, RECHECK_CURSOR, moved)
             raise
         if cursor:
             state_set(self.inv, RECHECK_CURSOR, None)
@@ -560,14 +610,17 @@ class Stitcher:
         token = f"{short_hash(o.mac)}~{o.canon}"
         if event_exists(self.inv, "rule_attach_suspect", token):
             return  # already flagged: costs the budget nothing
-        rule = next((r for r in self.snap.rules if r.id == o.rule_id), None)
-        if rule:
-            names = (bool(rule.hostname), bool(rule.mdns_name))
-        else:  # rule revoked or expired since: the names it shares with the target's other MACs
+        att = self.attachments.get(o.mac)
+        if att:  # the values and rule fields that justified the attach, immune to renames
+            view = replace(o, hostname=att.hostname, mdns=att.mdns_name)
+        else:  # attached before attachments were recorded: the names shared with the target
             others = [t for t in self.by_canon.get(o.canon, []) if t.mac != o.mac]
-            names = (any(_same(t.hostname, o.hostname) for t in others),
-                     any(_same(t.mdns, o.mdns) for t in others))  # fmt: skip
-        peers, _ = self._safety_peers(o.canon, [self._restrict(o, *names)])
+            view = self._restrict(
+                o,
+                any(_same(t.hostname, o.hostname) for t in others),
+                any(_same(t.mdns, o.mdns) for t in others),
+            )
+        peers, _ = self._safety_peers(o.canon, [view])
         if not self.sustained(o.mac, peers - {o.mac}):
             return
         if emit_once(self.inv, o.canon, "rule_attach_suspect", "warn",
@@ -579,8 +632,9 @@ class Stitcher:
     def _vetoed(self, c: Obs, into: str) -> bool:
         """A (candidate, target) pair once vetoed stays vetoed: re-evaluating it would only let
         the interval cap or fresh lone stamps launder the overlap that justified the veto. Only a
-        human dismissal (the state `dismissed`, written through the API) clears it."""
-        return candidate_state(self.inv, c.device_id, into) == "vetoed"
+        human dismissal (the state `dismissed`, written through the API) clears it. Both endpoints
+        are resolved through the current merges, so a veto survives its target being merged."""
+        return vetoed_between(self.inv, self.alias_ids(c.device_id), self.alias_ids(into))
 
     def _rule_live(self, rule: Rule) -> bool:
         """Not expired NOW (the snapshot's own check is as old as the snapshot)."""
@@ -631,9 +685,56 @@ class Stitcher:
             found = ["opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n))]
             self._suggest(c, target, score, evidence, "rule_hit_needs_confirm", found)
 
+    def _still_authorised(self, rule: Rule, target: str) -> bool:
+        """Re-read overrides.db (read-only) under the inventory lock: the rule must still be
+        active and unchanged and the target's group must still be an explicit auto_inherit=1
+        group, exactly as when the snapshot was taken."""
+        if self.overrides is None:
+            return True
+        try:
+            fresh = load_snapshot(self.overrides, self.clock())
+        except OverridesUnreadable:
+            return False
+        group = fresh.overrides.get(target, (0, None))[1]
+        return (
+            rule in fresh.rules
+            and group is not None
+            and group == self.snap.overrides.get(target, (0, None))[1]
+            and fresh.group_auto_inherit.get(group) == 1
+        )
+
+    def _dismiss_open_candidates(self, device_id: str, room: int) -> int:
+        """Settle the candidate rows of a device that a rule attach orphaned: at most `room`
+        rows now, the rest in later passes (see _settle_attached). Returns rows written."""
+        ids = [
+            r[0]
+            for r in self.inv.execute(
+                "SELECT id FROM identity_candidates WHERE device_a=? AND state IN"
+                " ('open','suggested') LIMIT ?",
+                (device_id, max(room, 0)),
+            )
+        ]
+        self.inv.executemany(
+            "UPDATE identity_candidates SET state='dismissed' WHERE id=?", [(i,) for i in ids]
+        )
+        return len(ids)
+
+    def _settle_attached(self) -> None:
+        """Finish the dismissal that an attach could not fit under the row cap."""
+        for key, in self.inv.execute("SELECT key FROM stitch_state WHERE key LIKE 'settle:%'")\
+                .fetchall():  # fmt: skip
+            device_id = key[len("settle:") :]
+            self.writes += self._dismiss_open_candidates(device_id, MAX_ROWS_PER_PASS - self.writes)
+            left = self.inv.execute(
+                "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
+                " ('open','suggested') LIMIT 1", (device_id,),
+            ).fetchone()  # fmt: skip
+            if left is None:
+                state_set(self.inv, key, None)
+
     def _attach(self, c: Obs, target: str, rule: Rule, score: float) -> None:
-        if not self._rule_live(rule):  # expired while this pass waited for the lock or worked
-            return
+        if not self._rule_live(rule) or not self._still_authorised(rule, target):
+            return  # expired, revoked or regrouped while this pass waited for the lock or worked
         old = self.inv.execute(
             "SELECT mac FROM observations WHERE device_id=? AND mac<>?"
             " ORDER BY last_seen DESC, mac LIMIT 1",
@@ -646,6 +747,11 @@ class Stitcher:
         ).rowcount
         if not moved:
             return
+        save_attachment(
+            self.inv, c.mac,
+            Attachment(rule.id, target, c.hostname if rule.hostname else None,
+                       c.mdns if rule.mdns_name else None), self.now,
+        )  # fmt: skip
         self.inv.execute(
             "UPDATE devices SET first_seen=MIN(first_seen,(SELECT first_seen FROM devices"
             " WHERE id=?)), last_seen=MAX(last_seen,(SELECT last_seen FROM devices WHERE id=?))"
@@ -657,11 +763,14 @@ class Stitcher:
         ).fetchone()[0]
         if not left:  # the orphaned self device is retired, never deleted
             self.inv.execute("UPDATE devices SET status='retired' WHERE id=?", (c.device_id,))
-        self.inv.execute(  # settled by the rule; an earlier open suggestion just expires
-            "UPDATE identity_candidates SET state='dismissed' WHERE device_a=?"
-            " AND state IN ('open','suggested')",
-            (c.device_id,),
-        )
+        # settled by the rule; an earlier open suggestion just expires. The candidate rows are
+        # dismissed under the row cap: what does not fit is finished by the next passes.
+        self.writes += self._dismiss_open_candidates(c.device_id, MAX_ROWS_PER_PASS - self.writes)
+        if self.inv.execute(
+            "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
+            " ('open','suggested') LIMIT 1", (c.device_id,),
+        ).fetchone():  # fmt: skip
+            state_set(self.inv, f"settle:{c.device_id}", "1")
         before = short_hash(old["mac"]) if old else "none"
         emit_event(self.inv, target, "mac_attached", "info",
                    f"mac attached: {before} -> {short_hash(c.mac)}", self.now)  # fmt: skip
@@ -760,12 +869,27 @@ def _evidence(c: Obs) -> dict:
 
 def stitch(
     inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
-    clock: Callable[[], float] | None = None,
+    clock: Callable[[], float] | None = None, overrides: sqlite3.Connection | None = None,
 ) -> StitchStats:  # fmt: skip
     """One stitching pass over inventory.db (a single transaction). With a live `clock`, `now` is
-    re-read once the inventory write lock is held and rule expiry is checked against the clock."""
+    re-read once the inventory write lock is held and rule expiry is checked against the clock.
+    `overrides` (read-only) is re-read under the lock before every attach."""
     with immediate(inv):
-        stitcher = Stitcher(inv, snap, cfg, clock() if clock else now, clock)
+        stamp = clock() if clock else now
+        try:
+            stitcher = Stitcher(inv, snap, cfg, stamp, clock, overrides)
+        except BudgetExhaustedError:  # loading alone outlasted the setup cap: release the lock
+            day = datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d")
+            emit_once(inv, None, "stitch_budget_exhausted", "warn",
+                      "stitching setup exceeded its time cap: nothing stitched this pass",
+                      day, stamp)  # fmt: skip
+            log(logger, logging.WARNING, "stitch_budget_exhausted", phase="setup")
+            return StitchStats()
+        widen_linked_devices(inv, snap.links)
+        if snap.malformed_rules:
+            emit_once(inv, None, "rule_malformed", "warn",
+                      f"{snap.malformed_rules} identity_rules rows with malformed fields ignored",
+                      stitcher.day(), stamp)  # fmt: skip
         stitcher.run()
     log(logger, logging.INFO, "stitch_complete", **stitcher.stats.__dict__)
     return stitcher.stats

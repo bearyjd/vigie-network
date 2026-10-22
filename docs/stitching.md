@@ -33,11 +33,13 @@ coalesce with neighbours). Rows whose `end` is older than 7 days are purged at t
 The table is derived and can be dropped.
 
 Row timestamps come from the collector and are untrusted. When a batch is folded, a stamp outside
-`[batch received_at - 7 d (activity retention), batch received_at + 300 s]` is **ignored** (not
-clamped, not stored): a router without an RTC emits epoch-near stamps and a hostile or broken
-collector could send far-future ones, either of which would fake observed history and mature a MAC
-instantly. The 300 s allows for ordinary clock skew (`ACTIVITY_SKEW_S`). The ingest wire contract is
-unchanged.
+`[batch received_at - ACTIVITY_MAX_REPORT_LAG_S (1 h), batch received_at + 300 s]` is **ignored**
+(not clamped, not stored), for every batch of every MAC, new or known: a router without an RTC emits
+epoch-near stamps, a hostile or broken collector could send far-future ones or back-fill a MAC's
+history (also in a later batch, over a peer's absence), any of which would fake observed history and
+mature a MAC. The 300 s allows for ordinary clock skew (`ACTIVITY_SKEW_S`). Residual: a collector
+that was offline for more than an hour loses the older part of its backlog (less evidence, never
+more). The ingest wire contract is unchanged.
 
 **Collector timestamps are untrusted; maturity is server-observed.** `mac_first_received (mac,
 received)` (pipeline schema v6) records the SERVER receipt time (`batches.received_at`) of the
@@ -46,7 +48,9 @@ has no activity left after retention). When the intervals are loaded for a pass,
 earlier than `first received - ACTIVITY_MAX_REPORT_LAG_S` (3600 s) is **clipped away**: a collector
 that back-fills stamps older than the report lag cannot thereby fabricate covered time or time
 apart. Honest delayed reporting (a batch is received up to an hour after its rows) is unaffected.
-Legacy MACs (activity stored before v6) are anchored at their earliest stored stamp. Residual: a
+Legacy MACs (activity stored before v6) are anchored at the **migration time** (server clock),
+never at a collector stamp, so they mature one grace window after the upgrade; a MAC with no anchor
+row at all is **not mature** (fail closed). Residual: a
 legitimately long collector outage makes a MAC first reported after it mature more slowly (fail
 closed), and clipping applies to peers alike (a victim MAC first reported with hour-old backlog has
 that backlog clipped, which weakens the veto only if the collector itself misbehaves).
@@ -107,7 +111,9 @@ exactly equal is tolerated) the pair is `vetoed`, event `identity_overlap_veto` 
 per unordered pair, and there is no suggestion. A rolling device that briefly holds two MACs
 (overlap well under the grace) is tolerated. The union (not a single MAC pair) is used because a
 rolling device presents as a chain of MACs: an impostor beside it overlaps the chain, not one MAC.
-A device linked by `identity_links` contributes all of its MACs.
+A device linked by `identity_links` contributes all of its MACs. A `vetoed` pair is looked up through
+the current merges on both endpoints (every device merged into the canonical candidate and target), so
+merging the vetoed target into another device does not let the candidate attach to the merged one.
 
 **Peer presence tail and own-time lead.** A silent peer is not gone until a full activity gap
 (`VIGIE_ACTIVITY_GAP_S`, 300 s) has passed, so an *established* peer interval (longer than
@@ -204,6 +210,15 @@ For a randomized self MAC:
    instead and the MAC stays unassigned until a human accepts it. If a `fingerprint_match`
    suggestion for the pair is already open it is kept (one open suggestion per pair).
 
+Immediately before the attach the pipeline re-reads overrides.db (read-only, under the inventory
+lock): the rule must still be active and unchanged and the target's group must still be the same
+explicit `auto_inherit=1` group, otherwise nothing attaches that pass (revocation and regrouping
+are seen at attach time, not only expiry). The attach also records `rule_attachments (mac, rule_id,
+target, hostname, mdns_name)`: the rule's required name fields with the MAC's values at that moment
+(pipeline schema v7). The post-attach re-check (section 8) derives its peers from these immutable
+values, so renaming the attached MAC, or revoking/expiring the rule, cannot erase the evidence of a
+later overlap. MACs attached before v7 fall back to the names they share with the target's other MACs.
+
 **Attach** sets `observations.device_id` to the canonical rule device with `link_source='rule'`,
 `link_rule_id`, `link_score` (the rule's score), widens that device's `first_seen`/`last_seen`,
 sets the orphaned self device to `status='retired'` (devices are never deleted; its earlier
@@ -248,7 +263,15 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
   validated first; on failure `stitching_skipped` is logged once (ERROR), the batches of the run are
   processed with no identity links (the cursor advances as usual), stitching is skipped and nothing
   is created. A canonical-device lookup that fails on a malformed table later in the run also
-  yields "no links" (logged), never an aborted run. Other missing tables are read as empty.
+  yields "no links" (logged), never an aborted run. The skip also writes one `stitching_skipped`
+  event per UTC day (summary names the error class) so the API can surface it, and the ranges
+  (`first_seen`/`last_seen`) of merged devices that the skipped batches could not widen are caught up
+  by the next readable pass (idempotent, writes only where too narrow). Other missing tables are
+  read as empty. Rule rows are validated field by field (non-blank string `id`/`device_id`, a
+  signature that parses as a JSON object): a malformed row (a BLOB `device_id`, nesting deep enough to
+  exhaust the parser, ...) is skipped fail-closed, logged, and counted in one `rule_malformed` event
+  per UTC day; non-text ids anywhere in links, groups, overrides or decisions make the whole snapshot
+  unreadable. Any unexpected exception while reading maps to `OverridesUnreadable`.
 - No attachment without a matching active, non-blank-creator rule (human-ness is the API's job,
   see the trust boundary above); no group or trust is created.
 - Hostile hostnames/mDNS names never appear in logs, events or suggestion payloads (hashes only;
@@ -354,7 +377,9 @@ hostname (or mDNS name), never against every observation.
   row. A decision needing two rows (a candidate and its suggestion) is reserved as a whole: if both do
   not fit, neither is written and it waits for the next pass, so the cap is never exceeded. Withdrawals
   of open suggestions (a safety update of existing rows, bounded by the pairs evaluated) are charged
-  to the work budget, not to the row cap.
+  to the work budget, not to the row cap. The dismissal of an attached MAC's open candidate rows
+  (section 6) counts against the cap too: what does not fit is finished by the following passes
+  (`stitch_state` key `settle:<device>`), the attach itself is never held back.
 - Once-only events (`identity_overlap_veto`, `identity_candidate_ambiguous`, `identity_candidate`) use
   the indexed column `events.dedup` with a unique index on `(kind, dedup)` (pipeline schema v5)
   instead of an `instr()` scan over all summaries. Pipeline schema v6 backfills `dedup` for events
@@ -376,18 +401,25 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
   `MAX_OVERLAP_OPS_PER_PASS` (20000 units, about 64 interval comparisons each) that is reset
   before and after the phase: (1) the post-attach re-check of rule-attached MACs
   (`rule_attach_suspect`), (2) standing rules, (3) fingerprint candidates. A phase that runs out
-  stops (the decision in flight is abandoned before any write, nothing is half-decided) but never
-  starves the others, and the pass emits one `stitch_budget_exhausted` event per UTC day however
+  stops (the decision in flight is abandoned before its first write; a decision that needs several
+  rows, or a candidate row plus withdrawals, is charged and reserved whole first, so a stop never
+  leaves a partial set of rows or withdrawals) but never starves the others, and the pass emits one `stitch_budget_exhausted` event per UTC day however
   many phases or passes ran out. Within the rule and candidate loops MACs without a candidate
   row are processed first, so repeated exhaustion of a phase still makes progress on new MACs;
   decided MACs wait. The re-check walks the rule-attached MACs in MAC order starting after a
   persisted cursor (`stitch_state`, written only when the re-check phase runs out of budget and
   cleared when it completes), so repeated budget stops rotate through all of them instead of
-  re-checking the same first ones. A vetoed (candidate, target) pair is skipped without any overlap
+  re-checking the same first ones; a pass that finishes no MAC moves the cursor past the head MAC
+  so one slow MAC cannot pin it. A vetoed (candidate, target) pair is skipped without any overlap
   work (section 8).
-- Time-box: the whole stitch transaction holds the inventory write lock, so it also stops at the
-  next safe point (before the write of the decision in flight, exactly like a spent work budget)
-  once `STITCH_MAX_TXN_SECONDS` (3 s, against a 5 s `busy_timeout`) have passed, and emits the same
+- Time-box: the stitch transaction holds the inventory write lock, so it is bounded in two parts.
+  Setup (loading observations, activity and anchors) may take `STITCH_SETUP_MAX_SECONDS` (2 s); if
+  it does not finish in that time the pass gives up, releases the lock and emits the once-per-day
+  `stitch_budget_exhausted` ("setup"), writing nothing. After setup the time-box
+  `STITCH_MAX_TXN_SECONDS` (3 s) is split into equal slices, one per phase (re-check, rules,
+  candidates), each starting when the phase starts: a slow setup can no longer exhaust every phase,
+  and the re-check always gets its slice. A phase stops at the next safe point (before the write of
+  the decision in flight, exactly like a spent work budget) and emits the same
   once-per-day `stitch_budget_exhausted`. Suggestion look-ups (including the withdraw of open
   suggestions) are charged to the work budget, and use the `idx_suggestions_pair` index on
   `suggestions(action, device_ids, expires_at)` (pipeline schema v6): measured, 200 suggested pairs
@@ -405,7 +437,9 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
 - At most `MAX_FLOOD_EVENTS_PER_PASS` (20) new `signature_flood` events are written per pass; any
   further flooded groups that pass are counted in one `signature_flood_summary` event per UTC day
   and reported by their own events on later passes.
-- Activity lower bound: stamps older than 24 h (`ACTIVITY_NEW_MAC_LOOKBACK_S`) before the batch
-  receipt are ignored **only in a MAC's first batch** (the MAC has no stored activity yet), so a
-  brand-new MAC cannot back-fill days of history; once a MAC has any stored activity every later
-  batch may carry stamps back to the 7 d retention window.
+- Activity lower bound: see section 1. Stamps older than the batch's own report lag (1 h) are
+  ignored in every batch; `mac_first_received` is the server-clock maturity anchor.
+- Residual: with a very large inventory (the 90 d pruning of old observations is not built) setup
+  can exceed its 2 s cap on every pass; stitching then stops for that pass and the daily
+  `stitch_budget_exhausted` event says so. The lock is released at once, so writers are not blocked
+  for more than about setup cap plus time-box (5 s worst case, equal to the `busy_timeout`).

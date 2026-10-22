@@ -19,7 +19,7 @@ from stitch_helpers import (
 from vigie_ingest.db import open_inventory
 from vigie_pipeline import stitch as stitch_mod
 from vigie_pipeline.activity import record_activity
-from vigie_pipeline.config import ACTIVITY_NEW_MAC_LOOKBACK_S, PipelineConfig
+from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, PipelineConfig
 from vigie_pipeline.schema import apply_pipeline_migrations
 from vigie_pipeline.snapshot import EMPTY
 from vigie_pipeline.sources import MacActivity
@@ -220,7 +220,7 @@ def test_candidates_own_identity_state_must_be_ok_for_a_rule_attach(data):
     ov.close()
 
 
-# ---- L1: new-MAC activity lower bound -----------------------------------------------------------
+# ---- L1: activity lower bound is the report lag of EVERY batch ---------------------------------
 
 
 def _fold(inv, mac_addr: str, stamps: set[int], received: int):
@@ -231,15 +231,17 @@ def _fold(inv, mac_addr: str, stamps: set[int], received: int):
     )
 
 
-def test_new_mac_stamps_older_than_a_day_are_ignored_known_mac_keeps_the_week(data):
+def test_stamps_older_than_the_report_lag_are_ignored_for_new_and_known_macs_alike(data):
     apply_pipeline_migrations(data.inv)
-    rec, day = T0, ACTIVITY_NEW_MAC_LOOKBACK_S
-    assert day == 86400
+    rec, lag = T0, ACTIVITY_MAX_REPORT_LAG_S
+    assert lag == 3600
     m = "ae:00:00:00:09:09"
-    assert _fold(data.inv, m, {rec - day - 1}, rec) == []  # first sighting of m: too old
-    assert _fold(data.inv, m, {rec - day + 1}, rec) == [rec - day + 1]
-    assert _fold(data.inv, m, {rec - 3 * day}, rec) == [rec - 3 * day, rec - day + 1]  # known now
-    assert _fold(data.inv, m, {rec - 8 * day}, rec) == [rec - 3 * day, rec - day + 1]  # retention
+    assert _fold(data.inv, m, {rec - lag - 1}, rec) == []  # first sighting: too old
+    assert _fold(data.inv, m, {rec - lag}, rec) == [rec - lag]  # exactly the lag: kept
+    # the MAC is known now, but a later batch cannot back-fill further than its own lag either
+    assert _fold(data.inv, m, {rec - 3 * lag}, rec) == [rec - lag]
+    assert _fold(data.inv, m, {rec - 3 * lag}, rec + 2 * lag) == [rec - lag]
+    assert _fold(data.inv, m, {rec + lag}, rec + 2 * lag) == [rec - lag, rec + lag]
 
 
 # ---- L3: flood event cap ------------------------------------------------------------------------

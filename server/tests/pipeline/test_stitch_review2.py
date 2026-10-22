@@ -137,13 +137,11 @@ def test_activity_window_boundaries(pinv):
     assert _fold(pinv, {rec + 300}, rec) == [rec + 300]  # small clock skew accepted
     pinv.execute("DELETE FROM mac_activity")
     assert _fold(pinv, {rec + 301}, rec) == []
-    # a MAC with stored activity keeps the whole retention window (a brand-new one only gets 24 h:
-    # test_stitch_review3.test_new_mac_stamps_older_than_a_day_are_ignored_known_mac_keeps_the_week)
-    assert _fold(pinv, {rec - week}, rec) == []  # new MAC: the retention edge is too old
-    pinv.execute("DELETE FROM mac_activity")
-    _fold(pinv, {rec}, rec)  # now known
-    assert _fold(pinv, {rec - week}, rec) == [rec - week, rec]  # exactly the retention edge
-    assert _fold(pinv, {rec - week - 1}, rec) == [rec - week, rec]
+    # the lower bound is the report lag (1 h) of the batch, not the retention window
+    # (test_stitch_review3.test_stamps_older_than_the_report_lag_...)
+    assert _fold(pinv, {rec - week}, rec) == []
+    assert _fold(pinv, {rec - 3600}, rec) == [rec - 3600]  # exactly the lag
+    assert _fold(pinv, {rec - 3601}, rec) == [rec - 3600]
 
 
 # ---- H3: the victim's own partial-signature MAC is a veto peer ----------------------------------
@@ -292,12 +290,12 @@ def test_populated_v4_database_migrates_to_v5(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 6
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 7
     rows = conn.execute("SELECT id, dedup FROM events ORDER BY seq").fetchall()
     assert [tuple(r) for r in rows] == [("e1", None), ("e2", None)]  # NULL dedup stays NULL
     assert conn.execute("SELECT COUNT(*) FROM mac_activity").fetchone()[0] == 1
-    assert apply_pipeline_migrations(conn) == 6  # re-apply is a no-op
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 6
+    assert apply_pipeline_migrations(conn) == 7  # re-apply is a no-op
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 7
     conn.execute(ins, ("e3",))  # NULLs never collide on the partial unique index
 
 

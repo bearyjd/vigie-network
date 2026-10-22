@@ -20,6 +20,7 @@ from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
 from vigie_pipeline.stitch import StitchStats, stitch
+from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -48,7 +49,7 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     try:
         # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
         # no identity links for the batches, no stitching, cursor progress is kept
-        usable = _overrides_readable(overrides, config, clock)
+        usable = _overrides_readable(inv, overrides, config, clock)
         totals = _process_batches(inv, overrides if usable else None, config, failures)
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
@@ -73,8 +74,9 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
 
 
 def _overrides_readable(
-    overrides: sqlite3.Connection | None, config: PipelineConfig, now: float
-) -> bool:
+    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, config: PipelineConfig,
+    now: float,
+) -> bool:  # fmt: skip
     """overrides.db missing entirely => readable (no rules, basis versions 0). Present but
     unreadable or malformed => fail closed: log `stitching_skipped` and report False."""
     try:
@@ -90,6 +92,11 @@ def _overrides_readable(
             reason="overrides_unreadable",
             error=str(exc),
         )
+        with immediate(inv):  # one event per UTC day, so the API can surface it
+            emit_once(inv, None, "stitching_skipped", "warn",
+                      "stitching skipped: overrides.db unreadable or malformed "
+                      f"({type(exc.__cause__ or exc).__name__})",
+                      iso_utc(now)[:10], now)  # fmt: skip
         return False
     return True
 
@@ -112,7 +119,7 @@ def _stitch(
         log(logger, logging.ERROR, "stitching_skipped", reason="overrides_unreadable",
             error=str(exc))  # fmt: skip
         return StitchStats()
-    return stitch(inv, snap, config, now, clock)
+    return stitch(inv, snap, config, now, clock, overrides)
 
 
 def _process_batches(

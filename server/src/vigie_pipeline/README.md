@@ -40,8 +40,8 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
   `mac_activity (mac, start, end)` intervals (a silence over 5 min splits an interval; 7 d
   retention; pipeline schema v4). Stamps outside [received - 7 d, received + 300 s] are ignored.
   Collector stamps are untrusted: `mac_first_received` (schema v6) holds the SERVER time a MAC was
-  first received, and activity earlier than that minus 1 h is clipped when loaded, so back-filled
-  stamps cannot mature a MAC. Derived data; safe to drop.
+  first received, activity earlier than that minus 1 h is clipped when loaded, and every batch drops
+  stamps older than its own receipt minus 1 h, so back-filled stamps cannot mature a MAC. Derived data; safe to drop.
 - **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
   opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a
   candidate, so a hostname alone never is. Rows go to `identity_candidates`

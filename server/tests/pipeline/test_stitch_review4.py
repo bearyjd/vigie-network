@@ -41,6 +41,10 @@ class Inv:
             (m, dev, rand, fp, host, mdns, src, fs, fs),
         )
         self.act(m, ivs)
+        self.db.execute(  # the server-clock anchor a real fold records (long ago by default)
+            "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",
+            (m, NOW - 10**6),
+        )
         return m
 
     def act(self, m, ivs) -> None:
@@ -102,7 +106,7 @@ def build_starve(inv: Inv, burners: int = 12, pool: int = 40):
 
 def test_rule_phase_budget_burn_starves_neither_suspect_nor_candidates(inv, monkeypatch):
     build_starve(inv)
-    monkeypatch.setattr(stitch_mod, "MAX_OVERLAP_OPS_PER_PASS", 90)
+    monkeypatch.setattr(stitch_mod, "MAX_OVERLAP_OPS_PER_PASS", 120)
     st = inv.stitch(RULE_SNAP)
     assert inv.count("stitch_budget_exhausted") == 1  # the rule loop did run out
     assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1
@@ -196,6 +200,7 @@ def test_interval_cap_keeps_the_newest_intervals(inv, monkeypatch):
     monkeypatch.setattr(stitch_mod, "MAX_INTERVALS_PER_MAC", 4)
     m = inv.mac("A", "h", None, "self", "2026-01-01T00:00:00Z",
                 [(1000 * i, 1000 * i) for i in range(10)])  # fmt: skip
+    inv.db.execute("INSERT OR REPLACE INTO mac_first_received VALUES (?,0)", (m,))
     st = inv.stitcher()
     assert len(st.act[m]) == 4
     assert [s for s, _ in st.act[m]] == [6000 - 150 + 0, 7000 - 150, 8000 - 150, 9000 - 150]

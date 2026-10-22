@@ -159,7 +159,7 @@ def test_a_mac_with_only_ignored_stamps_is_still_recorded_as_received(tmp_path):
 
 def test_purge_forgets_first_received_of_a_mac_without_activity_only(tmp_path):
     inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
-    inv.executemany("INSERT INTO mac_first_received VALUES (?,?)",
+    inv.executemany("INSERT OR REPLACE INTO mac_first_received VALUES (?,?)",
                     [("gone", 100), ("kept", 100), ("fresh", 10_000)])  # fmt: skip
     inv.execute(
         'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', ("kept", 9_000, 9_500)
@@ -204,14 +204,18 @@ def test_loading_is_bounded_to_the_newest_intervals_of_each_observed_mac(inv):
 
 
 @pytest.mark.parametrize(("first_ago", "covered", "expect"), [
-    (601, 601, True), (600, 601, False), (601, 600, False), (None, 601, True), (None, 600, False),
+    (601, 601, True), (600, 601, False), (601, 600, False), (None, 601, False),
 ])  # fmt: skip
 def test_mature_needs_both_server_age_and_covered_time_over_the_grace(
     inv, first_ago, covered, expect
 ):
     m = inv.mac("D", "h", None, "self", OLD, [(NOW - 1000, NOW - 1000 + covered)])
     if first_ago is not None:
-        inv.db.execute("INSERT INTO mac_first_received VALUES (?,?)", (m, NOW - first_ago))
+        inv.db.execute(
+            "INSERT OR REPLACE INTO mac_first_received VALUES (?,?)", (m, NOW - first_ago)
+        )
+    else:  # no anchor at all: unknown age is not mature
+        inv.db.execute("DELETE FROM mac_first_received WHERE mac=?", (m,))
     assert inv.stitcher().mature(m) is expect
 
 
@@ -849,6 +853,9 @@ def attached_world(inv: Inv, rule_id: str):
     a = inv.mac("D", "victim", "Dave", "rule", "2026-01-03T00:00:00Z", [(NOW - 3000, NOW)],
                 newdev=False)  # fmt: skip
     inv.db.execute("UPDATE observations SET link_rule_id=? WHERE mac=?", (rule_id, a))
+    inv.db.execute(  # the evidence recorded when A attached under the hostname-only rule
+        "INSERT INTO rule_attachments VALUES (?,?,'D','victim',NULL,'t')", (a, rule_id)
+    )
     inv.mac("V", None, "Elsewhere", "self", "2026-01-03T00:01:00Z", [(NOW - 3000, NOW)])
 
 
@@ -887,7 +894,7 @@ def test_stitcher_reads_bounded_clipped_activity(inv, monkeypatch):
 
     monkeypatch.setattr(stitch_mod, "load_activity", spy)
     m = inv.mac("D", "h", None, "self", OLD, [(NOW - 20000, NOW - 20000), (NOW - 100, NOW)])
-    inv.db.execute("INSERT INTO mac_first_received VALUES (?,?)", (m, NOW - 50))
+    inv.db.execute("INSERT OR REPLACE INTO mac_first_received VALUES (?,?)", (m, NOW - 50))
     st = inv.stitcher()
     assert seen["per_mac_limit"] == 64 and seen["max_lag_s"] == 3600
     assert st.act[m] == [(NOW - 200, NOW + 100)]  # the 20000 s old stamp is clipped away

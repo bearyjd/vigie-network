@@ -99,11 +99,12 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
     ),
     (
         # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity
-        # anchor. Legacy rows fall back to their earliest stored stamp.
+        # anchor. Legacy rows (activity stored before this migration) are anchored at the
+        # migration time (server clock), never at a collector stamp: they mature one grace later.
         "CREATE TABLE IF NOT EXISTS mac_first_received ("
         "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
         "INSERT OR IGNORE INTO mac_first_received (mac, received)"
-        " SELECT mac, MIN(start) FROM mac_activity GROUP BY mac",
+        " SELECT mac, CAST(strftime('%s', 'now') AS INTEGER) FROM mac_activity GROUP BY mac",
         # small key/value state of the stitcher (re-check cursor)
         "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         # suggestion look-ups are by (action, device_ids): no table scan inside the write lock
@@ -133,6 +134,14 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "UPDATE OR IGNORE events SET dedup = 'summary:' || substr(ts, 1, 10)"
         " WHERE dedup IS NULL AND kind = 'signature_flood_summary'",
     ),
+    (
+        # What justified a rule attach, fixed at attach time: the name fields the rule required
+        # and the MAC's values then. The re-check uses these, so renaming an attached MAC (or
+        # revoking/expiring its rule) cannot erase the evidence of a later overlap.
+        "CREATE TABLE IF NOT EXISTS rule_attachments ("
+        "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
+        " hostname TEXT, mdns_name TEXT, attached_at TEXT NOT NULL)",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -146,6 +155,7 @@ PIPELINE_TABLES = (
     "mac_activity",
     "mac_first_received",
     "stitch_state",
+    "rule_attachments",
 )
 
 

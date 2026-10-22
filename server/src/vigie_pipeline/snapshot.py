@@ -38,6 +38,7 @@ class Snapshot:
     group_auto_inherit: Mapping[str, int]
     overrides: Mapping[str, tuple[int, str | None]]  # device_id -> (version, group_id)
     decisions: Mapping[str, str]  # suggestion_id -> accepted|rejected
+    malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
 
     def canonical(self, device_id: str) -> str:
         seen, current = {device_id}, device_id
@@ -66,19 +67,34 @@ def _opt55(value: object) -> str | None:
     return _text(value)
 
 
+class MalformedRule(ValueError):
+    """An identity_rules row whose fields have the wrong type or shape: never used."""
+
+
+def _ident(value: object, what: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise MalformedRule(f"{what} is not a non-blank string")
+    return value
+
+
 def parse_rule(row: sqlite3.Row) -> Rule | None:
-    """A rule needs opt55 and opt60 plus hostname and/or mdns_name; anything else is ignored."""
+    """A rule needs opt55 and opt60 plus hostname and/or mdns_name; an incomplete signature is
+    ignored (None). Wrong types (non-string ids, a BLOB device_id, a signature that is not a JSON
+    object, nesting deep enough to exhaust the parser) raise MalformedRule."""
+    rule_id, device_id = _ident(row["id"], "rule id"), _ident(row["device_id"], "rule device_id")
     try:
         sig = json.loads(row["signature"])
     except (TypeError, ValueError):
         return None
+    except RecursionError as exc:
+        raise MalformedRule("signature nesting too deep") from exc
     if not isinstance(sig, dict):
         return None
     opt55, opt60 = _opt55(sig.get("opt55")), _text(sig.get("opt60"))
     host, mdns = _text(sig.get("hostname")), _text(sig.get("mdns_name"))
     if not (opt55 and opt60 and (host or mdns)):
         return None
-    return Rule(row["id"], row["device_id"], opt55, opt60, host, mdns, _expiry(row["expires_at"]))
+    return Rule(rule_id, device_id, opt55, opt60, host, mdns, _expiry(row["expires_at"]))
 
 
 def _expiry(value: object) -> float | None:
@@ -123,27 +139,45 @@ def _int(value: object, what: str) -> int:
     return value
 
 
+def _str(value: object, what: str) -> str:
+    if not isinstance(value, str):
+        raise OverridesUnreadable(f"{what} is not text")
+    return value
+
+
 def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
     links = {
-        r["from_device"]: r["into_device"]
+        _str(r["from_device"], "identity_links.from_device"): _str(
+            r["into_device"], "identity_links.into_device"
+        )
         for r in _rows(conn, "SELECT from_device, into_device FROM identity_links")
     }
-    rules = []
+    rules, malformed = [], 0
     for row in _rows(
         conn,
         "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM identity_rules"
         " ORDER BY id",
     ):
-        rule = parse_rule(row) if _active(row, now) else None
+        if not _active(row, now):
+            continue
+        try:
+            rule = parse_rule(row)
+        except MalformedRule as exc:  # fail closed: this row is never used
+            malformed += 1
+            log(logger, logging.ERROR, "rule_malformed", error=str(exc))
+            continue
         if rule:
             rules.append(rule)
     groups = {
-        r["id"]: _int(r["auto_inherit"], "groups.auto_inherit")
+        _str(r["id"], "groups.id"): _int(r["auto_inherit"], "groups.auto_inherit")
         for r in _rows(conn, "SELECT id, auto_inherit FROM groups")
     }
     # With a live rule, a missing device_overrides table would read as "unassigned" (= attach).
     overrides = {
-        r["device_id"]: (_int(r["version"], "device_overrides.version"), r["group_id"])
+        _str(r["device_id"], "device_overrides.device_id"): (
+            _int(r["version"], "device_overrides.version"),
+            None if r["group_id"] is None else _str(r["group_id"], "device_overrides.group_id"),
+        )
         for r in _rows(
             conn,
             "SELECT device_id, version, group_id FROM device_overrides",
@@ -151,10 +185,12 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
     }
     decisions = {
-        r["suggestion_id"]: r["state"]
+        _str(r["suggestion_id"], "suggestion_decisions.suggestion_id"): _str(
+            r["state"], "suggestion_decisions.state"
+        )
         for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
     }
-    return Snapshot(links, tuple(rules), groups, overrides, decisions)
+    return Snapshot(links, tuple(rules), groups, overrides, decisions, malformed)
 
 
 def load_snapshot(conn: sqlite3.Connection, now: float) -> Snapshot:
@@ -166,7 +202,7 @@ def load_snapshot(conn: sqlite3.Connection, now: float) -> Snapshot:
         finally:
             if conn.in_transaction:
                 conn.execute("COMMIT")
-    except (sqlite3.Error, OverridesUnreadable, KeyError, IndexError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - anything unexpected fails closed
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         log(logger, logging.ERROR, "overrides_snapshot_failed", error=str(exc))

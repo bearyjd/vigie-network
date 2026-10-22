@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterable, Mapping
 
-from vigie_pipeline.config import ACTIVITY_NEW_MAC_LOOKBACK_S, ACTIVITY_SKEW_S
+from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S
 from vigie_pipeline.sources import MacActivity
 
 Interval = tuple[int, int]
@@ -50,20 +50,19 @@ def record_activity(
     changes nothing, and out-of-order batches coalesce with neighbouring intervals.
 
     Row timestamps are collector-supplied and untrusted: a stamp outside
-    [received - retention, received + ACTIVITY_SKEW_S] (epoch-zero from a clock without an RTC, or
-    far in the future) is ignored, because it could otherwise fake observed history. For a MAC
-    with no stored activity the lower bound is tighter (ACTIVITY_NEW_MAC_LOOKBACK_S, 24 h): a MAC
-    that is new to us cannot have a week of back-filled history to hide an overlap in."""
+    [received - min(retention, ACTIVITY_MAX_REPORT_LAG_S), received + ACTIVITY_SKEW_S] is ignored
+    (epoch-zero from a clock without an RTC, far in the future, or back-filled older than the
+    report lag of THIS batch), because it could otherwise fake observed history. The rule is the
+    same for a new and a known MAC and for every batch, so a later batch cannot back-fill the
+    absence of a peer either. A collector offline for longer than the lag loses the older part of
+    its backlog (fail closed: less evidence, never more)."""
     inv.executemany(  # the server-clock maturity anchor: set once, never moved
         "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",
         [(mac, int(received_ts)) for mac in acts],
     )
     hi_ok = int(received_ts) + ACTIVITY_SKEW_S
-    lo_known = int(received_ts) - retention_s
-    lo_new = max(lo_known, int(received_ts) - ACTIVITY_NEW_MAC_LOOKBACK_S)
+    lo_ok = int(received_ts) - min(retention_s, ACTIVITY_MAX_REPORT_LAG_S)
     for mac, act in acts.items():
-        known = inv.execute("SELECT 1 FROM mac_activity WHERE mac=? LIMIT 1", (mac,)).fetchone()
-        lo_ok = lo_known if known else lo_new
         stamps = sorted(t for t in act.stamps if lo_ok <= t <= hi_ok)
         if not stamps:
             continue

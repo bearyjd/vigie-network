@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 from vigie_ingest.db import iso_utc
@@ -171,3 +172,60 @@ def state_set(inv: sqlite3.Connection, key: str, value: str | None) -> None:
         inv.execute("DELETE FROM stitch_state WHERE key=?", (key,))
     else:
         inv.execute("INSERT OR REPLACE INTO stitch_state (key, value) VALUES (?,?)", (key, value))
+
+
+def _marks(ids: Collection[str]) -> str:
+    return ",".join("?" * len(ids))
+
+
+def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Collection[str]) -> bool:
+    """Is any (a, b) pair of the two alias sets recorded as vetoed? A permanent veto keyed by a
+    device id must survive that device being merged into another."""
+    return (
+        inv.execute(
+            "SELECT 1 FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
+            f" AND device_a IN ({_marks(a_ids)}) AND device_b IN ({_marks(b_ids)}) LIMIT 1",
+            [*a_ids, *b_ids],
+        ).fetchone()
+        is not None
+    )
+
+
+def widen_linked_devices(inv: sqlite3.Connection, links: Mapping[str, str]) -> None:
+    """Catch-up for the first/last seen widening of merged devices that a run with unreadable
+    overrides.db could not do: every linked-into device covers its sources' ranges. Idempotent;
+    writes only where the range is actually too narrow."""
+    for src, dst in links.items():
+        inv.execute(
+            "UPDATE devices SET"
+            " first_seen=MIN(first_seen, (SELECT first_seen FROM devices WHERE id=?)),"
+            " last_seen=MAX(last_seen, (SELECT last_seen FROM devices WHERE id=?))"
+            " WHERE id=? AND EXISTS (SELECT 1 FROM devices s WHERE s.id=? AND"
+            " (s.first_seen < devices.first_seen OR s.last_seen > devices.last_seen))",
+            (src, src, dst, src),
+        )
+
+
+@dataclass(frozen=True)
+class Attachment:
+    rule_id: str
+    target: str
+    hostname: str | None
+    mdns_name: str | None
+
+
+def load_attachments(inv: sqlite3.Connection) -> dict[str, Attachment]:
+    return {
+        r["mac"]: Attachment(r["rule_id"], r["target"], r["hostname"], r["mdns_name"])
+        for r in inv.execute(
+            "SELECT mac, rule_id, target, hostname, mdns_name FROM rule_attachments"
+        )
+    }
+
+
+def save_attachment(inv: sqlite3.Connection, mac: str, att: Attachment, now: float) -> None:
+    inv.execute(
+        "INSERT OR REPLACE INTO rule_attachments (mac, rule_id, target, hostname, mdns_name,"
+        " attached_at) VALUES (?,?,?,?,?,?)",
+        (mac, att.rule_id, att.target, att.hostname, att.mdns_name, iso_utc(now)),
+    )
