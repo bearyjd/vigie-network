@@ -56,9 +56,9 @@ def slow_setup(monkeypatch, seconds: float, cap: float = 10**6) -> FakeTime:
     monkeypatch.setattr(stitch_mod, "STITCH_SETUP_MAX_SECONDS", cap)
     real = stitch_mod.load_first_received
 
-    def slow(conn):
+    def slow(conn, *args):
         clock.t += seconds
-        return real(conn)
+        return real(conn, *args)
 
     monkeypatch.setattr(stitch_mod, "load_first_received", slow)
     return clock
@@ -108,9 +108,9 @@ def test_the_setup_check_runs_inside_the_observation_loading(inv, monkeypatch):
     ticks = []
     real = stitch_mod._load_obs
 
-    def spy(conn, snap, tick):
+    def spy(conn, snap, tick, devices):
         ticks.append(tick)
-        return real(conn, snap, tick)
+        return real(conn, snap, tick, devices)
 
     monkeypatch.setattr(stitch_mod, "_load_obs", spy)
     inv.stitcher()
@@ -606,7 +606,16 @@ def test_legacy_macs_are_anchored_at_migration_time_not_at_a_collector_stamp(tmp
 def test_rule_attachments_table_exists_after_migration(tmp_path):
     conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(rule_attachments)")]
-    assert cols == ["mac", "rule_id", "target", "hostname", "mdns_name", "attached_at"]
+    assert cols == [
+        "mac",
+        "rule_id",
+        "target",
+        "hostname",
+        "mdns_name",
+        "attached_at",
+        "opt55",
+        "opt60",
+    ]
 
 
 # ---- survivors of the round-6 mutation check ----
@@ -724,7 +733,9 @@ def test_a_revoked_rules_attach_is_rechecked_against_the_persisted_evidence(inv)
         "UPDATE observations SET link_rule_id='gone', hostname='renamed' WHERE mac=?", (a,)
     )
     inv.db.execute(
-        "INSERT INTO rule_attachments VALUES (?, 'gone', 'D', 'victim', NULL, 't')", (a,)
+        "INSERT INTO rule_attachments (mac, rule_id, target, hostname, mdns_name, attached_at)"
+        " VALUES (?, 'gone', 'D', 'victim', NULL, 't')",
+        (a,),
     )
     inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW - 3000, NOW)])
     assert inv.stitch(Snapshot({}, (), {}, {}, {})).suspect == 1  # found via the stored hostname
@@ -745,7 +756,7 @@ def test_a_mac_without_an_anchor_is_never_attached_by_a_rule(inv):
     b = inv.mac("B", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)])
     inv.db.execute("DELETE FROM mac_first_received WHERE mac=?", (b,))
     assert inv.stitch(RULE_SNAP).attached == 0 and link_of(inv, b) == ("B", "self")
-    inv.db.execute("INSERT INTO mac_first_received VALUES (?, ?)", (b, NOW - 10**6))
+    inv.db.execute("INSERT INTO mac_first_received (mac, received) VALUES (?, ?)", (b, NOW - 10**6))
     assert inv.stitch(RULE_SNAP).attached == 1
 
 

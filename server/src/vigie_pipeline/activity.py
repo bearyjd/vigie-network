@@ -8,7 +8,7 @@ like raw).
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S
 from vigie_pipeline.sources import MacActivity
@@ -45,6 +45,7 @@ def record_activity(
     gap_s: int,
     received_ts: float,
     retention_s: int,
+    collector: str | None = None,
 ) -> None:
     """Fold a batch's row timestamps into mac_activity. Idempotent: re-folding the same stamps
     changes nothing, and out-of-order batches coalesce with neighbouring intervals.
@@ -55,13 +56,18 @@ def record_activity(
     report lag of THIS batch), because it could otherwise fake observed history. The rule is the
     same for a new and a known MAC and for every batch, so a later batch cannot back-fill the
     absence of a peer either. A collector offline for longer than the lag loses the older part of
-    its backlog (fail closed: less evidence, never more)."""
+    its backlog. That is MISSING evidence, not safe evidence: with a `collector`, the span of the
+    dropped stamps is recorded in `collector_gaps`; the stitcher refuses to mature a MAC whose
+    activity window overlaps a gap. (A collector that is simply silent delivers no stamps and
+    leaves no trace: that absence of evidence cannot be told from an idle network.)"""
     inv.executemany(  # the server-clock maturity anchor: set once, never moved
         "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",
         [(mac, int(received_ts)) for mac in acts],
     )
     hi_ok = int(received_ts) + ACTIVITY_SKEW_S
     lo_ok = int(received_ts) - min(retention_s, ACTIVITY_MAX_REPORT_LAG_S)
+    if collector is not None:
+        _record_gaps(inv, acts, collector, int(received_ts), lo_ok, retention_s)
     for mac, act in acts.items():
         stamps = sorted(t for t in act.stamps if lo_ok <= t <= hi_ok)
         if not stamps:
@@ -83,9 +89,54 @@ def record_activity(
         )
 
 
-def load_first_received(inv: sqlite3.Connection) -> dict[str, int]:
+def _record_gaps(
+    inv: sqlite3.Connection, acts: Mapping[str, MacActivity], collector: str, received: int,
+    lo_ok: int, retention_s: int,
+) -> None:  # fmt: skip
+    """Evidence this collector could not deliver in time: the span of the stamps dropped for being
+    older than the report lag (but inside retention)."""
+    late = [t for act in acts.values() for t in act.stamps if received - retention_s <= t < lo_ok]
+    if late:
+        inv.execute(
+            'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,?)',
+            (collector, min(late), lo_ok, received),
+        )
+
+
+def load_gaps(inv: sqlite3.Connection, since: int) -> list[Interval]:
+    """Evidence gaps that end no earlier than `since`."""
+    return [
+        (r[0], r[1])
+        for r in inv.execute('SELECT start, "end" FROM collector_gaps WHERE "end" >= ?', (since,))
+    ]
+
+
+def load_first_received(
+    inv: sqlite3.Connection, tick: Callable[[], None] = lambda: None
+) -> dict[str, int]:
     """SERVER time (batch receipt, epoch s) each MAC was first folded into mac_activity."""
-    return {r[0]: r[1] for r in inv.execute("SELECT mac, received FROM mac_first_received")}
+    out = {}
+    for i, r in enumerate(inv.execute("SELECT mac, received FROM mac_first_received")):
+        if not i % 4096:
+            tick()
+        out[r[0]] = r[1]
+    return out
+
+
+def _active_macs(inv: sqlite3.Connection, min_end: int, tick: Callable[[], None]) -> list[str]:
+    """MACs with activity ending no earlier than `min_end`, by index skip-scan: one seek per MAC
+    (never a scan of the intervals), so the work is proportional to the ACTIVE MACs and `tick`
+    can interrupt it."""
+    macs, last = [], ""
+    while True:
+        tick()
+        row = inv.execute(
+            'SELECT mac FROM mac_activity WHERE mac > ? AND "end" >= ? ORDER BY mac LIMIT 1',
+            (last, min_end),
+        ).fetchone()
+        if row is None:
+            return macs
+        macs.append(last := row[0])
 
 
 def load_activity(
@@ -95,26 +146,30 @@ def load_activity(
     per_mac_limit: int | None = None,
     first_received: Mapping[str, int] | None = None,
     max_lag_s: int = 0,
+    min_end: int = 0,
+    tick: Callable[[], None] = lambda: None,
 ) -> dict[str, list[Interval]]:
     """Per-MAC merged intervals. An interval shorter than min_width_s is widened symmetrically to
     that width: a stamp means "present around then", so a single-stamp or zero-length interval
     must still be able to overlap (otherwise sparse stamps dodge the overlap veto).
 
-    per_mac_limit reads only each observed MAC's newest raw intervals (index seeks, so the rows
-    loaded are bounded; raw intervals more than a gap apart never merge after widening, so this is
-    the same set as the newest merged ones). With first_received, a MAC's activity earlier than
-    its first server receipt minus max_lag_s is clipped away: collector stamps are untrusted and
+    per_mac_limit reads only the newest raw intervals of each MAC that has activity ending at or
+    after `min_end` (the retention cutoff): MACs come from an index skip-scan of mac_activity and
+    `tick` runs between MACs, so the rows loaded are bounded by the ACTIVE MACs, not by every MAC
+    ever observed. Raw intervals more than a gap apart never merge after widening, so this is the
+    same set as the newest merged ones. With first_received, a MAC's activity earlier than its
+    first server receipt minus max_lag_s is clipped away: collector stamps are untrusted and
     back-filled history must not establish maturity or time apart."""
     if per_mac_limit is None:
         rows = inv.execute('SELECT mac, start, "end" FROM mac_activity ORDER BY mac, start')
     else:
         rows = (
             row
-            for (mac,) in inv.execute("SELECT mac FROM observations").fetchall()
+            for mac in _active_macs(inv, min_end, tick)
             for row in inv.execute(
                 'SELECT mac, start, "end" FROM (SELECT mac, start, "end" FROM mac_activity'
-                " WHERE mac=? ORDER BY start DESC LIMIT ?) ORDER BY start",
-                (mac, per_mac_limit),
+                ' WHERE mac=? AND "end" >= ? ORDER BY start DESC LIMIT ?) ORDER BY start',
+                (mac, min_end, per_mac_limit),
             ).fetchall()
         )
     raw: dict[str, list[Interval]] = {}
@@ -136,6 +191,7 @@ def purge_activity(inv: sqlite3.Connection, now: float, retention_s: int) -> int
     purged = inv.execute(
         'DELETE FROM mac_activity WHERE "end" < ?', (int(now) - retention_s,)
     ).rowcount
+    inv.execute('DELETE FROM collector_gaps WHERE "end" < ?', (int(now) - retention_s,))
     inv.execute(  # a MAC with no activity left starts over (like a new one) if it returns
         "DELETE FROM mac_first_received WHERE received < ?"
         " AND mac NOT IN (SELECT mac FROM mac_activity)",

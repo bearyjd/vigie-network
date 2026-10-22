@@ -159,7 +159,7 @@ def test_a_mac_with_only_ignored_stamps_is_still_recorded_as_received(tmp_path):
 
 def test_purge_forgets_first_received_of_a_mac_without_activity_only(tmp_path):
     inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
-    inv.executemany("INSERT OR REPLACE INTO mac_first_received VALUES (?,?)",
+    inv.executemany("INSERT OR REPLACE INTO mac_first_received (mac, received) VALUES (?,?)",
                     [("gone", 100), ("kept", 100), ("fresh", 10_000)])  # fmt: skip
     inv.execute(
         'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', ("kept", 9_000, 9_500)
@@ -193,14 +193,24 @@ def test_clipping_applies_after_widening(tmp_path):
     assert got == {"m": [(6400, 6650)]}  # widened to [6350, 6650], then clipped at 6400
 
 
-def test_loading_is_bounded_to_the_newest_intervals_of_each_observed_mac(inv):
+def test_loading_is_bounded_to_the_newest_intervals_of_each_active_mac(inv):
     m = inv.mac("D", "h", None, "self", OLD, [(i * 1000, i * 1000) for i in range(200)])
     inv.mac("E", "h", None, "self", OLD, [(5, 5)])
-    inv.act("not-observed", [(1, 1)])
+    inv.act("elsewhere", [(1, 1)])  # active MACs are driven by mac_activity, not observations
     full = load_activity(inv.db, 300)[m]
     capped = load_activity(inv.db, 300, per_mac_limit=64)
     assert capped[m] == full[-64:] and len(capped[m]) == 64
-    assert "not-observed" not in capped and len(capped) == 2
+    assert set(capped) == {
+        m,
+        "elsewhere",
+        next(k for k in full_keys(inv) if k not in (m, "elsewhere")),
+    }
+    old_only = load_activity(inv.db, 300, per_mac_limit=64, min_end=150_000)
+    assert set(old_only) == {m} and old_only[m][-1] == full[-1]  # the retention cutoff applies
+
+
+def full_keys(inv):
+    return [r[0] for r in inv.db.execute("SELECT DISTINCT mac FROM mac_activity")]
 
 
 @pytest.mark.parametrize(("first_ago", "covered", "expect"), [
@@ -212,7 +222,8 @@ def test_mature_needs_both_server_age_and_covered_time_over_the_grace(
     m = inv.mac("D", "h", None, "self", OLD, [(NOW - 1000, NOW - 1000 + covered)])
     if first_ago is not None:
         inv.db.execute(
-            "INSERT OR REPLACE INTO mac_first_received VALUES (?,?)", (m, NOW - first_ago)
+            "INSERT OR REPLACE INTO mac_first_received (mac, received) VALUES (?,?)",
+            (m, NOW - first_ago),
         )
     else:  # no anchor at all: unknown age is not mature
         inv.db.execute("DELETE FROM mac_first_received WHERE mac=?", (m,))
@@ -854,7 +865,9 @@ def attached_world(inv: Inv, rule_id: str):
                 newdev=False)  # fmt: skip
     inv.db.execute("UPDATE observations SET link_rule_id=? WHERE mac=?", (rule_id, a))
     inv.db.execute(  # the evidence recorded when A attached under the hostname-only rule
-        "INSERT INTO rule_attachments VALUES (?,?,'D','victim',NULL,'t')", (a, rule_id)
+        "INSERT INTO rule_attachments (mac, rule_id, target, hostname, mdns_name, attached_at)"
+        " VALUES (?,?,'D','victim',NULL,'t')",
+        (a, rule_id),
     )
     inv.mac("V", None, "Elsewhere", "self", "2026-01-03T00:01:00Z", [(NOW - 3000, NOW)])
 
@@ -894,7 +907,9 @@ def test_stitcher_reads_bounded_clipped_activity(inv, monkeypatch):
 
     monkeypatch.setattr(stitch_mod, "load_activity", spy)
     m = inv.mac("D", "h", None, "self", OLD, [(NOW - 20000, NOW - 20000), (NOW - 100, NOW)])
-    inv.db.execute("INSERT OR REPLACE INTO mac_first_received VALUES (?,?)", (m, NOW - 50))
+    inv.db.execute(
+        "INSERT OR REPLACE INTO mac_first_received (mac, received) VALUES (?,?)", (m, NOW - 50)
+    )
     st = inv.stitcher()
     assert seen["per_mac_limit"] == 64 and seen["max_lag_s"] == 3600
     assert st.act[m] == [(NOW - 200, NOW + 100)]  # the 20000 s old stamp is clipped away

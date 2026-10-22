@@ -99,12 +99,11 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
     ),
     (
         # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity
-        # anchor. Legacy rows (activity stored before this migration) are anchored at the
-        # migration time (server clock), never at a collector stamp: they mature one grace later.
+        # anchor. Legacy rows fall back to their earliest stored stamp.
         "CREATE TABLE IF NOT EXISTS mac_first_received ("
         "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
         "INSERT OR IGNORE INTO mac_first_received (mac, received)"
-        " SELECT mac, CAST(strftime('%s', 'now') AS INTEGER) FROM mac_activity GROUP BY mac",
+        " SELECT mac, MIN(start) FROM mac_activity GROUP BY mac",
         # small key/value state of the stitcher (re-check cursor)
         "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         # suggestion look-ups are by (action, device_ids): no table scan inside the write lock
@@ -142,6 +141,26 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
         " hostname TEXT, mdns_name TEXT, attached_at TEXT NOT NULL)",
     ),
+    (
+        # the fingerprints at attach time too (the re-check searches the same buckets), and the
+        # evidence gaps: periods in which a collector's evidence is known to be missing
+        "ALTER TABLE rule_attachments ADD COLUMN opt55 TEXT",
+        "ALTER TABLE rule_attachments ADD COLUMN opt60 TEXT",
+        "CREATE TABLE IF NOT EXISTS collector_gaps ("
+        'collector_id TEXT NOT NULL, start INTEGER NOT NULL, "end" INTEGER NOT NULL,'
+        " recorded INTEGER NOT NULL)",
+        'CREATE INDEX IF NOT EXISTS idx_collector_gaps_end ON collector_gaps("end")',
+    ),
+    (
+        # Migration 6 anchored legacy MACs at their earliest stored COLLECTOR stamp (untrusted).
+        # Re-anchor those rows (anchor == earliest stored stamp) at the migration time on the
+        # server clock and mark them legacy; honest rows (a server receipt time) are untouched.
+        "ALTER TABLE mac_first_received ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
+        "UPDATE mac_first_received SET legacy = 1,"
+        " received = MAX(received, CAST(strftime('%s', 'now') AS INTEGER))"
+        " WHERE received = (SELECT MIN(start) FROM mac_activity a"
+        " WHERE a.mac = mac_first_received.mac)",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -156,6 +175,7 @@ PIPELINE_TABLES = (
     "mac_first_received",
     "stitch_state",
     "rule_attachments",
+    "collector_gaps",
 )
 
 

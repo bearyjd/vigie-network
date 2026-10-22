@@ -38,10 +38,14 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
 
 - **Activity.** Row timestamps (leases, neighbours, DNS, flows) are folded per MAC into
   `mac_activity (mac, start, end)` intervals (a silence over 5 min splits an interval; 7 d
-  retention; pipeline schema v4). Stamps outside [received - 7 d, received + 300 s] are ignored.
+  retention; pipeline schema v4). Stamps outside [received - 1 h, received + 300 s] are ignored.
   Collector stamps are untrusted: `mac_first_received` (schema v6) holds the SERVER time a MAC was
   first received, activity earlier than that minus 1 h is clipped when loaded, and every batch drops
-  stamps older than its own receipt minus 1 h, so back-filled stamps cannot mature a MAC. Derived data; safe to drop.
+  stamps older than its own receipt minus 1 h, so back-filled stamps cannot mature a MAC. Stamps
+  dropped for the lag are recorded as evidence gaps (`collector_gaps`, schema v8): a MAC whose
+  activity window overlaps a gap is not mature. Setup work (activity and observations) follows the
+  active MACs, so a large `observations` table does not lengthen the stitch transaction.
+  Derived data; safe to drop.
 - **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
   opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a
   candidate, so a hostname alone never is. Rows go to `identity_candidates`

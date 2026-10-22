@@ -16,7 +16,7 @@ import sqlite3
 import time
 from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
@@ -25,11 +25,13 @@ from vigie_pipeline.activity import (
     Interval,
     load_activity,
     load_first_received,
+    load_gaps,
     merge_intervals,
     overlap_seconds,
 )
 from vigie_pipeline.config import (
     ACTIVITY_MAX_REPORT_LAG_S,
+    MAX_ALIAS_IDS,
     MAX_FLOOD_EVENTS_PER_PASS,
     MAX_INTERVALS_PER_MAC,
     MAX_OVERLAP_OPS_PER_PASS,
@@ -52,6 +54,7 @@ from vigie_pipeline.stitch_db import (
     emit_once,
     event_exists,
     find_merge_suggestion,
+    has_open_orphan_suggestions,
     load_attachments,
     save_attachment,
     state_get,
@@ -60,6 +63,7 @@ from vigie_pipeline.stitch_db import (
     vetoed_between,
     widen_linked_devices,
     withdraw_open_suggestions,
+    withdraw_orphan_suggestions,
 )
 
 logger = logging.getLogger("vigie_pipeline")
@@ -79,6 +83,7 @@ class Obs:
     hostname: str | None
     mdns: str | None
     first_seen: str
+    first_ts: float = 0.0  # first_seen as epoch seconds, parsed once at load
     retired: bool = False  # the MAC's own device is retired
     rule_id: str | None = None  # observations.link_rule_id (rule-attached MACs)
 
@@ -155,24 +160,60 @@ def rule_score(rule: Rule) -> float:
     return score_of(["opt55", "opt60", *named])
 
 
-def _load_obs(inv: sqlite3.Connection, snap: Snapshot, tick: Callable[[], None]) -> list[Obs]:
-    """Every observation; `tick` is called every few thousand rows so that a huge inventory
-    cannot hold the write lock for long (it raises BudgetExhaustedError)."""
+def _components(links: Mapping[str, str]) -> dict[str, frozenset[str]]:
+    """Connected components of the merge links (undirected, iterative, any chain length): the
+    set of device ids that are one identity."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    for src, dst in links.items():
+        parent[find(src)] = find(dst)
+    groups: dict[str, set[str]] = defaultdict(set)
+    for device in list(parent):
+        groups[find(device)].add(device)
+    return {d: frozenset(g) for g in groups.values() for d in g}
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _chunked(items: list[str], size: int = 400) -> Iterable[list[str]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _load_obs(
+    inv: sqlite3.Connection, snap: Snapshot, tick: Callable[[], None], devices: Iterable[str]
+) -> list[Obs]:
+    """The observations of the given devices (index seeks by device), ordered by age. `tick` runs
+    between chunks, so loading is interruptible and proportional to the devices asked for."""
     out = []
-    for i, r in enumerate(inv.execute(
-        "SELECT o.mac, o.device_id, o.is_randomized, o.dhcp_fingerprint, o.vendor_class,"
-        " o.hostname, o.mdns_name, o.link_source, o.first_seen, o.link_rule_id, d.status"
-        " FROM observations o JOIN devices d ON d.id = o.device_id"
-        " ORDER BY o.first_seen, o.mac"
-    )):  # fmt: skip
-        if not i % 4096:
-            tick()
-        out.append(
-            Obs(r["mac"], r["device_id"], snap.canonical(r["device_id"]), bool(r["is_randomized"]),
-                r["link_source"], r["dhcp_fingerprint"] or None, r["vendor_class"] or None,
-                r["hostname"] or None, r["mdns_name"] or None, r["first_seen"],
-                r["status"] == "retired", r["link_rule_id"])
-        )  # fmt: skip
+    for chunk in _chunked(sorted(set(devices))):
+        tick()
+        for r in inv.execute(
+            "SELECT o.mac, o.device_id, o.is_randomized, o.dhcp_fingerprint, o.vendor_class,"  # noqa: S608
+            " o.hostname, o.mdns_name, o.link_source, o.first_seen, o.link_rule_id, d.status"
+            " FROM observations o JOIN devices d ON d.id = o.device_id"
+            f" WHERE o.device_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ):
+            out.append(
+                Obs(r["mac"], r["device_id"], snap.canonical(r["device_id"]),
+                    bool(r["is_randomized"]), r["link_source"], r["dhcp_fingerprint"] or None,
+                    r["vendor_class"] or None, r["hostname"] or None, r["mdns_name"] or None,
+                    r["first_seen"], _epoch(r["first_seen"]),
+                    r["status"] == "retired", r["link_rule_id"])
+            )  # fmt: skip
+    out.sort(key=lambda o: (o.first_seen, o.mac))
     return out
 
 
@@ -185,14 +226,17 @@ class Stitcher:
         self.clock = clock or (lambda: now)  # rule expiry is re-checked against this
         self.overrides = overrides  # re-read under the lock before an attach
         self.deadline = time.monotonic() + STITCH_SETUP_MAX_SECONDS  # setup only; see run()
-        self.first_recv = load_first_received(inv)  # SERVER time each MAC was first received
-        self.act = {  # only the most recent intervals of a MAC are compared
+        self.components = _components(snap.links)
+        self.first_recv = load_first_received(inv, self._check_time)  # SERVER first receipt
+        self.act = {  # only active MACs; only the most recent intervals of a MAC are compared
             m: ivs[-MAX_INTERVALS_PER_MAC:]
             for m, ivs in load_activity(
                 inv, cfg.activity_gap_s, per_mac_limit=MAX_INTERVALS_PER_MAC,
                 first_received=self.first_recv, max_lag_s=ACTIVITY_MAX_REPORT_LAG_S,
+                min_end=int(now) - cfg.activity_retention_s, tick=self._check_time,
             ).items()
         }  # fmt: skip
+        self.gaps = load_gaps(inv, int(now) - cfg.activity_retention_s)  # missing evidence
         self.ops = 0  # overlap-computation budget spent this pass
         self.flood_events = 0
         self.flood_suppressed = 0
@@ -201,19 +245,36 @@ class Stitcher:
         self.flooded_keys: set[GroupKey] = set()
         self.writes = 0  # candidate/suggestion rows written this pass
         self.attachments = load_attachments(inv)  # immutable evidence of each rule attach
-        members: dict[str, set[str]] = defaultdict(set)
-        for device in snap.links:  # every device merged (transitively) into a canonical one
-            members[snap.canonical(device)].add(device)
-        self.members = members
-        self.reload()
+        self.obs = _load_obs(inv, snap, self._check_time, self._relevant_devices())
+        self._index()
 
-    def alias_ids(self, device_id: str) -> set[str]:
-        """The device id, its canonical device and every device merged into that one."""
-        canon = self.snap.canonical(device_id)
-        return {device_id, canon, *self.members.get(canon, ())}
+    def _relevant_devices(self) -> set[str]:
+        """Every device the decisions can depend on: devices with an active MAC (all their MACs),
+        the rule targets, and everything merged with them (the target of an attach that is still
+        active is loaded through the attached MAC's own device).
+        A device with no active MAC that is none of these cannot overlap anything and is not a
+        peer; it is not loaded."""
+        devices: set[str] = set()
+        active = sorted(self.act)
+        for chunk in _chunked(active):
+            self._check_time()
+            marks = ",".join("?" * len(chunk))
+            devices.update(
+                r[0] for r in self.inv.execute(
+                    f"SELECT DISTINCT device_id FROM observations WHERE mac IN ({marks})",  # noqa: S608
+                    chunk,
+                )
+            )  # fmt: skip
+        devices.update(r.device_id for r in self.snap.rules)
+        for device in list(devices):
+            devices |= self.alias_ids(device)
+        return devices
 
-    def reload(self) -> None:
-        self.obs = _load_obs(self.inv, self.snap, self._check_time)
+    def alias_ids(self, device_id: str) -> frozenset[str]:
+        """Every device id of the same identity (the connected component of the merge links)."""
+        return self.components.get(device_id) or frozenset({device_id})
+
+    def _index(self) -> None:
         self.by_mac = {o.mac: o for o in self.obs}
         self.by_canon: dict[str, list[Obs]] = defaultdict(list)
         self.groups: dict[GroupKey, list[Obs]] = defaultdict(list)
@@ -221,10 +282,24 @@ class Stitcher:
             self.by_canon[o.canon].append(o)
             for key in group_keys(o):
                 self.groups[key].append(o)
+        self._reset_caches()
+
+    def _reset_caches(self) -> None:
         self._canon_ivs: dict[str, list[Interval]] = {}
         self._bad_pairs_cache: dict[tuple[GroupKey, ...], set[frozenset[str]]] = {}
         self._live_sizes: dict[GroupKey, int] | None = None
         self._by_fp: dict[tuple[str | None, str | None], list[Obs]] | None = None
+
+    def _moved(self, old: Obs, new: Obs) -> None:
+        """Swap one observation in the in-memory maps after a committed attach: no reload, so
+        no deadline can interrupt it halfway and leave the maps stale."""
+        self.obs = [new if o.mac == old.mac else o for o in self.obs]
+        self.by_mac[new.mac] = new
+        self.by_canon[old.canon].remove(old)
+        self.by_canon[new.canon].append(new)
+        for key in group_keys(old):
+            self.groups[key] = [new if o.mac == old.mac else o for o in self.groups[key]]
+        self._reset_caches()
 
     def _check_time(self) -> None:
         if time.monotonic() > self.deadline:
@@ -266,7 +341,21 @@ class Stitcher:
         collector stamp)."""
         grace = self.cfg.overlap_grace_s
         first = self.first_recv.get(mac)  # no anchor: unknown age, so not mature (fail closed)
-        return self.covered(mac) > grace and first is not None and self.now - first > grace
+        return (
+            self.covered(mac) > grace
+            and first is not None
+            and self.now - first > grace
+            and not self._in_gap(mac)
+        )
+
+    def _in_gap(self, mac: str) -> bool:
+        """Does the MAC's activity window overlap a span in which some collector's evidence is
+        known to be missing (stamps dropped for the report lag, or a long silence)?"""
+        ivs = self.act.get(mac)
+        if not ivs:
+            return False
+        lo, hi = ivs[0][0], ivs[-1][1]
+        return any(start < hi and end > lo for start, end in self.gaps)
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
         """Concurrent activity that rules out a rolling twin. Sustained = overlap longer than the
@@ -355,8 +444,7 @@ class Stitcher:
 
     def _close_in_time(self, a: Obs, b: Obs) -> bool:
         """First sightings within one activity gap of each other."""
-        first = [datetime.fromisoformat(o.first_seen.replace("Z", "+00:00")) for o in (a, b)]
-        return abs((first[0] - first[1]).total_seconds()) <= self.cfg.activity_gap_s
+        return abs(a.first_ts - b.first_ts) <= self.cfg.activity_gap_s
 
     def _names_of(self, canon: str) -> set[str]:
         """Casefolded hostnames and mDNS names seen on any MAC of a device."""
@@ -368,8 +456,10 @@ class Stitcher:
         """The filtered compatible set (see compatible_peers); `known` = names of the target
         device (default: c's own device). Only the filtered set is charged to the budget."""
         known = self._names_of(c.canon) if known is None else known
+        pool = self._pool(c)
+        self._charge(len(pool) // 1024)  # the scan itself, cheap per MAC
         out = {
-            o.mac for o in self._pool(c)
+            o.mac for o in pool
             if o.mac != c.mac and not (
                 (o.hostname and c.hostname and not _same(o.hostname, c.hostname))
                 or (o.mdns and c.mdns and not _same(o.mdns, c.mdns))
@@ -612,7 +702,10 @@ class Stitcher:
             return  # already flagged: costs the budget nothing
         att = self.attachments.get(o.mac)
         if att:  # the values and rule fields that justified the attach, immune to renames
-            view = replace(o, hostname=att.hostname, mdns=att.mdns_name)
+            view = replace(
+                o, hostname=att.hostname, mdns=att.mdns_name,
+                opt55=att.opt55 or o.opt55, opt60=att.opt60 or o.opt60,
+            )  # fmt: skip
         else:  # attached before attachments were recorded: the names shared with the target
             others = [t for t in self.by_canon.get(o.canon, []) if t.mac != o.mac]
             view = self._restrict(
@@ -634,7 +727,10 @@ class Stitcher:
         the interval cap or fresh lone stamps launder the overlap that justified the veto. Only a
         human dismissal (the state `dismissed`, written through the API) clears it. Both endpoints
         are resolved through the current merges, so a veto survives its target being merged."""
-        return vetoed_between(self.inv, self.alias_ids(c.device_id), self.alias_ids(into))
+        a, b = self.alias_ids(c.device_id), self.alias_ids(into)
+        if len(a) > MAX_ALIAS_IDS or len(b) > MAX_ALIAS_IDS:
+            return True  # an absurd merge component cannot be checked: fail closed
+        return vetoed_between(self.inv, a, b)
 
     def _rule_live(self, rule: Rule) -> bool:
         """Not expired NOW (the snapshot's own check is as old as the snapshot)."""
@@ -680,7 +776,7 @@ class Stitcher:
         group = self.snap.overrides.get(target, (0, None))[1]
         trusted_state = self._state_ok(target) and self._state_ok(c.device_id)
         if trusted_state and group is not None and self.snap.group_auto_inherit.get(group) == 1:
-            self._attach(c, target, rule, score)
+            self._attach(c, target, rule, score, matched)
         else:  # unassigned, auto_inherit=0, unknown group or identity_state != 'ok': human confirms
             found = ["opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n))]
             self._suggest(c, target, score, evidence, "rule_hit_needs_confirm", found)
@@ -720,19 +816,37 @@ class Stitcher:
         return len(ids)
 
     def _settle_attached(self) -> None:
-        """Finish the dismissal that an attach could not fit under the row cap."""
-        for key, in self.inv.execute("SELECT key FROM stitch_state WHERE key LIKE 'settle:%'")\
-                .fetchall():  # fmt: skip
+        """Finish the dismissal and the suggestion withdrawal that an attach could not fit under
+        the row cap. Stops at once when the allowance is spent or the time-box is."""
+        keys = [
+            r[0] for r in self.inv.execute("SELECT key FROM stitch_state WHERE key LIKE 'settle:%'")
+        ]
+        for key in keys:
+            self._charge(0)
+            if MAX_ROWS_PER_PASS - self.writes <= 0:
+                return
             device_id = key[len("settle:") :]
-            self.writes += self._dismiss_open_candidates(device_id, MAX_ROWS_PER_PASS - self.writes)
-            left = self.inv.execute(
-                "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
-                " ('open','suggested') LIMIT 1", (device_id,),
-            ).fetchone()  # fmt: skip
-            if left is None:
-                state_set(self.inv, key, None)
+            self._settle_device(device_id)
 
-    def _attach(self, c: Obs, target: str, rule: Rule, score: float) -> None:
+    def _settle_device(self, device_id: str) -> None:
+        """Expire the orphan's open suggestions, then dismiss its open candidate rows, within the
+        row allowance of this pass; the settle marker stays until nothing is left."""
+        self.writes += withdraw_orphan_suggestions(
+            self.inv, self.snap, device_id, self.now, MAX_ROWS_PER_PASS - self.writes
+        )
+        self.writes += self._dismiss_open_candidates(device_id, MAX_ROWS_PER_PASS - self.writes)
+        left = self.inv.execute(
+            "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
+            " ('open','suggested') LIMIT 1", (device_id,),
+        ).fetchone()  # fmt: skip
+        if left is None and not has_open_orphan_suggestions(
+            self.inv, self.snap, device_id, self.now
+        ):
+            state_set(self.inv, f"settle:{device_id}", None)
+        else:
+            state_set(self.inv, f"settle:{device_id}", "1")
+
+    def _attach(self, c: Obs, target: str, rule: Rule, score: float, matched: list[Rule]) -> None:
         if not self._rule_live(rule) or not self._still_authorised(rule, target):
             return  # expired, revoked or regrouped while this pass waited for the lock or worked
         old = self.inv.execute(
@@ -749,8 +863,10 @@ class Stitcher:
             return
         save_attachment(
             self.inv, c.mac,
-            Attachment(rule.id, target, c.hostname if rule.hostname else None,
-                       c.mdns if rule.mdns_name else None), self.now,
+            Attachment(rule.id, target,
+                       c.hostname if any(r.hostname for r in matched) else None,
+                       c.mdns if any(r.mdns_name for r in matched) else None,
+                       c.opt55, c.opt60), self.now,
         )  # fmt: skip
         self.inv.execute(
             "UPDATE devices SET first_seen=MIN(first_seen,(SELECT first_seen FROM devices"
@@ -763,20 +879,23 @@ class Stitcher:
         ).fetchone()[0]
         if not left:  # the orphaned self device is retired, never deleted
             self.inv.execute("UPDATE devices SET status='retired' WHERE id=?", (c.device_id,))
-        # settled by the rule; an earlier open suggestion just expires. The candidate rows are
-        # dismissed under the row cap: what does not fit is finished by the next passes.
-        self.writes += self._dismiss_open_candidates(c.device_id, MAX_ROWS_PER_PASS - self.writes)
-        if self.inv.execute(
-            "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
-            " ('open','suggested') LIMIT 1", (c.device_id,),
-        ).fetchone():  # fmt: skip
-            state_set(self.inv, f"settle:{c.device_id}", "1")
+        # settled by the rule: the orphan's open suggestions expire at once (a human must not be
+        # able to accept one after this) and its candidate rows are dismissed, both under the
+        # row cap; what does not fit is finished by the following passes (_settle_device).
+        self._settle_device(c.device_id)
         before = short_hash(old["mac"]) if old else "none"
         emit_event(self.inv, target, "mac_attached", "info",
                    f"mac attached: {before} -> {short_hash(c.mac)}", self.now)  # fmt: skip
         self.stats.attached += 1
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(c.mac))
-        self.reload()  # the canonical map changed: later MACs must see this attachment
+        status = self.inv.execute("SELECT status FROM devices WHERE id=?", (target,)).fetchone()
+        self._moved(  # the canonical map changed: later MACs must see this attachment
+            c,
+            replace(
+                c, device_id=target, canon=self.snap.canonical(target), source="rule",
+                rule_id=rule.id, retired=bool(status) and status[0] == "retired",
+            ),
+        )  # fmt: skip
 
     # ---- pass 2: fingerprint candidates ----------------------------------------------------------
 

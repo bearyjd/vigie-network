@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from vigie_pipeline.logs import log
 
 logger = logging.getLogger("vigie_pipeline")
 MAX_LINK_DEPTH = 32
+OPT55_RE = re.compile(r"[0-9]+(,[0-9]+)*")
 
 
 class OverridesUnreadable(RuntimeError):
@@ -61,12 +63,6 @@ def _text(value: object) -> str | None:
     return (value.strip() or None) if isinstance(value, str) else None
 
 
-def _opt55(value: object) -> str | None:
-    if isinstance(value, list) and all(isinstance(x, int) for x in value):
-        return ",".join(str(x) for x in value) or None
-    return _text(value)
-
-
 class MalformedRule(ValueError):
     """An identity_rules row whose fields have the wrong type or shape: never used."""
 
@@ -75,6 +71,31 @@ def _ident(value: object, what: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise MalformedRule(f"{what} is not a non-blank string")
     return value
+
+
+def _sig_text(value: object, what: str) -> str | None:
+    """A signature name field: absent or null means "not required"; anything else SUPPLIED must be
+    a non-blank string, otherwise the whole rule is malformed (never silently weakened)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise MalformedRule(f"signature {what} is supplied but not a non-blank string")
+    return value.strip()
+
+
+def _sig_opt55(value: object) -> str | None:
+    """opt55 as a comma list of integers ("1,2,3") or a list of integers; absent or null is
+    "missing" (the rule is then incomplete and ignored); any other supplied shape is malformed."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not value or not all(isinstance(x, int) and not isinstance(x, bool) for x in value):
+            raise MalformedRule("signature opt55 list must hold integers")
+        return ",".join(str(x) for x in value)
+    text = _sig_text(value, "opt55")
+    if text is None or not OPT55_RE.fullmatch(text):
+        raise MalformedRule("signature opt55 is not a comma list of integers")
+    return text
 
 
 def parse_rule(row: sqlite3.Row) -> Rule | None:
@@ -90,8 +111,8 @@ def parse_rule(row: sqlite3.Row) -> Rule | None:
         raise MalformedRule("signature nesting too deep") from exc
     if not isinstance(sig, dict):
         return None
-    opt55, opt60 = _opt55(sig.get("opt55")), _text(sig.get("opt60"))
-    host, mdns = _text(sig.get("hostname")), _text(sig.get("mdns_name"))
+    opt55 = _sig_opt55(sig.get("opt55"))
+    opt60, host, mdns = (_sig_text(sig.get(k), k) for k in ("opt60", "hostname", "mdns_name"))
     if not (opt55 and opt60 and (host or mdns)):
         return None
     return Rule(rule_id, device_id, opt55, opt60, host, mdns, _expiry(row["expires_at"]))

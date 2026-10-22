@@ -178,17 +178,27 @@ def _marks(ids: Collection[str]) -> str:
     return ",".join("?" * len(ids))
 
 
+CHUNK = 400  # ids per IN (...) list: far below SQLite's variable limit
+
+
+def _chunks(ids: Collection[str]) -> list[list[str]]:
+    items = sorted(ids)
+    return [items[i : i + CHUNK] for i in range(0, len(items), CHUNK)]
+
+
 def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Collection[str]) -> bool:
     """Is any (a, b) pair of the two alias sets recorded as vetoed? A permanent veto keyed by a
-    device id must survive that device being merged into another."""
-    return (
-        inv.execute(
-            "SELECT 1 FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
-            f" AND device_a IN ({_marks(a_ids)}) AND device_b IN ({_marks(b_ids)}) LIMIT 1",
-            [*a_ids, *b_ids],
-        ).fetchone()
-        is not None
-    )
+    device id must survive that device being merged into another. The id lists are chunked, so
+    the number of merged devices is not limited by SQLite's variable count."""
+    for a in _chunks(a_ids):
+        for b in _chunks(b_ids):
+            if inv.execute(
+                "SELECT 1 FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
+                f" AND device_a IN ({_marks(a)}) AND device_b IN ({_marks(b)}) LIMIT 1",
+                [*a, *b],
+            ).fetchone():
+                return True
+    return False
 
 
 def widen_linked_devices(inv: sqlite3.Connection, links: Mapping[str, str]) -> None:
@@ -212,13 +222,17 @@ class Attachment:
     target: str
     hostname: str | None
     mdns_name: str | None
+    opt55: str | None = None  # None: attached before the fingerprints were recorded
+    opt60: str | None = None
 
 
 def load_attachments(inv: sqlite3.Connection) -> dict[str, Attachment]:
     return {
-        r["mac"]: Attachment(r["rule_id"], r["target"], r["hostname"], r["mdns_name"])
+        r["mac"]: Attachment(
+            r["rule_id"], r["target"], r["hostname"], r["mdns_name"], r["opt55"], r["opt60"]
+        )
         for r in inv.execute(
-            "SELECT mac, rule_id, target, hostname, mdns_name FROM rule_attachments"
+            "SELECT mac, rule_id, target, hostname, mdns_name, opt55, opt60 FROM rule_attachments"
         )
     }
 
@@ -226,6 +240,42 @@ def load_attachments(inv: sqlite3.Connection) -> dict[str, Attachment]:
 def save_attachment(inv: sqlite3.Connection, mac: str, att: Attachment, now: float) -> None:
     inv.execute(
         "INSERT OR REPLACE INTO rule_attachments (mac, rule_id, target, hostname, mdns_name,"
-        " attached_at) VALUES (?,?,?,?,?,?)",
-        (mac, att.rule_id, att.target, att.hostname, att.mdns_name, iso_utc(now)),
+        " attached_at, opt55, opt60) VALUES (?,?,?,?,?,?,?,?)",
+        (mac, att.rule_id, att.target, att.hostname, att.mdns_name, iso_utc(now), att.opt55,
+         att.opt60),
+    )  # fmt: skip
+
+
+def withdraw_orphan_suggestions(
+    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float, limit: int
+) -> int:
+    """Expire (expires_at only) up to `limit` undecided merge suggestions that start at the
+    orphaned device `device_id`, by index range. Returns the rows expired."""
+    prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
+    ids = [
+        r["id"]
+        for r in inv.execute(
+            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
+            " AND device_ids < ? AND expires_at >= ?",
+            (prefix, prefix + "\uffff", iso_utc(now)),
+        )
+        if r["id"] not in snap.decisions
+    ][: max(limit, 0)]
+    inv.executemany(
+        "UPDATE suggestions SET expires_at=? WHERE id=?", [(iso_utc(now - 1), i) for i in ids]
+    )
+    return len(ids)
+
+
+def has_open_orphan_suggestions(
+    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float
+) -> bool:
+    prefix = json.dumps([device_id, ""])[:-2]
+    return any(
+        r["id"] not in snap.decisions
+        for r in inv.execute(
+            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
+            " AND device_ids < ? AND expires_at >= ?",
+            (prefix, prefix + "\uffff", iso_utc(now)),
+        )
     )

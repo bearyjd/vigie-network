@@ -141,7 +141,12 @@ def _process_batches(
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
                 record_activity(
-                    inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
+                    inv,
+                    acts,
+                    config.activity_gap_s,
+                    _epoch(received),
+                    config.activity_retention_s,
+                    collector,
                 )
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1

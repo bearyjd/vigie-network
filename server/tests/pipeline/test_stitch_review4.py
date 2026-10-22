@@ -198,12 +198,12 @@ def test_vetoed_pair_is_not_re_evaluated_and_stays_vetoed(inv, monkeypatch):
 
 def test_interval_cap_keeps_the_newest_intervals(inv, monkeypatch):
     monkeypatch.setattr(stitch_mod, "MAX_INTERVALS_PER_MAC", 4)
+    base = NOW - 20000
     m = inv.mac("A", "h", None, "self", "2026-01-01T00:00:00Z",
-                [(1000 * i, 1000 * i) for i in range(10)])  # fmt: skip
-    inv.db.execute("INSERT OR REPLACE INTO mac_first_received VALUES (?,0)", (m,))
+                [(base + 1000 * i, base + 1000 * i) for i in range(10)])  # fmt: skip
     st = inv.stitcher()
     assert len(st.act[m]) == 4
-    assert [s for s, _ in st.act[m]] == [6000 - 150 + 0, 7000 - 150, 8000 - 150, 9000 - 150]
+    assert [s for s, _ in st.act[m]] == [base + 1000 * i - 150 for i in (6, 7, 8, 9)]
 
 
 def test_cap_cannot_launder_a_veto_by_pushing_the_overlap_out_of_the_window(inv, monkeypatch):

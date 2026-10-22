@@ -504,7 +504,7 @@ def test_attach_never_moves_a_mac_that_is_not_a_self_link(data):
     before = data.q("SELECT * FROM observations WHERE mac=?", b)[0]
     o = obs(mac=b, device_id=before["device_id"], canon=before["device_id"], source="rule")
     rule = Rule("r", device_of(data, other), OPT55, OPT60, HOST, None)
-    st._attach(o, device_of(data, other), rule, 1.0)
+    st._attach(o, device_of(data, other), rule, 1.0, [rule])
     assert tuple(data.q("SELECT * FROM observations WHERE mac=?", b)[0]) == tuple(before)
     assert len(kinds(data, "mac_attached")) == 1
     ov.close()
