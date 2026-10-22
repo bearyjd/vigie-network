@@ -672,3 +672,88 @@ def test_run_once_hands_its_overrides_connection_to_the_attach_recheck(data, mon
     stats = run_at(data, T0 + 6000)
     assert stats.attached == 0 and source_of(data, b) == "self"
     ov.close()
+
+
+# ---- addendum: rotation, revoked-rule re-check, fail-closed anchor ----
+
+
+def quiet_attached(inv: Inv) -> list[str]:
+    """Three rule-attached MACs of D that never overlap anything, so none can ever be flagged."""
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    macs = [
+        inv.mac(
+            "D",
+            "victim",
+            None,
+            "rule",
+            f"2026-01-0{k + 2}T00:00:00Z",
+            [(NOW - 70000 + k * 20000, NOW - 60000 + k * 20000)],
+            newdev=False,
+        )  # fmt: skip
+        for k in range(3)
+    ]
+    inv.db.execute("UPDATE observations SET link_rule_id='r1' WHERE link_source='rule'")
+    return sorted(macs)
+
+
+def test_recheck_rotates_through_every_attached_mac_across_budget_stops(inv, monkeypatch):
+    macs = quiet_attached(inv)
+    monkeypatch.setattr(stitch_mod, "MAX_OVERLAP_OPS_PER_PASS", 4)  # one MAC (3 units) per pass
+    checked: list[str] = []
+    real = Stitcher._recheck
+
+    def spy(self, o):
+        real(self, o)
+        checked.append(o.mac)
+
+    monkeypatch.setattr(Stitcher, "_recheck", spy)
+    cursors = []
+    for i in range(3):
+        inv.stitch(RULE_SNAP, NOW + i)
+        row = inv.db.execute("SELECT value FROM stitch_state WHERE key='recheck_after_mac'")
+        cursors.append(row.fetchone()[0])
+    assert checked == macs  # one new MAC per pass, in order, none twice
+    assert cursors == macs  # the cursor is the last MAC checked
+
+
+def test_a_revoked_rules_attach_is_rechecked_against_the_persisted_evidence(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)],
+                newdev=False)  # fmt: skip
+    inv.db.execute(
+        "UPDATE observations SET link_rule_id='gone', hostname='renamed' WHERE mac=?", (a,)
+    )
+    inv.db.execute(
+        "INSERT INTO rule_attachments VALUES (?, 'gone', 'D', 'victim', NULL, 't')", (a,)
+    )
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW - 3000, NOW)])
+    assert inv.stitch(Snapshot({}, (), {}, {}, {})).suspect == 1  # found via the stored hostname
+
+
+def test_without_stored_evidence_a_name_shared_with_the_target_still_finds_the_suspect(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)],
+                newdev=False)  # fmt: skip
+    inv.db.execute("UPDATE observations SET link_rule_id='gone' WHERE mac=?", (a,))
+    inv.mac("V", "victim", None, "rule", "2026-01-03T00:00:00Z", [(NOW - 3000, NOW)])  # not pooled
+    assert inv.stitch(Snapshot({}, (), {}, {}, {})).suspect >= 1
+    assert inv.count("rule_attach_suspect") >= 1
+
+
+def test_a_mac_without_an_anchor_is_never_attached_by_a_rule(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    b = inv.mac("B", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)])
+    inv.db.execute("DELETE FROM mac_first_received WHERE mac=?", (b,))
+    assert inv.stitch(RULE_SNAP).attached == 0 and link_of(inv, b) == ("B", "self")
+    inv.db.execute("INSERT INTO mac_first_received VALUES (?, ?)", (b, NOW - 10**6))
+    assert inv.stitch(RULE_SNAP).attached == 1
+
+
+def test_legacy_recheck_uses_the_names_shared_with_the_target_to_exclude_contradicting_macs(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)],
+                newdev=False)  # fmt: skip
+    inv.db.execute("UPDATE observations SET link_rule_id='gone' WHERE mac=?", (a,))
+    # a different hostname contradicts the shared 'victim': not a peer, however close in time
+    inv.mac("V", "other", None, "self", "2026-01-02T00:01:00Z", [(NOW - 3000, NOW)])
+    assert inv.stitch(Snapshot({}, (), {}, {}, {})).suspect == 0
