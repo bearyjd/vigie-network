@@ -9,4 +9,10 @@ pin2=1111111111111111111111111111111111111111111111111111111111111111
 # Optional (defaults shown):
 # key_file=/etc/vigie/key
 # dnsmasq_log=/tmp/vigie/dnsmasq.log
+# dropin_path=/tmp/dnsmasq.d/vigie.conf
+# log_dir=/tmp/vigie
+# dropin_path and log_dir must be absolute, without `..`, trailing slash or NUL. dnsmasq_log must be
+# <log_dir>/dnsmasq.log (the root scripts hardcode /tmp/vigie and /tmp/dnsmasq.d); anything else
+# is refused unless allow_custom_log_path=1.
+# allow_custom_log_path=0
 # leases_file=/tmp/dhcp.leases

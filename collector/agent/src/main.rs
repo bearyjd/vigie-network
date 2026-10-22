@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
 use vigie_agent::config::{load_key, parse_config, wipe, Config};
 use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
-use vigie_agent::dropin::{check_dropin, QuietDetector, DROPIN_PATH, LOG_DIR};
+use vigie_agent::dropin::{check_dropin, QuietDetector};
 use vigie_agent::ids;
 use vigie_agent::leases::parse_leases;
 use vigie_agent::model::{Health, Lease, Meta, Neighbor, Sections};
@@ -279,8 +279,8 @@ impl Agent {
         }
         self.pump_sources(mono_s);
         self.sources.finish_window(&mut self.window, mono_s);
-        let dropin = std::fs::read_to_string(DROPIN_PATH).ok();
-        let state = check_dropin(dropin.as_deref(), LOG_DIR);
+        let dropin = std::fs::read_to_string(&self.cfg.dropin_path).ok();
+        let state = check_dropin(dropin.as_deref(), &self.cfg.log_dir.to_string_lossy());
         let quiet = self
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
@@ -581,6 +581,49 @@ mod tests {
                 body: Vec::new(),
             })
         }
+    }
+
+    /// `dns_log_quiet` of the first regular batch, with the drop-in at `dropin` checked against
+    /// `log_dir` (both come from the config).
+    fn quiet_flag(tag: &str, content: Option<&str>, log_dir: &str) -> bool {
+        let path =
+            std::env::temp_dir().join(format!("vigie-main-{}-{tag}.conf", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        if let Some(c) = content {
+            std::fs::write(&path, c).unwrap();
+        }
+        let mut a = agent();
+        a.cfg.dropin_path = path.clone();
+        a.cfg.log_dir = log_dir.into();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        let mut tr = Recorder(Vec::new());
+        let mut last = (0u64, 0u64);
+        let when = Clock {
+            wall: t0 + 60,
+            mono: 60,
+            jitter: 0,
+        };
+        a.step(when, 60, (&mut last.0, &mut last.1), &mut tr);
+        std::fs::remove_file(path).ok();
+        let j: serde_json::Value = serde_json::from_slice(&tr.0[0]).unwrap();
+        j["health"]["dns_log_quiet"].as_bool().unwrap()
+    }
+
+    #[test]
+    fn configured_dropin_path_and_log_dir_drive_the_quiet_flag() {
+        use vigie_agent::dropin::dropin_content;
+        let good = dropin_content("/run/vl");
+        assert!(
+            !quiet_flag("ok", Some(&good), "/run/vl"),
+            "matching drop-in"
+        );
+        assert!(quiet_flag("missing", None, "/run/vl"), "missing drop-in");
+        assert!(
+            quiet_flag("differs", Some(&good), "/other"),
+            "wrong log dir"
+        );
     }
 
     static NEIGH: std::sync::Mutex<Vec<vigie_agent::model::Neighbor>> =

@@ -21,6 +21,11 @@ const MAX_PENDING_DNS: usize = 1024;
 /// others' queries between two polls.
 const MAX_PENDING_PER_CLIENT: usize = 256;
 const MAX_PENDING_DHCP: usize = 256;
+/// Longest `tags:` value accepted. The value is never used (the line only has to be recognised so
+/// it does not break the attach context), so a router with many or non-ASCII tag names must still
+/// parse; the cap only bounds what a hostile line can carry. Lines failing it are unparsed (the
+/// context breaks) and not separately counted: there is no health counter for them.
+const MAX_TAGS_LEN: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEvent {
@@ -46,6 +51,11 @@ pub enum LogEvent {
     DhcpBoundary {
         id: String,
         poison: bool,
+    },
+    /// `<xid> tags: <iface>`: informational, between the packet line and its companions.
+    /// Neutral: it keeps the attach context of the same xid and never opens one.
+    DhcpTags {
+        id: String,
     },
     DhcpOptions {
         id: String,
@@ -152,6 +162,12 @@ fn parse_dns(id: &str, rest: &str) -> Option<LogEvent> {
 
 fn parse_dhcp(id: &str, rest: &str) -> Option<LogEvent> {
     let id = id.to_string();
+    if let Some(v) = rest.strip_prefix("tags:") {
+        // The value is ignored: any charset, bounded length, no control characters.
+        let v = v.trim();
+        let sane = v.len() <= MAX_TAGS_LEN && !v.chars().any(char::is_control);
+        return sane.then_some(LogEvent::DhcpTags { id });
+    }
     if let Some(v) = rest.strip_prefix("requested options:") {
         let opt55 = v
             .split(',')
@@ -317,6 +333,12 @@ impl DhcpAssembler {
             LogEvent::DhcpName { id, name } => {
                 if let Some((p, _)) = self.attach_target(id) {
                     p.name = Some(name.clone());
+                }
+            }
+            // Neutral: the context survives only if it is this xid's; it is never created here.
+            LogEvent::DhcpTags { id } => {
+                if self.ctx.as_ref().is_some_and(|c| &c.id != id) {
+                    self.ctx = None;
                 }
             }
             LogEvent::DhcpBoundary { id, poison } => {
