@@ -1,14 +1,43 @@
-//! Validated parameters for the (not yet written) SPKI-pinned HTTPS transport.
+//! Validated parameters for the SPKI-pinned HTTPS transport, and the factory the agent uses.
 //!
-//! A future TLS transport must be built from a `PinnedTransport`, which can only be made with an
-//! https URL without userinfo and at least one valid SHA-256 SPKI pin, so "TLS without pins" is not
-//! constructible. Nothing here talks to the network and `PinnedTransport` is not a `sender::Transport`:
-//! `NoTransport` in `main.rs` remains the only implementation shipped.
+//! `HttpsTransport` (in `https.rs`) can only be built from a `PinnedTransport`, which can only be
+//! made with an https URL without userinfo and at least one valid SHA-256 SPKI pin, so "TLS without
+//! pins" is not constructible. `PinnedTransport` itself does no I/O.
 
 use std::fmt;
 
+use crate::config::Config;
+use crate::https::HttpsTransport;
+use crate::sender::{Headers, HttpReply, Transport, TransportError};
+
 /// SHA-256 digest of a certificate's SubjectPublicKeyInfo.
 pub type Pin = [u8; 32];
+
+/// The transport the agent runs with, built from the (already validated) config. Never panics: if
+/// the URL or pins cannot be turned into a transport, every `post` fails with that reason.
+pub fn make(cfg: &Config) -> impl Transport {
+    match PinnedTransport::new(&cfg.server_url, &cfg.pins)
+        .map_err(|e| TransportError(format!("server_url/pins: {e}")))
+        .and_then(HttpsTransport::new)
+    {
+        Ok(t) => Made::Https(Box::new(t)),
+        Err(e) => Made::Broken(e),
+    }
+}
+
+enum Made {
+    Https(Box<HttpsTransport>),
+    Broken(TransportError),
+}
+
+impl Transport for Made {
+    fn post(&mut self, headers: &Headers, body: &[u8]) -> Result<HttpReply, TransportError> {
+        match self {
+            Self::Https(t) => t.post(headers, body),
+            Self::Broken(e) => Err(e.clone()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinError {
@@ -18,6 +47,8 @@ pub enum PinError {
     Port,
     NoPins,
     BadPin(usize),
+    /// Pin at this (0-based) index equals an earlier pin.
+    DuplicatePin(usize),
 }
 
 impl fmt::Display for PinError {
@@ -29,6 +60,7 @@ impl fmt::Display for PinError {
             Self::Port => f.write_str("server URL has an invalid port"),
             Self::NoPins => f.write_str("at least one SPKI pin is required"),
             Self::BadPin(i) => write!(f, "pin {} is not a 32-byte SHA-256 (base64 or hex)", i + 1),
+            Self::DuplicatePin(i) => write!(f, "pin {} is the same key as an earlier pin", i + 1),
         }
     }
 }
@@ -42,8 +74,9 @@ pub struct PinnedTransport {
 }
 
 impl PinnedTransport {
-    /// `pins`: each a standard-base64 SHA-256 (44 chars) or the lowercase hex (64 chars) the
-    /// config file uses; the two lengths cannot be confused.
+    /// `pins`: each a standard-base64 SHA-256 (44 chars) or hex (64 chars, either case); the two
+    /// lengths cannot be confused. Two pins that decode to the same digest, however spelled, are
+    /// refused (`DuplicatePin`): a repeated pin is a config mistake, not a rotation.
     pub fn new<S: AsRef<str>>(url: &str, pins: &[S]) -> Result<Self, PinError> {
         let (host, port, path) = parse_url(url)?;
         if pins.is_empty() {
@@ -54,6 +87,9 @@ impl PinnedTransport {
             .enumerate()
             .map(|(i, p)| parse_pin(p.as_ref()).ok_or(PinError::BadPin(i)))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(i) = (1..pins.len()).find(|&i| pins[..i].contains(&pins[i])) {
+            return Err(PinError::DuplicatePin(i));
+        }
         Ok(Self {
             host,
             port,
@@ -156,10 +192,7 @@ fn decode_hex(s: &str) -> Option<Pin> {
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
         let pair = s.get(2 * i..2 * i + 2)?;
-        if !pair
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
+        if !pair.bytes().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         *b = u8::from_str_radix(pair, 16).ok()?;

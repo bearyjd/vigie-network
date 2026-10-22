@@ -5,8 +5,8 @@
 //! The conntrack helper client and the mDNS/SSDP listener are wired in through `wiring::Sources`
 //! (reader threads behind bounded channels, drained by `Agent::step`).
 //!
-//! NOT DONE in this build: the HTTPS transport with SPKI pinning (the `NoTransport` below
-//! refuses to send, so nothing ever leaves the router in clear text). Never run on the router yet.
+//! The transport is HTTPS with SPKI pinning (`transport::make`, rustls + ring); a bad URL or pin
+//! makes every send fail instead of falling back to anything weaker. Never run on the router yet.
 //! Shutdown: std has no safe signal handler, so SIGTERM takes the default action and ends the
 //! process; all state is in RAM by design (spool, window) and the reader threads die with it.
 
@@ -24,7 +24,7 @@ use vigie_agent::model::{Health, Lease, Meta, Neighbor, Sections};
 use vigie_agent::neigh::{ip_to_mac, pairing_changed};
 use vigie_agent::procstat::{read_rss_kb, read_status, root_refusal};
 use vigie_agent::runtime::{random, random_u64, read_neighbors, wall_ms, wall_secs};
-use vigie_agent::sender::{Engine, Headers, HttpReply, Identity, Tick, Transport, TransportError};
+use vigie_agent::sender::{Engine, Identity, Tick, Transport};
 use vigie_agent::spool::SPOOL_CAP;
 use vigie_agent::syncstate::{FlushPlan, SyncState};
 use vigie_agent::tail::Tail;
@@ -49,17 +49,6 @@ const fn parse_build_ts(s: &str) -> u64 {
         i += 1;
     }
     n
-}
-
-/// Placeholder transport. TODO: HTTPS client with two SPKI pins (see docs/spikes/p2-collector-agent.md).
-struct NoTransport;
-
-impl Transport for NoTransport {
-    fn post(&mut self, _h: &Headers, _b: &[u8]) -> Result<HttpReply, TransportError> {
-        Err(TransportError(
-            "HTTPS/SPKI-pinned transport not implemented in this build".into(),
-        ))
-    }
 }
 
 struct Args {
@@ -415,7 +404,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
         let known = parse_leases(&t);
         agent.urgent.prime(known.iter().map(|l| l.mac.as_str()));
     }
-    let mut transport = NoTransport;
+    let mut transport = vigie_agent::transport::make(&agent.cfg);
     let (mut last_flush, mut last_neigh) = (0u64, 0u64);
     loop {
         let mono = agent.started.elapsed().as_secs();
@@ -451,6 +440,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use vigie_agent::model::DnsQuery;
+    use vigie_agent::sender::{Headers, HttpReply, TransportError};
 
     const MAC: &str = "aa:bb:cc:dd:ee:01";
 

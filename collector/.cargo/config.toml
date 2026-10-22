@@ -1,6 +1,14 @@
 # Cross-compiling without a C cross toolchain: use the rust-lld shipped with rustup.
-# musl targets bundle their own crt objects and libc (self-contained), and this
-# workspace has no C dependencies, so no gcc is needed.
+# musl targets bundle their own crt objects and libc (self-contained).
+#
+# The TLS stack (rustls + the `ring` provider) has a few small C/asm objects. They are compiled
+# with plain clang (no aarch64 sysroot, gcc or zig needed): `-nostdlibinc -ffreestanding` keeps
+# clang from looking for libc headers, ring only needs the compiler's own stdint/stddef.
+# Needs `clang` on PATH. See docs/spikes/p3-collector-https.md.
+[env]
+CC_aarch64_unknown_linux_musl = "clang"
+CFLAGS_aarch64_unknown_linux_musl = "--target=aarch64-unknown-linux-musl -nostdlibinc -ffreestanding -fno-stack-protector"
+
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 
