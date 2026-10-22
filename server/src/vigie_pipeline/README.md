@@ -27,6 +27,10 @@ data pages. `overrides.db` is expected to be in WAL mode (written by `vigie-api`
 database may still create or touch the `-wal` / `-shm` sidecar files, so the pipeline and the API
 **must run as the same uid/group** (or the data directory must otherwise allow the pipeline to
 create the sidecars); a pipeline that cannot create `-shm` cannot read a WAL database.
+Precisely: the `overrides.db` file bytes are never modified by the pipeline (a test asserts it), but a
+read-only open of a WAL database creates `overrides.db-wal` and `overrides.db-shm` beside it; those
+are SQLite bookkeeping, not data. Each run reads its snapshot inside one `BEGIN`/`COMMIT` read
+transaction, so rules, groups, versions and decisions are mutually consistent.
 
 ## Identity stitching
 After each `run_once` has folded new batches into `observations`, a stitching stage runs in one
@@ -50,8 +54,13 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
   exactly one device's active rule matches, there is no sustained overlap, and the device's group
   has `auto_inherit=1` or it has no group. `auto_inherit=0` raises a `rule_hit_needs_confirm`
   suggestion instead. Revoking or expiring a rule never detaches an existing attachment.
-- **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable:
-  stitching is skipped for that run (`stitching_skipped` at ERROR) and the rest of the run goes on.
+- **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable (also: a
+  missing column, a non-integer `auto_inherit`/`version`, or active rules without a
+  `device_overrides` table): stitching is skipped for that run (`stitching_skipped` at ERROR) and
+  the rest of the run goes on.
+- **Flood bounds.** A signature shared by more than 64 MACs is skipped for the pass (one
+  `signature_flood` event per pass per signature); at most 200 candidate/suggestion rows are
+  written per pass (`MAX_SIGNATURE_BUCKET`, `MAX_ROWS_PER_PASS` in `config.py`).
 - **Config.** `VIGIE_STITCH_THRESHOLD` (0.8), `VIGIE_OVERLAP_GRACE_S` (600), `VIGIE_ACTIVITY_GAP_S`
   (300); weights are the constants `SIGNAL_WEIGHTS` in `config.py`.
 - **Events.** `identity_candidate`, `identity_candidate_ambiguous`, `identity_overlap_veto`,

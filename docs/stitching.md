@@ -25,6 +25,12 @@ is quoted because it is an SQL keyword). A silence **longer than** `VIGIE_ACTIVI
 coalesce with neighbours). Rows whose `end` is older than 7 days are purged at the end of each run.
 The table is derived and can be dropped.
 
+When the intervals are loaded for a pass, any interval shorter than `VIGIE_ACTIVITY_GAP_S` is widened
+symmetrically to that width (a stamp means "present around then"). A single stamp, or a burst of
+a few stamps, therefore still has width and overlaps a continuously present device; otherwise a copy
+that sent one stamp per 301 s would have zero overlap and dodge the veto. Stored intervals are not
+changed.
+
 ## 2. Candidates
 
 A candidate is a randomized MAC that is still its own device (`link_source='self'`, locally
@@ -73,6 +79,19 @@ per unordered pair, and there is no suggestion. A rolling device that briefly ho
 rolling device presents as a chain of MACs: an impostor beside it overlaps the chain, not one MAC.
 A device linked by `identity_links` contributes all of its MACs.
 
+**Maturity.** The veto only works on observed history, so a MAC is not eligible for a rule attach
+until its observed activity span (first start to last end, after widening) is **strictly longer than**
+the grace window. Until then it is deferred silently (no attach, no event; it may still get a
+fingerprint suggestion, which is withdrawn if the pair later becomes vetoed). With a span longer
+than the grace, a copy that is present the whole time overlaps by at least its span and is vetoed;
+with `>=` an overlap of exactly the grace would slip through. Consequence: a device that rolls its
+MAC more often than every grace window (default 10 min) is not covered by rule attach and stays a
+human decision.
+
+When a pair becomes `vetoed` or `ambiguous`, its open (undecided, unexpired) suggestion is
+withdrawn: `suggestions.expires_at` is set to just before now, so every consumer sees it as
+expired. Decided suggestions are never touched and `overrides.db` is not involved.
+
 ## 5. Suggestions
 For a unique, non-vetoed candidate with `score >= threshold` the pipeline inserts one row in
 `suggestions` (never updated afterwards):
@@ -93,17 +112,22 @@ suggestion has expired undecided a new one may be created. The event `identity_c
 written once per pair.
 
 ## 6. Standing rules (pass 1, before candidates)
-`identity_rules` rows are used when not revoked and not expired (an unparseable `expires_at` counts
-as expired). The JSON signature must contain `opt55`, `opt60` and `hostname` and/or `mdns_name`
+`identity_rules` rows are used when `created_by` is non-blank, `revoked_at` is NULL (any non-NULL
+value, including an empty string, is a revocation) and the rule is not expired (a blank or
+unparseable `expires_at` counts as expired; `expires_at <= now` is expired). `created_by` carries the
+app principal name (`app:<token_id>`) and cannot tell a human from a token, so service/token
+principals cannot be rejected here; that distinction has to come from the rule-creation API. The JSON signature must contain `opt55`, `opt60` and `hostname` and/or `mdns_name`
 (opt55 as a `"1,2,3"` string or a list of ints); every field the rule names must equal the MAC's.
 For a randomized self MAC:
 
+0. The MAC is mature (section 4) and its signature is not flooded (section 12).
 1. The set of **distinct canonical devices** (following `identity_links`) whose active rules match
    must have exactly one member. Two or more devices: nothing attaches, the candidate is
    `ambiguous`, one `identity_candidate_ambiguous` event. Several rules for one device are fine.
 2. No sustained overlap (as section 4) between the MAC and the rule device's MACs plus every other
-   MAC that matches the rule; otherwise `vetoed`.
-3. Group gate: the rule device's `device_overrides.group_id` is NULL or absent (unassigned) or its
+   MAC that matches **any** matched rule; otherwise `vetoed`.
+3. Group gate: both the rule device and the MAC's own device must have `identity_state='ok'`
+   (`conflict` / `pending_confirm` go to the confirm suggestion). Then the rule device's `device_overrides.group_id` is NULL or absent (unassigned) or its
    group has `auto_inherit=1` (defaults: `iot`, `guest`) -> **attach**. An `auto_inherit=0` group,
    or a group row that cannot be found, -> no attach; a `merge_identity` suggestion with
    `reason_code='rule_hit_needs_confirm'` is created instead and the MAC stays unassigned until a
@@ -118,12 +142,23 @@ candidates become `dismissed`; an already open suggestion for it simply expires)
 new MAC only.
 
 Revoking or expiring a rule **never detaches** an existing attachment in this round (no
-`mac_detached` yet). Applying a rule twice changes nothing.
+`mac_detached` yet). **Attachments are also not re-gated when the group changes**: a MAC attached
+while the device was unassigned or in an `auto_inherit=1` group stays attached after the device is
+moved to an `auto_inherit=0` group, and a later group change does not re-run the gate. Applying a
+rule twice changes nothing. After each attach the canonical map is refreshed for the next MAC.
 
 ## 7. Safety properties (each has a test)
 - `overrides.db` is opened `mode=ro` + `query_only`; its bytes are identical before and after.
+  Sidecars: a read-only open of a WAL database still creates or touches `overrides.db-wal` and
+  `overrides.db-shm` in the same directory (SQLite bookkeeping, not data). The pipeline's uid must
+  therefore be able to write that directory (or a writer connection keeps the sidecars alive on a
+  read-only mount). Not redesigned this round.
+- The snapshot is read in one `BEGIN`/`COMMIT` read transaction. Anything unexpected fails closed
+  (`OverridesUnreadable`, run goes on without stitching): a missing column, a non-integer
+  `auto_inherit` or `version`, or live rules while the `device_overrides` table is missing (that
+  would read as "unassigned", which attaches).
 - Missing `overrides.db`: no rules, basis 0. Present but unreadable: stitching is skipped for the
-  run and logged (`stitching_skipped`, ERROR); nothing is created. Missing tables are read as empty.
+  run and logged (`stitching_skipped`, ERROR); nothing is created. Other missing tables are read as empty.
 - No attachment without a matching active human rule; no group or trust is created.
 - Hostile hostnames/mDNS names never appear in logs, events or suggestion payloads (hashes only;
   values are already control-character-stripped at ingest). They are present in the `evidence`
@@ -152,11 +187,22 @@ must be supported, the signature needs a different second factor (decision for t
   `identity_state='conflict'|'pending_confirm'` side effects.
 - API: accept, reject, merge, undo, rule creation/revocation, `mac_detached`.
 - Classification rules (OUI, fingerprint database) and a rate limit on attachments per hour.
-- Withdrawing a suggestion (suggestions are immutable; stale ones expire).
 - Pruning of candidate rows.
 
 ## 11. Tests
-`server/tests/pipeline/test_stitching.py`, `test_stitch_rules.py` (unit and rule harness; the
+`server/tests/pipeline/test_stitching.py`, `test_stitch_rules.py`, `test_stitch_review.py` (unit and rule harness; the
 seeded `overrides.db` is built with the API's own migrations in `stitch_helpers.py`) and
 `tools/trafficgen/tests/test_stitching.py` (every relevant committed fixture through the real
 ingest app and `run_once`).
+
+## 12. Flood bounds
+All matching is done inside the `(opt55, opt60)` bucket of the MAC, never against every observation.
+- A bucket with more than `MAX_SIGNATURE_BUCKET` (64) MACs is **flooded**: none of its MACs is
+  rule-attached or compared in that pass, and one `signature_flood` event (warn, short hash of the
+  signature and the MAC count) is written per pass per signature. Fail closed: a legitimate device
+  with that many MACs needs a human.
+- At most `MAX_ROWS_PER_PASS` (200) new or changed `identity_candidates` plus created `suggestions` rows
+  are written per pass; the rest wait for later passes (existing rows are unaffected).
+- Once-only events (`identity_overlap_veto`, `identity_candidate_ambiguous`, `identity_candidate`) use
+  the indexed column `events.dedup` with a unique index on `(kind, dedup)` (pipeline schema v5)
+  instead of an `instr()` scan over all summaries.

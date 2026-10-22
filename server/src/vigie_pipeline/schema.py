@@ -91,6 +91,12 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
         " ON identity_candidates(device_a, device_b)",
     ),
+    (
+        # indexed once-only guard for stitching events (replaces an instr() scan of summaries)
+        "ALTER TABLE events ADD COLUMN dedup TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
+        " WHERE dedup IS NOT NULL",
+    ),
 )
 
 PIPELINE_TABLES = (

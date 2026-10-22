@@ -121,7 +121,9 @@ Design notes that affect operation:
 - **Three volumes, PRP section 5 ownership.** `vigie-raw` (ingest rw, pipeline ro), `vigie-inv`
   (ingest and pipeline rw, api ro), `vigie-overrides` (api rw, pipeline ro, ingest not mounted). The
   read-only mounts work because each writer keeps one SQLite connection open (a "keeper"); readers
-  fail closed when it is gone. The exact table and the writable paths per service are in
+  fail closed when it is gone. A read-only open of the WAL `overrides.db` still creates
+  `overrides.db-wal`/`-shm` next to it (the file bytes are never changed), so that directory must be
+  writable by the pipeline's uid or kept alive by the writer's connection. The exact table and the writable paths per service are in
   `docs/deploy.md`; none of this has run in a real container yet.
 - Ports are published on `VIGIE_LAN_ADDR` only; compose refuses to start when it is unset.
 - **Restrict who can reach the ingest (8443) and API (8444) ports on the server host.** Traffic

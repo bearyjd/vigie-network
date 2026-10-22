@@ -16,7 +16,12 @@ from dataclasses import dataclass
 
 from vigie_ingest.db import immediate
 from vigie_pipeline.activity import Interval, load_activity, merge_intervals, overlap_seconds
-from vigie_pipeline.config import SIGNAL_WEIGHTS, PipelineConfig
+from vigie_pipeline.config import (
+    MAX_ROWS_PER_PASS,
+    MAX_SIGNATURE_BUCKET,
+    SIGNAL_WEIGHTS,
+    PipelineConfig,
+)
 from vigie_pipeline.logs import log
 from vigie_pipeline.snapshot import Rule, Snapshot
 from vigie_pipeline.stitch_db import (
@@ -24,6 +29,7 @@ from vigie_pipeline.stitch_db import (
     emit_once,
     ensure_merge_suggestion,
     upsert_candidate,
+    withdraw_open_suggestions,
 )
 
 logger = logging.getLogger("vigie_pipeline")
@@ -51,6 +57,8 @@ class StitchStats:
     attached: int = 0
     vetoed: int = 0
     ambiguous: int = 0
+    flooded: int = 0
+    capped: int = 0
 
 
 def short_hash(value: str) -> str:
@@ -113,16 +121,22 @@ def _load_obs(inv: sqlite3.Connection, snap: Snapshot) -> list[Obs]:
 class Stitcher:
     def __init__(self, inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float):
         self.inv, self.snap, self.cfg, self.now = inv, snap, cfg, now
-        self.act = load_activity(inv)
+        self.act = load_activity(inv, cfg.activity_gap_s)
         self.stats = StitchStats()
         self.handled: set[str] = set()
+        self.flooded_keys: set[tuple[str, str]] = set()
+        self.writes = 0  # candidate/suggestion rows written this pass
         self.reload()
 
     def reload(self) -> None:
         self.obs = _load_obs(self.inv, self.snap)
         self.by_canon: dict[str, list[Obs]] = defaultdict(list)
+        self.buckets: dict[tuple[str, str], list[Obs]] = defaultdict(list)
         for o in self.obs:
             self.by_canon[o.canon].append(o)
+            if o.opt55 and o.opt60:
+                self.buckets[(o.opt55, o.opt60)].append(o)
+        self._canon_ivs: dict[str, list[Interval]] = {}
 
     # ---- activity helpers -------------------------------------------------------------------
 
@@ -131,6 +145,16 @@ class Stitcher:
 
     def _canon_macs(self, canons: Iterable[str]) -> set[str]:
         return {o.mac for c in canons for o in self.by_canon.get(c, [])}
+
+    def _canon_union(self, canon: str) -> list[Interval]:
+        if canon not in self._canon_ivs:
+            self._canon_ivs[canon] = self._union(o.mac for o in self.by_canon.get(canon, []))
+        return self._canon_ivs[canon]
+
+    def span(self, mac: str) -> int:
+        """Observed activity span: first start to last end (after minimum-width widening)."""
+        ivs = self.act.get(mac)
+        return ivs[-1][1] - ivs[0][0] if ivs else 0
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
         """Concurrent activity longer than the grace window (intersection, not just touching)."""
@@ -143,22 +167,54 @@ class Stitcher:
             and o.opt55 and o.opt60 and (o.hostname or o.mdns) and self.act.get(o.mac)
         )  # fmt: skip
 
+    def _flooded(self, o: Obs) -> bool:
+        """A signature shared by too many MACs is skipped for the pass (one event per pass)."""
+        key = (o.opt55 or "", o.opt60 or "")
+        size = len(self.buckets.get(key, ()))
+        if size <= MAX_SIGNATURE_BUCKET:
+            return False
+        if key not in self.flooded_keys:
+            self.flooded_keys.add(key)
+            self.stats.flooded += 1
+            emit_event(self.inv, o.device_id, "signature_flood", "warn",
+                       f"signature flood {short_hash('|'.join(key))}: {size} MACs skipped",
+                       self.now)  # fmt: skip
+            log(logger, logging.WARNING, "signature_flood", signature=short_hash("|".join(key)),
+                macs=size)  # fmt: skip
+        return True
+
     def _eligible_sorted(self) -> list[Obs]:
         return sorted(
-            (o for o in self.obs if self.eligible(o)), key=lambda o: (o.first_seen, o.mac)
+            (o for o in self.obs if self.eligible(o) and not self._flooded(o)),
+            key=lambda o: (o.first_seen, o.mac),
         )
+
+    def _full(self) -> bool:
+        if self.writes < MAX_ROWS_PER_PASS:
+            return False
+        self.stats.capped += 1
+        return True
 
     # ---- recording -------------------------------------------------------------------------
 
-    def _record(self, c: Obs, into: str, score: float, evidence: dict, state: str) -> str:
+    def _record(self, c: Obs, into: str, score: float, evidence: dict, state: str) -> str | None:
+        if self._full():
+            return None
         cid, changed = upsert_candidate(
             self.inv, c.device_id, into, score, evidence, state, self.now
         )
         self.stats.candidates += changed
+        self.writes += changed
         return cid
 
+    def _withdraw(self, c: Obs, canons: Iterable[str]) -> None:
+        for canon in canons:
+            withdraw_open_suggestions(self.inv, self.snap, c.device_id, canon, self.now)
+
     def _veto(self, c: Obs, into: str, score: float, evidence: dict) -> None:
-        self._record(c, into, score, evidence, "vetoed")
+        self._withdraw(c, [into])
+        if self._record(c, into, score, evidence, "vetoed") is None:
+            return
         token = "~".join(sorted((c.device_id, into)))
         if emit_once(self.inv, c.device_id, "identity_overlap_veto", "warn",
                      f"identity overlap veto {token}", token, self.now):  # fmt: skip
@@ -166,8 +222,10 @@ class Stitcher:
             log(logger, logging.INFO, "identity_overlap_veto", mac=short_hash(c.mac))
 
     def _ambiguous(self, c: Obs, canons: list[str], score: float, evidence: dict) -> None:
+        self._withdraw(c, canons)
         for canon in canons:
-            self._record(c, canon, score, evidence, "ambiguous")
+            if self._record(c, canon, score, evidence, "ambiguous") is None:
+                return
         if emit_once(self.inv, c.device_id, "identity_candidate_ambiguous", "warn",
                      f"identity candidate ambiguous: {len(canons)} devices match {c.device_id}",
                      c.device_id, self.now):  # fmt: skip
@@ -178,6 +236,8 @@ class Stitcher:
         self, c: Obs, into: str, score: float, evidence: dict, reason: str, found: list[str]
     ) -> None:
         cid = self._record(c, into, score, evidence, "suggested")
+        if cid is None:
+            return
         summary = {
             "candidate_id": cid,
             "signals": found,
@@ -191,6 +251,7 @@ class Stitcher:
             self.inv.execute("UPDATE identity_candidates SET state='dismissed' WHERE id=?", (cid,))
         elif out.status == "created":
             self.stats.suggestions += 1
+            self.writes += 1
             token = f"{c.device_id} -> {into}"
             emit_once(self.inv, c.device_id, "identity_candidate", "info",
                       f"identity candidate {token} score {score:.2f}", token, self.now)  # fmt: skip
@@ -203,9 +264,16 @@ class Stitcher:
             return
         for c in self._eligible_sorted():
             self._apply_rule(c)
-        self.reload()
+
+    def _state_ok(self, device_id: str) -> bool:
+        row = self.inv.execute(
+            "SELECT identity_state FROM devices WHERE id=?", (device_id,)
+        ).fetchone()
+        return bool(row) and row[0] == "ok"
 
     def _apply_rule(self, c: Obs) -> None:
+        if self.span(c.mac) <= self.cfg.overlap_grace_s:
+            return  # too little observed history to rule out an overlapping twin: defer quietly
         matched = [r for r in self.snap.rules if rule_matches(r, c)]
         targets = sorted({self.snap.canonical(r.device_id) for r in matched})
         if not matched or c.canon in targets:
@@ -223,15 +291,19 @@ class Stitcher:
         rule = min((r for r in matched), key=lambda r: r.id)
         score = rule_score(rule)
         peers = self._canon_macs([target]) | {
-            o.mac for o in self.obs if o.mac != c.mac and rule_matches(rule, o)
+            o.mac
+            for r in matched
+            for o in self.buckets.get((r.opt55, r.opt60), ())
+            if o.mac != c.mac and rule_matches(r, o)
         }
         if self.sustained(c.mac, peers - {c.mac}):
             self._veto(c, target, score, evidence)
             return
         group = self.snap.overrides.get(target, (0, None))[1]
-        if group is None or self.snap.group_auto_inherit.get(group) == 1:
+        trusted_state = self._state_ok(target) and self._state_ok(c.device_id)
+        if trusted_state and (group is None or self.snap.group_auto_inherit.get(group) == 1):
             self._attach(c, target, rule, score)
-        else:  # auto_inherit=0 (or unknown group): a human must confirm
+        else:  # auto_inherit=0, unknown group or identity_state != 'ok': a human must confirm
             found = ["opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n))]
             self._suggest(c, target, score, evidence, "rule_hit_needs_confirm", found)
 
@@ -269,6 +341,7 @@ class Stitcher:
                    f"mac attached: {before} -> {short_hash(c.mac)}", self.now)  # fmt: skip
         self.stats.attached += 1
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(c.mac))
+        self.reload()  # the canonical map changed: later MACs must see this attachment
 
     # ---- pass 2: fingerprint candidates ----------------------------------------------------------
 
@@ -283,7 +356,8 @@ class Stitcher:
         return not self.eligible(p) or p.mac < c.mac  # tie: only one direction per pair
 
     def _candidate(self, c: Obs) -> None:
-        peers = [(o, f) for o in self.obs if o.mac != c.mac and o.canon != c.canon
+        bucket = self.buckets.get((c.opt55 or "", c.opt60 or ""), ())
+        peers = [(o, f) for o in bucket if o.mac != c.mac and o.canon != c.canon
                  if is_candidate_match(f := signals(c, o))]  # fmt: skip
         older = [(o, f) for o, f in peers if self._older(o, c)]
         if not older:
@@ -309,9 +383,8 @@ class Stitcher:
     def _has_concurrent_pair(self, canons: list[str]) -> bool:
         """Two matching devices that were active together beyond the grace window are provably
         distinct: the signature then names more than one device."""
-        macs = {c: self._canon_macs([c]) for c in canons}
         return any(
-            overlap_seconds(self._union(macs[a]), self._union(macs[b])) > self.cfg.overlap_grace_s
+            overlap_seconds(self._canon_union(a), self._canon_union(b)) > self.cfg.overlap_grace_s
             for i, a in enumerate(canons)
             for b in canons[i + 1 :]
         )

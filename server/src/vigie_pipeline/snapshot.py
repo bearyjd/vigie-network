@@ -81,51 +81,86 @@ def parse_rule(row: sqlite3.Row) -> Rule | None:
 
 
 def _active(row: sqlite3.Row, now: float) -> bool:
-    if row["revoked_at"]:
+    """Active = created by a named principal, never revoked, and not expired. Anything odd fails
+    closed: ANY non-NULL revoked_at counts as revoked, a blank/unparseable expires_at as expired."""
+    if row["revoked_at"] is not None:
         return False
-    if not row["expires_at"]:
+    if not _text(row["created_by"]):
+        return False
+    if row["expires_at"] is None:
         return True
+    expiry = _text(row["expires_at"])
+    if not expiry:
+        return False
     try:
-        expires = datetime.fromisoformat(row["expires_at"])
+        expires = datetime.fromisoformat(expiry)
     except ValueError:
-        return False  # unparseable expiry fails closed
+        return False
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=UTC)
     return expires.timestamp() > now
 
 
-def _rows(conn: sqlite3.Connection, sql: str) -> list[sqlite3.Row]:
+def _rows(conn: sqlite3.Connection, sql: str, *, required: bool = False) -> list[sqlite3.Row]:
     try:
         return conn.execute(sql).fetchall()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):  # the api has not created that table yet
+        if "no such table" in str(exc) and not required:  # the api has not created it yet
             return []
         raise
 
 
+def _int(value: object, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OverridesUnreadable(f"{what} is not an integer")
+    return value
+
+
+def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
+    links = {
+        r["from_device"]: r["into_device"]
+        for r in _rows(conn, "SELECT from_device, into_device FROM identity_links")
+    }
+    rules = []
+    for row in _rows(
+        conn,
+        "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM identity_rules"
+        " ORDER BY id",
+    ):
+        rule = parse_rule(row) if _active(row, now) else None
+        if rule:
+            rules.append(rule)
+    groups = {
+        r["id"]: _int(r["auto_inherit"], "groups.auto_inherit")
+        for r in _rows(conn, "SELECT id, auto_inherit FROM groups")
+    }
+    # With a live rule, a missing device_overrides table would read as "unassigned" (= attach).
+    overrides = {
+        r["device_id"]: (_int(r["version"], "device_overrides.version"), r["group_id"])
+        for r in _rows(
+            conn,
+            "SELECT device_id, version, group_id FROM device_overrides",
+            required=bool(rules),
+        )
+    }
+    decisions = {
+        r["suggestion_id"]: r["state"]
+        for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
+    }
+    return Snapshot(links, tuple(rules), groups, overrides, decisions)
+
+
 def load_snapshot(conn: sqlite3.Connection, now: float) -> Snapshot:
+    """One consistent read transaction; any surprise (missing column, odd type) fails closed."""
     try:
-        links = {
-            r["from_device"]: r["into_device"] for r in _rows(conn, "SELECT * FROM identity_links")
-        }
-        rules = []
-        for row in _rows(conn, "SELECT * FROM identity_rules ORDER BY id"):
-            rule = parse_rule(row) if _active(row, now) else None
-            if rule:
-                rules.append(rule)
-        groups = {
-            r["id"]: int(r["auto_inherit"])
-            for r in _rows(conn, "SELECT id, auto_inherit FROM groups")
-        }
-        overrides = {
-            r["device_id"]: (int(r["version"]), r["group_id"])
-            for r in _rows(conn, "SELECT device_id, version, group_id FROM device_overrides")
-        }
-        decisions = {
-            r["suggestion_id"]: r["state"]
-            for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
-        }
-    except sqlite3.Error as exc:
+        conn.execute("BEGIN")
+        try:
+            return _read(conn, now)
+        finally:
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+    except (sqlite3.Error, OverridesUnreadable, KeyError, IndexError, TypeError) as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         log(logger, logging.ERROR, "overrides_snapshot_failed", error=str(exc))
         raise OverridesUnreadable(str(exc)) from exc
-    return Snapshot(links, tuple(rules), groups, overrides, decisions)

@@ -19,17 +19,14 @@ def emit_once(
     inv: sqlite3.Connection, device_id: str | None, kind: str, severity: str, summary: str,
     token: str, now: float,
 ) -> bool:  # fmt: skip
-    """Insert an event unless one of this kind already carries `token` in its summary."""
-    seen = inv.execute(
-        "SELECT 1 FROM events WHERE kind=? AND instr(summary, ?)>0 LIMIT 1", (kind, token)
-    ).fetchone()
-    if seen:
-        return False
-    inv.execute(
-        "INSERT INTO events (id, device_id, ts, kind, severity, summary) VALUES (?,?,?,?,?,?)",
-        (str(uuid.uuid4()), device_id, iso_utc(now), kind, severity, summary),
+    """Insert an event unless one of this kind already carries `token` (unique index lookup)."""
+    return bool(
+        inv.execute(
+            "INSERT OR IGNORE INTO events (id, device_id, ts, kind, severity, summary, dedup)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), device_id, iso_utc(now), kind, severity, summary, token),
+        ).rowcount
     )
-    return True
 
 
 def emit_event(
@@ -64,6 +61,27 @@ def upsert_candidate(
         (score, text, state, row["id"]),
     )
     return row["id"], row["state"] != state
+
+
+def withdraw_open_suggestions(
+    inv: sqlite3.Connection, snap: Snapshot, frm: str, into: str, now: float
+) -> int:
+    """Expire the undecided, unexpired merge suggestion(s) for (frm -> into) right now: the pair
+    became vetoed or ambiguous. Inventory side only; a decided suggestion is never touched."""
+    pair = json.dumps([frm, into])
+    now_iso = iso_utc(now)
+    ids = [
+        r["id"]
+        for r in inv.execute(
+            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids=?"
+            " AND expires_at>=?",
+            (pair, now_iso),
+        )
+        if r["id"] not in snap.decisions
+    ]
+    for sid in ids:
+        inv.execute("UPDATE suggestions SET expires_at=? WHERE id=?", (iso_utc(now - 1), sid))
+    return len(ids)
 
 
 @dataclass(frozen=True)

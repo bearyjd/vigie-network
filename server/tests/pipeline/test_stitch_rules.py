@@ -50,7 +50,7 @@ def digest(ov: Overrides) -> str:
 
 def test_rule_attaches_unassigned_device_and_retires_the_orphan(data):
     ov, dev = seeded(data)
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     row = link_of(data, b)
     assert tuple(row)[:3] == (dev, "rule", RULE) and row[3] == 0.8  # opt55+opt60+hostname
@@ -64,7 +64,7 @@ def test_rule_attaches_unassigned_device_and_retires_the_orphan(data):
 
 def test_attach_is_idempotent_and_overrides_stay_byte_identical(data):
     ov, dev = seeded(data)
-    appear(data, 2, 400, 700)
+    appear(data, 2, 400, 1100)
     ov.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     before = digest(ov)
     run(data)
@@ -82,7 +82,7 @@ def test_attach_is_idempotent_and_overrides_stay_byte_identical(data):
 
 def test_auto_inherit_group_attaches(data):
     ov, dev = seeded(data, group="iot")
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "rule"
     ov.close()
@@ -90,7 +90,7 @@ def test_auto_inherit_group_attaches(data):
 
 def test_auto_inherit_off_group_makes_a_confirm_suggestion_and_does_not_attach(data):
     ov, dev = seeded(data, group="trusted")
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
@@ -112,7 +112,7 @@ def test_auto_inherit_off_group_makes_a_confirm_suggestion_and_does_not_attach(d
 )
 def test_revoked_or_expired_rules_do_not_attach(data, kw):
     ov, _ = seeded(data, rule_kw=kw)
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
     ov.close()
@@ -120,7 +120,7 @@ def test_revoked_or_expired_rules_do_not_attach(data, kw):
 
 def test_rule_with_future_expiry_is_active(data):
     ov, _ = seeded(data, rule_kw={"expires_at": "2099-01-01T00:00:00Z"})
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "rule"
     ov.close()
@@ -134,7 +134,7 @@ def test_invalid_rule_signatures_are_ignored(data):
     ov.conn.execute(
         "INSERT INTO identity_rules VALUES ('r-bad', ?, '{nope', 't', 'o', NULL, NULL)", (dev,)
     )
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
     ov.close()
@@ -145,7 +145,7 @@ def test_signature_matching_two_rule_devices_attaches_nothing(data):
     other = appear(data, 5, 0, 300, opt55="[9]")  # a second device with another fingerprint
     run(data)
     ov.rule("22222222-rule", device_of(data, other), sig())  # same signature, other device
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
@@ -158,7 +158,7 @@ def test_signature_matching_two_rule_devices_attaches_nothing(data):
 def test_two_rules_for_the_same_device_still_attach(data):
     ov, dev = seeded(data)
     ov.rule("33333333-rule", dev, sig())
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["device_id"] == dev
     ov.close()
@@ -200,7 +200,7 @@ def test_overlap_veto_uses_the_whole_device(data):
 
 def test_short_overlap_with_the_rule_device_attaches(data):
     ov, dev = seeded(data)
-    b = appear(data, 2, 150, 700)  # 150 s concurrent with A (0..300)
+    b = appear(data, 2, 150, 1100)  # 150 s concurrent with A (0..300)
     run(data)
     assert link_of(data, b)["link_source"] == "rule"
     ov.close()
@@ -211,7 +211,7 @@ def test_attach_follows_identity_links_to_the_canonical_device(data):
     z = appear(data, 6, 0, 100, opt55="[9]")
     run(data)
     ov.link(dev, device_of(data, z))
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["device_id"] == device_of(data, z)
     ov.close()
@@ -219,7 +219,7 @@ def test_attach_follows_identity_links_to_the_canonical_device(data):
 
 def test_revoking_a_rule_never_detaches_existing_attachments(data):
     ov, dev = seeded(data)
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     ov.conn.execute("UPDATE identity_rules SET revoked_at='2026-10-03T00:00:00Z'")
     run(data)
@@ -229,7 +229,7 @@ def test_revoking_a_rule_never_detaches_existing_attachments(data):
 
 def test_without_any_rule_nothing_is_ever_attached(data):
     appear(data, 1, 0, 300)
-    appear(data, 2, 400, 700)
+    appear(data, 2, 400, 1100)
     appear(data, 3, 800, 900)
     run(data)
     assert {r[0] for r in data.q("SELECT link_source FROM observations")} == {"self"}
@@ -239,7 +239,7 @@ def test_without_any_rule_nothing_is_ever_attached(data):
 
 def test_chain_of_rolled_macs_all_attach_to_the_rule_device(data):
     ov, dev = seeded(data)
-    macs = [appear(data, n, 400 * (n - 1), 400 * (n - 1) + 300) for n in (2, 3, 4)]
+    macs = [appear(data, n, 400 + 800 * (n - 2), 1100 + 800 * (n - 2)) for n in (2, 3, 4)]
     run(data)
     assert {link_of(data, m)["device_id"] for m in macs} == {dev}
     assert len(kinds(data, "mac_attached")) == 3
@@ -258,7 +258,7 @@ def test_group_row_that_cannot_be_found_fails_closed(data):
     ov, dev = seeded(data)
     ov.conn.execute("PRAGMA foreign_keys=OFF")  # a dangling group reference
     ov.override(dev, "ghost-group")
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
     (s,) = suggestions(data)
@@ -270,7 +270,7 @@ def test_rule_with_a_different_opt60_does_not_match(data):
     ov, dev = seeded(data)
     ov.conn.execute("DELETE FROM identity_rules")
     ov.rule(RULE, dev, sig(opt60="some-other-dhcp-client"))
-    b = appear(data, 2, 400, 700)
+    b = appear(data, 2, 400, 1100)
     run(data)
     assert link_of(data, b)["link_source"] == "self"
     ov.close()

@@ -24,6 +24,10 @@ OVERLAP_GRACE_DEFAULT_S = 600
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
 SUGGESTION_TTL_DEFAULT_S = 7 * 86400
+# Flood bounds (docs/stitching.md section 12): a signature (opt55, opt60) shared by more MACs than
+# this is skipped for the pass; at most this many candidate/suggestion rows are written per pass.
+MAX_SIGNATURE_BUCKET = 64
+MAX_ROWS_PER_PASS = 200
 
 
 def _opt_path(value: str | None) -> Path | None:

@@ -103,6 +103,11 @@ class World:
         self.run()
 
 
+# A MAC must be observed for longer than the grace window before a rule may attach it (so an
+# overlapping copy cannot dodge the veto by timing). The fixture rollers live 3-5 min, hence a
+# grace below the 5 min minimum interval width; the default 10 min would defer every roll.
+RULE_GRACE_S = 200
+
 ROLLER_SIG = {
     "opt55": ",".join(map(str, IOS_OPT55)),
     "opt60": INJECTED_OPT60,
@@ -161,7 +166,7 @@ def test_fingerprint_copy_away_attaches_under_an_auto_inherit_rule_residual_risk
     """ACCEPTED RESIDUAL RISK (PRP section 8): with a human-approved rule in an auto_inherit
     group, a fingerprint copy arriving after the victim left is attached. Only behavioural
     demotion (a later stage, not built) or the human can catch it."""
-    w = World(ingest, "rolling_fingerprint_copy_away")
+    w = World(ingest, "rolling_fingerprint_copy_away", overlap_grace_s=RULE_GRACE_S)
     first = w.macs["dev-08"][0]
     attacker = w.macs["dev-09"][0]
     w.seed_rule(first, ROLLER_SIG, group="iot")  # iot: auto_inherit=1
@@ -183,14 +188,27 @@ def test_copy_away_into_a_confirm_group_attaches_nothing(ingest):
     assert {s[0] for s in w.suggested()} == {*w.macs["dev-08"][1:], *w.macs["dev-09"]}
 
 
-def test_victim_present_rule_attaches_the_roller_but_not_the_overlapping_copy(ingest):
-    w = World(ingest, "rolling_fingerprint_copy_present")
-    first, *later = w.macs["dev-08"]
+def test_victim_present_rule_never_attaches_the_overlapping_copy(ingest):
+    """With a low grace the fast rollers overlap the copy too, so they are vetoed as well (a
+    signature shared by concurrent MACs is not trusted, though one short roll may slip
+    through); the copy must never attach."""
+    w = World(ingest, "rolling_fingerprint_copy_present", overlap_grace_s=RULE_GRACE_S)
+    first = w.macs["dev-08"][0]
     attacker = w.macs["dev-09"][0]
     w.seed_rule(first, ROLLER_SIG, group="iot")
-    assert {w.link_source(m) for m in later} == {"rule"}
     assert w.link_source(attacker) == "self"
     assert w.edges()[(attacker, first)] == "vetoed"
+    assert w.device(attacker) != w.device(first)
+
+
+def test_victim_present_with_default_grace_defers_every_short_lived_roll(ingest):
+    """Rollers that live under the grace window are not attached until they have been observed
+    for longer than it (no event noise while they are deferred); the copy never attaches."""
+    w = World(ingest, "rolling_fingerprint_copy_present")
+    first, *later = w.macs["dev-08"]
+    w.seed_rule(first, ROLLER_SIG, group="iot")
+    assert {w.link_source(m) for m in [*later, w.macs["dev-09"][0]]} == {"self"}
+    assert w.count("mac_attached") == 0
 
 
 def test_hostname_only_spoof_is_never_a_candidate(ingest):

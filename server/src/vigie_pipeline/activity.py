@@ -62,11 +62,18 @@ def record_activity(inv: sqlite3.Connection, acts: Mapping[str, MacActivity], ga
         )
 
 
-def load_activity(inv: sqlite3.Connection) -> dict[str, list[Interval]]:
-    out: dict[str, list[Interval]] = {}
+def load_activity(inv: sqlite3.Connection, min_width_s: int = 0) -> dict[str, list[Interval]]:
+    """Per-MAC merged intervals. An interval shorter than min_width_s is widened symmetrically to
+    that width: a stamp means "present around then", so a single-stamp or zero-length interval
+    must still be able to overlap (otherwise sparse stamps dodge the overlap veto)."""
+    raw: dict[str, list[Interval]] = {}
     for row in inv.execute('SELECT mac, start, "end" FROM mac_activity ORDER BY mac, start'):
-        out.setdefault(row[0], []).append((row[1], row[2]))
-    return out
+        start, end = row[1], row[2]
+        short = min_width_s - (end - start)
+        if short > 0:
+            start, end = start - short // 2, end + short - short // 2
+        raw.setdefault(row[0], []).append((start, end))
+    return {mac: merge_intervals(ivs) for mac, ivs in raw.items()}
 
 
 def purge_activity(inv: sqlite3.Connection, now: float, retention_s: int) -> int:
