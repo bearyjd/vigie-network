@@ -28,6 +28,7 @@ PHONE_IP, PHONE_HOST = "192.168.1.50", "Pixel-8"
 PHONE_OPT55 = "1:netmask, 3:router, 6:dns-server, 15:domain-name, 26:mtu, 28:broadcast, 51:lease-time, 58:T1, 59:T2"
 LAPTOP_OPT55 = "1:netmask, 3:router, 6:dns-server, 15:domain-name, 119:domain-search, 121:classless-static-route"
 CAMERA_OPT55 = "1:netmask, 3:router, 6:dns-server"
+CAMERA_VENDOR = "udhcp 1.31.1"
 
 _serial = [5000]
 
@@ -45,7 +46,7 @@ def _next() -> int:
 def dhcp_block(mac: str, ip: str, host: str, opt55: str, vendor: str | None) -> list[str]:
     n, p = _next(), f"{_stamp()} dnsmasq-dhcp[5023]: "
     lines = [f"{p}{n} DHCPREQUEST(br-lan) {ip} {mac}"]
-    if os.environ.get("VIGIE_E2E_NO_TAGS") != "1":  # real dnsmasq emits this line; see F1
+    if os.environ.get("VIGIE_E2E_NO_TAGS") != "1":  # real dnsmasq emits this line (F1, fixed)
         lines.append(f"{p}{n} tags: br-lan")
     lines.append(f"{p}{n} requested options: {opt55}")
     if vendor:
@@ -94,7 +95,7 @@ def main() -> int:
         lines = dhcp_block(mac, PHONE_IP, PHONE_HOST, PHONE_OPT55, "android-dhcp-14")
         if i == 0:
             lines += dhcp_block(*LAPTOP[0:1], LAPTOP[1], LAPTOP[2], LAPTOP_OPT55, None)
-            lines += dhcp_block(CAMERA[0], CAMERA[1], CAMERA[2], CAMERA_OPT55, None)
+            lines += dhcp_block(CAMERA[0], CAMERA[1], CAMERA[2], CAMERA_OPT55, CAMERA_VENDOR)
         append(log, lines)
         for tick in range(step_s):
             q = dns_pair(CAMERA[1], "cam.vendor.example", "203.0.113.5")

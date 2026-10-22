@@ -8,6 +8,7 @@ phase2: after a second pipeline pass, the human data must have survived.
 from __future__ import annotations
 
 import json
+import sqlite3
 import ssl
 import sys
 import urllib.error
@@ -54,6 +55,17 @@ def device_of(api: Api, mac: str) -> str:
     st, body, _ = api.call("GET", f"/macs/{mac}")
     check(st == 200, f"GET /macs/{mac} -> {st}")
     return body["data"]["device_id"] if st == 200 else ""
+
+
+def check_observation_fingerprints(run: Path) -> None:
+    """The pipeline stored the DHCP fingerprint and vendor class for every device (F1)."""
+    db = sqlite3.connect(f"file:{run / 'data' / 'inventory.db'}?mode=ro", uri=True)
+    rows = db.execute("select mac, dhcp_fingerprint, vendor_class from observations")
+    obs = {m: (f, v) for m, f, v in rows}
+    for mac in (LAPTOP, CAMERA, *PHONE):
+        check(bool(obs.get(mac, (None, None))[0]), f"observations.dhcp_fingerprint set for {mac}")
+    for mac in (CAMERA, *PHONE):
+        check(bool(obs.get(mac, (None, None))[1]), f"observations.vendor_class set for {mac}")
 
 
 def main() -> int:
@@ -110,6 +122,8 @@ def main() -> int:
     check(d.get("override_version", 0) >= 1, f"override_version {d.get('override_version')}")
     st, body, _ = api.call("GET", "/devices?group=trusted")
     check(st == 200 and [x["id"] for x in body["data"]] == [laptop], "GET /devices?group=trusted")
+    if phase == "phase1":
+        check_observation_fingerprints(run)
     print("FAILURES:", FAILS or "none")
     return 1 if FAILS else 0
 

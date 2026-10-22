@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Stage (d): what did ingest record? Usage: assert_ingest.py DATA_DIR
 
-Hard assertions cover the chain working. DHCP fingerprints (opt55/opt60) are a soft check unless
-VIGIE_E2E_NO_TAGS=1 (the control run without the `tags:` line), see docs/e2e.md finding F1.
+Hard assertions cover the chain working, including the DHCP fingerprints (opt55 for every device,
+opt60 for the phones and the camera). VIGIE_E2E_NO_TAGS=1 is the control run without dnsmasq's
+`tags:` line (docs/e2e.md finding F1); it must pass the same assertions.
 """
 
 from __future__ import annotations
 
 import glob
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -67,12 +67,18 @@ def main() -> int:
     flow_macs = {r[2] for r in rows["raw_flow"]}
     check({LAPTOP, CAMERA} <= flow_macs and flow_macs & set(PHONE), "conntrack flow rows attributed")
     check(len(rows["raw_health"]) == n_batches, "one health row per batch")
-    fp = [r for r in rows["raw_lease"] if r[6] not in ("[]", None, "")]
-    msg = f"DHCP opt55 fingerprint present on {len(fp)}/{len(rows['raw_lease'])} lease rows"
-    if os.environ.get("VIGIE_E2E_NO_TAGS") == "1":
-        check(len(fp) >= 1, msg + " (control run without 'tags:' line)")
-    else:
-        print(("ok   " if fp else "WARN ") + msg + " (soft; finding F1)")
+    check(all(r[3] == 0 for r in rows["raw_health"]), "dns_log_quiet false on every batch (F4)")
+    people = [(LAPTOP, "laptop", False), (CAMERA, "camera", True)]
+    people += [(m, "phone " + m[-2:], True) for m in PHONE]
+    for mac, label, want_class in people:
+        mine = [r for r in rows["raw_lease"] if r[3] == mac]
+        check(any(r[6] not in ("[]", None, "") for r in mine), f"{label}: non-empty opt55 in raw_lease")
+        if want_class:
+            check(any(r[7] not in (None, "") for r in mine), f"{label}: non-empty opt60 in raw_lease")
+    check(any(r[7] == "android-dhcp-14" for r in rows["raw_lease"] if r[3] in PHONE),
+          "phone vendor class android-dhcp-14")
+    check(any(r[7] == "udhcp 1.31.1" for r in rows["raw_lease"] if r[3] == CAMERA),
+          "camera vendor class udhcp 1.31.1")
     ct = [r[3] for r in q("select * from batches where truncated != '{}'")]
     print("batches with truncated/drops:", ct)
     print("FAILURES:", FAILS or "none")

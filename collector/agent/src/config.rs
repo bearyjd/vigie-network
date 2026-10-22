@@ -29,6 +29,9 @@ pub struct Config {
     pub key_file: PathBuf,
     pub dnsmasq_log: PathBuf,
     pub leases_file: PathBuf,
+    /// The dnsmasq drop-in the health check verifies, and the log directory it must point at.
+    pub dropin_path: PathBuf,
+    pub log_dir: PathBuf,
     /// The root conntrack helper's unix socket.
     pub conntrack_socket: PathBuf,
     /// The router's own LAN address and prefix (multicast join and on-link filter) and the bridge
@@ -102,7 +105,7 @@ fn is_pin(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 14] = [
     "server_url",
     "collector_id",
     "key_id",
@@ -111,6 +114,8 @@ const KNOWN: [&str; 12] = [
     "key_file",
     "dnsmasq_log",
     "leases_file",
+    "dropin_path",
+    "log_dir",
     "conntrack_socket",
     "lan_addr",
     "lan_prefix",
@@ -207,6 +212,15 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     if conntrack_socket.as_os_str().is_empty() {
         return Err(ConfigError::Invalid("conntrack_socket is empty".into()));
     }
+    let (dropin_path, log_dir) = (
+        opt("dropin_path", crate::dropin::DROPIN_PATH),
+        opt("log_dir", crate::dropin::LOG_DIR),
+    );
+    if dropin_path.as_os_str().is_empty() || log_dir.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid(
+            "dropin_path or log_dir is empty".into(),
+        ));
+    }
     Ok(Config {
         server_url: server_url.into(),
         collector_id: collector_id.into(),
@@ -215,6 +229,8 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         key_file: opt("key_file", DEFAULT_KEY_FILE),
         dnsmasq_log: opt("dnsmasq_log", DEFAULT_DNSMASQ_LOG),
         leases_file: opt("leases_file", DEFAULT_LEASES_FILE),
+        dropin_path,
+        log_dir,
         conntrack_socket,
         lan_addr,
         lan_prefix,
