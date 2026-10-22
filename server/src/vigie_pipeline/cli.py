@@ -51,6 +51,9 @@ def _config(args: argparse.Namespace) -> PipelineConfig:
         migrate=args.migrate,
         inventory_db=base.inventory_db,
         overrides_db=base.overrides_db,
+        suggest_threshold=base.suggest_threshold,
+        overlap_grace_s=base.overlap_grace_s,
+        activity_gap_s=base.activity_gap_s,
     )
 
 

@@ -79,6 +79,18 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
           created_at TEXT NOT NULL, expires_at TEXT NOT NULL
         )""",
     ),
+    (
+        # identity stitching: per-MAC activity intervals derived from the raw shards (7 d
+        # retention, like raw). `end` is quoted because END is an SQL keyword.
+        """CREATE TABLE IF NOT EXISTS mac_activity (
+          mac TEXT NOT NULL, start INTEGER NOT NULL, "end" INTEGER NOT NULL,
+          PRIMARY KEY (mac, start)
+        )""",
+        'CREATE INDEX IF NOT EXISTS idx_mac_activity_end ON mac_activity("end")',
+        # one candidate row per (from, into) pair
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
+        " ON identity_candidates(device_a, device_b)",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -89,6 +101,7 @@ PIPELINE_TABLES = (
     "transient_state",
     "promotion_log",
     "suggestions",
+    "mac_activity",
 )
 
 

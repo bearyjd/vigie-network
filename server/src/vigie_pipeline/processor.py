@@ -10,11 +10,14 @@ import uuid
 from dataclasses import dataclass
 
 from vigie_ingest.db import immediate, iso_utc
+from vigie_pipeline.activity import purge_activity, record_activity
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.schema import open_pipeline_inventory
+from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
+from vigie_pipeline.stitch import StitchStats, stitch
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -29,6 +32,8 @@ class RunStats:
     skipped_macs: int = 0
     promoted: int = 0
     retired: int = 0
+    suggestions: int = 0
+    attached: int = 0
 
 
 def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
@@ -39,16 +44,50 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     failures: list[ShardReadError] = []
     try:
         totals = _process_batches(inv, overrides, config, failures)
+        stitched = _stitch(inv, overrides, config, clock)
         promoted, retired = sweep_transients(inv, clock, config)
+        purge_activity(inv, clock, config.activity_retention_s)
     finally:
         inv.close()
         if overrides is not None:
             overrides.close()
-    stats = RunStats(**totals, promoted=promoted, retired=retired)
+    stats = RunStats(
+        **totals,
+        promoted=promoted,
+        retired=retired,
+        suggestions=stitched.suggestions,
+        attached=stitched.attached,
+    )
     log(logger, logging.INFO, "run_complete", failed_collectors=len(failures), **stats.__dict__)
     if failures:
         raise failures[0]
     return stats
+
+
+def _stitch(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    now: float,
+) -> StitchStats:
+    """Run identity stitching. overrides.db missing entirely => no rules, basis versions 0.
+    Present but unreadable => fail closed: skip stitching, log, and let the run go on."""
+    snap: Snapshot = EMPTY
+    try:
+        if overrides is not None:
+            snap = load_snapshot(overrides, now)
+        elif config.overrides_path.exists():
+            raise OverridesUnreadable("overrides.db exists but could not be opened")
+    except OverridesUnreadable as exc:
+        log(
+            logger,
+            logging.ERROR,
+            "stitching_skipped",
+            reason="overrides_unreadable",
+            error=str(exc),
+        )
+        return StitchStats()
+    return stitch(inv, snap, config, now)
 
 
 def _process_batches(
@@ -69,6 +108,7 @@ def _process_batches(
                 break
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
+                record_activity(inv, acts, config.activity_gap_s)
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)

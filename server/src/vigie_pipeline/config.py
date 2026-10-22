@@ -10,6 +10,21 @@ TRANSIENT_WINDOW_DEFAULT_S = 24 * 3600
 TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
 PROMOTION_CAP_DEFAULT = 20
 
+# Identity stitching (docs/stitching.md). Weights sum to 1.0; a candidate additionally REQUIRES
+# opt55 AND opt60 AND (hostname OR mdns_name) equal, so with these weights every structurally
+# valid candidate scores >= 0.8 and hostname alone can never reach a candidate.
+SIGNAL_WEIGHTS: dict[str, float] = {
+    "opt55": 0.3,
+    "opt60": 0.3,
+    "mdns_name": 0.2,
+    "hostname": 0.2,
+}
+SUGGEST_THRESHOLD_DEFAULT = 0.8
+OVERLAP_GRACE_DEFAULT_S = 600
+ACTIVITY_GAP_DEFAULT_S = 300
+ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
+SUGGESTION_TTL_DEFAULT_S = 7 * 86400
+
 
 def _opt_path(value: str | None) -> Path | None:
     return Path(value) if value else None
@@ -25,12 +40,24 @@ class PipelineConfig:
     # Direct locations (VIGIE_INVENTORY_PATH / VIGIE_OVERRIDES_PATH); None = under data_dir.
     inventory_db: Path | None = None
     overrides_db: Path | None = None
+    # Identity stitching
+    suggest_threshold: float = SUGGEST_THRESHOLD_DEFAULT
+    overlap_grace_s: int = OVERLAP_GRACE_DEFAULT_S
+    activity_gap_s: int = ACTIVITY_GAP_DEFAULT_S  # silence longer than this splits an interval
+    activity_retention_s: int = ACTIVITY_RETENTION_DEFAULT_S
+    suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
 
     def __post_init__(self) -> None:
         if self.transient_window_s < 1:
             raise ValueError("transient_window_s must be positive")
         if self.transient_min_dwell_s < 0 or self.promotion_cap_per_hour < 0:
             raise ValueError("transient_min_dwell_s and promotion_cap_per_hour must be >= 0")
+        if not 0 < self.suggest_threshold <= 1:
+            raise ValueError("suggest_threshold must be in (0, 1]")
+        if min(self.overlap_grace_s, self.activity_gap_s) < 0 or self.activity_retention_s < 1:
+            raise ValueError("overlap_grace_s/activity_gap_s must be >= 0, retention positive")
+        if self.suggestion_ttl_s < 1:
+            raise ValueError("suggestion_ttl_s must be positive")
 
     @property
     def inventory_path(self) -> Path:
@@ -56,4 +83,9 @@ class PipelineConfig:
             ),
             inventory_db=_opt_path(source.get("VIGIE_INVENTORY_PATH")),
             overrides_db=_opt_path(source.get("VIGIE_OVERRIDES_PATH")),
+            suggest_threshold=float(
+                source.get("VIGIE_STITCH_THRESHOLD", SUGGEST_THRESHOLD_DEFAULT)
+            ),
+            overlap_grace_s=int(source.get("VIGIE_OVERLAP_GRACE_S", OVERLAP_GRACE_DEFAULT_S)),
+            activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
         )
