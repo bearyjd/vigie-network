@@ -340,13 +340,16 @@ The pipeline can **never** create trust on its own: it can only *apply* a rule a
 
 Each phase = feature branch(es) and PRs, each reviewed by a separate reviewer pass.
 
-## 13. Open questions
+## 13. Decisions and open questions
 
-1. `device_id` is the key (agreed). Will the control app poll `GET /macs/{mac}` and consume `mac_attached` events to program router rules for rolled MACs, and handle `merged_into` aliases and `identity_state` values (`ok|conflict|pending_confirm`)?
-2. Which groups should have `auto_inherit` on? Proposed: `iot`, `guest` on; `trusted`, `kids` off (rolled MAC arrives pending your one-tap confirmation).
-3. How do your devices roll MACs (per SSID, per connection, per day)? P0 can measure this from DHCP logs.
-4. Ollama model available on the homelab (for P3)?
-5. P3 stays conditional on the P2 result — confirm.
+**Decided 2026-10-22** (the owner delegated these to the recommendations in this PRP):
+1. **Control app contract.** The control app keys on `device_id`, polls `GET /macs/{mac}` and consumes `mac_attached`/`mac_detached` events to program router rules for rolled MACs, and handles `merged_into` aliases and `identity_state` (`ok|conflict`; `pending_confirm` is reserved). Unknown MACs are "unassigned".
+2. **`auto_inherit` defaults.** `iot` and `guest` = on; `trusted` and `kids` = off. A rolled MAC matching a standing rule enters an `auto_inherit=0` group only after a human confirms (implemented as a `merge_identity` suggestion with `reason_code='rule_hit_needs_confirm'`; the MAC stays unassigned until accepted).
+3. **P3 stays conditional.** Decide after P2 measures how many devices rules cannot classify.
+4. **Collector user.** Dedicated `vigie` user, default uid 6700 (first free in 6700..6799), never `nobody`.
+5. **LLM.** Ollama on localhost/same pod only in v1; model choice deferred to P3 (not needed before).
+
+**Still open (owner action on the router):** DHCP log line order and `tags:`/`next server:`/`sent size:` behavior on the real dnsmasq; conntrack text format; whether `SO_REUSEPORT` coexists with avahi; the first real collector push. P2 *classification rules* (OUI, fingerprint database) wait for real DHCP data; identity stitching works on structured observations and does not.
 
 ## 14. Risks
 
