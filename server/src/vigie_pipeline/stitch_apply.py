@@ -1,7 +1,8 @@
 """APPLY phase of identity stitching (docs/stitching-design.md section 4): one short
-BEGIN IMMEDIATE that re-validates every decision of the plan with indexed point lookups, re-reads
-overrides.db once, drops what went stale, and writes a count-bounded number of rows:
-at most MAX_ROWS_PER_PASS candidate/suggestion/widen rows and MAX_ATTACHES_PER_PASS attaches.
+BEGIN IMMEDIATE that re-validates every decision of the plan with indexed point lookups (the
+pair's candidate state; for an attach the rule, links and group rows of overrides.db by primary
+key), drops what went stale, and writes a count-bounded number of rows: at most MAX_ROWS_PER_PASS
+candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_PASS attaches.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
-from vigie_pipeline.snapshot import OverridesUnreadable, Snapshot, load_snapshot
+from vigie_pipeline.overrides import canonical_device
+from vigie_pipeline.snapshot import MalformedRule, Snapshot, parse_rule, rule_active
 from vigie_pipeline.stitch_db import (
     Attachment,
     candidate_state,
@@ -29,6 +31,7 @@ from vigie_pipeline.stitch_db import (
     emit_event,
     emit_once,
     find_merge_suggestion,
+    open_candidates_left,
     open_suggestions_into,
     save_attachment,
     state_set,
@@ -44,6 +47,7 @@ from vigie_pipeline.stitch_types import (
     Decision,
     Flag,
     Plan,
+    Settle,
     StitchStats,
     Suggest,
     Veto,
@@ -56,10 +60,10 @@ logger = logging.getLogger("vigie_pipeline")
 
 class Applier:
     def __init__(
-        self, inv: sqlite3.Connection, snap: Snapshot, fresh: Snapshot | None,
+        self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
         cfg: PipelineConfig, now: float, at: float, stats: StitchStats,
     ) -> None:  # fmt: skip
-        self.inv, self.snap, self.fresh, self.cfg = inv, snap, fresh, cfg
+        self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
         self.writes = 0
         self.attaches = 0
@@ -69,7 +73,7 @@ class Applier:
         handler = {
             Attach: self._attach, Candidate: self._candidate, Veto: self._veto,
             Ambiguous: self._ambiguous, Suggest: self._suggest, Flag: self._flag,
-            Widen: self._widen,
+            Widen: self._widen, Settle: self._settle,
         }[type(d)]  # fmt: skip
         handler(d)  # type: ignore[operator]
 
@@ -80,6 +84,15 @@ class Applier:
             "SELECT device_id, link_source FROM observations WHERE mac=?", (mac,)
         ).fetchone()
         return row is not None and (row[0], row[1]) == (device_id, "self")
+
+    def _unchanged(self, a: str, b: str, expected: str | None) -> bool:
+        """The pair's candidate row is as it was when the decision was computed; a human
+        decision in between (dismissed, or any other change) drops the decision, which is
+        recomputed against the new state on a later pass."""
+        if candidate_state(self.inv, a, b) == expected:
+            return True
+        self.stats.stale += 1
+        return False
 
     def _reserve(self, rows: int) -> bool:
         """Does a whole decision of `rows` writes fit under MAX_ROWS_PER_PASS? If not, nothing of
@@ -103,7 +116,9 @@ class Applier:
     def _candidate(self, d: Candidate) -> None:
         if not self._still_self(d.mac, d.from_device):
             return
-        if d.provisional and candidate_state(self.inv, d.from_device, d.into) is not None:
+        if not self._unchanged(d.from_device, d.into, d.expected):
+            return
+        if d.provisional and d.expected is not None:
             return  # a provisional overlap never downgrades an existing row
         evidence = dict(d.evidence)
         if self._reserve(self._need(d.from_device, d.into, d.score, evidence, d.state)):
@@ -111,6 +126,8 @@ class Applier:
 
     def _veto(self, d: Veto) -> None:
         if not self._still_self(d.mac, d.from_device):
+            return
+        if not self._unchanged(d.from_device, d.into, d.expected):
             return
         evidence = dict(d.evidence)
         if not self._reserve(self._need(d.from_device, d.into, d.score, evidence, "vetoed")):
@@ -125,6 +142,9 @@ class Applier:
 
     def _ambiguous(self, d: Ambiguous) -> None:
         if not self._still_self(d.mac, d.from_device):
+            return
+        if not all(self._unchanged(d.from_device, t, e) for t, e in zip(d.targets, d.expected,
+                                                                         strict=True)):  # fmt: skip
             return
         evidence = dict(d.evidence)
         need = sum(self._need(d.from_device, t, d.score, evidence, "ambiguous") for t in d.targets)
@@ -141,6 +161,8 @@ class Applier:
 
     def _suggest(self, d: Suggest) -> None:
         if not self._still_self(d.mac, d.from_device):
+            return
+        if not self._unchanged(d.from_device, d.into, d.expected):
             return
         if self.snap.canonical(d.from_device) == self.snap.canonical(d.into):
             return  # already one identity
@@ -180,6 +202,13 @@ class Applier:
     def _flag(self, d: Flag) -> None:
         emit_once(self.inv, d.device_id, d.kind, d.severity, d.summary, d.token, self.now)
 
+    def _settle(self, d: Settle) -> None:
+        """Finish dismissing an orphan's candidate rows under this pass's remaining row cap."""
+        written = dismiss_open_candidates(self.inv, d.device_id, MAX_ROWS_PER_PASS - self.writes)
+        self.writes += written
+        if not open_candidates_left(self.inv, d.device_id):
+            state_set(self.inv, f"settle:{d.device_id}", None)
+
     def _widen(self, d: Widen) -> None:
         if not self._reserve(1):
             return
@@ -195,21 +224,24 @@ class Applier:
     # ---- the attach: T1 re-validated under the lock ----------------------------------------
 
     def _authorised(self, d: Attach) -> bool:
-        """The fresh overrides.db snapshot (read under the inventory lock) must still hold the
-        rule unexpired, pointing at the same canonical target, in the same explicit
-        auto_inherit=1 group as when the decision was computed."""
-        fresh = self.fresh
-        if fresh is None or d.rule not in fresh.rules:
-            return False
+        """T1 re-validated under the inventory lock with primary-key lookups in overrides.db (the
+        rule row, the target's links, its override row, its group): the rule must still be the
+        same active rule pointing at the same canonical target in the same explicit auto_inherit=1
+        group, and the candidate's device must not have been merged away. Any read problem fails
+        closed. Without an overrides connection (tests) the compute snapshot stands in."""
         if d.rule.expires_at is not None and d.rule.expires_at <= self.at:
             return False
-        group = fresh.overrides.get(d.target, (0, None))[1]
-        return (
-            fresh.canonical(d.rule.device_id) == d.target
-            and group is not None
-            and group == self.snap.overrides.get(d.target, (0, None))[1]
-            and fresh.group_auto_inherit.get(group) == 1
-        )
+        group = self.snap.overrides.get(d.target, (0, None))[1]
+        if self.overrides is None:
+            return (
+                d.rule in self.snap.rules and self.snap.canonical(d.rule.device_id) == d.target
+                and group is not None and self.snap.group_auto_inherit.get(group) == 1
+            )  # fmt: skip
+        try:
+            return _rule_lookup(self.overrides, d, group, self.at)
+        except (sqlite3.Error, MalformedRule, TypeError, ValueError) as exc:
+            log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
+            return False
 
     def _state_ok(self, device_id: str) -> bool:
         row = self.inv.execute(
@@ -226,7 +258,8 @@ class Applier:
             and self._still_self(d.mac, d.from_device)
             and self._state_ok(d.target)
             and self._state_ok(d.from_device)
-            and candidate_state(self.inv, d.from_device, d.target) != "vetoed"
+            and self._unchanged(d.from_device, d.target, d.expected)
+            and d.expected != "vetoed"
         ):
             return  # expired, revoked, regrouped, vetoed or moved while the plan was computed
         old = self.inv.execute(
@@ -255,9 +288,15 @@ class Applier:
             " (SELECT 1 FROM observations WHERE device_id=?)",
             (d.from_device, d.from_device),
         )
-        # settled by the rule: nobody may accept a merge of the orphan after this
-        dismiss_open_candidates(self.inv, d.from_device)
+        # settled by the rule: its suggestions become unactionable at once (two indexed
+        # statements, bounded by the suggestion cap); its candidate rows are dismissed under the
+        # remaining row cap, the rest on later passes (Settle)
         withdraw_orphan_suggestions(self.inv, self.snap, d.from_device, self.now)
+        self.writes += dismiss_open_candidates(
+            self.inv, d.from_device, MAX_ROWS_PER_PASS - self.writes
+        )
+        if open_candidates_left(self.inv, d.from_device):
+            state_set(self.inv, f"settle:{d.from_device}", "1")
         before = short_hash(old["mac"]) if old else "none"
         emit_event(self.inv, d.target, "mac_attached", "info",
                    f"mac attached: {before} -> {short_hash(d.mac)}", self.now)  # fmt: skip
@@ -266,16 +305,31 @@ class Applier:
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(d.mac))
 
 
-def _fresh_snapshot(
-    overrides: sqlite3.Connection | None, snap: Snapshot, at: float
-) -> Snapshot | None:
-    """overrides.db re-read under the inventory lock; None (no attach) when it cannot be read."""
-    if overrides is None:
-        return snap
+def _rule_lookup(overrides: sqlite3.Connection, d: Attach, group: str | None, at: float) -> bool:
+    """Primary-key reads of exactly the rows the attach depends on, in one read transaction."""
+    overrides.execute("BEGIN")
     try:
-        return load_snapshot(overrides, at)
-    except OverridesUnreadable:
-        return None
+        row = overrides.execute(
+            "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM"
+            " identity_rules WHERE id=?",
+            (d.rule.id,),
+        ).fetchone()
+        if row is None or not rule_active(row, at) or parse_rule(row) != d.rule:
+            return False
+        if canonical_device(overrides, d.rule.device_id) != d.target:
+            return False
+        if canonical_device(overrides, d.from_device) != d.from_device:
+            return False  # the candidate's device was merged away in the meantime
+        over = overrides.execute(
+            "SELECT group_id FROM device_overrides WHERE device_id=?", (d.target,)
+        ).fetchone()
+        if over is None or over[0] is None or over[0] != group:
+            return False
+        grp = overrides.execute("SELECT auto_inherit FROM groups WHERE id=?", (over[0],)).fetchone()
+        return grp is not None and grp[0] == 1 and not isinstance(grp[0], bool)
+    finally:
+        if overrides.in_transaction:
+            overrides.execute("COMMIT")
 
 
 def apply_plan(
@@ -285,12 +339,7 @@ def apply_plan(
     stats = plan.stats
     with immediate(inv):
         at = clock()  # read once the lock is held: rule expiry is judged against it
-        fresh = (
-            _fresh_snapshot(overrides, snap, at)
-            if any(isinstance(d, Attach) for d in plan.decisions)
-            else snap
-        )
-        applier = Applier(inv, snap, fresh, cfg, now, at, stats)
+        applier = Applier(inv, snap, overrides, cfg, now, at, stats)
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

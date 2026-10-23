@@ -24,8 +24,9 @@ COMPUTE  one read-only transaction (a WAL reader; never blocks ingest or the API
          re-check robin: <= MACS_PER_PASS rule-attached MACs, from a persisted cursor
          self robin:     <= MACS_PER_PASS randomized self MACs, from a persisted cursor
          each subject -> bounded neighbourhood -> one DECISION or a deferral
-APPLY    one BEGIN IMMEDIATE, count-bounded, no scans: re-reads overrides.db once, re-validates
-         every decision with indexed point lookups, drops the stale ones, writes.
+APPLY    one BEGIN IMMEDIATE, count-bounded, no scans: re-validates every decision with indexed
+         point lookups (the pair's candidate state; for an attach the rule, link, override and
+         group rows of overrides.db by primary key), drops the stale ones, writes.
 ```
 
 The pipeline is the only writer of the tables the decisions read (ingest writes only
@@ -43,13 +44,18 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 | `INTERVALS_PER_MAC` | 64 | `mac_activity` rows per MAC, coalesced at fold time |
 | `MAX_ALIAS_IDS` | 5000 | merge component expanded; more = incomplete (a human decides) |
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before a flood |
-| `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion + widen rows per APPLY (a decision fits whole or waits) |
+| `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion + widen + orphan-cleanup rows per APPLY (a decision fits whole or waits) |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY |
 | `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions into one device (bounds the orphan cleanup) |
 | evidence gaps | retention / `activity_gap_s` | rows of `evidence_gaps`: merged within one gap at write time, pruned at retention |
 
-APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject:
-well under a second on the server (`test_apply_holds_the_lock_under_a_second_with_a_full_action_list`).
+APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject,
+and its reads of `overrides.db` are primary-key lookups whose cost does not depend on how many
+overrides, rules or links exist: well under a second on the server
+(`test_apply_holds_the_lock_under_a_second_with_a_full_action_list`,
+`test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides`). Every decision carries
+the candidate state of its pair as computed; a human change in between (a `dismissed` row, for
+instance) drops the decision, which is recomputed against the new state on the next pass.
 
 ## 2. Inputs
 
@@ -159,19 +165,26 @@ suggestion-only. For a mature randomized self MAC whose signature matches:
    its *compatible peers*: live self MACs with the same fingerprint whose names do not contradict
    the view and that share a name with it, carry a name the target already used, or were first
    seen within one activity gap of the applicant. Retired MACs stay peers but do not count toward
-   floods. A compatible pool over `MAX_SIGNATURE_BUCKET` is a flood: nothing attaches.
+   floods. A compatible pool over `MAX_SIGNATURE_BUCKET` is a flood AND incomplete evidence: the
+   hit degrades to `rule_hit_needs_confirm (compatible_flood)` (section 7), never an attach.
 4. Both devices `identity_state='ok'` and the target in an EXPLICIT `auto_inherit=1` group;
    otherwise a `rule_hit_needs_confirm` suggestion.
 
-The APPLY phase re-reads `overrides.db` once under the inventory lock and re-checks that the rule
-is present and unexpired (clock read under the lock), that the target is still the same canonical
-device in the same explicit `auto_inherit=1` group, that the MAC is still a self MAC of the same
-device, both states `ok`, and the pair not `vetoed`; otherwise nothing attaches that pass.
+The APPLY phase re-reads, by primary key under the inventory lock, the rule row (still present,
+active and byte-for-byte the same rule, unexpired at the clock read under the lock), the target's
+`identity_links` chain (still the same canonical device; the candidate's own device not merged
+away), its `device_overrides` row (same explicit group) and that group's `auto_inherit` (1); it
+also re-checks that the MAC is still a self MAC of the same device, both states `ok`, and that the
+pair's candidate row is as it was when computed and not `vetoed`. Otherwise nothing attaches that
+pass. A rule row whose target cannot even be read (a malformed `device_id`) makes EVERY rule hit
+of that snapshot a `rule_hit_needs_confirm` suggestion.
 
 **Attach** sets `observations.device_id` to the target with `link_source='rule'`, `link_rule_id`,
 `link_score`; widens the target's `first_seen`/`last_seen`; retires the orphaned self device
-(never deleted); dismisses the orphan's open candidate rows and expires every undecided suggestion
-from or into it (both bounded by the suggestion cap); records `rule_attachments (mac, rule_id,
+(never deleted); expires every undecided suggestion from or into the orphan at once (two indexed
+statements, bounded by the suggestion cap); dismisses the orphan's open candidate rows under the
+pass's remaining row cap and finishes the rest on later passes (`stitch_state` key
+`settle:<device>`, at most `MAX_ATTACHES_PER_PASS` orphans per pass); records `rule_attachments (mac, rule_id,
 target, hostname, mdns_name, opt55, opt60, views)` with the values and each matched rule's field
 mask at that moment; writes `mac_attached` (8-hex hashes only). Revoking or expiring a rule never
 detaches; a later group change does not re-gate an attachment.
@@ -187,7 +200,9 @@ veto. Every degrade except "immature" also writes one `stitch_deferred` event pe
 | evidence gap in the MAC's window | overlap visible: `open`; else `rule_hit_needs_confirm (evidence_gap)` | `open` if overlapping (maturity only matters for permanence) | n/a |
 | malformed rule on the target | `rule_hit_needs_confirm (malformed_target)` | n/a | n/a |
 | young / sparse MAC | silent defer | `open` if overlapping | n/a |
-| name group / compatible pool flooded | nothing + `signature_flood` once per group per day | nothing | pool ignored |
+| name group flooded | nothing + `signature_flood` once per group per day | nothing | n/a |
+| compatible pool flooded | `signature_flood` + `rule_hit_needs_confirm (compatible_flood)` | n/a | `rule_attach_suspect` ("evidence incomplete") |
+| the pair's candidate row changed between COMPUTE and APPLY | decision dropped, recomputed next pass | same | n/a |
 | compute budget spent | subjects not reached wait; the cursor persists | same | same (the re-check robin runs first) |
 | row cap / attach cap / suggestion cap | the decision waits for a later pass | same | n/a |
 
@@ -229,7 +244,12 @@ not detach and creates no suggestion. Detaching waits for the API (`mac_detached
 | unbounded CPU / memory | `BUCKET_ROWS`, `INTERVALS_PER_MAC`, `MACS_PER_PASS`, compute budget | `test_compute_budget_stops_between_subjects_and_the_cursor_persists`, `test_a_mac_never_holds_more_than_the_interval_cap_however_many_bursts_it_sends` |
 | late backlog restores maturity | one gap list, all loaded, retention-pruned | `test_every_gap_is_loaded_so_the_oldest_relevant_one_still_blocks`, `test_the_copy_beside_a_late_collectors_victim_becomes_a_human_decision` |
 | a human merges thousands of devices | links read outside the lock; `Widen` under the row cap; oversize components defer | `test_widening_is_count_bounded_per_pass_and_writes_only_where_narrow`, `test_an_oversize_component_is_deferred_not_recorded_as_a_veto` |
-| malformed rule on the target | target becomes suggestion-only | `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion` (attach_rules) |
+| malformed rule on the target (even one whose id is a BLOB) | target becomes suggestion-only; an unreadable target makes every hit suggestion-only | `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion`, `test_a_malformed_rule_with_a_blob_id_still_names_its_target`, `test_a_malformed_rule_whose_target_cannot_be_read_makes_every_rule_hit_a_suggestion` |
+| 65 compatible junk MACs around an attached copy | a flooded pool is incomplete evidence: flag / confirm, never silence | `test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag`, `test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion` |
+| dismiss or decide a pair between COMPUTE and APPLY | candidate-state preconditions drop the decision | `test_a_dismissal_between_compute_and_apply_cancels_the_attach`, `test_a_dismissal_between_compute_and_apply_cancels_the_suggestion` |
+| 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later; suggestions expired at once | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
+| grow overrides.db to lengthen the lock | point lookups only under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
+| 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | fresh snapshot and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
 
 ## 11. Accepted residual risk (asserted in tests)

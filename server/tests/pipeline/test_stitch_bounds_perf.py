@@ -163,21 +163,6 @@ def test_the_compatible_pool_flood_ignores_retired_macs_too(inv):
     assert inv.stitch(RULE_SNAP).attached == 1 and inv.link_of(b) == ("D", "rule")
 
 
-def test_pool_larger_than_a_signature_bucket_is_flooded_for_rule_attach(inv, monkeypatch):
-    monkeypatch.setattr(compute_mod, "MAX_SIGNATURE_BUCKET", 3)
-    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
-    for k in range(5):  # five live MACs with their own names, first seen within a gap of B
-        inv.mac(f"P{k}", None, f"p{k}", "self", f"2026-02-01T00:00:{k + 1:02d}Z",
-                [(NOW_ABS - 3600 * (k + 1),) * 2])  # fmt: skip
-    b = inv.mac(
-        "B", "victim", None, "self", "2026-02-01T00:00:00Z", [(NOW_ABS - 70000, NOW_ABS - 69000)]
-    )
-    st = inv.stitch(RULE_SNAP)
-    assert inv.link_of(b) == ("B", "self") and st.attached == 0 and st.suggestions == 0
-    assert inv.db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 0
-    assert inv.count("signature_flood") == 1 and st.flooded >= 1
-
-
 def test_junk_named_macs_first_seen_long_before_or_after_are_not_a_flood(inv, monkeypatch):
     monkeypatch.setattr(compute_mod, "MAX_SIGNATURE_BUCKET", 3)
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
@@ -751,3 +736,37 @@ def test_a_rule_target_without_a_group_is_reported_through_stats(inv):
     snap = Snapshot({}, (Rule("r1", "D", "1,2,3", "x", "victim", None),), {}, {}, {})
     st = inv.stitch(snap)
     assert st.suggestions == 1 and st.attached == 0 and st.examined == 1
+
+
+# ---- fix round 1 -------------------------------------------------------------------------------
+
+
+def test_a_dismissal_between_compute_and_apply_cancels_the_suggestion(inv):
+    inv.mac("O", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("Y", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('c1','Y','O',0.8,'{}','open','t')"
+    )
+    inv.commit()
+    plan = compute_plan(inv.db, EMPTY, inv.cfg, NOW_ABS)
+    inv.db.execute("UPDATE identity_candidates SET state='dismissed' WHERE id='c1'")  # a human
+    st = apply_plan(inv.db, EMPTY, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert st.suggestions == 0 and st.stale == 1
+    assert inv.totals() == (1, 0) and inv.state("Y") == [("O", "dismissed")]
+
+
+def test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion(inv, monkeypatch):
+    monkeypatch.setattr(compute_mod, "MAX_SIGNATURE_BUCKET", 3)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(5):  # five live MACs with their own names, first seen within a gap of B
+        inv.mac(f"P{k}", None, f"p{k}", "self", f"2026-02-01T00:00:{k + 1:02d}Z",
+                [(NOW_ABS - 3600 * (k + 1),) * 2])  # fmt: skip
+    b = inv.mac(
+        "B", "victim", None, "self", "2026-02-01T00:00:00Z", [(NOW_ABS - 70000, NOW_ABS - 69000)]
+    )
+    st = inv.stitch(RULE_SNAP)
+    assert inv.link_of(b) == ("B", "self") and st.attached == 0 and st.suggestions == 1
+    row = inv.db.execute("SELECT reason_code, reason_text FROM suggestions").fetchone()
+    assert tuple(row) == ("rule_hit_needs_confirm", "compatible_flood")
+    assert inv.count("signature_flood") == 1 and inv.count("stitch_deferred") == 1

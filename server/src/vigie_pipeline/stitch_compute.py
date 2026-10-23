@@ -21,6 +21,7 @@ from vigie_pipeline.activity import Gaps, Interval, merge_intervals, overlap_sec
 from vigie_pipeline.config import (
     MACS_PER_PASS,
     MAX_ALIAS_IDS,
+    MAX_ATTACHES_PER_PASS,
     MAX_ROWS_PER_PASS,
     MAX_SIGNATURE_BUCKET,
     PEER_TAIL_MIN_GRACE_MULT,
@@ -29,7 +30,13 @@ from vigie_pipeline.config import (
 )
 from vigie_pipeline.logs import log
 from vigie_pipeline.snapshot import Rule, Snapshot
-from vigie_pipeline.stitch_db import event_exists, load_attachment, state_get, vetoed_between
+from vigie_pipeline.stitch_db import (
+    candidate_state,
+    event_exists,
+    load_attachment,
+    state_get,
+    vetoed_between,
+)
 from vigie_pipeline.stitch_hood import Hood, load_obs
 from vigie_pipeline.stitch_types import (
     EPSILON,
@@ -41,6 +48,7 @@ from vigie_pipeline.stitch_types import (
     GroupKey,
     Obs,
     Plan,
+    Settle,
     StitchStats,
     Suggest,
     Veto,
@@ -94,6 +102,7 @@ class Compute:
     def run(self) -> Plan:
         """The re-check robin first (the only guard on trust already given), then the self robin,
         then the bounded range catch-up of merged devices."""
+        self._settle()
         cursors = {
             RECHECK_CURSOR: self._robin(RECHECK_CURSOR, self._rule_subjects, self._recheck),
             SELF_CURSOR: self._robin(SELF_CURSOR, self._self_subjects, self._examine),
@@ -125,6 +134,20 @@ class Compute:
     def _rule_subjects(self, after: str) -> list[str]:
         rows = self.inv.execute(RULE_SUBJECTS, (after, MACS_PER_PASS))
         return [r[0] for r in rows]
+
+    def _settle(self) -> None:
+        """Orphans whose candidate rows an earlier attach could not finish dismissing under the row
+        cap: at most MAX_ATTACHES_PER_PASS of them per pass, finished under this pass's cap."""
+        rows = self.inv.execute(
+            "SELECT key FROM stitch_state WHERE key LIKE 'settle:%' ORDER BY key LIMIT ?",
+            (MAX_ATTACHES_PER_PASS,),
+        ).fetchall()
+        self.decisions.extend(Settle(r[0][len("settle:") :]) for r in rows)
+
+    def _pair_state(self, a: str, b: str) -> str | None:
+        """The pair's candidate row state when the decision is computed: APPLY re-reads it and
+        drops the decision if a human changed it in between."""
+        return candidate_state(self.inv, a, b)
 
     def _hood(self) -> Hood:
         return Hood(self.inv, self.snap, self.cfg, self.components, self.cutoff)
@@ -314,11 +337,10 @@ class Compute:
             return False  # too little trusted history yet: resolves itself, no noise
         evidence = {"rule_ids": sorted(r.id for r in matched), **evidence_of(c)}
         if len(targets) > 1:  # a signature that names two devices attaches nothing
-            self.decisions.append(
-                Ambiguous(
-                    c.mac, c.device_id, tuple(targets), max(map(rule_score, matched)), evidence
-                )
-            )
+            self.decisions.append(Ambiguous(
+                c.mac, c.device_id, tuple(targets), max(map(rule_score, matched)), evidence,
+                tuple(self._pair_state(c.device_id, t) for t in targets),
+            ))  # fmt: skip
             return True
         target = targets[0]
         if not self.inv.execute("SELECT 1 FROM devices WHERE id=?", (target,)).fetchone():
@@ -332,32 +354,38 @@ class Compute:
         views = [replace(c, hostname=c.hostname if h else None, mdns=c.mdns if m else None)
                  for h, m in masks]  # fmt: skip
         peers, flooded = self._safety_peers(hood, target, views)
-        if flooded:
-            return True  # too many look-alikes to rule out a twin: attach nothing, suggest nothing
+        if flooded:  # too many look-alikes to rule out a twin: incomplete evidence
+            hood.truncated.add("compatible_flood")
         score = rule_score(rule)
+        state = self._pair_state(c.device_id, target)
         if self.sustained(hood, c.mac, peers - {c.mac}):
             if maturity == "gap":  # provisional: a gap means the overlap cannot be judged
                 self._defer("evidence_gap", target)
                 self.decisions.append(
-                    Candidate(c.mac, c.device_id, target, score, evidence, "open")
+                    Candidate(c.mac, c.device_id, target, score, evidence, "open", expected=state)
                 )
             else:
-                self.decisions.append(Veto(c.mac, c.device_id, target, score, evidence))
+                self.decisions.append(Veto(c.mac, c.device_id, target, score, evidence, state))
             return True
         reason = self._incomplete(hood, veto, maturity, target)
         found = ("opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n)))
         if reason == "component_oversize":
-            self.decisions.append(Candidate(c.mac, c.device_id, target, score, evidence, "open"))
+            self.decisions.append(
+                Candidate(c.mac, c.device_id, target, score, evidence, "open", expected=state)
+            )
         elif reason is not None or not self._gate(c, target):
             if reason:
                 self._defer(reason, target)
-            self.decisions.append(Suggest(c.mac, c.device_id, target, score, evidence,
-                                          "rule_hit_needs_confirm", reason, found))  # fmt: skip
+            self.decisions.append(Suggest(
+                c.mac, c.device_id, target, score, evidence, "rule_hit_needs_confirm", reason,
+                found, state,
+            ))  # fmt: skip
         else:
             self.decisions.append(Attach(
                 c.mac, c.device_id, target, rule, score,
                 c.hostname if any(r.hostname for r in matched) else None,
                 c.mdns if any(r.mdns_name for r in matched) else None, c.opt55, c.opt60, masks,
+                state,
             ))  # fmt: skip
         return True
 
@@ -369,7 +397,7 @@ class Compute:
             return "component_oversize"
         if maturity == "gap":
             return "evidence_gap"
-        if target in self.malformed_targets:
+        if target in self.malformed_targets or self.snap.unknown_target:
             return "malformed_target"
         return None
 
@@ -424,20 +452,29 @@ class Compute:
         if hood.truncated:
             self._defer(self._incomplete(hood, None, "ok", into) or "truncated", c.device_id)
             return
+        state = self._pair_state(c.device_id, into)
         if self._concurrent(hood, canons):
-            self.decisions.append(Ambiguous(c.mac, c.device_id, tuple(canons), score, evidence))
+            self.decisions.append(Ambiguous(
+                c.mac, c.device_id, tuple(canons), score, evidence,
+                tuple(self._pair_state(c.device_id, t) for t in canons),
+            ))  # fmt: skip
         elif self.sustained(hood, c.mac, hood.canon_macs(canons)):
             if self.maturity(hood, c.mac) == "ok":
-                self.decisions.append(Veto(c.mac, c.device_id, into, score, evidence))
+                self.decisions.append(Veto(c.mac, c.device_id, into, score, evidence, state))
             else:  # provisional evidence, never a permanent veto: written only once
-                self.decisions.append(
-                    Candidate(c.mac, c.device_id, into, score, evidence, "open", provisional=True)
-                )
+                self.decisions.append(Candidate(
+                    c.mac, c.device_id, into, score, evidence, "open", provisional=True,
+                    expected=state,
+                ))  # fmt: skip
         elif score + EPSILON >= self.cfg.suggest_threshold:
-            self.decisions.append(Suggest(c.mac, c.device_id, into, score, evidence,
-                                          "fingerprint_match", None, tuple(best_f)))  # fmt: skip
+            self.decisions.append(Suggest(
+                c.mac, c.device_id, into, score, evidence, "fingerprint_match", None,
+                tuple(best_f), state,
+            ))  # fmt: skip
         else:
-            self.decisions.append(Candidate(c.mac, c.device_id, into, score, evidence, "open"))
+            self.decisions.append(
+                Candidate(c.mac, c.device_id, into, score, evidence, "open", expected=state)
+            )
 
     # ---- rule-attached subjects: the post-attach re-check ----------------------------------
 
@@ -460,11 +497,13 @@ class Compute:
                          mdns=att.mdns_name if m else None) for h, m in att.views]  # fmt: skip
         hood = self._hood()
         hood.load(mac)
-        peers, _ = self._safety_peers(hood, o.canon, views)
-        if self.sustained(hood, mac, peers - {mac}):
-            self._suspect(o, token, "sustained overlap with peers")
-        elif hood.truncated:
+        peers, flooded = self._safety_peers(hood, o.canon, views)
+        if flooded:  # a dropped compatible pool is incomplete evidence, never a free pass
+            hood.truncated.add("compatible_flood")
+        if hood.truncated:
             self._suspect(o, token, "evidence incomplete, " + sorted(hood.truncated)[0])
+        elif self.sustained(hood, mac, peers - {mac}):
+            self._suspect(o, token, "sustained overlap with peers")
 
     def _has_activity(self, mac: str) -> bool:
         return self.inv.execute(

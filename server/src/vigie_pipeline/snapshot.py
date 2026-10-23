@@ -42,6 +42,7 @@ class Snapshot:
     decisions: Mapping[str, str]  # suggestion_id -> accepted|rejected
     malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
     malformed_devices: frozenset[str] = frozenset()  # their targets: these need a human
+    unknown_target: bool = False  # a malformed rule whose target is unreadable: every hit needs one
 
     @cached_property
     def _canon(self) -> dict[str, str]:
@@ -125,7 +126,11 @@ def parse_rule(row: sqlite3.Row) -> Rule | None:
     """A rule needs opt55 and opt60 plus hostname and/or mdns_name; an incomplete signature is
     ignored (None). Wrong types (non-string ids, a BLOB device_id, a signature that is not a JSON
     object, nesting deep enough to exhaust the parser) raise MalformedRule."""
-    rule_id, device_id = _ident(row["id"], "rule id"), _ident(row["device_id"], "rule device_id")
+    device_id = _ident(row["device_id"], "rule device_id")  # first: kept on every later failure
+    try:
+        rule_id = _ident(row["id"], "rule id")
+    except MalformedRule as exc:
+        raise MalformedRule(str(exc), device_id) from exc
     try:
         sig = json.loads(row["signature"])
     except (TypeError, ValueError) as exc:
@@ -158,7 +163,7 @@ def _expiry(value: object) -> float | None:
     return expires.timestamp()
 
 
-def _active(row: sqlite3.Row, now: float) -> bool:
+def rule_active(row: sqlite3.Row, now: float) -> bool:
     """Active = created by a named principal, never revoked, and not expired. Anything odd fails
     closed: ANY non-NULL revoked_at counts as revoked, a blank/unparseable expires_at as expired."""
     if row["revoked_at"] is not None:
@@ -199,13 +204,13 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
         for r in _rows(conn, "SELECT from_device, into_device FROM identity_links")
     }
-    rules, malformed, bad_devices = [], 0, set()
+    rules, malformed, bad_devices, unknown = [], 0, set(), False
     for row in _rows(
         conn,
         "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM identity_rules"
         " ORDER BY id",
     ):
-        if not _active(row, now):
+        if not rule_active(row, now):
             continue
         try:
             rule = parse_rule(row)
@@ -213,6 +218,8 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
             malformed += 1
             if exc.device_id:
                 bad_devices.add(exc.device_id)
+            else:
+                unknown = True  # not even the target is readable: every rule hit needs a human
             log(logger, logging.ERROR, "rule_malformed", error=str(exc))
             continue
         if rule:
@@ -240,7 +247,14 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
     }
     return Snapshot(
-        links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices)
+        links,
+        tuple(rules),
+        groups,
+        overrides,
+        decisions,
+        malformed,
+        frozenset(bad_devices),
+        unknown,
     )
 
 

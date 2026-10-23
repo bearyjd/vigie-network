@@ -270,3 +270,47 @@ def test_a_recheck_that_cannot_gather_complete_evidence_flags_the_attachment(inv
     assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")
     row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
     assert "evidence incomplete" in row[0]
+
+
+# ---- fix round 1 -------------------------------------------------------------------------------
+
+
+def junk_pool(inv: Inv, n: int, first: str) -> None:
+    for i in range(n):  # live, same fingerprint, own mDNS names only (nothing contradicts a
+        # hostname-only view), first seen within a gap of the subject
+        inv.mac(f"J{i}", None, f"junk{i}", "self", first, [(NOW_ABS - 5000, NOW_ABS)])
+
+
+def test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag(inv):
+    """Codex HIGH: 65 compatible junk MACs used to replace the flag with a mere signature_flood."""
+    a = attached(inv)
+    inv.mac("V", None, "Dave", "self", "2026-01-02T00:01:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    junk_pool(inv, 65, "2026-01-02T00:02:00Z")
+    st = inv.stitch(RULE_SNAP)
+    assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1 and inv.link_of(a)[1] == "rule"
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete" in row[0]
+
+
+def test_the_recheck_robin_cycles_through_every_attached_mac(inv, monkeypatch):
+    from vigie_pipeline import stitch_compute as compute_mod
+    from vigie_pipeline.stitch_compute import RECHECK_CURSOR
+
+    monkeypatch.setattr(compute_mod, "MACS_PER_PASS", 10)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(25):  # quiet rule-attached MACs, none ever overlapping anything
+        ivs = [(NOW_ABS - 80000 + k * 1000, NOW_ABS - 79500 + k * 1000)]
+        m = inv.mac(
+            "D", "victim", None, "rule", f"2026-01-{k + 2:02d}T00:00:00Z", ivs, newdev=False
+        )
+        inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
+    examined, cursors = [], []
+    for _ in range(3):
+        examined.append(inv.stitch(RULE_SNAP).examined)
+        cursors.append(
+            inv.db.execute(
+                "SELECT value FROM stitch_state WHERE key=?", (RECHECK_CURSOR,)
+            ).fetchone()
+        )
+    assert examined == [10, 10, 5] and cursors[-1] is None and all(c for c in cursors[:2])
+    assert inv.count("rule_attach_suspect") == 0

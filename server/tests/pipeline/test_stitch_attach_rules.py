@@ -45,7 +45,10 @@ from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.processor import run_once
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Rule, Snapshot, load_snapshot
 from vigie_pipeline.stitch import stitch
+from vigie_pipeline.stitch_apply import apply_plan
+from vigie_pipeline.stitch_compute import compute_plan
 from vigie_pipeline.stitch_db import withdraw_orphan_suggestions
+from vigie_pipeline.stitch_types import Attach
 
 
 def link_of(data: Data, mac_addr: str):
@@ -781,7 +784,7 @@ def test_a_weakened_rule_cannot_attach_a_different_mdns_name(data):
     ov.close()
 
 
-def test_two_matching_rules_one_with_a_blob_device_do_not_abort_the_run(data):
+def test_a_rule_with_a_blob_device_does_not_abort_the_run_and_makes_hits_suggestions(data):
     ov, dev = seeded_d(data, 300)
     ov.conn.execute(
         "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
@@ -789,8 +792,10 @@ def test_two_matching_rules_one_with_a_blob_device_do_not_abort_the_run(data):
     )  # fmt: skip
     ov.conn.commit()
     b = appear(data, 2, 4000, 4700)
-    run_at(data, T0 + 6000)  # must not raise
-    assert source_of(data, b) == "rule" and device_of(data, b) == dev
+    run_at(data, T0 + 6000)  # must not raise; the unreadable target makes every hit a suggestion
+    assert source_of(data, b) == "self" and kinds(data, "mac_attached") == []
+    (s,) = suggestions(data)
+    assert (s["reason_code"], s["reason_text"]) == ("rule_hit_needs_confirm", "malformed_target")
     assert len(kinds(data, "rule_malformed")) == 1
     run_at(data, T0 + 6100)
     assert len(kinds(data, "rule_malformed")) == 1  # once per day
@@ -879,26 +884,6 @@ def suggestion(inv: Inv, sid: str, pair: list[str], expires: int) -> None:
         "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, basis, created_at,"
         " expires_at) VALUES (?,'merge_identity',?,'{}','x','{}','t',?)",
         (sid, json.dumps(pair), iso_utc(expires)),
-    )
-
-
-def test_the_attach_settles_every_open_candidate_of_the_orphan_at_once(inv):
-    a = attach_unit(inv)
-    inv.db.executemany(
-        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
-        " created_at) VALUES (?, 'A', ?, 0.8, '{}', 'open', 't')",
-        ((f"c{i}", f"X{i}") for i in range(201)),
-    )
-    inv.commit()
-    st = inv.stitch(RULE_SNAP)
-    assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
-    assert (
-        inv.db.execute("SELECT COUNT(*) FROM identity_candidates WHERE state='open'").fetchone()[0]
-        == 0
-    )
-    assert (
-        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
-        == 0
     )
 
 
@@ -1000,4 +985,127 @@ def test_stats_name_the_attach(data):
     appear(data, 2, 400, 1100)
     assert run(data).attached == 1
     assert EMPTY.rules == () and mac(2).startswith("ae:")
+    ov.close()
+
+
+# ---- fix round 1 -------------------------------------------------------------------------------
+
+
+def test_a_malformed_rule_with_a_blob_id_still_names_its_target(tmp_path):
+    ov = Overrides(tmp_path)
+    ov.rule("good", "D", sig())
+    ov.conn.execute(
+        "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+        " VALUES (?, 'D', ?, 't', 'owner')", (b"\xff", json.dumps(sig())),
+    )  # fmt: skip
+    ov.conn.commit()
+    snap = load_snapshot(ro(tmp_path / "overrides.db"), NOW)
+    assert [r.id for r in snap.rules] == ["good"] and snap.malformed_rules == 1
+    assert snap.malformed_devices == {"D"} and snap.unknown_target is False
+
+
+def test_a_malformed_rule_whose_target_cannot_be_read_makes_every_rule_hit_a_suggestion(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    snap = Snapshot({}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset(), True)
+    st = inv.stitch(snap)
+    assert st.attached == 0 and st.suggestions == 1 and inv.link_of(a) == ("A", "self")
+    assert inv.db.execute("SELECT reason_text FROM suggestions").fetchone()[0] == "malformed_target"
+
+
+@pytest.mark.parametrize("device_id", [b"\x00\x01", "", "   "])
+def test_an_unreadable_target_is_reported_on_the_snapshot(tmp_path, device_id):
+    ov = Overrides(tmp_path)
+    ov.conn.execute(
+        "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+        " VALUES ('bad',?,?,'t','owner')", (device_id, json.dumps(sig())),
+    )  # fmt: skip
+    ov.conn.commit()
+    snap = load_snapshot(ro(tmp_path / "overrides.db"), NOW)
+    assert snap.malformed_rules == 1 and snap.unknown_target is True
+
+
+def test_a_dismissal_between_compute_and_apply_cancels_the_attach(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('c1','A','D',0.8,'{}','open','t')"
+    )
+    inv.commit()
+    plan = compute_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS)
+    assert any(isinstance(d, Attach) for d in plan.decisions)
+    inv.db.execute("UPDATE identity_candidates SET state='dismissed' WHERE id='c1'")  # a human
+    st = apply_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
+    assert inv.stitch(RULE_SNAP).attached == 1  # recomputed against the new state
+
+
+def test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later(inv, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MAX_ROWS_PER_PASS", 200)
+    a = attach_unit(inv)
+    inv.db.executemany(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES (?, 'A', ?, 0.8, '{}', 'open', 't')",
+        ((f"c{i}", f"X{i}") for i in range(1000)),
+    )
+    for i in range(3):
+        suggestion(inv, f"s{i}", ["A", f"X{i}"], NOW_ABS + 10**6)
+    inv.commit()
+    open_q = "SELECT COUNT(*) FROM identity_candidates WHERE state='open'"
+    st = inv.stitch(RULE_SNAP)
+    assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
+    assert 800 <= inv.db.execute(open_q).fetchone()[0] < 1000  # at most the budget per pass
+    rows = inv.db.execute(
+        "SELECT COUNT(*) FROM suggestions WHERE expires_at >= ?", (iso_utc(NOW_ABS),)
+    )
+    assert rows.fetchone()[0] == 0  # the suggestions are unactionable at once
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
+        == 1
+    )
+    for i in range(6):
+        inv.stitch(RULE_SNAP, NOW_ABS + i + 1)
+    assert inv.db.execute(open_q).fetchone()[0] == 0
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
+        == 0
+    )
+
+
+def test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides(data):
+    ov, dev, b = authorised_world(data)
+    conn = ro(data.root / "overrides.db")
+    snap = load_snapshot(conn, T0 + 6000)
+    cfg = PipelineConfig(data_dir=data.root)
+
+    def measure() -> int:
+        steps = [0]
+        conn.set_progress_handler(lambda: steps.__setitem__(0, steps[0] + 1) or 0, 1)
+        plan = compute_plan(data.inv, snap, cfg, T0 + 6000)
+        steps[0] = 0  # only the APPLY phase is measured
+        apply_plan(data.inv, snap, cfg, T0 + 6000, lambda: T0 + 6000, conn, plan)
+        conn.set_progress_handler(None, 0)
+        return steps[0]
+
+    small = measure()
+    data.inv.execute(
+        "UPDATE observations SET device_id=?, link_source='self' WHERE mac=?",
+        (device_of(data, b), b),
+    )
+    assert source_of(data, b) == "self"
+    ov.conn.execute("BEGIN")
+    ov.conn.executemany(
+        "INSERT INTO device_overrides (device_id, group_id, version, updated_at, updated_by)"
+        " VALUES (?, 'guest', 1, 't', 'owner')", ((f"u{i}",) for i in range(10_000)),
+    )  # fmt: skip
+    ov.conn.executemany(
+        "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+        " VALUES (?, ?, ?, 't', 'owner')",
+        ((f"r{i}", f"u{i}", json.dumps(sig(hostname=f"h{i}"))) for i in range(2_000)),
+    )  # fmt: skip
+    ov.conn.execute("COMMIT")
+    snap = load_snapshot(conn, T0 + 6000)
+    big = measure()
+    assert small > 0 and big <= small * 2 + 2_000, (small, big)
     ov.close()

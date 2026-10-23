@@ -81,7 +81,8 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before flood |
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion rows written per APPLY |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY (each <= ~12 statements + orphan cleanup) |
-| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; bounds orphan cleanup |
+| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; bounds the suggestion expiry at attach |
+| orphan cleanup | `MAX_ROWS_PER_PASS` | candidate rows dismissed per pass; `Settle` decisions finish the rest |
 | gaps | retention / gap_s (~2016) | `evidence_gaps` rows: merged within `activity_gap_s` at write time, pruned at retention |
 
 Lock hold (APPLY) is therefore `<= MAX_ROWS_PER_PASS + MAX_ATTACHES_PER_PASS * (12 + 64 + 2) +
@@ -90,10 +91,15 @@ MAC's own silence only ADDS presence (more overlap, never less), and maturity is
 server clock, so it cannot help an attacker.
 
 ## 4. APPLY preconditions (indexed point lookups)
+- Every pair decision carries `expected`, the pair's candidate state at compute time; APPLY
+  re-reads the row and drops the decision when it differs (a human dismissal in between).
 - Attach: `observations.mac` still `('self', from_device)`; both `identity_state='ok'`; target
-  exists; fresh snapshot: rule present and unexpired at `clock()`, `canonical(rule.device_id) ==
-  target`, target group unchanged and `auto_inherit=1`; pair not `vetoed`/`dismissed`.
+  exists; by primary key in overrides.db: the rule row still active and equal to the computed rule,
+  unexpired at the clock read under the lock, `canonical(rule.device_id) == target`, the candidate's
+  device not linked away, the target's override row in the same explicit group, that group
+  `auto_inherit=1`; pair state unchanged and not `vetoed`. No snapshot is loaded under the lock.
 - Candidate: row re-read; identical or sticky (`dismissed`, `vetoed`) rows are not written.
+- Settle: an orphan's remaining candidate rows are dismissed under the pass's row cap.
 - Suggest: no open/decided suggestion for the pair; devices not linked; target below the cap.
 - Event: `INSERT OR IGNORE` on `(kind, dedup)`.
 
@@ -147,7 +153,12 @@ fresh install; reapply is a no-op.
 | unbounded memory/CPU | BUCKET_ROWS, INTERVALS_PER_MAC, MACS_PER_PASS, compute budget | bounds_perf: `test_compute_budget_stops_between_subjects_and_the_cursor_persists` |
 | late-collector gap restores maturity | one gap list, retention-pruned, all loaded | maturity_activity: `test_a_mac_whose_window_overlaps_a_gap_is_not_mature` |
 | human merges 100k devices | links read outside the lock; widen under the row cap | bounds_perf: `test_widening_is_count_bounded_per_pass` |
-| malformed rule on the target | target becomes suggestion-only | attach_rules: `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion` |
+| malformed rule on the target | target becomes suggestion-only; an unreadable target makes every hit suggestion-only | attach_rules: `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion`, `test_a_malformed_rule_whose_target_cannot_be_read_makes_every_rule_hit_a_suggestion` |
+| 65 compatible junk MACs around an attached copy | flooded pool = incomplete evidence: flag / confirm | evidence_recheck: `test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag` |
+| dismiss a pair between COMPUTE and APPLY | candidate-state preconditions | attach_rules: `test_a_dismissal_between_compute_and_apply_cancels_the_attach` |
+| 1000 candidate rows on an attaching orphan | cleanup under the row cap + `Settle` | attach_rules: `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
+| grow overrides.db to lengthen the lock | point lookups only under the lock | attach_rules: `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
+| 30k old attachments to switch the re-check off | recheck robin with persisted cursor | evidence_recheck: `test_the_recheck_robin_cycles_through_every_attached_mac` |
 
 ## 9. Tests: deleted or replaced (by file)
 `test_stitching.py`, `test_stitch_rules.py`, `test_stitch_perf.py` and `test_stitch_review.py`
@@ -182,3 +193,8 @@ dropped because the machinery they pinned no longer exists:
    be hidden) and raises the daily `stitch_deferred (truncated)` event.
 8. A rule-attached MAC without a `rule_attachments` row is flagged `rule_attach_suspect` (evidence
    missing) rather than re-checked against guessed names.
+9. (fix round 1) A compatible pool over `MAX_SIGNATURE_BUCKET` degrades the rule hit to a
+   `rule_hit_needs_confirm (compatible_flood)` suggestion instead of attaching nothing silently, and
+   flags a re-checked attachment as incomplete evidence.
+10. (fix round 1) A decision whose pair's candidate row changed between COMPUTE and APPLY is
+    dropped (`stats.stale`), not applied.

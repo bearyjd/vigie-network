@@ -141,6 +141,7 @@ class Attach:
     opt55: str | None
     opt60: str | None
     views: tuple[tuple[bool, bool], ...]
+    expected: str | None = None  # the pair's candidate state when computed (None: no row)
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class Candidate:
     evidence: Mapping[str, object]
     state: str
     provisional: bool = False  # written only when the pair has no row yet (immature overlap)
+    expected: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,7 @@ class Veto:
     into: str
     score: float
     evidence: Mapping[str, object]
+    expected: str | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,7 @@ class Ambiguous:
     targets: tuple[str, ...]
     score: float
     evidence: Mapping[str, object]
+    expected: tuple[str | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,7 @@ class Suggest:
     reason_code: str  # fingerprint_match | rule_hit_needs_confirm
     reason_text: str | None  # the deferral reason when the rule hit needs a human
     signals: tuple[str, ...]
+    expected: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,14 @@ class Flag:
 
 
 @dataclass(frozen=True)
+class Settle:
+    """Dismiss (under the row cap) the undecided candidate rows of a device a rule attach orphaned;
+    the `settle:<device>` state key stays until none is left."""
+
+    device_id: str
+
+
+@dataclass(frozen=True)
 class Widen:
     """Catch-up of a merged device's first/last seen range from one of its sources."""
 
@@ -207,7 +220,7 @@ class Widen:
     dst: str
 
 
-Decision = Attach | Candidate | Veto | Ambiguous | Suggest | Flag | Widen
+Decision = Attach | Candidate | Veto | Ambiguous | Suggest | Flag | Widen | Settle
 
 
 @dataclass
@@ -222,6 +235,7 @@ class StitchStats:
     suspect: int = 0
     deferred: int = 0
     examined: int = 0
+    stale: int = 0  # decisions dropped by APPLY because their preconditions changed
 
 
 @dataclass(frozen=True)
