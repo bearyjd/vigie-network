@@ -1379,3 +1379,47 @@ def test_the_orphan_cleanup_keeps_half_the_row_cap_for_decisions(inv, monkeypatc
         " AND state IN ('open','suggested')"
     ).fetchone()[0]
     assert open_rows == 0
+
+
+# ---- round 3 -----------------------------------------------------------------------------------
+
+
+def test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones(inv):
+    """Opus/Codex L1: 102 decided rows filled the LIMITed window, `more` came back False and the
+    undecided ones stayed open with the settle key dropped."""
+    attach_unit(inv)
+    inv.db.execute("BEGIN")
+    for i in range(102):
+        suggestion(inv, f"d{i:03d}", ["A", f"X{i}"], NOW_ABS + 10**6)
+    for i in range(5):
+        suggestion(inv, f"u{i}", ["A", f"Y{i}"], NOW_ABS + 10**6)
+    inv.commit()
+    snap = Snapshot({}, (), {}, {}, {f"d{i:03d}": "rejected" for i in range(102)})
+    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100) == (5, False)
+    live = inv.db.execute(
+        "SELECT id FROM suggestions WHERE expires_at >= ? ORDER BY id", (iso_utc(NOW_ABS),)
+    )
+    assert [r[0] for r in live] == [f"d{i:03d}" for i in range(102)]  # decided rows untouched
+
+
+def test_rule_expiry_is_read_again_before_each_attach_write(inv, tmp_path):
+    """Codex L2: expiry does not change data_version, so the clock must be read per attach."""
+    ov, conn = snapshot_world(tmp_path)
+    ov.conn.execute("UPDATE identity_rules SET expires_at=?", (iso_utc(NOW_ABS + 1),))
+    ov.conn.commit()
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a1 = inv.mac(
+        "A1", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 59000)]
+    )
+    a2 = inv.mac("A2", "victim", None, "self", "2026-01-04T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    assert sum(isinstance(d, Attach) for d in plan.decisions) == 2
+    reads = iter([NOW_ABS, NOW_ABS, NOW_ABS + 2])  # lock, first attach, second attach
+
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: next(reads), conn, plan)
+    assert (
+        st.attached == 1 and inv.link_of(a1) == ("D", "rule") and inv.link_of(a2) == ("A2", "self")
+    )
+    ov.close()

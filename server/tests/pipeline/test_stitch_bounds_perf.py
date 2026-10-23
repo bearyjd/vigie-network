@@ -808,3 +808,29 @@ def test_flood_tokens_are_not_brute_forceable_short_hashes(inv, monkeypatch):
         r[0] for r in inv.db.execute("SELECT dedup FROM events WHERE kind='signature_flood'")
     ]
     assert len(token.split(":")[0]) >= 32
+
+
+def test_flood_tokens_of_different_groups_never_collide_on_a_pipe_in_a_name(inv, monkeypatch):
+    """L3: ("x|h", "name") and ("x", "h|name") joined with '|' were one token: one flood hid."""
+    monkeypatch.setattr(compute_mod, "MAX_SIGNATURE_BUCKET", 2)
+    for k in range(4):
+        inv.mac(
+            f"F{k}",
+            "name",
+            None,
+            "self",
+            "2026-02-01T00:00:00Z",
+            [(NOW_ABS - 3000, NOW_ABS)],
+            vc="x|h",
+        )
+        inv.mac(
+            f"G{k}",
+            "h|name",
+            None,
+            "self",
+            "2026-02-01T00:00:00Z",
+            [(NOW_ABS - 3000, NOW_ABS)],
+            vc="x",
+        )
+    inv.stitch()
+    assert inv.count("signature_flood") == 2

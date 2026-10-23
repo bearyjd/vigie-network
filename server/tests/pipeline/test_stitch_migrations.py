@@ -149,3 +149,27 @@ def test_upgrade_from_mains_frozen_schema_text_survives_duplicate_candidate_rows
     assert [r[0] for r in rows] == ["c2"]  # the newest of the duplicates is kept
     folds = conn.execute("SELECT hostname_fold, mdns_fold FROM observations").fetchone()
     assert tuple(folds) == ("éloïse", "strasse")  # back-filled for main's rows
+
+
+@pytest.mark.timeout(20)
+def test_the_fold_backfill_terminates_on_empty_and_null_names(tmp_path):
+    from vigie_pipeline.schema import backfill_folds
+
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
+    conn.execute(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen) VALUES ('e','d',1,'','','self','t','t')"
+    )
+    conn.execute(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen) VALUES ('n','d',1,NULL,NULL,'self','t','t')"
+    )
+    conn.execute(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen) VALUES ('h','d',1,'Ｓtraße',NULL,'self','t','t')"
+    )
+    assert backfill_folds(conn) == 1
+    assert backfill_folds(conn) == 0  # nothing left: the empty names are not re-selected forever
+    rows = conn.execute("SELECT mac, hostname_fold FROM observations ORDER BY mac").fetchall()
+    assert [tuple(r) for r in rows] == [("e", None), ("h", "strasse"), ("n", None)]

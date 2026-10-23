@@ -9,6 +9,7 @@ for a human, a provisional row, or a daily deferral event): never an attach, nev
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -56,6 +57,7 @@ from vigie_pipeline.stitch_types import (
     Widen,
     components,
     evidence_of,
+    fold,
     group_keys,
     is_candidate_match,
     long_hash,
@@ -254,7 +256,7 @@ class Compute:
         key, size = fresh[0]
         token = short_hash("|".join(key))
         self.decisions.append(Flag("signature_flood", device_id,
-                                   f"{long_hash('|'.join(key))}:{self.day}",
+                                   f"{long_hash(json.dumps(list(key)))}:{self.day}",
                                    f"signature flood {token}: {size} MACs skipped"))  # fmt: skip
         log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
 
@@ -282,7 +284,7 @@ class Compute:
             and not ((o.hostname and c.hostname and not same(o.hostname, c.hostname))
                      or (o.mdns and c.mdns and not same(o.mdns, c.mdns)))
             and (same(o.hostname, c.hostname) or same(o.mdns, c.mdns)
-                 or any(n.casefold() in known for n in (o.hostname, o.mdns) if n)
+                 or any(fold(n) in known for n in (o.hostname, o.mdns) if n)
                  or abs(o.first_ts - c.first_ts) <= gap)
         }  # fmt: skip
 
@@ -304,6 +306,10 @@ class Compute:
         MACs, every MAC sharing a name with any of them, and per rule view its name peers and
         compatible peers. Returns (peers, compatible_pool_flooded)."""
         self._gather_peers(hood, target, views)
+        return self._derive_peers(hood, target, views)
+
+    def _derive_peers(self, hood: Hood, target: str, views: list[Obs]) -> tuple[set[str], bool]:
+        """The peer set from whatever the neighbourhood holds (complete or cut short)."""
         peers, flooded = hood.canon_macs([target]), False
         known = hood.known_names(target)
         groups = hood.groups()  # once: the peer derivation is linear in the neighbourhood
@@ -530,10 +536,10 @@ class Compute:
         try:
             hood.load(mac)
             peers, flooded = self._safety_peers(hood, o.canon, views)
-        except BudgetSpent:  # cut mid-subject: incomplete evidence, judged on what was gathered
+        except BudgetSpent:  # cut mid-subject: incomplete evidence, judged on EVERYTHING gathered
             hood.tick = lambda: None
-            hood.load(mac)
-            peers, flooded = hood.canon_macs([o.canon]), False
+            hood.load(mac)  # activity of the MACs already gathered (bounded by the hood size)
+            peers, flooded = self._derive_peers(hood, o.canon, views)
             hood.truncated.add("budget")
         if flooded:  # a dropped compatible pool is incomplete evidence, never a free pass
             hood.truncated.add("compatible_flood")
@@ -571,7 +577,7 @@ class Compute:
         """One flag per (MAC, device, reason): a later, different reason raises a fresh flag. The
         dedup token carries a 128-bit hash of the MAC (a chosen local MAC cannot collide with a
         32-bit one) and the reason's first word."""
-        token = f"{long_hash(o.mac)}~{o.canon}~{why.split()[0]}"
+        token = f"{long_hash(o.mac)}~{o.canon}~{why.replace(' ', '_')}"
         if event_exists(self.inv, SUSPECT, token):
             return
         self.stats.suspect += 1

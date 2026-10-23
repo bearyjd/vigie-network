@@ -62,10 +62,11 @@ logger = logging.getLogger("vigie_pipeline")
 class Applier:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
-        cfg: PipelineConfig, now: float, at: float, stats: StitchStats,
+        cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
-        self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
+        self.now, self.clock, self.stats = now, clock, stats
+        self.at = clock()  # the clock under the lock; read again before each attach write
         self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
         self.writes = 0
@@ -284,6 +285,7 @@ class Applier:
         if self.attaches >= MAX_ATTACHES_PER_PASS:
             self.stats.capped += 1
             return
+        self.at = self.clock()  # expiry does not change data_version: judge it per attach
         if not (
             self._authorised(d)
             and self._still_self(d.mac, d.from_device)
@@ -337,8 +339,7 @@ def apply_plan(
 ) -> StitchStats:  # fmt: skip
     stats = plan.stats
     with immediate(inv):
-        at = clock()  # read once the lock is held: rule expiry is judged against it
-        applier = Applier(inv, snap, overrides, cfg, now, at, stats)
+        applier = Applier(inv, snap, overrides, cfg, now, clock, stats)
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

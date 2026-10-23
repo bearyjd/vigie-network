@@ -183,7 +183,7 @@ class Inv:
         self.db.execute("BEGIN")
 
     def mac(self, dev, host, mdns, src, fs, ivs, *, rand=1, newdev=True, fp="1,2,3",
-            last_seen: str | None = None) -> str:  # fmt: skip
+            last_seen: str | None = None, vc: str = "x") -> str:  # fmt: skip
         m = f"ae:{self.n >> 16 & 255:02x}:{self.n >> 8 & 255:02x}:{self.n & 255:02x}:00:01"
         self.n += 1
         if newdev:
@@ -193,8 +193,8 @@ class Inv:
         self.db.execute(
             "INSERT INTO observations (mac, device_id, is_randomized, dhcp_fingerprint,"
             " vendor_class, hostname, mdns_name, link_source, first_seen, last_seen,"
-            " hostname_fold, mdns_fold) VALUES (?,?,?,?,'x',?,?,?,?,?,?,?)",
-            (m, dev, rand, fp, host, mdns, src, fs, last_seen or fs,
+            " hostname_fold, mdns_fold) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (m, dev, rand, fp, vc, host, mdns, src, fs, last_seen or fs,
              fold(host) if host else None, fold(mdns) if mdns else None),
         )  # fmt: skip
         self.act(m, ivs)

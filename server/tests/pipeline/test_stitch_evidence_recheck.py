@@ -431,3 +431,60 @@ def test_a_subject_cut_by_the_budget_does_not_pin_the_robin(inv, monkeypatch):
     assert (
         len({c[0] if c else None for c in cursors}) >= 3
     )  # the cursor moved past each cut subject
+
+
+# ---- round 3 -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cut_at", [1, 2, 3, 4, 5, 6])  # the subject needs about six ticks
+def test_a_budget_cut_at_any_lookup_still_flags_the_overlap_it_has_seen(inv, monkeypatch, cut_at):
+    """Opus M2: the fallback after BudgetSpent judged only the target's own MACs; peers already
+    gathered (the victim, found by the target's name bucket at the third tick) were dropped."""
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    a = attached(inv)
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    ticks = {"n": 0}
+
+    def tick(self):
+        ticks["n"] += 1
+        if ticks["n"] >= cut_at:
+            raise compute_mod.BudgetSpent
+
+    monkeypatch.setattr(compute_mod.Compute, "_tick", tick)
+    st = inv.stitch(RULE_SNAP)
+    rows = [
+        r[0] for r in inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert any("incomplete, budget" in r for r in rows) and inv.link_of(a) == ("D", "rule")
+    if cut_at >= 4:  # the victim was in the neighbourhood when the budget ran out
+        assert any("sustained" in r for r in rows) and st.suspect == 2
+    tokens = [
+        r[0] for r in inv.db.execute("SELECT dedup FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert len(set(tokens)) == len(tokens)  # one token per (MAC, device, full reason)
+
+
+def test_truncation_and_budget_cuts_have_distinct_flag_tokens(inv, monkeypatch):
+    monkeypatch.setattr(stitch_hood, "BUCKET_ROWS", 3)
+    a = attached(inv)
+    for i in range(5):
+        inv.mac(
+            f"S{i}",
+            "victim",
+            None,
+            "self",
+            "2026-06-01T00:00:00Z",
+            [],
+            last_seen="2026-09-01T00:00:00Z",
+        )
+    assert inv.stitch(RULE_SNAP).suspect == 1  # evidence incomplete, truncated
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    monkeypatch.setattr(
+        compute_mod.Compute, "_tick", lambda self: (_ for _ in ()).throw(compute_mod.BudgetSpent)
+    )
+    assert (
+        inv.stitch(RULE_SNAP, NOW_ABS + 1).suspect == 1
+    )  # evidence incomplete, budget: a new reason
+    assert inv.link_of(a) == ("D", "rule")

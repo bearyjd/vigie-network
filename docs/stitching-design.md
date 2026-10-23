@@ -75,7 +75,7 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 |---|---|---|
 | `MACS_PER_PASS` | 256 | subjects examined per robin per pass (self robin, recheck robin) |
 | `STITCH_COMPUTE_BUDGET_S` | 5 | wall time of COMPUTE (read-only); stops between subjects |
-| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of it; the self robin always keeps the rest |
+| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of it (checked between subjects and per lookup inside one; overrun bounded by one lookup plus the cut subject's evaluation); the self robin gets the remainder |
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; more = truncated = degrade |
 | `TARGET_KEYS` | 16 | distinct (fp, vc, name) keys of a target identity; more = degrade |
 | `INTERVALS_PER_MAC` | 64 | rows of `mac_activity` per MAC, enforced at fold time (closest pair coalesced) |
@@ -215,6 +215,13 @@ dropped because the machinery they pinned no longer exists:
     that pass (`PRAGMA data_version`), closing merge/veto laundering, late second rules and late
     malformed rules at once. The point lookups of the first fix commit were replaced by this O(1)
     check.
+15. (round 3) The known-name clause folds with `fold` (a lint test bans every other fold); a
+    re-check cut by the budget is judged on everything gathered and flagged with its own reason;
+    the fold back-fill skips empty names; the clock is re-read before each attach write; flood
+    tokens hash a JSON key; decided suggestions are excluded in SQL from the orphan cleanup window.
+    Mutation survivors kept as equivalent pairs: the `target_keys` flag is set both by
+    `Hood.add_target` and `Hood.known_names` (either alone degrades the hit), beside the two
+    intentional redundancies above.
 14. (fix round 2, opus) Names are compared through ONE fold (NFKC + Unicode casefold) stored in
     `observations.hostname_fold`/`mdns_fold` (pipeline-written, back-filled at upgrade); the compute
     budget ticks per lookup inside a subject (a cut subject is deferred or flagged, the cursor

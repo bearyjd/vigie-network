@@ -216,8 +216,8 @@ def backfill_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
     done = 0
     while True:
         rows = conn.execute(
-            "SELECT mac, hostname, mdns_name FROM observations WHERE (hostname IS NOT NULL AND"
-            " hostname_fold IS NULL) OR (mdns_name IS NOT NULL AND mdns_fold IS NULL) LIMIT ?",
+            "SELECT mac, hostname, mdns_name FROM observations WHERE (hostname <> '' AND"
+            " hostname_fold IS NULL) OR (mdns_name <> '' AND mdns_fold IS NULL) LIMIT ?",
             (chunk,),
         ).fetchall()
         if not rows:

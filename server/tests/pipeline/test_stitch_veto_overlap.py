@@ -4,6 +4,7 @@ merges, safety peers derived from the rule and the target, and immutable suggest
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 from pipeline_helpers import T0, Data, data  # noqa: F401
@@ -898,21 +899,71 @@ def test_a_present_non_ascii_victim_still_vetoes_the_copy(data, stored, seen):
     assert [c["state"] for c in candidates(data)] == ["vetoed"], (stored, seen)
 
 
-def test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule(data):
-    """Opus H1 e2e: the copy attached beside the present victim because every name-bucket lookup
-    missed the Unicode name; the ASCII control was vetoed."""
-    host = "Éloïse-iPhone"
-    ov, dev = seeded(data, a_end=300, rule_sig=sig(hostname=host))
-    data.inv.execute("UPDATE observations SET hostname=?", (host,))  # the seeded device too
-    v = appear(data, 3, 1000, 4000, host=host, mdns=None)  # the victim's fresh roll
-    b = appear(data, 2, 1400, 2400, host=host.lower(), mdns=None)  # the copy, beside it
+COMPAT_NAMES = [  # compatibility characters: casefold alone differs from NFKC + casefold
+    ("Ｓtraße-PC", "strasse-pc"),  # full-width S and sharp s
+    ("Phone²", "phone2"),  # superscript two
+    ("Daves\u00a0Phone", "Daves Phone"),  # no-break space
+    ("Room-Ⅻ", "room-xii"),  # Roman numeral
+    ("ｶﾞｼﾞｴｸﾄ", "ガジエクト"),  # half-width katakana with dakuten
+    ("ﬁrewall", "FIREWALL"),  # ligature
+    ("Éloïse-iPhone", "éloïse-iphone"),
+]
+
+
+@pytest.mark.parametrize(("stored", "seen"), [*COMPAT_NAMES, ("Eloise-iPhone", "eloise-iphone")])
+def test_a_fresh_roll_of_the_victim_vetoes_a_copy_under_a_rule_whatever_the_script(
+    data, stored, seen
+):
+    """Opus H1 e2e through ingest and run_once: the copy sits beside the victim's fresh roll; a
+    name-bucket miss used to let it attach silently. ASCII control included."""
+    a = appear(data, 1, 0, 300, host=stored, mdns=None)
+    run(data)
+    ov = Overrides(data.root)
+    dev = device_of(data, a)
+    ov.rule(RULE, dev, sig(hostname=stored))
+    ov.override(dev, "iot", version=3)
+    v = appear(data, 3, 1000, 4000, host=stored, mdns=None)  # the victim's fresh roll
+    b = appear(data, 2, 1400, 2400, host=seen, mdns=None)  # the copy, beside it
     run(data)
     assert source_of(data, b) == "self" and device_of(data, b) != dev
-    assert ("vetoed" in {c["state"] for c in candidates(data)}) or kinds(
-        data, "rule_attach_suspect"
-    )
-    assert source_of(data, v) in ("self", "rule")
+    assert [c["state"] for c in candidates(data) if c["device_a"] == device_of(data, b)] == [
+        "vetoed"
+    ]
+    assert kinds(data, "mac_attached") == [] and source_of(data, v) == "self"
     ov.close()
+
+
+@pytest.mark.parametrize(
+    ("target_name", "peer_name"),
+    [("Straße", "Ｓtraße"), ("Ｓtraße", "Straße"), ("Room-Ⅻ", "room-xii"), ("ﬁrewall", "Firewall")],
+)
+def test_a_known_name_with_a_compatibility_character_still_makes_a_peer(
+    inv, target_name, peer_name
+):
+    """Opus H1: the known-name clause compared casefolded names with folded ones."""
+    inv.mac("D", target_name, "Dave", "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    c = inv.mac("C", "victim", None, "self", "2026-03-01T00:00:00Z", [(NOW_ABS - 500, NOW_ABS)])
+    v = inv.mac("V", None, peer_name, "self", "2026-09-01T00:00:00Z", [(NOW_ABS - 500, NOW_ABS)])
+    cp, hood, obs = inv.hood(c)
+    cp._gather_peers(hood, "D", [obs])
+    assert v in cp._compatible(hood, obs, hood.known_names("D"))
+
+
+def test_no_other_fold_than_fold_exists_in_the_stitching_sources():
+    """Lint: every name comparison goes through stitch_types.fold (NFKC + casefold); ASCII-only
+    SQLite NOCASE, bare casefold() and lower() are banned everywhere else."""
+    root = pathlib.Path(__file__).resolve().parents[2] / "src" / "vigie_pipeline"
+    offenders = []
+    for path in sorted(root.glob("stitch*.py")):
+        text = path.read_text()
+        if path.name == "stitch_types.py":
+            start = text.index("def fold(")
+            end = text.index("\n\n\n", start)
+            text = text[:start] + text[end:]
+        for needle in (".casefold()", ".lower(", "COLLATE NOCASE", "NOCASE"):
+            if needle in text:
+                offenders.append((path.name, needle))
+    assert offenders == []
 
 
 def test_fold_is_one_function_for_python_and_sql(inv):

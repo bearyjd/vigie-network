@@ -242,17 +242,20 @@ def withdraw_orphan_suggestions(
         return 0, True
     prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
     now_iso = iso_utc(now)
+    decided = json.dumps(sorted(snap.decisions))  # excluded in SQL: never inside the window
     rows = inv.execute(
         "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
-        " AND device_ids < ? AND expires_at >= ? LIMIT ?",
-        (prefix, prefix + "\uffff", now_iso, limit + 1),
+        " AND device_ids < ? AND expires_at >= ?"
+        " AND id NOT IN (SELECT value FROM json_each(?)) LIMIT ?",
+        (prefix, prefix + "\uffff", now_iso, decided, limit + 1),
     ).fetchall()
     rows += inv.execute(
         "SELECT id FROM suggestions WHERE action='merge_identity'"
-        " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ? LIMIT ?",
-        (device_id, now_iso, limit + 1),
+        " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ?"
+        " AND id NOT IN (SELECT value FROM json_each(?)) LIMIT ?",
+        (device_id, now_iso, decided, limit + 1),
     ).fetchall()
-    todo = sorted({r["id"] for r in rows if r["id"] not in snap.decisions})
+    todo = sorted({r["id"] for r in rows})
     written = _expire_ids(inv, todo[:limit], now)
     return written, len(todo) > limit
 

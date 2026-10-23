@@ -39,7 +39,7 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 |---|---|---|
 | `MACS_PER_PASS` | 256 | subjects per robin per pass; every MAC gets its turn as the cursor advances and wraps |
 | `STITCH_COMPUTE_BUDGET_S` | 5 s | wall time of COMPUTE; stops between subjects, the cursor stays on the last finished one |
-| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of the budget; the self robin always keeps the rest |
+| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of the budget, checked between subjects and before every lookup inside one; it can overrun its share by at most the lookup in flight (`BUCKET_ROWS` rows) plus the evaluation of what that subject gathered; the self robin gets the remainder up to the full budget |
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; one more = incomplete evidence |
 | `TARGET_KEYS` | 16 | distinct (opt55, opt60, name) keys of a target identity; more = incomplete |
 | `INTERVALS_PER_MAC` | 64 | `mac_activity` rows per MAC, coalesced at fold time |
@@ -242,8 +242,10 @@ in `rule_attachments` (each matched rule's view, the attach-time fingerprints), 
 MAC calls itself now, so renaming or re-fingerprinting an attached copy, or revoking its rule, cannot
 hide a later overlap. On sustained overlap, on incomplete evidence, or on a missing evidence row the
 attachment is FLAGGED once per reason (`rule_attach_suspect`, warn, on the target device; the dedup
-token is a 128-bit hash of the MAC, the device and the reason, so a later different reason raises
-a fresh flag); the pipeline does not detach and creates no suggestion. Detaching waits for the API (`mac_detached`).
+token is a 128-bit hash of the MAC, the device and the full reason text, so a later different
+reason raises a fresh flag); the pipeline does not detach and creates no suggestion. A re-check cut
+by the compute budget is judged on everything gathered up to the cut and flagged
+`evidence incomplete, budget`. Detaching waits for the API (`mac_detached`).
 
 ## 9. Safety properties (each has a test)
 - `overrides.db` is opened `mode=ro` + `query_only`; its bytes are identical before and after. A
@@ -282,6 +284,11 @@ a fresh flag); the pipeline does not detach and creates no suggestion. Detaching
 | Unicode names (É, ß, ς, full-width, NFD) to dodge the name buckets | one fold (NFKC + casefold) in Python and in the stored indexed `*_fold` columns; no NOCASE on names | `test_non_ascii_names_match_exactly_like_ascii_ones`, `test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule` |
 | one enormous subject to eat the compute budget | the budget ticks per lookup inside a subject; known names capped; a cut subject is deferred/flagged and the cursor moves past it | `test_one_huge_recheck_subject_cannot_exceed_its_budget_share`, `test_a_subject_cut_by_the_budget_does_not_pin_the_robin` |
 | a persistent spray to mask the overlap flag behind the truncation flag | overlap always evaluated on the peers at hand; both flags fire | `test_an_overlap_seen_in_a_truncated_hood_is_still_flagged` |
+| a budget cut mid re-check to hide an overlap already gathered | the cut subject is judged on everything gathered so far; `budget` is its own flag reason | `test_a_budget_cut_at_any_lookup_still_flags_the_overlap_it_has_seen` |
+| compatibility characters (full-width, superscripts, NBSP, Roman numerals, half-width kana, ligatures) in a known name | every name comparison, including the known-name clause, goes through `fold`; a lint test bans any other fold | `test_a_known_name_with_a_compatibility_character_still_makes_a_peer`, `test_no_other_fold_than_fold_exists_in_the_stitching_sources` |
+| a rule expiring between two attaches of one pass | the clock is read again before each attach write | `test_rule_expiry_is_read_again_before_each_attach_write` |
+| `\|` in a name or vendor class to collide two flood tokens | tokens hash a JSON encoding of the key | `test_flood_tokens_of_different_groups_never_collide_on_a_pipe_in_a_name` |
+| decided suggestions crowding the orphan cleanup window | decided ids are excluded in SQL; `more` counts real rows | `test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones` |
 | a malformed rule on another device whose signature could match | any malformed rule makes every rule hit suggestion-only | `test_any_malformed_rule_makes_every_rule_hit_a_suggestion` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
