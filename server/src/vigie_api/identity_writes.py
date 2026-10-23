@@ -6,10 +6,12 @@ import hashlib
 import json
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 from vigie_api import writes
+from vigie_api.config import Settings
 from vigie_api.effective import link_map, resolve
 from vigie_api.errors import ApiError
 from vigie_api.models import DevicePatch
@@ -95,7 +97,7 @@ def _versions(ov, ids, body, *, basis=None):
 
 
 def _targets(inv, ov, ids, *, canonical=True):
-    links = link_map(ov)
+    links = link_map(ov) if canonical else {}
     for device in ids:
         row = inv.execute("SELECT status FROM devices WHERE id=?", (device,)).fetchone()
         if row is None or row["status"] == "retired":
@@ -172,26 +174,74 @@ def _candidate(inv, candidate_id, ids):
     return row
 
 
-def _overlap(inv, ov, source, target, config, now):
-    links = link_map(ov)
-    component = [
-        source,
-        target,
-        *[device for device in links if resolve(links, device) in {source, target}],
-    ]
+def _too_large(kind):
+    raise ApiError(409, "merge_too_large", f"merge exceeds configured {kind} limit")
+
+
+def _merge_component(ov, source, target, limits):
+    """Indexed incoming edges, with one sentinel row beyond the configured budget."""
+    roots = {}
+    for device in (source, target):
+        row = ov.execute("SELECT * FROM identity_links WHERE from_device=?", (device,)).fetchone()
+        roots[device] = dict(row) if row else None
+        if row and row["revoked_at"] is None:
+            raise ApiError(409, "device_merged", "a device is no longer canonical")
+    owners = {source: source, target: target}
+    edges = {}
+    pending = [source, target]
+    for device in pending:
+        rows = ov.execute(
+            "SELECT * FROM identity_links WHERE into_device=? AND revoked_at IS NULL"
+            " ORDER BY from_device LIMIT ?",
+            (device, limits.max_merge_aliases - len(owners) + 1),
+        ).fetchall()
+        for row in rows:
+            alias = row["from_device"]
+            if alias in owners:
+                raise ApiError(409, "merge_changed", "identity component contains a cycle")
+            owners[alias] = owners[device]
+            edges[alias] = dict(row)
+            if len(owners) > limits.max_merge_aliases:
+                _too_large("component size")
+            pending.append(alias)
+    if len(owners) > limits.max_merge_aliases:
+        _too_large("component size")
+    flattened = {d: row["into_device"] for d, row in edges.items() if owners[d] == source}
+    if len(flattened) + 1 > limits.max_merge_flatten_writes:
+        _too_large("flatten writes")
+    return {"owners": owners, "edges": edges, "roots": roots, "flattened": flattened}
+
+
+def _overlap(inv, component, source, target, config, now, limits):
+    owners = component["owners"]
+    devices = list(owners)
     observations = []
-    for start in range(0, len(component), 400):
-        chunk = component[start : start + 400]
+    for start in range(0, len(devices), 400):
+        chunk = devices[start : start + 400]
         observations.extend(
             inv.execute(
                 "SELECT mac,device_id FROM observations WHERE device_id IN "  # noqa: S608
-                f"({','.join('?' * len(chunk))})",  # noqa: S608
-                chunk,
+                f"({','.join('?' * len(chunk))}) LIMIT ?",  # noqa: S608
+                [*chunk, limits.max_merge_observations - len(observations) + 1],
             ).fetchall()
         )
-    a = [r["mac"] for r in observations if resolve(links, r["device_id"]) == source]
-    b = [r["mac"] for r in observations if resolve(links, r["device_id"]) == target]
+        if len(observations) > limits.max_merge_observations:
+            _too_large("observations")
+    a = [r["mac"] for r in observations if owners[r["device_id"]] == source]
+    b = [r["mac"] for r in observations if owners[r["device_id"]] == target]
     macs = a + b
+    activity_rows = 0
+    for start in range(0, len(macs), 400):
+        chunk = macs[start : start + 400]
+        activity_rows += len(
+            inv.execute(
+                "SELECT mac FROM mac_activity WHERE mac IN "  # noqa: S608
+                f"({','.join('?' * len(chunk))}) LIMIT ?",  # noqa: S608
+                [*chunk, limits.max_merge_activity_rows - activity_rows + 1],
+            ).fetchall()
+        )
+        if activity_rows > limits.max_merge_activity_rows:
+            _too_large("activity rows")
     activity = load_activity(
         inv,
         macs,
@@ -222,9 +272,64 @@ def _overlap(inv, ov, source, target, config, now):
             raise ApiError(409, "active_overlap", "devices have conflicting concurrent activity")
 
 
-def decide(inv, ov, *, sid, accept, body, principal, now, request_id, config):
+@contextmanager
+def _prepare_merge(inv, ov, *, sid, accept, body, principal, now, request_id, config, limits):
+    """Keep evidence in one inventory snapshot; release overrides reads before writer lock."""
+    fingerprint = dump(body.model_dump())
+    key = hashlib.sha256(
+        dump(
+            [
+                principal,
+                "suggestion.accept" if accept else "suggestion.reject",
+                sid,
+                request_id or fingerprint,
+            ]
+        ).encode()
+    ).hexdigest()
+    if (
+        not accept
+        or ov.execute("SELECT 1 FROM api_write_receipts WHERE id=?", (key,)).fetchone()
+        or ov.execute("SELECT 1 FROM suggestion_decisions WHERE suggestion_id=?", (sid,)).fetchone()
+    ):
+        yield None
+        return
+    inv.execute("BEGIN")
+    try:
+        row = inv.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
+        prepared = None
+        if row and row["action"] == "merge_identity":
+            try:
+                ids, payload = json.loads(row["device_ids"]), json.loads(row["payload"])
+                source, target = payload.get("from_device"), payload.get("into_device")
+                if (
+                    not isinstance(ids, list)
+                    or len(ids) != 2
+                    or not all(isinstance(d, str) for d in ids)
+                    or not isinstance(source, str)
+                    or not isinstance(target, str)
+                    or source == target
+                    or {source, target} != set(ids)
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, AttributeError):
+                raise ApiError(409, "invalid_suggestion", "merge endpoints do not match") from None
+            ov.execute("BEGIN")
+            try:
+                _targets(inv, ov, ids, canonical=False)
+                _versions(ov, ids, body)
+                prepared = _merge_component(ov, source, target, limits)
+                _overlap(inv, prepared, source, target, config, now, limits)
+            finally:
+                ov.execute("ROLLBACK")
+        yield prepared
+    finally:
+        inv.execute("ROLLBACK")
+
+
+def decide(inv, ov, *, sid, accept, body, principal, now, request_id, config, merge_limits=None):
     principal.require_write(rules=bool(accept and body.remember))
     action = "suggestion.accept" if accept else "suggestion.reject"
+    limits = merge_limits or Settings(data_dir=config.data_dir)
 
     def operation():
         old = ov.execute(
@@ -257,7 +362,7 @@ def decide(inv, ov, *, sid, accept, body, principal, now, request_id, config):
             raise ApiError(
                 409, "invalid_suggestion", "suggestion has invalid structured data"
             ) from None
-        _targets(inv, ov, ids)
+        _targets(inv, ov, ids, canonical=prepared is None)
         _versions(ov, ids, body, basis=basis)
         before = _snapshot(ov, ids)
         result = {"suggestion_id": sid, "state": "accepted" if accept else "rejected"}
@@ -274,10 +379,12 @@ def decide(inv, ov, *, sid, accept, body, principal, now, request_id, config):
                 candidate = _candidate(inv, cid, ids)
                 if candidate["state"] not in {"open", "suggested"}:
                     raise ApiError(409, "invalid_candidate", "candidate is no longer open")
-                _overlap(inv, ov, source, target, config, now)
+                if prepared is None or _merge_component(ov, source, target, limits) != prepared:
+                    raise ApiError(
+                        409, "merge_changed", "identity component changed during approval"
+                    )
                 merge_id = str(uuid.uuid4())
-                links = link_map(ov)
-                flattened = {d: t for d, t in links.items() if resolve(links, d) == source}
+                flattened = prepared["flattened"]
                 for device in flattened:
                     ov.execute(
                         "UPDATE identity_links SET into_device=? WHERE from_device=? AND"
@@ -369,18 +476,38 @@ def decide(inv, ov, *, sid, accept, body, principal, now, request_id, config):
             " (suggestion_id,state,decided_by,decided_at,applied) VALUES (?,?,?,?,?)",
             (sid, result["state"], principal.name, now, dump(result)),
         )
-        return result, before, {"decision": result, "overrides": _snapshot(ov, ids)}
+        after = {"decision": result, "overrides": _snapshot(ov, ids)}
+        if result.get("rule_id"):
+            after["remembered_rule"] = dict(
+                ov.execute(
+                    "SELECT * FROM identity_rules WHERE id=?", (result["rule_id"],)
+                ).fetchone()
+            )
+            after["group_id"] = after["overrides"][target].get("group_id")
+        return result, before, after
 
-    return atomic(
+    with _prepare_merge(
+        inv,
         ov,
-        principal=principal.name,
-        action=action,
-        target=sid,
+        sid=sid,
+        accept=accept,
         body=body,
-        request_id=request_id,
+        principal=principal.name,
         now=now,
-        operation=operation,
-    )
+        request_id=request_id,
+        config=config,
+        limits=limits,
+    ) as prepared:
+        return atomic(
+            ov,
+            principal=principal.name,
+            action=action,
+            target=sid,
+            body=body,
+            request_id=request_id,
+            now=now,
+            operation=operation,
+        )
 
 
 def undo(inv, ov, *, merge_id, body, principal, now, request_id):
@@ -599,4 +726,9 @@ def list_rules(ov, now):
         for key in ("created_by", "device_id", "id"):
             item[key] = display_json(item[key])
         result.append(display_json(item))
-    return result
+    nxt = (
+        encode_cursor(dump([found[limit - 1]["created_at"], found[limit - 1]["id"]]))
+        if len(found) > limit
+        else None
+    )
+    return result, nxt

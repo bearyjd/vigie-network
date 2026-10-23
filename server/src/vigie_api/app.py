@@ -415,6 +415,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
                 now=iso_utc(clock()),
                 request_id=x_request_id,
                 config=pipeline_config,
+                merge_limits=settings,
             )
         )
 

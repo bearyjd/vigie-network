@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MAX_BODY_BYTES = 16 * 1024
+MAX_MERGE_ALIASES = 256
+MAX_MERGE_OBSERVATIONS = 1024
+MAX_MERGE_ACTIVITY_ROWS = 8192
+MAX_MERGE_FLATTEN_WRITES = 256
 
 
 def _opt_path(value: str | None) -> Path | None:
@@ -24,10 +28,24 @@ class Settings:
     # path inside a directory another service can write (no symlink to swap).
     inventory_db: Path | None = None
     overrides_db: Path | None = None
+    max_merge_aliases: int = MAX_MERGE_ALIASES
+    max_merge_observations: int = MAX_MERGE_OBSERVATIONS
+    max_merge_activity_rows: int = MAX_MERGE_ACTIVITY_ROWS
+    max_merge_flatten_writes: int = MAX_MERGE_FLATTEN_WRITES
 
     def __post_init__(self) -> None:
         if min(self.max_body_bytes, self.rate_limit_per_window, self.rate_limit_window_s) < 1:
             raise ValueError("max_body_bytes and rate limit values must be positive")
+        if (
+            min(
+                self.max_merge_aliases,
+                self.max_merge_observations,
+                self.max_merge_activity_rows,
+                self.max_merge_flatten_writes,
+            )
+            < 1
+        ):
+            raise ValueError("merge limits must be positive")
 
     @property
     def inventory_path(self) -> Path:
@@ -47,4 +65,14 @@ class Settings:
             rate_limit_window_s=int(source.get("VIGIE_API_RATE_WINDOW_S", 60)),
             inventory_db=_opt_path(source.get("VIGIE_INVENTORY_PATH")),
             overrides_db=_opt_path(source.get("VIGIE_OVERRIDES_PATH")),
+            max_merge_aliases=int(source.get("VIGIE_API_MAX_MERGE_ALIASES", MAX_MERGE_ALIASES)),
+            max_merge_observations=int(
+                source.get("VIGIE_API_MAX_MERGE_OBSERVATIONS", MAX_MERGE_OBSERVATIONS)
+            ),
+            max_merge_activity_rows=int(
+                source.get("VIGIE_API_MAX_MERGE_ACTIVITY_ROWS", MAX_MERGE_ACTIVITY_ROWS)
+            ),
+            max_merge_flatten_writes=int(
+                source.get("VIGIE_API_MAX_MERGE_FLATTEN_WRITES", MAX_MERGE_FLATTEN_WRITES)
+            ),
         )
