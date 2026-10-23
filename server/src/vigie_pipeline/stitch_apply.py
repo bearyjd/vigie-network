@@ -8,6 +8,7 @@ MAX_ROWS_PER_PASS candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_P
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from vigie_pipeline.stitch_db import (
     open_candidates_left,
     open_suggestions_into,
     save_attachment,
+    state_get,
     state_set,
     upsert_candidate,
     withdraw_open_suggestions,
@@ -218,14 +220,17 @@ class Applier:
             int(MAX_ROWS_PER_PASS * CLEANUP_ROWS_SHARE) - self.cleanup_writes,
             MAX_ROWS_PER_PASS - self.writes,
         )
-        written, more = withdraw_orphan_suggestions(
-            self.inv, self.snap, device_id, self.now, allowance
+        key = f"settle:{device_id}"
+        stored = state_get(self.inv, key)
+        cursor = json.loads(stored) if stored and stored.startswith("{") else {}
+        written, more, cursor = withdraw_orphan_suggestions(
+            self.inv, self.snap, device_id, self.now, allowance, cursor
         )
         written += dismiss_open_candidates(self.inv, device_id, allowance - written)
         self.writes += written
         self.cleanup_writes += written
         left = more or open_candidates_left(self.inv, device_id)
-        state_set(self.inv, f"settle:{device_id}", "1" if left else None)
+        state_set(self.inv, key, json.dumps(cursor, sort_keys=True) if left else None)
 
     def _widen(self, d: Widen) -> None:
         if not self._reserve(1):

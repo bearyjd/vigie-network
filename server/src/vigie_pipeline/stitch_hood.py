@@ -65,15 +65,16 @@ class Hood:
         for r in rows[:BUCKET_ROWS]:
             self.obs.setdefault(r["mac"], obs_from_row(self.snap, r))
 
-    def add_name(self, opt55: str, opt60: str, kind: str, name: str) -> None:
-        """Every MAC with this fingerprint and this hostname ('h') or mDNS name ('m'), compared
-        on the stored fold (the same `fold` as in Python)."""
+    def add_name(self, opt55: str, opt60: str, kind: str, folded_key: str) -> None:
+        """Every MAC with this fingerprint and this hostname ('h') or mDNS name ('m'). The key is
+        ALREADY the fold (group_keys / known_names produce folds) and is compared as is against
+        the stored fold column: never folded again here."""
         column = FOLD_COLUMNS[kind]
         self._rows(
-            ("name", opt55, opt60, kind, fold(name)),
+            ("name", opt55, opt60, kind, folded_key),
             f"SELECT {OBS_COLUMNS} {OBS_FROM} WHERE o.dhcp_fingerprint=? AND o.vendor_class=?"  # noqa: S608
             f" AND o.{column} = ? ORDER BY o.last_seen DESC LIMIT ?",
-            (opt55, opt60, fold(name)),
+            (opt55, opt60, folded_key),
         )
 
     def add_keys(self, o: Obs) -> None:

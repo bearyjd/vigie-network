@@ -84,7 +84,7 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion rows written per APPLY |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY (each <= ~12 statements + orphan cleanup) |
 | `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; bounds the suggestion expiry at attach |
-| orphan cleanup | `MAX_ROWS_PER_PASS` | candidate rows dismissed per pass; `Settle` decisions finish the rest |
+| orphan cleanup | `CLEANUP_ROWS_SHARE` x `MAX_ROWS_PER_PASS` | suggestion expiries + candidate dismissals per pass (keyset cursors, decided ids skipped in Python); `Settle` decisions finish the rest |
 | gaps | retention / gap_s (~2016) | `evidence_gaps` rows: merged within `activity_gap_s` at write time, pruned at retention |
 
 Lock hold (APPLY) is therefore `<= MAX_ROWS_PER_PASS + MAX_ATTACHES_PER_PASS * (12 + 64 + 2) +
@@ -215,6 +215,11 @@ dropped because the machinery they pinned no longer exists:
     that pass (`PRAGMA data_version`), closing merge/veto laundering, late second rules and late
     malformed rules at once. The point lookups of the first fix commit were replaced by this O(1)
     check.
+16. (round 4) `fold` is a fixpoint (NFKC, casefold, NFKC; property-tested over the BMP and all
+    special x combining pairs); `Hood.add_name` takes an already-folded key and never folds again;
+    stored folds carry a version marker (`pipeline_meta.fold_version` = `FOLD_VERSION/unidata`)
+    and are recomputed, chunked and resumable, when it changes; the orphan cleanup pages by keyset
+    and skips decided ids in Python (cost independent of the number of decisions).
 15. (round 3) The known-name clause folds with `fold` (a lint test bans every other fold); a
     re-check cut by the budget is judged on everything gathered and flagged with its own reason;
     the fold back-fill skips empty names; the clock is re-read before each attach write; flood

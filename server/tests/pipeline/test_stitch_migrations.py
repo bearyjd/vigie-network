@@ -153,7 +153,7 @@ def test_upgrade_from_mains_frozen_schema_text_survives_duplicate_candidate_rows
 
 @pytest.mark.timeout(20)
 def test_the_fold_backfill_terminates_on_empty_and_null_names(tmp_path):
-    from vigie_pipeline.schema import backfill_folds
+    from vigie_pipeline.schema import refresh_folds as backfill_folds
 
     conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
@@ -173,3 +173,59 @@ def test_the_fold_backfill_terminates_on_empty_and_null_names(tmp_path):
     assert backfill_folds(conn) == 0  # nothing left: the empty names are not re-selected forever
     rows = conn.execute("SELECT mac, hostname_fold FROM observations ORDER BY mac").fetchall()
     assert [tuple(r) for r in rows] == [("e", None), ("h", "strasse"), ("n", None)]
+
+
+def test_stored_folds_are_recomputed_when_the_fold_version_changes(tmp_path):
+    import unicodedata
+
+    from vigie_pipeline import schema as schema_mod
+    from vigie_pipeline.schema import refresh_folds
+    from vigie_pipeline.stitch_types import fold
+
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
+    old_fold = unicodedata.normalize("NFKC", "ß́-PC").casefold()  # the previous function
+    assert old_fold != fold("ß́-PC")
+    conn.execute(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen, hostname_fold, mdns_fold)"
+        " VALUES ('m','d',1,'ß́-PC','','self','t','t',?,NULL)", (old_fold,),
+    )  # fmt: skip
+    conn.execute("UPDATE pipeline_meta SET value='stale' WHERE key='fold_version'")
+    assert refresh_folds(conn) == 1  # every row recomputed with the current fold
+    assert conn.execute("SELECT hostname_fold FROM observations").fetchone()[0] == fold("ß́-PC")
+    marker = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()[0]
+    assert marker == f"{schema_mod.FOLD_VERSION}/{unicodedata.unidata_version}"
+    before = conn.total_changes
+    assert refresh_folds(conn) == 0 and conn.total_changes == before  # a no-op afterwards
+    conn.close()
+    conn = open_pipeline_inventory(tmp_path / "inventory.db")  # the open path runs it too
+    assert conn.execute("SELECT hostname_fold FROM observations").fetchone()[0] == fold("ß́-PC")
+
+
+def test_a_fold_recompute_is_resumable_and_terminates_on_empty_names(tmp_path):
+    from vigie_pipeline.schema import refresh_folds
+    from vigie_pipeline.stitch_types import fold
+
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
+    conn.executemany(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen, hostname_fold) VALUES (?,'d',1,?,?,'self','t','t','stale')",
+        [(f"m{i:04d}", f"Host{i}", "" if i % 2 else None) for i in range(5000)],
+    )
+    conn.execute("UPDATE pipeline_meta SET value='stale' WHERE key='fold_version'")
+    conn.execute("COMMIT")
+    assert refresh_folds(conn, chunk=2000) == 5000
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM observations WHERE hostname_fold=?", (fold("Host7"),)
+    ).fetchone()
+    assert (
+        rows[0] == 1
+        and conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE mdns_fold IS NOT NULL"
+        ).fetchone()[0]
+        == 0
+    )
+    assert refresh_folds(conn) == 0

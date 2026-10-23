@@ -103,8 +103,10 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
         " hostname TEXT, mdns_name TEXT, opt55 TEXT, opt60 TEXT, views TEXT NOT NULL,"
         " attached_at TEXT NOT NULL)",
-        # small key/value state of the stitcher (round-robin cursors)
+        # small key/value state of the stitcher (round-robin cursors, settle cursors)
         "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        # pipeline bookkeeping that is not stitching state: the fold version of the stored names
+        "CREATE TABLE IF NOT EXISTS pipeline_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         # indexed once-only guard for stitching events
         "ALTER TABLE events ADD COLUMN dedup TEXT",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
@@ -201,18 +203,36 @@ def open_pipeline_inventory(path: Path, migrate: bool = False) -> sqlite3.Connec
         )
     conn = open_inventory(path) if version < expected else connect(path)
     apply_pipeline_migrations(conn)
-    backfill_folds(conn)
+    refresh_folds(conn)
     return conn
 
 
-def backfill_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
-    """Store the fold of every observation name that has none yet (rows written before the
-    pipeline knew the column); chunked, idempotent, one short transaction per chunk."""
+# Bump when stitch_types.fold changes: every stored hostname_fold/mdns_fold is recomputed on the
+# next open. The Unicode database version of the interpreter is part of the marker too.
+FOLD_VERSION = 2
+
+
+def _fold_marker() -> str:
+    import unicodedata  # noqa: PLC0415 - a one-off at open
+
+    return f"{FOLD_VERSION}/{unicodedata.unidata_version}"
+
+
+def refresh_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
+    """Keep the stored name folds equal to `stitch_types.fold` of the names: when the fold
+    version marker differs from the current one (the fold function or the Unicode database
+    changed) EVERY row is recomputed, chunked by MAC in short transactions and resumable through a
+    cursor; otherwise only rows that have no fold yet are filled (rows written before the
+    pipeline knew the column). Empty and NULL names never get a fold and are never re-selected.
+    Returns the rows written."""
     from vigie_pipeline.stitch_types import fold  # noqa: PLC0415 - avoid an import cycle
 
     columns = {r[1] for r in conn.execute("PRAGMA table_info(observations)")}
     if "hostname_fold" not in columns:  # a schema sliced below migration 4 (tests)
         return 0
+    row = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()
+    if row is None or row[0] != _fold_marker():
+        return _recompute_folds(conn, chunk, fold)
     done = 0
     while True:
         rows = conn.execute(
@@ -222,9 +242,41 @@ def backfill_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
         ).fetchall()
         if not rows:
             return done
-        with immediate(conn):
-            conn.executemany(
-                "UPDATE observations SET hostname_fold=?, mdns_fold=? WHERE mac=?",
-                [(fold(r[1]) if r[1] else None, fold(r[2]) if r[2] else None, r[0]) for r in rows],
-            )
+        _write_folds(conn, rows, fold)
         done += len(rows)
+
+
+def _recompute_folds(conn: sqlite3.Connection, chunk: int, fold) -> int:
+    """All rows, by MAC order from the persisted cursor; the marker is written once the cursor
+    has passed the last MAC, so an interrupted recompute resumes where it stopped."""
+    done = 0
+    while True:
+        cursor = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_cursor'").fetchone()
+        after = cursor[0] if cursor else ""
+        rows = conn.execute(
+            "SELECT mac, hostname, mdns_name FROM observations WHERE mac > ? ORDER BY mac LIMIT ?",
+            (after, chunk),
+        ).fetchall()
+        if not rows:
+            with immediate(conn):
+                conn.execute("DELETE FROM pipeline_meta WHERE key='fold_cursor'")
+                conn.execute(
+                    "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES ('fold_version', ?)",
+                    (_fold_marker(),),
+                )
+            return done
+        _write_folds(conn, rows, fold, cursor=rows[-1][0])
+        done += len(rows)
+
+
+def _write_folds(conn: sqlite3.Connection, rows, fold, cursor: str | None = None) -> None:
+    with immediate(conn):
+        conn.executemany(
+            "UPDATE observations SET hostname_fold=?, mdns_fold=? WHERE mac=?",
+            [(fold(r[1]) if r[1] else None, fold(r[2]) if r[2] else None, r[0]) for r in rows],
+        )
+        if cursor is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES ('fold_cursor', ?)",
+                (cursor,),
+            )

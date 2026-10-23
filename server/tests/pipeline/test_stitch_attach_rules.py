@@ -912,7 +912,8 @@ def test_a_decided_suggestion_is_never_withdrawn_by_the_orphan_cleanup(inv):
     suggestion(inv, "into", ["X", "A"], NOW_ABS + 10**6)
     inv.commit()
     snap = Snapshot({}, (), {}, {}, {"s1": "accepted", "into": "rejected"})
-    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100) == (0, False)
+    written, more, _cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100, {})
+    assert (written, more) == (0, False)
 
 
 def test_an_attach_to_a_retired_target_still_moves_the_mac(inv):
@@ -1395,7 +1396,10 @@ def test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones(i
         suggestion(inv, f"u{i}", ["A", f"Y{i}"], NOW_ABS + 10**6)
     inv.commit()
     snap = Snapshot({}, (), {}, {}, {f"d{i:03d}": "rejected" for i in range(102)})
-    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100) == (5, False)
+    written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100, {})
+    assert (written, more) == (0, True)  # the window was all decided rows: the cursor moved on
+    written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100, cursor)
+    assert (written, more) == (5, False)
     live = inv.db.execute(
         "SELECT id FROM suggestions WHERE expires_at >= ? ORDER BY id", (iso_utc(NOW_ABS),)
     )
@@ -1423,3 +1427,54 @@ def test_rule_expiry_is_read_again_before_each_attach_write(inv, tmp_path):
         st.attached == 1 and inv.link_of(a1) == ("D", "rule") and inv.link_of(a2) == ("A2", "self")
     )
     ov.close()
+
+
+# ---- round 4 -----------------------------------------------------------------------------------
+
+
+def test_orphan_cleanup_cost_does_not_depend_on_the_number_of_decisions(inv):
+    """Opus/Codex M1: the decided-id set used to be serialised into every cleanup statement."""
+    attach_unit(inv)
+    inv.db.execute("BEGIN")
+    for i in range(300):
+        suggestion(inv, f"s{i:04d}", ["A", f"X{i}"], NOW_ABS + 10**6)
+    inv.commit()
+
+    def steps(decisions: dict) -> int:
+        count = [0]
+        inv.db.set_progress_handler(lambda: count.__setitem__(0, count[0] + 1) or 0, 1)
+        snap = Snapshot({}, (), {}, {}, decisions)
+        inv.db.execute("BEGIN")
+        written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 50, {})
+        inv.db.execute("ROLLBACK")
+        inv.db.set_progress_handler(None, 0)
+        assert (written, more) == (50, True)
+        return count[0]
+
+    small = steps({"other": "rejected"})
+    big = steps({f"z{i}": "rejected" for i in range(200_000)})
+    assert big <= small * 2 + 100, (small, big)
+
+
+def test_the_orphan_cleanup_cursor_advances_past_decided_rows(inv):
+    attach_unit(inv)
+    inv.db.execute("BEGIN")
+    for i in range(102):
+        suggestion(inv, f"d{i:03d}", ["A", f"X{i}"], NOW_ABS + 10**6)
+    for i in range(5):
+        suggestion(inv, f"u{i}", ["A", f"Y{i}"], NOW_ABS + 10**6)
+    inv.commit()
+    snap = Snapshot({}, (), {}, {}, {f"d{i:03d}": "rejected" for i in range(102)})
+    written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 50, {})
+    assert written == 0 and more is True and cursor  # fifty decided rows examined, cursor moved
+    total = written
+    for _ in range(5):
+        written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 50, cursor)
+        total += written
+        if not more:
+            break
+    assert total == 5 and more is False
+    live = inv.db.execute(
+        "SELECT id FROM suggestions WHERE expires_at >= ? ORDER BY id", (iso_utc(NOW_ABS),)
+    )
+    assert [r[0] for r in live] == [f"d{i:03d}" for i in range(102)]

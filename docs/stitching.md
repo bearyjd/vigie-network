@@ -286,6 +286,9 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | a persistent spray to mask the overlap flag behind the truncation flag | overlap always evaluated on the peers at hand; both flags fire | `test_an_overlap_seen_in_a_truncated_hood_is_still_flagged` |
 | a budget cut mid re-check to hide an overlap already gathered | the cut subject is judged on everything gathered so far; `budget` is its own flag reason | `test_a_budget_cut_at_any_lookup_still_flags_the_overlap_it_has_seen` |
 | compatibility characters (full-width, superscripts, NBSP, Roman numerals, half-width kana, ligatures) in a known name | every name comparison, including the known-name clause, goes through `fold`; a lint test bans any other fold | `test_a_known_name_with_a_compatibility_character_still_makes_a_peer`, `test_no_other_fold_than_fold_exists_in_the_stitching_sources` |
+| a letter + combining mark whose fold is not a fixpoint (ß́, İ̖, Ĥ̱, Ϊ́) | `fold` is a fixpoint (property test over the Unicode corpus); lookups take already-folded keys; stored folds are recomputed when the fold version changes | `test_fold_is_a_fixpoint_over_the_unicode_corpus`, `test_add_name_takes_a_folded_key_and_never_folds_again`, `test_a_young_victim_roll_is_never_silently_locked_out_behind_a_copy`, `test_stored_folds_are_recomputed_when_the_fold_version_changes` |
+| a rename after the first sighting | the stored fold follows the newest name | `test_a_hostname_change_after_the_first_sighting_refreshes_the_stored_fold` |
+| hundreds of thousands of decisions to lengthen the orphan cleanup | keyset paging, decided ids skipped in Python | `test_orphan_cleanup_cost_does_not_depend_on_the_number_of_decisions` |
 | a rule expiring between two attaches of one pass | the clock is read again before each attach write | `test_rule_expiry_is_read_again_before_each_attach_write` |
 | `\|` in a name or vendor class to collide two flood tokens | tokens hash a JSON encoding of the key | `test_flood_tokens_of_different_groups_never_collide_on_a_pipe_in_a_name` |
 | decided suggestions crowding the orphan cleanup window | decided ids are excluded in SQL; `more` counts real rows | `test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones` |
@@ -325,9 +328,17 @@ by the compute budget is judged on everything gathered up to the cut and flagged
   that pass's attaches (one pass of delay each, never a wrong attach). The API's rate limit bounds
   it; requirement for the API round: keep write endpoints rate-limited per token.
 - **Names and the fold.** Hostnames and mDNS names are compared through one Unicode fold
-  (`stitch_types.fold`: NFKC + casefold, stored as `observations.hostname_fold`/`mdns_fold`); the
-  pipeline writes those columns and back-fills them once at upgrade. Turkish dotless i is its own
-  letter under Unicode casefold (locale-independent), as in Python.
+  (`stitch_types.fold`: NFKC, casefold, NFKC again so that fold(fold(x)) == fold(x); stored as
+  `observations.hostname_fold`/`mdns_fold`). The pipeline writes those columns; the stored values
+  carry a version marker (`pipeline_meta.fold_version` = `FOLD_VERSION/<Unicode database
+  version>`) and are recomputed, chunked in short transactions and resumable, whenever the fold
+  function or the interpreter's Unicode database changes. Turkish dotless i is its own letter
+  under Unicode casefold (locale-independent), as in Python.
+- **Upgrade cost (operators).** Migration 4 itself takes about a second; the first open then
+  folds every observation name (about 30 s at 600k observations, chunks of 2,000 in short
+  transactions). Ingest waits at most about a second per chunk, which under load can exceed its
+  busy timeouts: run the first pipeline start after the upgrade with the collector paused, or
+  expect a few collector retries.
 - **`canonical_device` in batch processing** (main code) walks at most 32 links when widening a
   device's range per batch; stitching uses the full-chain snapshot resolution. A chain longer than
   32 only delays the range widening to the stitching pass (`Widen` decisions).

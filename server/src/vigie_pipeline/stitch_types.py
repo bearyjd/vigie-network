@@ -50,9 +50,18 @@ def long_hash(value: str) -> str:
 
 def fold(name: str) -> str:
     """THE name fold, used identically in Python and as the stored indexed column: NFKC (full-width
-    and compatibility forms, NFD vs NFC) then Unicode casefold (ß -> ss, final sigma, dotless i).
-    SQLite's NOCASE folds ASCII only and is never used on names."""
-    return unicodedata.normalize("NFKC", name).casefold()
+    and compatibility forms, NFD vs NFC), Unicode casefold (ß -> ss, final sigma, dotless i), then
+    NFKC again so the result is a FIXPOINT (casefold can expand a letter in front of a combining
+    mark into a sequence NFKC recomposes: without the second pass fold(fold(x)) != fold(x) for
+    about 900 two-character sequences). A bounded loop guards the property; a stored fold is
+    therefore equal to the fold of the fold. SQLite's NOCASE folds ASCII only and is never used."""
+    out = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+    for _ in range(3):
+        again = unicodedata.normalize("NFKC", out.casefold())
+        if again == out:
+            break
+        out = again
+    return out
 
 
 def same(a: str | None, b: str | None) -> bool:

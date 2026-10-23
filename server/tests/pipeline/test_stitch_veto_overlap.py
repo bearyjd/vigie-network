@@ -907,6 +907,11 @@ COMPAT_NAMES = [  # compatibility characters: casefold alone differs from NFKC +
     ("ｶﾞｼﾞｴｸﾄ", "ガジエクト"),  # half-width katakana with dakuten
     ("ﬁrewall", "FIREWALL"),  # ligature
     ("Éloïse-iPhone", "éloïse-iphone"),
+    ("ß\u0301-PC", "ẞ\u0301-pc"),  # the fold must be a fixpoint: a re-folded key found nothing
+    ("İ\u0316stanbul", "i̇\u0316stanbul"),
+    ("Ĥ\u0331ome", "ĥ\u0331ome"),
+    ("Ϊ\u0301sos", "ϊ\u0301sos"),
+    ("Straße\u0301", "STRASSE\u0301"),
 ]
 
 
@@ -984,3 +989,108 @@ def test_fold_is_one_function_for_python_and_sql(inv):
     plan = " ".join(r[3] for r in inv.db.execute(sql, ("a", "b", "c")))
     assert "idx_obs_fp_host" in plan and "SCAN" not in plan
     assert "NOCASE" not in open("src/vigie_pipeline/stitch_hood.py").read()
+
+
+# ---- round 4: the fold is idempotent and never applied twice -------------------------------------
+
+NON_IDEMPOTENT = [  # NFKC + casefold alone is not a fixpoint for these (a second fold changes them)
+    ("ß́-PC", "ẞ́-pc"),
+    ("İ̖stanbul", "i̖̇stanbul"),
+    ("Ĥ̱ome", "ẖ̂ome"),
+    ("Ϊ́sos", "ΐsos"),
+    ("Straßé", "STRASSÉ"),
+]
+
+
+def _corpus() -> list[str]:
+    import unicodedata
+
+    cps = [chr(c) for c in range(0x10000) if unicodedata.category(chr(c))[0] not in "CZ"]
+    marks = [c for c in cps if unicodedata.category(c).startswith("M")]
+    special = [c for c in cps if unicodedata.normalize("NFKC", c).casefold() != c]
+    return (
+        cps
+        + [a + m for a in special for m in marks[::7]]
+        + [s for pair in NON_IDEMPOTENT for s in pair]
+    )
+
+
+def test_fold_is_a_fixpoint_over_the_unicode_corpus():
+    from vigie_pipeline.stitch_types import fold
+
+    corpus = _corpus()
+    assert len(corpus) > 100_000
+    assert all(fold(fold(s)) == fold(s) for s in corpus)
+    for stored, seen in NON_IDEMPOTENT:
+        assert fold(stored) == fold(seen)
+
+
+def test_add_name_takes_a_folded_key_and_never_folds_again(inv):
+    from vigie_pipeline.stitch_types import fold
+
+    macs = {}
+    for i, (stored, _seen) in enumerate(NON_IDEMPOTENT):
+        macs[stored] = inv.mac(f"D{i}", stored, None, "self", OLD, [(NOW_ABS - 100, NOW_ABS)])
+    inv.commit()
+    cp = inv.compute()
+    for stored, m in macs.items():
+        hood = cp._hood()
+        hood.add_name("1,2,3", "x", "h", fold(stored))  # callers always pass the fold
+        assert m in hood.obs, stored
+
+
+@pytest.mark.parametrize(("stored", "seen"), NON_IDEMPOTENT)
+def test_non_idempotent_names_match_and_veto_like_ascii(data, stored, seen):
+    appear(data, 1, 0, 1500, host=stored, mdns=None)
+    appear(data, 2, 100, 1500, host=seen, mdns=None)
+    run(data)
+    assert [c["state"] for c in candidates(data)] == ["vetoed"], (stored, seen)
+
+
+def _lockout_attempt(data, stored: str, seen: str) -> tuple:
+    """The copy rule-attaches beside the victim's young roll (300 s of overlap: tolerated); the
+    victim then carries on and overlaps the attached copy for 800 s."""
+    a = appear(data, 1, 0, 300, host=stored, mdns=None)
+    run(data)
+    ov = Overrides(data.root)
+    dev = device_of(data, a)
+    ov.rule(RULE, dev, sig(hostname=stored))
+    ov.override(dev, "iot", version=3)
+    b = appear(data, 2, 1400, 2600, host=seen, mdns=None)  # the copy
+    v = appear(data, 3, 1800, 1800, host=stored, mdns=None)  # the victim's roll, young
+    run(data)
+    appear(data, 3, 1800, 4800, host=stored, mdns=None)  # the victim carries on (batches inside
+    appear(data, 3, 4800, 6000, host=stored, mdns=None)  # the one-hour report lag)
+    for i in range(4):
+        run(data, now=NOW + 60 * (i + 1))
+    ov.close()
+    states = sorted((c["device_a"] == device_of(data, b), c["state"]) for c in candidates(data))
+    return (
+        source_of(data, b) == "rule",
+        source_of(data, v),
+        states,
+        len(kinds(data, "rule_attach_suspect")),
+    )
+
+
+@pytest.mark.parametrize(("stored", "seen"), NON_IDEMPOTENT)
+def test_a_young_victim_roll_is_never_silently_locked_out_behind_a_copy(
+    data, tmp_path_factory, stored, seen
+):
+    """Opus H1 silent variant: with a blind name bucket the copy attached, the victim's later
+    overlap was vetoed against the target and rule_attach_suspect stayed 0 over four passes."""
+    from pipeline_helpers import Data
+
+    copy_attached, victim_source, states, flags = _lockout_attempt(data, stored, seen)
+    assert flags >= 1  # whatever else happened, the overlap with the attached copy is flagged
+    assert not (victim_source == "self" and any(st == "vetoed" for _, st in states)) or flags
+    control = Data(tmp_path_factory.mktemp("ascii"))
+    try:
+        assert _lockout_attempt(control, "Plain-PC", "plain-pc") == (
+            copy_attached,
+            victim_source,
+            states,
+            flags,
+        )
+    finally:
+        control.inv.close()

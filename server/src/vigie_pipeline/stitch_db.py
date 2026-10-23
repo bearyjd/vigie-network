@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 from vigie_ingest.db import iso_utc
@@ -232,32 +232,47 @@ def withdraw_open_suggestions(
 
 
 def withdraw_orphan_suggestions(
-    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float, limit: int
-) -> tuple[int, bool]:
+    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float, limit: int,
+    cursor: Mapping[str, str],
+) -> tuple[int, bool, dict[str, str]]:  # fmt: skip
     """Expire up to `limit` undecided merge suggestions that start at, or point into, the orphaned
-    `device_id` (an attach settled it): an index range in the 'from' direction, idx_suggestions_into
-    in the other, each `LIMIT`ed, so the work under the lock is bounded by the row cap. Returns
-    (rows written, more left). Decided suggestions are never touched."""
+    `device_id` (an attach settled it). Each direction is read by keyset (`id > cursor`,
+    `LIMIT limit + 1`, through idx_suggestions_pair / idx_suggestions_into), decided ids are
+    skipped in Python against the snapshot's set (never serialised into SQL: the cost does not
+    depend on how many decisions exist), and the cursor advances past every row examined, decided
+    or not. Returns (rows written, more left, cursor). Decided suggestions are never touched."""
     if limit <= 0:
-        return 0, True
+        return 0, True, dict(cursor)
     prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
     now_iso = iso_utc(now)
-    decided = json.dumps(sorted(snap.decisions))  # excluded in SQL: never inside the window
-    rows = inv.execute(
-        "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
-        " AND device_ids < ? AND expires_at >= ?"
-        " AND id NOT IN (SELECT value FROM json_each(?)) LIMIT ?",
-        (prefix, prefix + "\uffff", now_iso, decided, limit + 1),
-    ).fetchall()
-    rows += inv.execute(
-        "SELECT id FROM suggestions WHERE action='merge_identity'"
-        " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ?"
-        " AND id NOT IN (SELECT value FROM json_each(?)) LIMIT ?",
-        (device_id, now_iso, decided, limit + 1),
-    ).fetchall()
-    todo = sorted({r["id"] for r in rows})
-    written = _expire_ids(inv, todo[:limit], now)
-    return written, len(todo) > limit
+    queries = {
+        "from": (
+            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
+            " AND device_ids < ? AND expires_at >= ? AND id > ? ORDER BY id LIMIT ?",
+            (prefix, prefix + "\uffff", now_iso),
+        ),
+        "into": (
+            "SELECT id FROM suggestions WHERE action='merge_identity'"
+            " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ? AND id > ? ORDER BY id"
+            " LIMIT ?",
+            (device_id, now_iso),
+        ),
+    }
+    out, written, more = dict(cursor), 0, False
+    for direction, (sql, params) in queries.items():
+        room = limit - written
+        if room <= 0:
+            more = True
+            break
+        rows = [r["id"] for r in inv.execute(sql, (*params, out.get(direction, ""), room + 1))]
+        if len(rows) > room:
+            more = True
+        examined = rows[:room]
+        todo = [i for i in examined if i not in snap.decisions]
+        written += _expire_ids(inv, todo, now)
+        if examined:
+            out[direction] = examined[-1]
+    return written, more, out
 
 
 def _expire_ids(inv: sqlite3.Connection, ids: list[str], now: float) -> int:

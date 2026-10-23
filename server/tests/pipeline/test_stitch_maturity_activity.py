@@ -531,3 +531,19 @@ from stitch_helpers import RULE_SNAP as RULE_SNAP_LOCAL  # noqa: E402
 def test_a_mac_with_no_stamps_in_the_subject_query_is_not_examined(inv):
     inv.mac("D", "victim", None, "self", OLD, [], rand=1)
     assert inv.stitch(EMPTY).examined == 0 and NOW > 0
+
+
+def test_a_hostname_change_after_the_first_sighting_refreshes_the_stored_fold(data):
+    """Opus M2 (mutant): the lookup must follow the NEW name of a known MAC."""
+    from vigie_pipeline.stitch_types import fold
+
+    m = appear(data, 1, 0, 300, host="Old-Name", mdns=None)
+    run(data)
+    assert data.q("SELECT hostname_fold FROM observations WHERE mac=?", m)[0][0] == fold("Old-Name")
+    appear(data, 1, 400, 700, host="Ｓtraße-PC", mdns=None)  # renamed, newest batch wins
+    appear(data, 2, 800, 1100, host="strasse-pc", mdns=None)  # a later roll under the new name
+    run(data)
+    assert data.q("SELECT hostname_fold FROM observations WHERE mac=?", m)[0][0] == fold(
+        "Ｓtraße-PC"
+    )
+    assert [c["state"] for c in candidates(data)] == ["suggested"]
