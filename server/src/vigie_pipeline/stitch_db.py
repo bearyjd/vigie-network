@@ -231,25 +231,36 @@ def withdraw_open_suggestions(
 
 
 def withdraw_orphan_suggestions(
-    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float
-) -> int:
-    """Expire EVERY undecided merge suggestion that starts at, or points into, the orphaned
-    `device_id` (an attach settled it): index range in the 'from' direction, idx_suggestions_into
-    in the other, so none stays actionable. Bounded by MAX_OPEN_SUGGESTIONS_PER_DEVICE plus the
-    handful the orphan itself proposed."""
+    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float, limit: int
+) -> tuple[int, bool]:
+    """Expire up to `limit` undecided merge suggestions that start at, or point into, the orphaned
+    `device_id` (an attach settled it): an index range in the 'from' direction, idx_suggestions_into
+    in the other, each `LIMIT`ed, so the work under the lock is bounded by the row cap. Returns
+    (rows written, more left). Decided suggestions are never touched."""
+    if limit <= 0:
+        return 0, True
     prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
     now_iso = iso_utc(now)
     rows = inv.execute(
         "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
-        " AND device_ids < ? AND expires_at >= ?",
-        (prefix, prefix + "￿", now_iso),
+        " AND device_ids < ? AND expires_at >= ? LIMIT ?",
+        (prefix, prefix + "\uffff", now_iso, limit + 1),
     ).fetchall()
     rows += inv.execute(
         "SELECT id FROM suggestions WHERE action='merge_identity'"
-        " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ?",
-        (device_id, now_iso),
+        " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ? LIMIT ?",
+        (device_id, now_iso, limit + 1),
     ).fetchall()
-    return _expire(inv, snap, rows, now)
+    todo = sorted({r["id"] for r in rows if r["id"] not in snap.decisions})
+    written = _expire_ids(inv, todo[:limit], now)
+    return written, len(todo) > limit
+
+
+def _expire_ids(inv: sqlite3.Connection, ids: list[str], now: float) -> int:
+    inv.executemany(
+        "UPDATE suggestions SET expires_at=? WHERE id=?", [(iso_utc(now - 1), i) for i in ids]
+    )
+    return len(ids)
 
 
 # ---- state and attach evidence --------------------------------------------------------------

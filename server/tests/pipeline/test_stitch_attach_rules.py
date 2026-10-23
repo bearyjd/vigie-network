@@ -887,10 +887,10 @@ def suggestion(inv: Inv, sid: str, pair: list[str], expires: int) -> None:
     )
 
 
-def test_the_attach_expires_the_orphans_suggestions_in_both_directions_whatever_the_row_cap(
+def test_the_attach_expires_the_orphans_suggestions_in_both_directions_under_the_row_cap(
     inv, monkeypatch
 ):
-    monkeypatch.setattr(apply_mod, "MAX_ROWS_PER_PASS", 0)  # the row allowance is spent
+    monkeypatch.setattr(apply_mod, "MAX_ROWS_PER_PASS", 10)
     a = attach_unit(inv)
     inv.db.execute(
         "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
@@ -907,6 +907,10 @@ def test_the_attach_expires_the_orphans_suggestions_in_both_directions_whatever_
     assert rows["from"] < iso_utc(NOW_ABS) and rows["from2"] < iso_utc(NOW_ABS)
     assert rows["into"] < iso_utc(NOW_ABS)
     assert rows["other"] == iso_utc(NOW_ABS + 10**6) and rows["gone"] == iso_utc(NOW_ABS - 10)
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
+        == 0
+    )
 
 
 def test_a_decided_suggestion_is_never_withdrawn_by_the_orphan_cleanup(inv):
@@ -915,7 +919,7 @@ def test_a_decided_suggestion_is_never_withdrawn_by_the_orphan_cleanup(inv):
     suggestion(inv, "into", ["X", "A"], NOW_ABS + 10**6)
     inv.commit()
     snap = Snapshot({}, (), {}, {}, {"s1": "accepted", "into": "rejected"})
-    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS) == 0
+    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW_ABS, 100) == (0, False)
 
 
 def test_an_attach_to_a_retired_target_still_moves_the_mac(inv):
@@ -1228,3 +1232,90 @@ def test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only(inv, tm
     assert stitch(inv.db, fresh, inv.cfg, NOW_ABS + 1, None, conn).attached == 1
     assert inv.link_of(a) == ("D", "rule")
     ov.close()
+
+
+# ---- fix round 2 (Codex) -------------------------------------------------------------------------
+
+
+def test_data_version_is_re_read_immediately_before_every_attach(inv, tmp_path, monkeypatch):
+    """Two attaches in one pass; the API commits between them: the second is dropped, the pass
+    ends for attaches."""
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a1 = inv.mac(
+        "A1", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 59000)]
+    )
+    a2 = inv.mac("A2", "victim", None, "self", "2026-01-04T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    assert sum(isinstance(d, Attach) for d in plan.decisions) == 2
+    real = apply_mod.save_attachment
+
+    def commit_in_between(*args, **kwargs):  # right after the first attach's write
+        real(*args, **kwargs)
+        ov.conn.execute("UPDATE identity_rules SET revoked_at='t'")
+        ov.conn.commit()
+
+    monkeypatch.setattr(apply_mod, "save_attachment", commit_in_between)
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
+    assert st.attached == 1 and st.stale == 1
+    assert inv.link_of(a1) == ("D", "rule") and inv.link_of(a2) == ("A2", "self")
+    ov.close()
+
+
+@pytest.mark.parametrize("change", [
+    "UPDATE identity_rules SET revoked_at='t'",
+    "UPDATE identity_rules SET expires_at='2000-01-01T00:00:00Z'",
+    "UPDATE groups SET auto_inherit=0 WHERE id='iot'",
+    "UPDATE device_overrides SET group_id='trusted' WHERE device_id='D'",
+])  # fmt: skip
+def test_an_attachment_whose_rule_or_group_no_longer_authorises_it_is_flagged_next_pass(
+    inv, tmp_path, change
+):
+    """The check-to-write window between overrides.db and inventory.db cannot be closed; an attach
+    made in it is surfaced by the next pass (event only, never a detach)."""
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    assert stitch(inv.db, load_snapshot(conn, NOW_ABS), inv.cfg, NOW_ABS, None, conn).attached == 1
+    assert inv.stitch(load_snapshot(conn, NOW_ABS), NOW_ABS + 1).suspect == 0  # still authorised
+    ov.conn.execute(change)
+    ov.conn.commit()
+    st = stitch(inv.db, load_snapshot(conn, NOW_ABS + 2), inv.cfg, NOW_ABS + 2, None, conn)
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")  # flagged, not detached
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "no longer authorises" in row[0]
+    assert (
+        stitch(inv.db, load_snapshot(conn, NOW_ABS + 3), inv.cfg, NOW_ABS + 3, None, conn).suspect
+        == 0
+    )
+    ov.close()
+
+
+def test_orphan_suggestion_expiry_is_bounded_per_pass_and_finishes_later(inv, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MAX_ROWS_PER_PASS", 200)
+    a = attach_unit(inv)
+    inv.db.execute("BEGIN")
+    for i in range(1000):
+        suggestion(inv, f"s{i}", ["A", f"X{i}"], NOW_ABS + 10**6)
+    for i in range(5):
+        suggestion(inv, f"in{i}", [f"Y{i}", "A"], NOW_ABS + 10**6)
+    inv.commit()
+    live = "SELECT COUNT(*) FROM suggestions WHERE expires_at >= ?"
+    st = inv.stitch(RULE_SNAP)
+    assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
+    left = inv.db.execute(live, (iso_utc(NOW_ABS + 100),)).fetchone()[0]
+    assert 805 <= left <= 1005  # at most the row budget of one pass was spent
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
+        == 1
+    )
+    for i in range(7):
+        inv.stitch(RULE_SNAP, NOW_ABS + i + 1)
+    assert inv.db.execute(live, (iso_utc(NOW_ABS + 100),)).fetchone()[0] == 0
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
+        == 0
+    )

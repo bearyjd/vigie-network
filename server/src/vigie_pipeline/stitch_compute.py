@@ -510,6 +510,23 @@ class Compute:
             self._suspect(o, "evidence incomplete, " + sorted(hood.truncated)[0])
         elif self.sustained(hood, mac, peers - {mac}):
             self._suspect(o, "sustained overlap with peers")
+        elif not self._still_authorises(att.rule_id, o.canon):
+            self._suspect(o, "rule or group no longer authorises this attach")
+
+    def _still_authorises(self, rule_id: str, canon: str) -> bool:
+        """The rule the MAC attached under is still active and its device still in an explicit
+        auto_inherit=1 group. Not a re-gate (nothing is detached): it surfaces an attach made in
+        the cross-database window between the last overrides check and the inventory write, and a
+        revocation or regroup the owner may want to follow up on."""
+        group = self.snap.overrides.get(canon, (0, None))[1]
+        return (
+            any(
+                r.id == rule_id and self.snap.canonical(r.device_id) == canon
+                for r in self.snap.rules
+            )
+            and group is not None
+            and self.snap.group_auto_inherit.get(group) == 1
+        )
 
     def _has_activity(self, mac: str) -> bool:
         return self.inv.execute(

@@ -172,7 +172,9 @@ suggestion-only. For a mature randomized self MAC whose signature matches:
    otherwise a `rule_hit_needs_confirm` suggestion.
 
 The snapshot records `PRAGMA data_version` of the pipeline's `overrides.db` connection inside its
-read transaction. Under the inventory lock the APPLY phase re-reads it: if anything was committed
+read transaction. Under the inventory lock the APPLY phase re-reads it FRESH immediately before
+every attach write (never cached across attaches; once it differs, no further attach is made that
+pass): if anything was committed
 to `overrides.db` since (a merge, a new, revoked or malformed rule, a regroup), every attach of the
 pass is dropped and recomputed against a fresh snapshot next pass, so a merge can never launder a
 veto and a second rule can never appear unseen. The check is deliberately coarse: `vigie-api`
@@ -190,10 +192,10 @@ so it may carry a `fingerprint_match` suggestion or an `open` row meanwhile.
 
 **Attach** sets `observations.device_id` to the target with `link_source='rule'`, `link_rule_id`,
 `link_score`; widens the target's `first_seen`/`last_seen`; retires the orphaned self device
-(never deleted); expires every undecided suggestion from or into the orphan at once (two indexed
-statements, bounded by the suggestion cap); dismisses the orphan's open candidate rows under the
-pass's remaining row cap and finishes the rest on later passes (`stitch_state` key
-`settle:<device>`, at most `MAX_ATTACHES_PER_PASS` orphans per pass); records `rule_attachments (mac, rule_id,
+(never deleted); expires the orphan's undecided suggestions (both directions, two indexed
+`LIMIT`ed lookups) and dismisses its open candidate rows, all under the pass's remaining row cap,
+and finishes the rest on later passes (`stitch_state` key `settle:<device>`, at most
+`MAX_ATTACHES_PER_PASS` orphans per pass); records `rule_attachments (mac, rule_id,
 target, hostname, mdns_name, opt55, opt60, views)` with the values and each matched rule's field
 mask at that moment; writes `mac_attached` (8-hex hashes only). Revoking or expiring a rule never
 detaches; a later group change does not re-gate an attachment.
@@ -214,6 +216,24 @@ veto. Every degrade except "immature" also writes one `stitch_deferred` event pe
 | the pair's candidate row changed between COMPUTE and APPLY | decision dropped, recomputed next pass | same | n/a |
 | compute budget spent | subjects not reached wait; the cursor persists | same | same (the re-check robin runs first) |
 | row cap / attach cap / suggestion cap | the decision waits for a later pass | same | n/a |
+
+**Residual window (cross-database race).** `overrides.db` and `inventory.db` are separate files
+and the inventory write lock does not serialise API commits; the pipeline cannot lock
+`overrides.db` (mounted read-only). Between the last `data_version` read and the `observations`
+UPDATE that follows it directly lies a window of microseconds in which a rule could be revoked or
+the target regrouped. Such an attach lands only in an `auto_inherit=1` group, is never widened by
+the window (every other check already passed), and is surfaced by the next pass: the re-check
+verifies for every rule-attached MAC that its rule is still active and its device still in an
+explicit `auto_inherit=1` group, and flags `rule_attach_suspect` ("rule or group no longer
+authorises this attach"; event only, never a detach) otherwise. Note that this also fires, by
+design, when the owner revokes a rule or moves the device to an `auto_inherit=0` group later: the
+attachment stays (section 6) and the owner sees the event.
+
+**Orphan suggestions and the API.** Until the row cap has expired every suggestion of an orphan
+(one or a few passes), a suggestion whose `from_device` is a retired device without observations
+can still look open to a reader that trusts `expires_at` alone. Requirement for the API round: the
+accept path MUST refuse a `merge_identity` suggestion whose `from_device` (or `into_device`) is
+retired with no observations, whatever `expires_at` says, and the suggestion feed SHOULD hide them.
 
 ## 8. Post-attach re-check
 Every pass re-checks up to `MACS_PER_PASS` rule-attached MACs (its own robin, run before the self
@@ -262,6 +282,9 @@ a fresh flag); the pipeline does not detach and creates no suggestion. Detaching
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
 | merge a vetoed device into the target between COMPUTE and APPLY | data_version drops the attach; the next pass vetoes through the fresh components | `test_a_merge_between_compute_and_apply_cannot_launder_a_veto`, `test_any_overrides_change_between_compute_and_apply_drops_the_attach` |
+| commit to overrides.db between two attaches of one pass | data_version re-read before every write; the pass ends for attaches | `test_data_version_is_re_read_immediately_before_every_attach` |
+| revoke / regroup in the microsecond window before the write | next-pass re-check flags the attachment | `test_an_attachment_whose_rule_or_group_no_longer_authorises_it_is_flagged_next_pass` |
+| 1000 accumulated suggestions on an attaching orphan | expiry under the row cap, finished by `Settle` | `test_orphan_suggestion_expiry_is_bounded_per_pass_and_finishes_later` |
 | change identity_state or write a veto row between COMPUTE and APPLY | inventory-side preconditions | `test_an_identity_state_change_between_compute_and_apply_drops_the_attach`, `test_a_veto_row_written_between_compute_and_apply_drops_the_attach` |
 | expensive re-checks to starve the self robin (or the reverse) | `RECHECK_BUDGET_SHARE` | `test_the_self_robin_keeps_a_share_of_the_budget_whatever_the_recheck_costs` |
 | an early "incomplete" flag to hide a later overlap; a chosen MAC to collide a dedup token | one flag per reason, 128-bit token hash | `test_a_later_different_reason_raises_a_fresh_flag_and_tokens_are_long` |

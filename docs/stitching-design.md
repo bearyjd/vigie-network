@@ -204,6 +204,10 @@ dropped because the machinery they pinned no longer exists:
     that pass (`PRAGMA data_version`), closing merge/veto laundering, late second rules and late
     malformed rules at once. The point lookups of the first fix commit were replaced by this O(1)
     check.
+13. (fix round 2) `data_version` is re-read immediately before every attach write; the orphan's
+    suggestion expiry is under the row cap (`Settle` finishes it); the re-check also flags an
+    attachment whose rule is no longer active or whose device left its `auto_inherit=1` group
+    ("rule or group no longer authorises this attach", event only).
 12. (fix round 1) A re-checked attachment is flagged once per REASON (`evidence incomplete`,
     `sustained overlap`, `evidence missing`); a later different reason raises a fresh flag. Dedup
     tokens carry a 128-bit hash of the MAC.

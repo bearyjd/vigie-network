@@ -64,7 +64,7 @@ class Applier:
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
-        self.version: int | None = None  # overrides.db data_version, read once under the lock
+        self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
         self.writes = 0
         self.attaches = 0
         self.day = datetime.fromtimestamp(now, tz=UTC).strftime("%Y-%m-%d")
@@ -204,11 +204,19 @@ class Applier:
         emit_once(self.inv, d.device_id, d.kind, d.severity, d.summary, d.token, self.now)
 
     def _settle(self, d: Settle) -> None:
-        """Finish dismissing an orphan's candidate rows under this pass's remaining row cap."""
-        written = dismiss_open_candidates(self.inv, d.device_id, MAX_ROWS_PER_PASS - self.writes)
+        """Finish an orphan's cleanup under this pass's remaining row cap."""
+        self._cleanup(d.device_id)
+
+    def _cleanup(self, device_id: str) -> None:
+        """Expire the orphan's undecided suggestions (both directions) and dismiss its candidate
+        rows, each charged to the row cap; a `settle:` key keeps whatever did not fit for later."""
+        written, more = withdraw_orphan_suggestions(
+            self.inv, self.snap, device_id, self.now, MAX_ROWS_PER_PASS - self.writes
+        )
         self.writes += written
-        if not open_candidates_left(self.inv, d.device_id):
-            state_set(self.inv, f"settle:{d.device_id}", None)
+        self.writes += dismiss_open_candidates(self.inv, device_id, MAX_ROWS_PER_PASS - self.writes)
+        left = more or open_candidates_left(self.inv, device_id)
+        state_set(self.inv, f"settle:{device_id}", "1" if left else None)
 
     def _widen(self, d: Widen) -> None:
         if not self._reserve(1):
@@ -225,37 +233,38 @@ class Applier:
     # ---- the attach: T1 re-validated under the lock ----------------------------------------
 
     def _authorised(self, d: Attach) -> bool:
-        """T1 re-validated under the inventory lock: the rule is unexpired at the clock read under
-        the lock, and overrides.db has not been written since the snapshot was read (its
-        PRAGMA data_version is unchanged on the pipeline's connection), so the snapshot's rule,
-        links, group and malformed-rule facts are exactly the current ones. ANY write in between (a
-        merge, a new or revoked rule, a regroup) drops every attach of this pass; they are
-        recomputed against a fresh snapshot next pass. O(1), whatever the size of overrides.db.
-        Without an overrides connection (tests) the compute snapshot stands in."""
+        """T1 against the snapshot and the clock read under the lock; the snapshot's currency is
+        checked separately, immediately before the write (`_overrides_unchanged`)."""
         if d.rule.expires_at is not None and d.rule.expires_at <= self.at:
             return False
         group = self.snap.overrides.get(d.target, (0, None))[1]
-        if not (
+        return (
             d.rule in self.snap.rules and self.snap.canonical(d.rule.device_id) == d.target
             and group is not None and self.snap.group_auto_inherit.get(group) == 1
-        ):  # fmt: skip
-            return False
+        )  # fmt: skip
+
+    def _overrides_unchanged(self) -> bool:
+        """overrides.db has not been written since the snapshot was read: PRAGMA data_version on
+        the pipeline's own long-lived connection, read FRESH immediately before every attach write
+        (never cached: a commit between two attaches of one pass ends the pass for attaches). Any
+        write (a merge, a new, revoked or malformed rule, a regroup) drops the attach; it is
+        recomputed against a fresh snapshot next pass. Without an overrides connection (tests)
+        the compute snapshot stands in. The remaining window between this read and the write is
+        the cross-database race documented in docs/stitching.md; the next pass's re-check surfaces
+        an attach made in it."""
         if self.overrides is None:
             return True
-        if self.snap.data_version is None or self._overrides_version() != self.snap.data_version:
-            self.stats.stale += 1
-            return False
-        return True
-
-    def _overrides_version(self) -> int:
-        if self.version is None:
+        if not self.dirty:
             try:
                 row = self.overrides.execute("PRAGMA data_version").fetchone()  # type: ignore[union-attr]
-                self.version = int(row[0])
+                current: int | None = int(row[0])
             except (sqlite3.Error, TypeError, ValueError) as exc:  # unreadable: fail closed
                 log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
-                self.version = -1
-        return self.version
+                current = None
+            self.dirty = current is None or current != self.snap.data_version
+        if self.dirty:
+            self.stats.stale += 1
+        return not self.dirty
 
     def _state_ok(self, device_id: str) -> bool:
         row = self.inv.execute(
@@ -280,6 +289,8 @@ class Applier:
             " ORDER BY last_seen DESC, mac LIMIT 1",
             (d.target, d.mac),
         ).fetchone()
+        if not self._overrides_unchanged():  # the last read before the write: nothing in between
+            return
         self.inv.execute(
             "UPDATE observations SET device_id=?, link_source='rule', link_rule_id=?,"
             " link_score=? WHERE mac=? AND link_source='self'",
@@ -301,15 +312,9 @@ class Applier:
             " (SELECT 1 FROM observations WHERE device_id=?)",
             (d.from_device, d.from_device),
         )
-        # settled by the rule: its suggestions become unactionable at once (two indexed
-        # statements, bounded by the suggestion cap); its candidate rows are dismissed under the
-        # remaining row cap, the rest on later passes (Settle)
-        withdraw_orphan_suggestions(self.inv, self.snap, d.from_device, self.now)
-        self.writes += dismiss_open_candidates(
-            self.inv, d.from_device, MAX_ROWS_PER_PASS - self.writes
-        )
-        if open_candidates_left(self.inv, d.from_device):
-            state_set(self.inv, f"settle:{d.from_device}", "1")
+        # settled by the rule: its open suggestions are expired and its candidate rows dismissed
+        # under the remaining row cap, the rest on later passes (Settle)
+        self._cleanup(d.from_device)
         before = short_hash(old["mac"]) if old else "none"
         emit_event(self.inv, d.target, "mac_attached", "info",
                    f"mac attached: {before} -> {short_hash(d.mac)}", self.now)  # fmt: skip
