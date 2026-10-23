@@ -47,7 +47,7 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before a flood |
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion + widen + orphan-cleanup rows per APPLY (a decision fits whole or waits) |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY |
-| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions into one device (bounds the orphan cleanup) |
+| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions into one device (limits pending suggestions) |
 | evidence gaps | retention / `activity_gap_s` | rows of `evidence_gaps`: merged within one gap at write time, pruned at retention |
 
 APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject,
@@ -192,13 +192,19 @@ so it may carry a `fingerprint_match` suggestion or an `open` row meanwhile.
 
 **Attach** sets `observations.device_id` to the target with `link_source='rule'`, `link_rule_id`,
 `link_score`; widens the target's `first_seen`/`last_seen`; retires the orphaned self device
-(never deleted); expires the orphan's undecided suggestions (both directions, two indexed
-`LIMIT`ed lookups) and dismisses its open candidate rows, all under the pass's remaining row cap,
+(never deleted); expires the orphan's undecided suggestions and dismisses its open candidate rows,
+all under the pass's remaining row cap,
 and finishes the rest on later passes (`stitch_state` key `settle:<device>`, at most
 `MAX_ATTACHES_PER_PASS` orphans per pass); records `rule_attachments (mac, rule_id,
 target, hostname, mdns_name, opt55, opt60, views)` with the values and each matched rule's field
 mask at that moment; writes `mac_attached` (8-hex hashes only). Revoking or expiring a rule never
 detaches; a later group change does not re-gate an attachment.
+
+Each orphan cleanup call seeks through `idx_suggestions_from_id` and `idx_suggestions_into_id`
+by direction and `id > cursor`, ordered by id. Each direction fetches at most its remaining
+write allowance + 1 rows, at most `2 * (limit + 1)` rows per call. Expired and decided rows are
+skipped in Python; the persistent cursor advances past every examined row. Decided suggestions
+remain untouched. Accumulated history takes additional passes; the write cap is shared per pass.
 
 ## 7. One uncertainty rule
 Whenever a subject's evidence is incomplete it DEGRADES; it never attaches and never gets a silent
@@ -279,7 +285,7 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | malformed rule on the target (even one whose id is a BLOB) | target becomes suggestion-only; an unreadable target makes every hit suggestion-only | `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion`, `test_a_malformed_rule_with_a_blob_id_still_names_its_target`, `test_a_malformed_rule_whose_target_cannot_be_read_makes_every_rule_hit_a_suggestion` |
 | 65 compatible junk MACs around an attached copy | a flooded pool is incomplete evidence: flag / confirm, never silence | `test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag`, `test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion` |
 | dismiss or decide a pair between COMPUTE and APPLY | candidate-state preconditions drop the decision | `test_a_dismissal_between_compute_and_apply_cancels_the_attach`, `test_a_dismissal_between_compute_and_apply_cancels_the_suggestion` |
-| 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later; suggestions expired at once | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
+| 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
 | grow overrides.db to lengthen the lock | one PRAGMA data_version per attach under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
 | Unicode names (É, ß, ς, full-width, NFD) to dodge the name buckets | one fold (NFKC + casefold) in Python and in the stored indexed `*_fold` columns; no NOCASE on names | `test_non_ascii_names_match_exactly_like_ascii_ones`, `test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule` |
 | one enormous subject to eat the compute budget | the budget ticks per lookup inside a subject; known names capped; a cut subject is deferred/flagged and the cursor moves past it | `test_one_huge_recheck_subject_cannot_exceed_its_budget_share`, `test_a_subject_cut_by_the_budget_does_not_pin_the_robin` |
@@ -291,7 +297,8 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | hundreds of thousands of decisions to lengthen the orphan cleanup | keyset paging, decided ids skipped in Python | `test_orphan_cleanup_cost_does_not_depend_on_the_number_of_decisions` |
 | a rule expiring between two attaches of one pass | the clock is read again before each attach write | `test_rule_expiry_is_read_again_before_each_attach_write` |
 | `\|` in a name or vendor class to collide two flood tokens | tokens hash a JSON encoding of the key | `test_flood_tokens_of_different_groups_never_collide_on_a_pipe_in_a_name` |
-| decided suggestions crowding the orphan cleanup window | decided ids are excluded in SQL; `more` counts real rows | `test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones` |
+| decided suggestions crowding the orphan cleanup window | bounded id-ordered pages; cursor advances past decided rows in Python | `test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones` |
+| thousands of decided or expired suggestions on one orphan | indexed direction/id seek keeps each cleanup window bounded; later passes reach undecided rows | `test_orphan_cleanup_vm_work_is_bounded_by_the_window` |
 | a malformed rule on another device whose signature could match | any malformed rule makes every rule hit suggestion-only | `test_any_malformed_rule_makes_every_rule_hit_a_suggestion` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |

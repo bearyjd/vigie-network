@@ -4,6 +4,7 @@ attach caps, the suggestion cap, the round-robins and compute budget, bounded ne
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -39,6 +40,7 @@ from vigie_pipeline.config import MAX_ROWS_PER_PASS, PipelineConfig
 from vigie_pipeline.snapshot import EMPTY, Rule, Snapshot
 from vigie_pipeline.stitch_apply import apply_plan
 from vigie_pipeline.stitch_compute import RECHECK_CURSOR, SELF_CURSOR, compute_plan
+from vigie_pipeline.stitch_db import withdraw_orphan_suggestions
 from vigie_pipeline.stitch_types import Veto
 
 # ---- floods ------------------------------------------------------------------------------------
@@ -336,6 +338,108 @@ def test_an_ambiguous_decision_is_written_whole_or_not_at_all(inv, monkeypatch):
 
 
 # ---- the per-target suggestion cap bounds the orphan cleanup -------------------------------------
+
+
+def _cleanup_suggestions(inv, direction, decided, *, expired=False):
+    expiry = iso_utc(NOW_ABS - 100 if expired else NOW_ABS + 10**6)
+    rows = [(f"d{i:05d}", expiry) for i in range(decided)]
+    rows += [(f"u{i}", iso_utc(NOW_ABS + 10**6)) for i in range(5)]
+    inv.db.executemany(
+        "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, basis,"
+        " created_at, expires_at) VALUES (?,'merge_identity',?,'{}','x','{}','t',?)",
+        [
+            (sid, json.dumps(["orphan", sid] if direction == "from" else [sid, "orphan"]), at)
+            for sid, at in rows
+        ],
+    )
+    decisions = {} if expired else {sid: "rejected" for sid, _ in rows if sid.startswith("d")}
+    return Snapshot({}, (), {}, {}, decisions)
+
+
+@pytest.mark.parametrize("direction", ["from", "into"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_orphan_cleanup_vm_work_is_bounded_by_the_window(inv, direction, expired):
+    def measure(size):
+        inv.db.execute("DELETE FROM suggestions")
+        snap = _cleanup_suggestions(inv, direction, size, expired=expired)
+        steps = 0
+
+        def tick():
+            nonlocal steps
+            steps += 1
+            return 0
+
+        inv.db.set_progress_handler(tick, 1)
+        try:
+            written, more, cursor = withdraw_orphan_suggestions(
+                inv.db, snap, "orphan", NOW_ABS, 50, {}
+            )
+        finally:
+            inv.db.set_progress_handler(None, 0)
+        assert (written, more) == (0, True)
+        assert cursor[direction] == "d00049"
+        return steps, snap, cursor
+
+    small, _, _ = measure(400)
+    large, snap, cursor = measure(8000)
+    assert large <= small * 2 + 100, (small, large)
+
+    total = 0
+    for _ in range(161):
+        written, more, cursor = withdraw_orphan_suggestions(
+            inv.db, snap, "orphan", NOW_ABS, 50, cursor
+        )
+        total += written
+        if not more:
+            break
+    assert total == 5 and more is False
+    assert (
+        inv.db.execute(
+            "SELECT COUNT(*) FROM suggestions WHERE id LIKE 'd%' AND expires_at=?",
+            (iso_utc(NOW_ABS - 100 if expired else NOW_ABS + 10**6),),
+        ).fetchone()[0]
+        == 8000
+    )
+
+
+@pytest.mark.parametrize("direction", ["from", "into"])
+def test_orphan_cleanup_advances_the_cursor_past_expired_rows(inv, direction):
+    snap = _cleanup_suggestions(inv, direction, 102, expired=True)
+    written, more, cursor = withdraw_orphan_suggestions(inv.db, snap, "orphan", NOW_ABS, 50, {})
+    assert (written, more) == (0, True)
+    assert cursor[direction] == "d00049"
+    total = 0
+    for _ in range(3):
+        written, more, cursor = withdraw_orphan_suggestions(
+            inv.db, snap, "orphan", NOW_ABS, 50, cursor
+        )
+        total += written
+        if not more:
+            break
+    assert total == 5 and more is False
+    assert (
+        inv.db.execute(
+            "SELECT COUNT(*) FROM suggestions WHERE id LIKE 'd%' AND expires_at=?",
+            (iso_utc(NOW_ABS - 100),),
+        ).fetchone()[0]
+        == 102
+    )
+
+
+def test_orphan_cleanup_production_queries_use_id_ordered_indexes(inv):
+    statements = []
+    inv.db.set_trace_callback(statements.append)
+    try:
+        withdraw_orphan_suggestions(inv.db, EMPTY, "orphan", NOW_ABS, 50, {})
+    finally:
+        inv.db.set_trace_callback(None)
+    queries = [sql for sql in statements if sql.startswith("SELECT") and "FROM suggestions" in sql]
+    assert len(queries) == 2
+    indexes = ("idx_suggestions_from_id", "idx_suggestions_into_id")
+    for sql, index in zip(queries, indexes, strict=True):
+        plan = " ".join(row[3] for row in inv.db.execute("EXPLAIN QUERY PLAN " + sql))
+        assert index in plan, (sql, plan)
+        assert "SCAN suggestions" not in plan and "TEMP B-TREE" not in plan, (sql, plan)
 
 
 def test_open_suggestions_into_one_device_are_capped_and_the_cap_is_reported(inv):

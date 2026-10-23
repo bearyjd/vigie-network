@@ -237,25 +237,26 @@ def withdraw_orphan_suggestions(
 ) -> tuple[int, bool, dict[str, str]]:  # fmt: skip
     """Expire up to `limit` undecided merge suggestions that start at, or point into, the orphaned
     `device_id` (an attach settled it). Each direction is read by keyset (`id > cursor`,
-    `LIMIT limit + 1`, through idx_suggestions_pair / idx_suggestions_into), decided ids are
-    skipped in Python against the snapshot's set (never serialised into SQL: the cost does not
-    depend on how many decisions exist), and the cursor advances past every row examined, decided
-    or not. Returns (rows written, more left, cursor). Decided suggestions are never touched."""
+    `LIMIT remaining write allowance + 1`, through idx_suggestions_from_id /
+    idx_suggestions_into_id).
+    Each call reads at most 2 * (limit + 1) rows. Expired rows and decided ids are skipped in
+    Python against the snapshot's set (never serialised into SQL), and the cursor advances past
+    every row examined. History takes additional passes; decided suggestions are never touched.
+    Returns (rows written, more left, cursor)."""
     if limit <= 0:
         return 0, True, dict(cursor)
-    prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
     now_iso = iso_utc(now)
     queries = {
         "from": (
-            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
-            " AND device_ids < ? AND expires_at >= ? AND id > ? ORDER BY id LIMIT ?",
-            (prefix, prefix + "\uffff", now_iso),
+            "SELECT id, expires_at FROM suggestions WHERE action='merge_identity'"
+            " AND json_extract(device_ids, '$[0]')=? AND id > ? ORDER BY id LIMIT ?",
+            (device_id,),
         ),
         "into": (
-            "SELECT id FROM suggestions WHERE action='merge_identity'"
-            " AND json_extract(device_ids, '$[1]')=? AND expires_at >= ? AND id > ? ORDER BY id"
+            "SELECT id, expires_at FROM suggestions WHERE action='merge_identity'"
+            " AND json_extract(device_ids, '$[1]')=? AND id > ? ORDER BY id"
             " LIMIT ?",
-            (device_id, now_iso),
+            (device_id,),
         ),
     }
     out, written, more = dict(cursor), 0, False
@@ -264,14 +265,18 @@ def withdraw_orphan_suggestions(
         if room <= 0:
             more = True
             break
-        rows = [r["id"] for r in inv.execute(sql, (*params, out.get(direction, ""), room + 1))]
+        rows = inv.execute(sql, (*params, out.get(direction, ""), room + 1)).fetchall()
         if len(rows) > room:
             more = True
         examined = rows[:room]
-        todo = [i for i in examined if i not in snap.decisions]
+        todo = [
+            r["id"]
+            for r in examined
+            if r["id"] not in snap.decisions and r["expires_at"] >= now_iso
+        ]
         written += _expire_ids(inv, todo, now)
         if examined:
-            out[direction] = examined[-1]
+            out[direction] = examined[-1]["id"]
     return written, more, out
 
 

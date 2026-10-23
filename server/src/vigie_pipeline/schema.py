@@ -123,6 +123,11 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " ON suggestions(action, device_ids, expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_suggestions_into"
         " ON suggestions(action, json_extract(device_ids, '$[1]'), expires_at)",
+        # Orphan cleanup seeks by direction and id, including decided/expired history.
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_from_id"
+        " ON suggestions(action, json_extract(device_ids, '$[0]'), id)",
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_into_id"
+        " ON suggestions(action, json_extract(device_ids, '$[1]'), id)",
         # the ONE name fold (NFKC + Unicode casefold, computed in Python: stitch_types.fold),
         # stored and indexed; back-filled for existing rows by open_pipeline_inventory
         "ALTER TABLE observations ADD COLUMN hostname_fold TEXT",

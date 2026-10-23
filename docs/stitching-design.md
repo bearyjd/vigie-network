@@ -83,12 +83,17 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before flood |
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion rows written per APPLY |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY (each <= ~12 statements + orphan cleanup) |
-| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; bounds the suggestion expiry at attach |
+| `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; limits pending suggestions |
 | orphan cleanup | `CLEANUP_ROWS_SHARE` x `MAX_ROWS_PER_PASS` | suggestion expiries + candidate dismissals per pass (keyset cursors, decided ids skipped in Python); `Settle` decisions finish the rest |
 | gaps | retention / gap_s (~2016) | `evidence_gaps` rows: merged within `activity_gap_s` at write time, pruned at retention |
 
 Lock hold (APPLY) is therefore `<= MAX_ROWS_PER_PASS + MAX_ATTACHES_PER_PASS * (12 + 64 + 2) +
-widen + events` point writes, about 2,000, no scan. Interval coalescing is conservative: bridging a
+widen + events` point writes, about 2,000, with bounded index pages. Each orphan cleanup call
+fetches at most the remaining write allowance + 1 rows per direction, at most `2 * (limit + 1)`
+rows total, through direction/id expression indexes. Expired and decided rows are skipped in
+Python; each direction's persistent id cursor advances past every examined row. Decided rows
+remain untouched; accumulated history takes additional passes. This read bound is per orphan
+call; cleanup writes share the pass's row cap. Interval coalescing is conservative: bridging a
 MAC's own silence only ADDS presence (more overlap, never less), and maturity is anchored on the
 server clock, so it cannot help an attacker.
 
@@ -132,8 +137,9 @@ memory bound on the decision list; not candidates for removal.
 ## 6. Migration plan
 Pipeline migration 4 (additive, on top of main's v3): `mac_activity`, `mac_first_received`,
 `evidence_gaps`, `rule_attachments`, `stitch_state`, `events.dedup` + unique index, candidate
-indexes, suggestion indexes (`idx_suggestions_pair`, expression index on
-`json_extract(device_ids,'$[1]')`), observation indexes (`idx_obs_fp_host`, `idx_obs_fp_mdns`,
+indexes, suggestion indexes (`idx_suggestions_pair`, expiry index on
+`json_extract(device_ids,'$[1]')`, and direction/id expression indexes
+`idx_suggestions_from_id` / `idx_suggestions_into_id`), observation indexes (`idx_obs_fp_host`, `idx_obs_fp_mdns`,
 `idx_obs_fp_first`, partial `idx_obs_rule`). Tests: upgrade from a populated main v3 database;
 fresh install; reapply is a no-op.
 
@@ -143,7 +149,8 @@ fresh install; reapply is a no-op.
    with a per-collector event. The human decides; nothing attaches.
 2. Evidence gaps are not scoped per collector (section 5).
 3. At most `MAX_OPEN_SUGGESTIONS_PER_DEVICE` open merge suggestions into one device; more wait
-   (daily `stitch_deferred suggestion_cap`). Bounds orphan cleanup at attach.
+   (daily `stitch_deferred suggestion_cap`). Limits pending suggestions; historical cleanup uses
+   bounded index pages and persistent cursors.
 4. Recheck with incomplete evidence flags the attachment (`rule_attach_suspect`, once) instead of
    silently skipping: a spray of look-alikes around a rule-attached MAC is itself suspicious.
 5. `mac_activity` keeps at most 64 intervals per MAC (coalescing, conservative).
@@ -223,7 +230,8 @@ dropped because the machinery they pinned no longer exists:
 15. (round 3) The known-name clause folds with `fold` (a lint test bans every other fold); a
     re-check cut by the budget is judged on everything gathered and flagged with its own reason;
     the fold back-fill skips empty names; the clock is re-read before each attach write; flood
-    tokens hash a JSON key; decided suggestions are excluded in SQL from the orphan cleanup window.
+    tokens hash a JSON key; decided suggestions were excluded in SQL from the orphan cleanup window
+    (superseded by round 4's Python filtering and bounded direction/id pages).
     Mutation survivors kept as equivalent pairs: the `target_keys` flag is set both by
     `Hood.add_target` and `Hood.known_names` (either alone degrades the hit), beside the two
     intentional redundancies above.
