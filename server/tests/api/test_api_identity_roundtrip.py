@@ -187,14 +187,14 @@ def test_api_veto_clearance_allows_fresh_pipeline_rule_evaluation(env: Env) -> N
     assert resolved["device_id"] == "target" and resolved["link_source"] == "rule"
 
 
-def test_api_reads_preserve_pipeline_snapshot_data_version(env: Env) -> None:
+def test_api_reads_preserve_pipeline_snapshot_identity_version(env: Env) -> None:
     _pair(env)
     _, token = tokens.create_token(env.ov, "version-human", rules_write=True)
     privileged = {"Authorization": f"Bearer {token}"}
     observer = open_overrides_ro(env.root / "overrides.db")
     assert observer is not None
     try:
-        baseline = load_snapshot(observer, NOW).data_version
+        baseline = load_snapshot(observer, NOW).identity_version
         audit_before = list(env.ov.execute("SELECT * FROM audit_log"))
         writes_before = list(env.ov.execute("SELECT * FROM api_write_receipts"))
         decisions_before = list(env.ov.execute("SELECT * FROM candidate_decisions"))
@@ -202,7 +202,7 @@ def test_api_reads_preserve_pipeline_snapshot_data_version(env: Env) -> None:
         for _ in range(3):
             for path in ("/identity/rules", "/suggestions", "/devices", "/healthz"):
                 assert env.get(path).status_code == 200
-        assert load_snapshot(observer, NOW).data_version == baseline
+        assert load_snapshot(observer, NOW).identity_version == baseline
         assert list(env.ov.execute("SELECT * FROM audit_log")) == audit_before
         assert list(env.ov.execute("SELECT * FROM api_write_receipts")) == writes_before
         assert list(env.ov.execute("SELECT * FROM candidate_decisions")) == decisions_before
@@ -212,7 +212,7 @@ def test_api_reads_preserve_pipeline_snapshot_data_version(env: Env) -> None:
         write_headers = {**privileged, "X-Request-Id": "version-rule-create"}
         response = env.client.post("/identity/rules", json=body, headers=write_headers)
         assert response.status_code in (200, 201), response.text
-        after_write = load_snapshot(observer, NOW).data_version
+        after_write = load_snapshot(observer, NOW).identity_version
         assert after_write != baseline
         audit_after_write = list(env.ov.execute("SELECT * FROM audit_log"))
         writes_after = list(env.ov.execute("SELECT * FROM api_write_receipts"))
@@ -228,7 +228,7 @@ def test_api_reads_preserve_pipeline_snapshot_data_version(env: Env) -> None:
         for _ in range(3):
             assert env.get("/identity/rules").status_code == 200
             assert env.get("/devices/target").status_code == 200
-        assert load_snapshot(observer, NOW).data_version == after_write
+        assert load_snapshot(observer, NOW).identity_version == after_write
         assert list(env.ov.execute("SELECT * FROM audit_log")) == audit_after_write
         assert list(env.ov.execute("SELECT * FROM api_write_receipts")) == writes_after
         assert list(env.ov.execute("SELECT * FROM candidate_decisions")) == decisions_before
@@ -271,12 +271,9 @@ def test_api_clear_needs_rule_and_fresh_nonoverlap_before_attachment(
 
     _run(env)
 
-    assert (
-        env.inv.execute("SELECT state FROM identity_candidates WHERE id='blocked-veto'").fetchone()[
-            "state"
-        ]
-        == ("vetoed" if active_rule_with_overlap else "suggested")
-    )
+    assert env.inv.execute(
+        "SELECT state FROM identity_candidates WHERE id='blocked-veto'"
+    ).fetchone()["state"] == ("vetoed" if active_rule_with_overlap else "suggested")
     resolved = env.get(f"/macs/{ALIAS_MAC}").json()["data"]
     assert resolved["device_id"] == "alias" and resolved["link_source"] == "self"
     assert (

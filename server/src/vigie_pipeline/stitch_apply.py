@@ -1,7 +1,7 @@
 """APPLY phase of identity stitching (docs/stitching-design.md section 4): one short
 BEGIN IMMEDIATE that re-validates every decision of the plan with indexed point lookups (the
 pair's candidate state, the MAC's link, both identity states) and, immediately before each attach
-write, that overrides.db is unwritten since the snapshot (PRAGMA data_version on the pipeline's
+write, that identity inputs are unchanged since the snapshot (identity_version on the pipeline's
 own connection); drops what went stale; writes a count-bounded number of rows: at most
 MAX_ROWS_PER_PASS candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_PASS attaches.
 """
@@ -23,7 +23,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
-from vigie_pipeline.snapshot import Snapshot
+from vigie_pipeline.snapshot import OverridesUnreadable, Snapshot, read_identity_version
 from vigie_pipeline.stitch_db import (
     Attachment,
     SuggestionOutcome,
@@ -73,7 +73,7 @@ class Applier:
         self.now, self.clock, self.stats = now, clock, stats
         self.merge_decisions = merge_decisions
         self.at = clock()  # the clock under the lock; read again before each attach write
-        self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
+        self.dirty = False  # identity inputs changed since snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
         self.writes = 0
         self.attaches = 0
@@ -264,24 +264,29 @@ class Applier:
         )  # fmt: skip
 
     def _overrides_unchanged(self) -> bool:
-        """overrides.db has not been written since the snapshot was read: PRAGMA data_version on
-        the pipeline's own long-lived connection, read FRESH immediately before every attach write
-        (never cached: a commit between two attaches of one pass ends the pass for attaches). Any
-        write (a merge, a new, revoked or malformed rule, a regroup) drops the attach; it is
-        recomputed against a fresh snapshot next pass. Without an overrides connection (tests)
-        the compute snapshot stands in. The remaining window between this read and the write is
-        the cross-database race documented in docs/stitching.md; the next pass's re-check surfaces
-        an attach made in it."""
+        """Point-read identity_version immediately before every attach. Identity changes end
+        attaches for this pass; token, audit and label writes do not. Only legacy schemas missing
+        the version table use coarse PRAGMA data_version. Any unreadable stamp fails closed.
+        The cross-database check-to-write window is documented in docs/stitching.md."""
         if self.overrides is None:
             return True
         if not self.dirty:
             try:
-                row = self.overrides.execute("PRAGMA data_version").fetchone()  # type: ignore[union-attr]
-                current: int | None = int(row[0])
-            except (sqlite3.Error, TypeError, ValueError) as exc:  # unreadable: fail closed
+                if self.snap.schema_version is not None:
+                    schema = self.overrides.execute("PRAGMA schema_version").fetchone()[0]
+                    if schema != self.snap.schema_version:
+                        self.dirty = True
+                current = read_identity_version(self.overrides)
+                if self.snap.identity_version is None and current is None:
+                    row = self.overrides.execute("PRAGMA data_version").fetchone()
+                    current = int(row[0])
+                    expected = self.snap.data_version
+                else:
+                    expected = self.snap.identity_version
+                self.dirty = self.dirty or current is None or current != expected
+            except (sqlite3.Error, TypeError, ValueError, OverridesUnreadable) as exc:
                 log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
-                current = None
-            self.dirty = current is None or current != self.snap.data_version
+                self.dirty = True
         if self.dirty:
             self.stats.stale += 1
         return not self.dirty
@@ -296,7 +301,7 @@ class Applier:
         if self.attaches >= MAX_ATTACHES_PER_PASS:
             self.stats.capped += 1
             return
-        self.at = self.clock()  # expiry does not change data_version: judge it per attach
+        self.at = self.clock()  # expiry does not change identity_version: judge it per attach
         if not (
             self._authorised(d)
             and self._still_self(d.mac, d.from_device)

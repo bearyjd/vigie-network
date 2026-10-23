@@ -102,9 +102,9 @@ def test_clear_work_is_bounded_and_remaining_decisions_progress_next_pass(inv):
     snap = replace(EMPTY, candidate_decisions=tuple(decisions))
     inv.stitch(snap)
     assert (
-        inv.db.execute(
-            "SELECT COUNT(*) FROM identity_candidates WHERE state='cleared'"
-        ).fetchone()[0]
+        inv.db.execute("SELECT COUNT(*) FROM identity_candidates WHERE state='cleared'").fetchone()[
+            0
+        ]
         == limit
     )
     inv.stitch(snap)

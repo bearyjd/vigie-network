@@ -52,10 +52,10 @@ class Snapshot:
     malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
     malformed_devices: frozenset[str] = frozenset()  # their targets: these need a human
     unknown_target: bool = False  # a malformed rule whose target is unreadable: every hit needs one
-    data_version: int | None = (
-        None  # PRAGMA data_version when read: APPLY drops attaches if changed
-    )
+    data_version: int | None = None  # coarse fallback ONLY for old schemas without identity_version
     candidate_decisions: tuple[CandidateDecision, ...] = ()
+    identity_version: int | None = None  # identity inputs, read in the same transaction
+    schema_version: int | None = None  # DDL must also fail closed, without tracking unrelated DML
 
     @cached_property
     def _canon(self) -> dict[str, str]:
@@ -210,7 +210,31 @@ def _str(value: object, what: str) -> str:
     return value
 
 
+def read_identity_version(conn: sqlite3.Connection) -> int | None:
+    """One indexed point read. Only a missing legacy table permits the coarse fallback."""
+    try:
+        row = conn.execute("SELECT version FROM identity_version WHERE singleton=1").fetchone()
+    except sqlite3.OperationalError as exc:
+        if str(exc) == "no such table: identity_version":
+            return None
+        raise
+    if row is None:
+        raise OverridesUnreadable("identity_version singleton is missing")
+    version = _int(row[0], "identity_version.version")
+    if version < 0:
+        raise OverridesUnreadable("identity_version.version is negative")
+    return version
+
+
 def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
+    # This first table read pins the SQLite snapshot before any identity inputs are read.
+    identity_version = read_identity_version(conn)
+    schema_version = _int(conn.execute("PRAGMA schema_version").fetchone()[0], "schema_version")
+    data_version = (
+        _int(conn.execute("PRAGMA data_version").fetchone()[0], "data_version")
+        if identity_version is None
+        else None
+    )
     links_query = (
         "SELECT from_device, into_device FROM identity_links WHERE revoked_at IS NULL"
         if link_revocations_supported(conn)
@@ -289,10 +313,14 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
                 values["id"], values["candidate_id"], values["device_a"], values["device_b"]
             )
         )
-    version = _int(conn.execute("PRAGMA data_version").fetchone()[0], "data_version")
+    if (
+        identity_version is None
+        and data_version != conn.execute("PRAGMA data_version").fetchone()[0]
+    ):
+        raise OverridesUnreadable("legacy overrides changed while reading snapshot")
     return Snapshot(
         links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices),
-        unknown, version, tuple(candidate_decisions),
+        unknown, data_version, tuple(candidate_decisions), identity_version, schema_version,
     )  # fmt: skip
 
 

@@ -1122,14 +1122,15 @@ def snapshot_world(tmp_path):
     return ov, conn
 
 
-def test_the_snapshot_records_the_overrides_data_version(tmp_path):
+def test_the_snapshot_records_the_overrides_identity_version(tmp_path):
     ov, conn = snapshot_world(tmp_path)
     snap = load_snapshot(conn, NOW)
-    assert isinstance(snap.data_version, int)
-    assert load_snapshot(conn, NOW).data_version == snap.data_version  # nothing changed
+    assert isinstance(snap.identity_version, int)
+    assert snap.data_version is None
+    assert load_snapshot(conn, NOW).identity_version == snap.identity_version  # nothing changed
     ov.override("Z", "guest", version=1)
     ov.conn.commit()
-    assert load_snapshot(conn, NOW).data_version != snap.data_version  # another writer committed
+    assert load_snapshot(conn, NOW).identity_version != snap.identity_version
     ov.close()
 
 
@@ -1207,10 +1208,8 @@ def test_a_veto_row_written_between_compute_and_apply_drops_the_attach(inv):
     assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
 
 
-def test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only(inv, tmp_path):
-    """The data_version check is coarse by design: overrides.db is written only on human actions
-    (overrides, rules, links, token lifecycle and their audit rows; never on reads), so a commit in
-    between costs one pass, not liveness."""
+def test_an_unrelated_overrides_write_allows_the_attach_in_the_same_pass(inv, tmp_path):
+    """Audit activity cannot delay an attach authorized by unchanged identity inputs."""
     ov, conn = snapshot_world(tmp_path)
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
     a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
@@ -1222,9 +1221,7 @@ def test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only(inv, tm
     )
     ov.conn.commit()
     st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
-    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
-    fresh = load_snapshot(conn, NOW_ABS)  # the next pass, with a fresh snapshot, attaches
-    assert stitch(inv.db, fresh, inv.cfg, NOW_ABS + 1, None, conn).attached == 1
+    assert st.attached == 1 and st.stale == 0
     assert inv.link_of(a) == ("D", "rule")
     ov.close()
 
@@ -1232,7 +1229,7 @@ def test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only(inv, tm
 # ---- fix round 2 (Codex) -------------------------------------------------------------------------
 
 
-def test_data_version_is_re_read_immediately_before_every_attach(inv, tmp_path, monkeypatch):
+def test_identity_version_is_re_read_immediately_before_every_attach(inv, tmp_path, monkeypatch):
     """Two attaches in one pass; the API commits between them: the second is dropped, the pass
     ends for attaches."""
     ov, conn = snapshot_world(tmp_path)
