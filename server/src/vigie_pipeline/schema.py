@@ -79,6 +79,75 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
           created_at TEXT NOT NULL, expires_at TEXT NOT NULL
         )""",
     ),
+    (
+        # Identity stitching (docs/stitching.md), one additive migration. Main's v3 has no
+        # stitching table, so nothing here has a legacy shape to migrate from.
+        # Per-MAC activity intervals derived from the raw shards (7 d retention, like raw); at
+        # most INTERVALS_PER_MAC rows per MAC. `end` is quoted because END is an SQL keyword.
+        """CREATE TABLE IF NOT EXISTS mac_activity (
+          mac TEXT NOT NULL, start INTEGER NOT NULL, "end" INTEGER NOT NULL,
+          PRIMARY KEY (mac, start)
+        )""",
+        'CREATE INDEX IF NOT EXISTS idx_mac_activity_end ON mac_activity("end")',
+        # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity anchor
+        "CREATE TABLE IF NOT EXISTS mac_first_received ("
+        "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_mac_first_received_received"
+        " ON mac_first_received(received, mac)",
+        # spans in which evidence from ANY collector is known to be missing (stamps dropped for
+        # the report lag); merged within one activity gap at write time, pruned with the activity
+        'CREATE TABLE IF NOT EXISTS evidence_gaps (start INTEGER NOT NULL, "end" INTEGER NOT NULL)',
+        'CREATE INDEX IF NOT EXISTS idx_evidence_gaps_end ON evidence_gaps("end")',
+        # What justified a rule attach, fixed at attach time: the fields each matched rule
+        # required (views) and the MAC's values then. The re-check uses these, so renaming an
+        # attached MAC (or revoking/expiring its rule) cannot erase the evidence of a later overlap.
+        "CREATE TABLE IF NOT EXISTS rule_attachments ("
+        "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
+        " hostname TEXT, mdns_name TEXT, opt55 TEXT, opt60 TEXT, views TEXT NOT NULL,"
+        " attached_at TEXT NOT NULL)",
+        # small key/value state of the stitcher (round-robin cursors, settle cursors)
+        "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        # pipeline bookkeeping that is not stitching state: the fold version of the stored names
+        "CREATE TABLE IF NOT EXISTS pipeline_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        # indexed once-only guard for stitching events
+        "ALTER TABLE events ADD COLUMN dedup TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
+        " WHERE dedup IS NOT NULL",
+        # one candidate row per (from, into) pair (main never wrote the table; any duplicate pair
+        # keeps its newest row so the unique index cannot abort the upgrade)
+        "DELETE FROM identity_candidates WHERE rowid NOT IN (SELECT MAX(rowid) FROM"
+        " identity_candidates GROUP BY device_a, device_b)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
+        " ON identity_candidates(device_a, device_b)",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b, device_a)",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_open_a ON identity_candidates(device_a)"
+        " WHERE state IN ('open','suggested')",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_open_b ON identity_candidates(device_b)"
+        " WHERE state IN ('open','suggested')",
+        # suggestion look-ups by pair and by target device: never a table scan inside the lock
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_pair"
+        " ON suggestions(action, device_ids, expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_into"
+        " ON suggestions(action, json_extract(device_ids, '$[1]'), expires_at)",
+        # Orphan cleanup seeks by direction and id, including decided/expired history.
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_from_id"
+        " ON suggestions(action, json_extract(device_ids, '$[0]'), id)",
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_into_id"
+        " ON suggestions(action, json_extract(device_ids, '$[1]'), id)",
+        # the ONE name fold (NFKC + Unicode casefold, computed in Python: stitch_types.fold),
+        # stored and indexed; back-filled for existing rows by open_pipeline_inventory
+        "ALTER TABLE observations ADD COLUMN hostname_fold TEXT",
+        "ALTER TABLE observations ADD COLUMN mdns_fold TEXT",
+        # neighbourhood lookups: (fingerprint, folded name) buckets newest-last_seen first, the
+        # fingerprint by first sighting, and the rule-attached MACs
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_host ON observations(dhcp_fingerprint,"
+        " vendor_class, hostname_fold, last_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_mdns ON observations(dhcp_fingerprint,"
+        " vendor_class, mdns_fold, last_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_first ON observations(dhcp_fingerprint,"
+        " vendor_class, first_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_rule ON observations(mac) WHERE link_source = 'rule'",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -89,6 +158,11 @@ PIPELINE_TABLES = (
     "transient_state",
     "promotion_log",
     "suggestions",
+    "mac_activity",
+    "mac_first_received",
+    "evidence_gaps",
+    "rule_attachments",
+    "stitch_state",
 )
 
 
@@ -140,4 +214,99 @@ def open_pipeline_inventory(path: Path, migrate: bool = False) -> sqlite3.Connec
         )
     conn = open_inventory(path) if version < expected else connect(path)
     apply_pipeline_migrations(conn)
+    refresh_folds(conn)
     return conn
+
+
+# Bump when stitch_types.fold changes: every stored hostname_fold/mdns_fold is recomputed on the
+# next open. The Unicode database version of the interpreter is part of the marker too.
+FOLD_VERSION = 2
+
+
+def _fold_marker() -> str:
+    import unicodedata  # noqa: PLC0415 - a one-off at open
+
+    return f"{FOLD_VERSION}/{unicodedata.unidata_version}"
+
+
+def refresh_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
+    """Keep the stored name folds equal to `stitch_types.fold` of the names: when the fold
+    version marker differs from the current one (the fold function or the Unicode database
+    changed) EVERY row is recomputed, chunked by MAC in short transactions and resumable through a
+    cursor; otherwise only rows that have no fold yet are filled (rows written before the
+    pipeline knew the column). Empty and NULL names never get a fold and are never re-selected.
+    Returns the rows written."""
+    from vigie_pipeline.stitch_types import fold  # noqa: PLC0415 - avoid an import cycle
+
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(observations)")}
+    if "hostname_fold" not in columns:  # a schema sliced below migration 4 (tests)
+        return 0
+    row = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()
+    pending = conn.execute(
+        "SELECT 1 FROM pipeline_meta WHERE key IN ('fold_cursor', 'fold_cursor_version') LIMIT 1"
+    ).fetchone()
+    # An interrupted upgrade may have overwritten rows even when rolling back to the last
+    # completed version. Its pending cursor takes precedence over that completion marker.
+    if pending is not None or row is None or row[0] != _fold_marker():
+        return _recompute_folds(conn, chunk, fold)
+    done = 0
+    while True:
+        rows = conn.execute(
+            "SELECT mac, hostname, mdns_name FROM observations WHERE (hostname <> '' AND"
+            " hostname_fold IS NULL) OR (mdns_name <> '' AND mdns_fold IS NULL) LIMIT ?",
+            (chunk,),
+        ).fetchall()
+        if not rows:
+            return done
+        _write_folds(conn, rows, fold)
+        done += len(rows)
+
+
+def _recompute_folds(conn: sqlite3.Connection, chunk: int, fold) -> int:
+    """Resume a cursor only for its target fold/Unicode version. Publish the completed
+    version once the cursor has passed every row under that target."""
+    target = _fold_marker()
+    with immediate(conn):
+        version = conn.execute(
+            "SELECT value FROM pipeline_meta WHERE key='fold_cursor_version'"
+        ).fetchone()
+        if version is None or version[0] != target:
+            conn.execute("DELETE FROM pipeline_meta WHERE key='fold_cursor'")
+            conn.execute(
+                "INSERT OR REPLACE INTO pipeline_meta (key, value)"
+                " VALUES ('fold_cursor_version', ?)",
+                (target,),
+            )
+    done = 0
+    while True:
+        cursor = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_cursor'").fetchone()
+        after = cursor[0] if cursor else ""
+        rows = conn.execute(
+            "SELECT mac, hostname, mdns_name FROM observations WHERE mac > ? ORDER BY mac LIMIT ?",
+            (after, chunk),
+        ).fetchall()
+        if not rows:
+            with immediate(conn):
+                conn.execute(
+                    "DELETE FROM pipeline_meta WHERE key IN ('fold_cursor', 'fold_cursor_version')"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES ('fold_version', ?)",
+                    (target,),
+                )
+            return done
+        _write_folds(conn, rows, fold, cursor=rows[-1][0])
+        done += len(rows)
+
+
+def _write_folds(conn: sqlite3.Connection, rows, fold, cursor: str | None = None) -> None:
+    with immediate(conn):
+        conn.executemany(
+            "UPDATE observations SET hostname_fold=?, mdns_fold=? WHERE mac=?",
+            [(fold(r[1]) if r[1] else None, fold(r[2]) if r[2] else None, r[0]) for r in rows],
+        )
+        if cursor is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES ('fold_cursor', ?)",
+                (cursor,),
+            )

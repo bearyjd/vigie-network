@@ -1,0 +1,490 @@
+"""The post-attach re-check: attach-time evidence (names, fingerprints, per-rule views) is
+immutable, the re-check flags (never detaches), incomplete evidence is itself flagged."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from pipeline_helpers import data  # noqa: F401
+from stitch_helpers import (
+    NOW_ABS,
+    OLD,
+    RULE,
+    RULE_SNAP,
+    Inv,
+    Overrides,
+    appear,
+    device_of,
+    inv,  # noqa: F401
+    kinds,
+    run,
+    sig,
+    source_of,
+)
+
+from vigie_pipeline import stitch_hood
+from vigie_pipeline.snapshot import EMPTY, Rule, Snapshot
+
+
+def seed(data, victim_end: int = 2880, step: int = 120):
+    a = appear(data, 1, 0, victim_end, step=step)
+    run(data)
+    dev = device_of(data, a)
+    ov = Overrides(data.root)
+    ov.rule(RULE, dev, sig())
+    ov.override(dev, "iot", version=1)
+    return ov, dev
+
+
+def test_attached_mac_later_found_overlapping_is_flagged_never_detached(data):
+    ov, dev = seed(data, victim_end=300, step=60)
+    b = appear(data, 2, 1000, 2000, step=30)
+    run(data)
+    assert device_of(data, b) == dev and source_of(data, b) == "rule"
+    appear(data, 3, 1200, 4000, step=60)  # the real victim's new MAC, concurrent with b
+    before = (data.root / "overrides.db").read_bytes()
+    run(data)
+    suspects = kinds(data, "rule_attach_suspect")
+    assert len(suspects) == 1 and suspects[0]["device_id"] == dev
+    assert device_of(data, b) == dev and source_of(data, b) == "rule"  # trust is not rewritten
+    run(data)
+    assert len(kinds(data, "rule_attach_suspect")) == 1  # once per MAC
+    assert kinds(data, "mac_detached") == []
+    assert (data.root / "overrides.db").read_bytes() == before
+    ov.close()
+
+
+def test_clean_rule_attach_chain_raises_no_suspect(data):
+    ov, dev = seed(data, victim_end=700, step=60)
+    appear(data, 2, 760, 1800, step=60)
+    run(data)
+    assert len(kinds(data, "mac_attached")) == 1 and kinds(data, "rule_attach_suspect") == []
+    ov.close()
+
+
+# ---- the evidence is frozen at attach time ------------------------------------------------------
+
+
+def attach_then_rename(inv: Inv, rename: str | None) -> str:
+    inv.mac("D", "previous-name", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac(
+        "A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 4000)]
+    )
+    assert inv.stitch(RULE_SNAP, NOW_ABS - 3000).attached == 1
+    if rename:
+        inv.db.execute("UPDATE observations SET hostname=? WHERE mac=?", (rename, a))
+    inv.act(a, [(NOW_ABS - 3999, NOW_ABS)])
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 4000, NOW_ABS)])
+    return a
+
+
+@pytest.mark.parametrize("rename", [None, "renamed-copy"])
+def test_renaming_an_attached_copy_cannot_hide_a_later_overlap(inv, rename):
+    attach_then_rename(inv, rename)
+    st = inv.stitch(RULE_SNAP, NOW_ABS)
+    assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1
+
+
+def test_the_evidence_survives_the_rule_being_revoked(inv):
+    attach_then_rename(inv, "renamed-copy")
+    revoked = Snapshot({}, (), {"iot": 1}, {"D": (1, "iot")}, {})
+    assert inv.stitch(revoked, NOW_ABS).suspect == 1
+
+
+def two_rule_snap() -> Snapshot:
+    rules = (
+        Rule("r1", "D", "1,2,3", "x", "victim", None),
+        Rule("r2", "D", "1,2,3", "x", None, "Dave"),
+    )
+    return Snapshot({}, rules, {"iot": 1}, {"D": (1, "iot")}, {})
+
+
+def attach_with_two_rules(inv: Inv) -> str:
+    inv.mac("D", "previous", "old", "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac(
+        "A", "victim", "Dave", "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 4000)]
+    )
+    assert inv.stitch(two_rule_snap(), NOW_ABS - 3000).attached == 1
+    return a
+
+
+def test_the_recheck_uses_both_rules_fields_after_a_rename(inv):
+    a = attach_with_two_rules(inv)
+    inv.db.execute("UPDATE observations SET hostname='x1', mdns_name='x2' WHERE mac=?", (a,))
+    inv.act(a, [(NOW_ABS - 3999, NOW_ABS)])
+    inv.mac(
+        "V", None, "Dave", "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 4000, NOW_ABS)]
+    )  # mdns only
+    assert inv.stitch(two_rule_snap(), NOW_ABS).suspect == 1
+
+
+def test_the_recheck_searches_the_attach_time_fingerprint_bucket(inv):
+    a = attach_with_two_rules(inv)
+    inv.db.execute("UPDATE observations SET dhcp_fingerprint='9,9' WHERE mac=?", (a,))
+    inv.act(a, [(NOW_ABS - 3999, NOW_ABS)])
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 4000, NOW_ABS)])
+    assert inv.stitch(two_rule_snap(), NOW_ABS).suspect == 1
+
+
+def test_each_matched_rules_view_is_stored_and_checked_separately(inv):
+    a = attach_with_two_rules(inv)
+    views = inv.db.execute("SELECT views FROM rule_attachments WHERE mac=?", (a,)).fetchone()[0]
+    assert json.loads(views) == [[False, True], [True, False]]
+    inv.act(a, [(NOW_ABS - 3999, NOW_ABS)])
+    # no hostname, an mDNS name that contradicts the UNION but not the hostname-only view,
+    # first seen within a gap of the attached MAC
+    inv.mac("V", None, "Elsewhere", "self", "2026-01-02T00:01:00Z", [(NOW_ABS - 4000, NOW_ABS)])
+    assert inv.stitch(two_rule_snap(), NOW_ABS).suspect == 1
+
+
+def attached_world(inv: Inv, rule_id: str) -> str:
+    inv.mac("D", "victim", "Dave", "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("D", "victim", "Dave", "rule", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    inv.db.execute("UPDATE observations SET link_rule_id=? WHERE mac=?", (rule_id, a))
+    inv.attachment(a, rule_id, "D", "victim", None, [[True, False]])  # hostname-only rule
+    inv.mac("V", None, "Elsewhere", "self", "2026-01-03T00:01:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    return a
+
+
+def test_recheck_with_its_rule_uses_the_rule_names_only(inv):
+    attached_world(inv, "r1")  # hostname-only rule: V (mDNS only, other name) is a peer
+    assert inv.stitch(RULE_SNAP).suspect == 1
+
+
+def test_an_extra_applicant_name_cannot_hide_a_suspect_from_the_recheck(inv):
+    inv.mac("D", "victim", "Dave", "self", OLD, [(NOW_ABS - 10000, NOW_ABS - 5000)], rand=0)
+    inv.mac("V", None, "Dave", "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 4000, NOW_ABS)])
+    a = inv.mac("D", "victim", "Other", "rule", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    inv.attachment(a, "r1", "D", "victim", None, [[True, False]])
+    st = inv.stitch(RULE_SNAP)
+    assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1
+
+
+def test_a_revoked_rules_attach_is_rechecked_against_the_persisted_evidence(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    inv.db.execute(
+        "UPDATE observations SET link_rule_id='gone', hostname='renamed' WHERE mac=?", (a,)
+    )
+    inv.attachment(a, "gone", "D", "victim", None, [[True, False]])
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    assert inv.stitch(EMPTY).suspect == 1  # found via the stored hostname
+
+
+def test_attachments_without_stored_fingerprints_use_the_current_ones(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    inv.db.execute(
+        "INSERT INTO rule_attachments (mac, rule_id, target, hostname, mdns_name, views,"
+        " attached_at) VALUES (?, 'gone', 'D', 'victim', NULL, '[[true,false]]', 't')", (a,),
+    )  # fmt: skip
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    assert inv.stitch(EMPTY).suspect == 1
+
+
+def test_a_missing_attach_record_is_itself_flagged(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    st = inv.stitch(EMPTY)
+    assert st.suspect == 1
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence missing" in row[0] and inv.link_of(a) == ("D", "rule")
+
+
+def test_a_recheck_subject_without_activity_in_retention_is_skipped(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [], newdev=False)
+    assert inv.stitch(EMPTY).examined == 0 and inv.count("rule_attach_suspect") == 0
+
+
+# ---- each peer source matters to the re-check --------------------------------------------------
+
+
+def attached(inv: Inv, host="victim", mdns=None) -> str:
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac(
+        "D", host, mdns, "rule", "2026-01-02T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)], newdev=False
+    )
+    inv.attachment(a, "r1", "D", host, mdns, [[True, False]])
+    return a
+
+
+def test_recheck_flags_overlap_with_a_compatible_mdns_only_peer(inv):
+    attached(inv)
+    inv.mac("V", None, "Dave", "self", "2026-01-02T00:01:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    assert inv.stitch(RULE_SNAP).suspect == 1  # only compatible_peers can see V (first seen
+    # within a gap of the attached MAC)
+
+
+def test_recheck_flags_overlap_with_a_same_name_rule_attached_mac_of_another_device(inv):
+    attached(inv)
+    inv.mac("E", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    e = inv.mac("E", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)],
+                newdev=False)  # fmt: skip
+    inv.attachment(e, "r1", "E", "victim", None, [[True, False]])
+    # not a live self MAC (so not compatible) and another canonical device: only name_peers
+    assert inv.stitch(RULE_SNAP).suspect == 2  # each of the two flags the other
+
+
+def test_recheck_stays_quiet_for_a_clean_attach(inv):
+    attached(inv)
+    assert inv.stitch(RULE_SNAP).suspect == 0
+
+
+def test_a_copy_attached_before_the_victim_is_flagged_when_the_victim_arrives(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 200000, NOW_ABS - 190000)], rand=0)
+    copy = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z",
+                   [(NOW_ABS - 100000 + i * 400,) * 2 for i in range(70)])  # fmt: skip
+    st = inv.stitch(RULE_SNAP, NOW_ABS - 60000)
+    assert st.attached == 1 and inv.link_of(copy) == ("D", "rule")
+    inv.act(copy, [(NOW_ABS - 5000 + i * 400,) * 2 for i in range(13)])
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    st = inv.stitch(RULE_SNAP, NOW_ABS)
+    assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1
+
+
+def test_a_recheck_that_cannot_gather_complete_evidence_flags_the_attachment(inv, monkeypatch):
+    """A spray of look-alikes around a rule-attached MAC pushes the victim out of the bounded
+    lookup: the re-check cannot conclude, so it flags instead of staying silent."""
+    monkeypatch.setattr(stitch_hood, "BUCKET_ROWS", 10)
+    a = attached(inv)
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)],
+            last_seen="2026-01-03T00:00:00Z")  # fmt: skip
+    for i in range(12):  # newer last_seen than the victim: they fill the bounded lookup
+        inv.mac(
+            f"S{i}",
+            "victim",
+            None,
+            "self",
+            "2026-06-01T00:00:00Z",
+            [],
+            last_seen="2026-09-01T00:00:00Z",
+        )
+    st = inv.stitch(RULE_SNAP)
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete" in row[0]
+
+
+# ---- fix round 1 -------------------------------------------------------------------------------
+
+
+def junk_pool(inv: Inv, n: int, first: str) -> None:
+    for i in range(n):  # live, same fingerprint, own mDNS names only (nothing contradicts a
+        # hostname-only view), first seen within a gap of the subject
+        inv.mac(f"J{i}", None, f"junk{i}", "self", first, [(NOW_ABS - 5000, NOW_ABS)])
+
+
+def test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag(inv):
+    """Codex HIGH: 65 compatible junk MACs used to replace the flag with a mere signature_flood."""
+    a = attached(inv)
+    inv.mac("V", None, "Dave", "self", "2026-01-02T00:01:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    junk_pool(inv, 65, "2026-01-02T00:02:00Z")
+    st = inv.stitch(RULE_SNAP)
+    assert st.suspect == 1 and inv.count("rule_attach_suspect") == 1 and inv.link_of(a)[1] == "rule"
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete" in row[0]
+
+
+def test_the_recheck_robin_cycles_through_every_attached_mac(inv, monkeypatch):
+    from vigie_pipeline import stitch_compute as compute_mod
+    from vigie_pipeline.stitch_compute import RECHECK_CURSOR
+
+    monkeypatch.setattr(compute_mod, "MACS_PER_PASS", 10)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(25):  # quiet rule-attached MACs, none ever overlapping anything
+        ivs = [(NOW_ABS - 80000 + k * 1000, NOW_ABS - 79500 + k * 1000)]
+        m = inv.mac(
+            "D", "victim", None, "rule", f"2026-01-{k + 2:02d}T00:00:00Z", ivs, newdev=False
+        )
+        inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
+    examined, cursors = [], []
+    for _ in range(3):
+        examined.append(inv.stitch(RULE_SNAP).examined)
+        cursors.append(
+            inv.db.execute(
+                "SELECT value FROM stitch_state WHERE key=?", (RECHECK_CURSOR,)
+            ).fetchone()
+        )
+    assert examined == [10, 10, 5] and cursors[-1] is None and all(c for c in cursors[:2])
+    assert inv.count("rule_attach_suspect") == 0
+
+
+def test_an_oversize_target_component_is_incomplete_evidence_for_the_recheck(inv, monkeypatch):
+    monkeypatch.setattr(stitch_hood, "MAX_ALIAS_IDS", 2)
+    a = attached(inv)
+    snap = Snapshot({"X": "D", "Y": "D"}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {})
+    st = inv.stitch(snap)
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete, component_oversize" in row[0]
+
+
+def test_a_later_different_reason_raises_a_fresh_flag_and_tokens_are_long(inv):
+    a = attached(inv)
+    junk_pool(inv, 65, "2026-01-02T00:02:00Z")  # incomplete evidence first
+    assert inv.stitch(RULE_SNAP).suspect == 1
+    inv.db.execute("DELETE FROM observations WHERE device_id LIKE 'J%'")
+    inv.db.execute("DELETE FROM mac_activity WHERE mac NOT IN (SELECT mac FROM observations)")
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    assert inv.stitch(RULE_SNAP, NOW_ABS + 1).suspect == 1  # a different reason: a fresh flag
+    rows = inv.db.execute(
+        "SELECT summary, dedup FROM events WHERE kind='rule_attach_suspect'"
+    ).fetchall()
+    assert len(rows) == 2 and {r[0].split(": ")[1][:9] for r in rows} == {"evidence ", "sustained"}
+    assert all(len(r[1].split("~")[0]) >= 32 for r in rows)  # not a brute-forceable 32-bit hash
+    assert inv.stitch(RULE_SNAP, NOW_ABS + 2).suspect == 0 and inv.link_of(a) == ("D", "rule")
+
+
+# ---- fix round 2 (opus) -------------------------------------------------------------------------
+
+
+def test_an_overlap_seen_in_a_truncated_hood_is_still_flagged(inv, monkeypatch):
+    """Opus M2: while a spray persists, the overlap flag must still fire beside the truncation."""
+    monkeypatch.setattr(stitch_hood, "BUCKET_ROWS", 10)
+    a = attached(inv)
+    inv.mac(
+        "V",
+        "victim",
+        None,
+        "self",
+        "2026-01-03T00:00:00Z",
+        [(NOW_ABS - 5000, NOW_ABS)],
+        last_seen="2026-09-02T00:00:00Z",
+    )  # the victim is among the newest rows: visible
+    for i in range(12):
+        inv.mac(
+            f"S{i}",
+            "victim",
+            None,
+            "self",
+            "2026-06-01T00:00:00Z",
+            [],
+            last_seen="2026-09-01T00:00:00Z",
+        )
+    st = inv.stitch(RULE_SNAP)
+    rows = [
+        r[0] for r in inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert (
+        st.suspect == 2
+        and any("sustained" in r for r in rows)
+        and any("incomplete" in r for r in rows)
+    )
+    assert inv.link_of(a) == ("D", "rule")
+
+
+def test_one_huge_recheck_subject_cannot_exceed_its_budget_share(inv, monkeypatch):
+    """Opus M1: 300 target MACs with distinct names used to cost two lookups each inside one
+    subject, far beyond the budget; the known names are capped and the budget ticks per lookup."""
+    import time as real_time
+
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    a = attached(inv)
+    for k in range(300):
+        inv.mac("D", f"name{k}", f"mdns{k}", "rule", OLD, [], newdev=False)
+    inv.commit()
+    monkeypatch.setattr(compute_mod, "STITCH_COMPUTE_BUDGET_S", 0.4)
+    start = real_time.perf_counter()
+    st = inv.stitch(RULE_SNAP)
+    assert real_time.perf_counter() - start < 2.0
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")  # incomplete evidence is flagged
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete" in row[0]
+
+
+def test_a_subject_cut_by_the_budget_does_not_pin_the_robin(inv, monkeypatch):
+    from vigie_pipeline import stitch_compute as compute_mod
+    from vigie_pipeline.stitch_compute import RECHECK_CURSOR
+
+    class Slow:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def monotonic(self) -> float:
+            self.t += 1.0  # every budget check costs a second: the first lookup already overruns
+            return self.t
+
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(3):
+        ivs = [(NOW_ABS - 80000 + k * 1000, NOW_ABS - 79500 + k * 1000)]
+        m = inv.mac("D", "victim", None, "rule", f"2026-01-0{k + 2}T00:00:00Z", ivs, newdev=False)
+        inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
+    inv.commit()
+    monkeypatch.setattr(compute_mod, "time", Slow())
+    monkeypatch.setattr(compute_mod, "STITCH_COMPUTE_BUDGET_S", 3.0)
+    cursors = []
+    for i in range(4):
+        inv.stitch(RULE_SNAP, NOW_ABS + i)
+        cursors.append(
+            inv.db.execute(
+                "SELECT value FROM stitch_state WHERE key=?", (RECHECK_CURSOR,)
+            ).fetchone()
+        )
+    assert (
+        len({c[0] if c else None for c in cursors}) >= 3
+    )  # the cursor moved past each cut subject
+
+
+# ---- round 3 -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cut_at", [1, 2, 3, 4, 5, 6])  # the subject needs about six ticks
+def test_a_budget_cut_at_any_lookup_still_flags_the_overlap_it_has_seen(inv, monkeypatch, cut_at):
+    """Opus M2: the fallback after BudgetSpent judged only the target's own MACs; peers already
+    gathered (the victim, found by the target's name bucket at the third tick) were dropped."""
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    a = attached(inv)
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    ticks = {"n": 0}
+
+    def tick(self):
+        ticks["n"] += 1
+        if ticks["n"] >= cut_at:
+            raise compute_mod.BudgetSpent
+
+    monkeypatch.setattr(compute_mod.Compute, "_tick", tick)
+    st = inv.stitch(RULE_SNAP)
+    rows = [
+        r[0] for r in inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert any("incomplete, budget" in r for r in rows) and inv.link_of(a) == ("D", "rule")
+    if cut_at >= 4:  # the victim was in the neighbourhood when the budget ran out
+        assert any("sustained" in r for r in rows) and st.suspect == 2
+    tokens = [
+        r[0] for r in inv.db.execute("SELECT dedup FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert len(set(tokens)) == len(tokens)  # one token per (MAC, device, full reason)
+
+
+def test_truncation_and_budget_cuts_have_distinct_flag_tokens(inv, monkeypatch):
+    monkeypatch.setattr(stitch_hood, "BUCKET_ROWS", 3)
+    a = attached(inv)
+    for i in range(5):
+        inv.mac(
+            f"S{i}",
+            "victim",
+            None,
+            "self",
+            "2026-06-01T00:00:00Z",
+            [],
+            last_seen="2026-09-01T00:00:00Z",
+        )
+    assert inv.stitch(RULE_SNAP).suspect == 1  # evidence incomplete, truncated
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    monkeypatch.setattr(
+        compute_mod.Compute, "_tick", lambda self: (_ for _ in ()).throw(compute_mod.BudgetSpent)
+    )
+    assert (
+        inv.stitch(RULE_SNAP, NOW_ABS + 1).suspect == 1
+    )  # evidence incomplete, budget: a new reason
+    assert inv.link_of(a) == ("D", "rule")

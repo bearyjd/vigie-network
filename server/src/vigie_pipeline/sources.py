@@ -36,6 +36,7 @@ class MacActivity:
     first_ts: int
     last_ts: int
     hours: set[int] = field(default_factory=set)
+    stamps: set[int] = field(default_factory=set)  # every row ts seen, for activity intervals
     hostname: str | None = None
     opt55: str | None = None
     opt60: str | None = None
@@ -95,6 +96,7 @@ def _note(
     act.first_ts = min(act.first_ts, ts)
     act.last_ts = max(act.last_ts, ts)
     act.hours.add(ts // 3600)
+    act.stamps.add(ts)
     return act
 
 

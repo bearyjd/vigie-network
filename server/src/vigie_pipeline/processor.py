@@ -7,14 +7,21 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from vigie_ingest.db import immediate, iso_utc
+from vigie_pipeline.activity import purge_activity, record_activity
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.schema import open_pipeline_inventory
+from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
+from vigie_pipeline.stitch import StitchStats, stitch
+from vigie_pipeline.stitch_db import emit_once
+from vigie_pipeline.stitch_types import fold
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -29,26 +36,91 @@ class RunStats:
     skipped_macs: int = 0
     promoted: int = 0
     retired: int = 0
+    suggestions: int = 0
+    attached: int = 0
 
 
 def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     """Process every recorded, not-yet-processed batch, then promote/retire transients."""
     clock = time.time() if now is None else now
+    live = time.time if now is None else None  # injected `now` pins every clock read (tests)
     inv = open_pipeline_inventory(config.inventory_path, config.migrate)
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
     try:
-        totals = _process_batches(inv, overrides, config, failures)
+        # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
+        # no identity links for the batches, no stitching, cursor progress is kept
+        usable = _overrides_readable(inv, overrides, config, clock)
+        totals = _process_batches(inv, overrides if usable else None, config, failures)
+        stitched = (
+            _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
+        )
         promoted, retired = sweep_transients(inv, clock, config)
+        purge_activity(inv, clock, config.activity_retention_s)
     finally:
         inv.close()
         if overrides is not None:
             overrides.close()
-    stats = RunStats(**totals, promoted=promoted, retired=retired)
+    stats = RunStats(
+        **totals,
+        promoted=promoted,
+        retired=retired,
+        suggestions=stitched.suggestions,
+        attached=stitched.attached,
+    )
     log(logger, logging.INFO, "run_complete", failed_collectors=len(failures), **stats.__dict__)
     if failures:
         raise failures[0]
     return stats
+
+
+def _overrides_readable(
+    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, config: PipelineConfig,
+    now: float,
+) -> bool:  # fmt: skip
+    """overrides.db missing entirely => readable (no rules, basis versions 0). Present but
+    unreadable or malformed => fail closed: log `stitching_skipped` and report False."""
+    try:
+        if overrides is not None:
+            load_snapshot(overrides, now)
+        elif config.overrides_path.exists():
+            raise OverridesUnreadable("overrides.db exists but could not be opened")
+    except OverridesUnreadable as exc:
+        log(
+            logger,
+            logging.ERROR,
+            "stitching_skipped",
+            reason="overrides_unreadable",
+            error=str(exc),
+        )
+        with immediate(inv):  # one event per UTC day, so the API can surface it
+            emit_once(inv, None, "stitching_skipped", "warn",
+                      "stitching skipped: overrides.db unreadable or malformed "
+                      f"({type(exc.__cause__ or exc).__name__})",
+                      iso_utc(now)[:10], now)  # fmt: skip
+        return False
+    return True
+
+
+def _stitch(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    clock: Callable[[], float],
+) -> StitchStats:
+    """Run identity stitching on a snapshot read NOW (after the batches, so rule expiry is judged
+    against the current time, not the start of the run). A snapshot that turns unreadable between
+    the early check and now also skips stitching."""
+    now = clock()
+    snap: Snapshot = EMPTY
+    try:
+        if overrides is not None:
+            snap = load_snapshot(overrides, now)
+    except OverridesUnreadable as exc:
+        log(logger, logging.ERROR, "stitching_skipped", reason="overrides_unreadable",
+            error=str(exc))  # fmt: skip
+        return StitchStats()
+    return stitch(inv, snap, config, now, clock, overrides)
 
 
 def _process_batches(
@@ -69,6 +141,9 @@ def _process_batches(
                 break
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
+                record_activity(
+                    inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
+                )
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)
@@ -77,6 +152,10 @@ def _process_batches(
             log(logger, logging.DEBUG, "batch_processed", collector=collector, batch_id=batch_id,
                 macs=len(acts), new_devices=created)  # fmt: skip
     return totals
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).timestamp()
 
 
 def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str, str]]:
@@ -149,10 +228,10 @@ def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity, received
         )
     inv.execute(
         "INSERT INTO observations (mac, device_id, is_randomized, dhcp_fingerprint, vendor_class,"
-        " hostname, mdns_name, link_source, first_seen, last_seen)"
-        " VALUES (?,?,?,?,?,?,?,'self',?,?)",
+        " hostname, mdns_name, link_source, first_seen, last_seen, hostname_fold, mdns_fold)"
+        " VALUES (?,?,?,?,?,?,?,'self',?,?,?,?)",
         (mac, device_id, int(randomized), act.opt55, act.opt60, act.hostname, act.mdns_name,
-         first, last),
+         first, last, _fold(act.hostname), _fold(act.mdns_name)),
     )  # fmt: skip
     inv.execute(
         "INSERT OR IGNORE INTO events (id, device_id, ts, kind, severity, summary)"
@@ -229,13 +308,18 @@ def _update_observation(inv: sqlite3.Connection, row: sqlite3.Row, act: MacActiv
         _flag_conflict(inv, row, field, new, last)
         return old
 
+    host, mdns = pick(row["hostname"], act.hostname), pick(row["mdns_name"], act.mdns_name)
     inv.execute(
         "UPDATE observations SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?),"
-        " hostname=?, dhcp_fingerprint=?, vendor_class=?, mdns_name=? WHERE mac=?",
-        (first, last, pick(row["hostname"], act.hostname),
-         first_wins("dhcp_fingerprint", act.opt55), first_wins("vendor_class", act.opt60),
-         pick(row["mdns_name"], act.mdns_name), row["mac"]),
+        " hostname=?, dhcp_fingerprint=?, vendor_class=?, mdns_name=?, hostname_fold=?,"
+        " mdns_fold=? WHERE mac=?",
+        (first, last, host, first_wins("dhcp_fingerprint", act.opt55),
+         first_wins("vendor_class", act.opt60), mdns, _fold(host), _fold(mdns), row["mac"]),
     )  # fmt: skip
+
+
+def _fold(name: str | None) -> str | None:
+    return fold(name) if name else None
 
 
 def _touch_devices(
