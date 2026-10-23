@@ -344,6 +344,35 @@ class Applier:
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(d.mac))
 
 
+def apply_candidate_decisions(inv: sqlite3.Connection, snap: Snapshot) -> None:
+    """Consume human clears before COMPUTE, never attaching or changing observations.
+
+    A receipt in inventory makes each decision id one-shot, including stale decisions whose
+    candidate no longer matches. A later clear requires a new API decision id. Select outside
+    the writer lock, then recheck receipts and exact candidate id/pair/state under the lock.
+    At most MAX_ROWS_PER_PASS rows are written in this separate bounded transaction.
+    """
+    pending = []
+    for decision in snap.candidate_decisions:
+        key = f"candidate-clear:{decision.id}"
+        if state_get(inv, key) is None:
+            pending.append((key, decision))
+            if len(pending) >= MAX_ROWS_PER_PASS // 2:
+                break
+    if not pending:
+        return
+    with immediate(inv):
+        for key, decision in pending:
+            if state_get(inv, key) is not None:
+                continue
+            inv.execute(
+                "UPDATE identity_candidates SET state='dismissed'"
+                " WHERE id=? AND device_a=? AND device_b=? AND state='vetoed'",
+                (decision.candidate_id, decision.device_a, decision.device_b),
+            )
+            state_set(inv, key, "consumed")
+
+
 def apply_plan(
     inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
     clock: Callable[[], float], overrides: sqlite3.Connection | None, plan: Plan,

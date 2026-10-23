@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from functools import cached_property
 
 from vigie_pipeline.logs import log
+from vigie_pipeline.overrides import link_revocations_supported
 
 logger = logging.getLogger("vigie_pipeline")
 OPT55_RE = re.compile(r"[0-9]+(,[0-9]+)*")
@@ -34,6 +35,14 @@ class Rule:
 
 
 @dataclass(frozen=True)
+class CandidateDecision:
+    id: str
+    candidate_id: str
+    device_a: str
+    device_b: str
+
+
+@dataclass(frozen=True)
 class Snapshot:
     links: Mapping[str, str]
     rules: tuple[Rule, ...]
@@ -46,6 +55,7 @@ class Snapshot:
     data_version: int | None = (
         None  # PRAGMA data_version when read: APPLY drops attaches if changed
     )
+    candidate_decisions: tuple[CandidateDecision, ...] = ()
 
     @cached_property
     def _canon(self) -> dict[str, str]:
@@ -201,11 +211,16 @@ def _str(value: object, what: str) -> str:
 
 
 def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
+    links_query = (
+        "SELECT from_device, into_device FROM identity_links WHERE revoked_at IS NULL"
+        if link_revocations_supported(conn)
+        else "SELECT from_device, into_device FROM identity_links"
+    )
     links = {
         _str(r["from_device"], "identity_links.from_device"): _str(
             r["into_device"], "identity_links.into_device"
         )
-        for r in _rows(conn, "SELECT from_device, into_device FROM identity_links")
+        for r in _rows(conn, links_query)
     }
     rules, malformed, bad_devices, unknown = [], 0, set(), False
     for row in _rows(
@@ -249,10 +264,26 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
         for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
     }
+    candidate_decisions = []
+    for row in _rows(
+        conn,
+        "SELECT id, candidate_id, device_a, device_b, action, decided_by, decided_at"
+        " FROM candidate_decisions ORDER BY id",
+    ):
+        values = {
+            name: _ident(row[name], f"candidate_decisions.{name}")
+            for name in ("id", "candidate_id", "device_a", "device_b", "action",
+                         "decided_by", "decided_at")
+        }
+        if values["action"] != "clear_veto":
+            raise OverridesUnreadable("candidate_decisions.action is not clear_veto")
+        candidate_decisions.append(CandidateDecision(
+            values["id"], values["candidate_id"], values["device_a"], values["device_b"]
+        ))
     version = _int(conn.execute("PRAGMA data_version").fetchone()[0], "data_version")
     return Snapshot(
         links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices),
-        unknown, version,
+        unknown, version, tuple(candidate_decisions),
     )  # fmt: skip
 
 
