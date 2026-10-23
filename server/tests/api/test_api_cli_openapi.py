@@ -110,6 +110,7 @@ EXPECTED_ERRORS = {
     ("patch", "/devices/{device_id}"): {
         "400",
         "401",
+        "403",
         "404",
         "409",
         "412",

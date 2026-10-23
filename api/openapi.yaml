@@ -1785,6 +1785,16 @@
             },
             "description": "Unauthorized (uniform for every authentication failure)"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Token lacks the required write privilege"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -2408,9 +2418,38 @@
     },
     "/identity/rules": {
       "get": {
-        "description": "Read-only list including revoked and expired rules with computed active state. Authentication and rate limiting never write token-use stamps.",
+        "description": "Keyset-paginated rule history ordered by (created_at, id), including revoked and expired rules with computed active state. Pass page.next_cursor as cursor. Authentication and rate limiting never write token-use stamps.",
         "operationId": "get_rules_identity_rules_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -2438,6 +2477,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed cursor, If-Match or updated_since"
           },
           "401": {
             "content": {

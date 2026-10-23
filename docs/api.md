@@ -13,7 +13,7 @@ No generated TypeScript client exists in `api/`.
 | POST | `/suggestions/{suggestion_id}/accept` | Apply a label/group decision or confirm a merge; `remember: true` also approves a rule |
 | POST | `/suggestions/{suggestion_id}/reject` | Reject a suggestion |
 | POST | `/identity/merges/{merge_id}/undo` | Revoke a confirmed merge |
-| GET | `/identity/rules` | List rules, including expiration/revocation and active state |
+| GET | `/identity/rules` | Page through rules, including expiration/revocation and active state |
 | POST | `/identity/rules` | Approve a standing rule |
 | DELETE | `/identity/rules/{rule_id}` | Revoke a standing rule |
 | POST | `/identity/candidates/{candidate_id}/clear-veto` | Request one veto clearance |
@@ -50,6 +50,11 @@ field is validated; a malformed optional field rejects the whole rule. Names use
 Unicode `fold()` before storage, and validation shares the pipeline rule parser. Rule expiration
 uses `expires_at`, defaulting to 180 days; revocation records a timestamp and retains history.
 
+`GET /identity/rules` uses keyset pagination ordered by `(created_at, id)`. `limit` defaults
+to 50 and accepts 1–200; pass the opaque `page.next_cursor` back as `cursor`. A null cursor
+means the history is exhausted. Revoked and expired rules remain in this paged history.
+Malformed cursors return an enveloped 400; invalid limits return an enveloped 422.
+
 Rules may be created for any group. Automatic rule attachment still requires the target to have
 an explicit group whose `auto_inherit` is 1. In other groups the pipeline requests confirmation;
 creating a rule does not bypass that gate. Revoking or expiring a rule does not detach a MAC
@@ -62,14 +67,22 @@ Retiring its target does not prevent revocation.
 Acceptance checks both the caller's device versions and the suggestion's stored basis under
 one overrides write transaction. Expired suggestions, retired/orphaned devices, aliases, and
 merge candidates outside `open`/`suggested` cannot be accepted. Merge acceptance checks current
-inventory activity as well. Inventory checks are read-only; there is no cross-database atomic
-transaction with the pipeline's independently changing inventory.
+inventory activity and components in read transactions before acquiring the overrides writer
+lock, then revalidates the exact links and device versions with indexed lookups under the lock.
+Oversized components, observation/activity inputs, or alias flattening return 409
+(`merge_too_large`, requiring an operator) before any mutation.
+The defaults in API `config.py` are 256 combined component IDs (`MAX_MERGE_ALIASES`),
+1024 observations (`MAX_MERGE_OBSERVATIONS`), 8192 activity rows
+(`MAX_MERGE_ACTIVITY_ROWS`), and 256 link writes (`MAX_MERGE_FLATTEN_WRITES`).
+Operators can set the corresponding `VIGIE_API_MAX_MERGE_*` environment variables.
 
 Merge acceptance records one identity link, merge history, the suggestion decision, version
 increments, and an audit entry together. Repeating an accepted request returns its recorded
 result without another decision or link. Rejection records a decision without changing device
 classification or trust. Undo revokes the link and retains history; repeating an undo is a no-op.
 Device versions protect undo against intervening human changes.
+Remembered-rule approval includes the complete inserted rule in the same transaction's audit
+entry, including signature, expiry, target group, and creator.
 Undo also revokes a rule created by that merge's `remember: true` approval, so it requires
 `rules:write` when it revokes that rule. Independently created rules remain separate approvals.
 
@@ -77,9 +90,11 @@ Undo also revokes a rule created by that merge's `remember: true` approval, so i
 
 Clearing records an audited `candidate_decisions` intent in `overrides.db`, keyed by candidate
 id and its exact ordered device pair. It never updates inventory from the API. The next pipeline
-pass consumes that intent once, marks the matching veto `dismissed` in inventory, and performs
+pass consumes that intent once, marks the matching veto `cleared` in inventory, and performs
 a fresh compute/apply cycle. A clearance alone never attaches a MAC, and current overlap still
-blocks attachment. A consumed clearance cannot clear any later veto again.
+blocks attachment and establishes a fresh sticky veto. That veto survives evidence retention;
+another audited clearance is required. A consumed clearance cannot clear any later veto again.
+An ordinary dismissed suggestion keeps its existing sticky semantics.
 
 ## Write costs and safety
 
@@ -89,6 +104,32 @@ new audit rows. Request ids correlate audit entries without including bearer cre
 The existing body-size cap and per-token rate limiter apply to every new write endpoint.
 
 Reads, token verification, failed requests, and idempotent retries do not stamp tokens or update
-counters in SQLite. Every actual overrides commit invalidates an in-flight pipeline attach plan
-through `PRAGMA data_version`, delaying those attaches by one pass. Rate limiting bounds this
-availability cost; it does not weaken the attach checks.
+counters in SQLite. `identity_version.version` advances in the same transaction as
+attach-relevant changes: rules, links, candidate/clear-veto decisions, suggestion decisions,
+device group changes, and group `auto_inherit` changes. The pipeline reads it in its snapshot
+and compares it immediately before each attach. It also checks the schema version to fail
+closed on concurrent schema changes. A relevant write drops remaining attaches for
+that pass; the next pass recomputes. Repeated relevant writes can keep delaying attachment.
+Token lifecycle, audit/receipt/history-only writes, and device `name`, `owner`, `type`, version
+and update metadata alone are irrelevant to attach authorization and do not delay attaches.
+Inventory `identity_state` is checked separately under the pipeline lock; the API exposes no
+override for it. Old overrides schemas without the version table retain the conservative
+`PRAGMA data_version` fallback, where any commit delays the pass's remaining attaches.
+
+The write-path policy test enumerates every SQL mutation in `vigie_api/*writes*.py`.
+Its explicit irrelevant-table allowlist is `audit_log` (audit history), `api_write_receipts`
+(retry receipts), and `identity_merges` (undo history; live authorization resides in links,
+rules, and decisions). Label-only `device_overrides` writes are excluded by column-sensitive
+triggers. Token writes in `tokens.py` are also irrelevant. Changes to this policy require an
+explicit classification in the test; table triggers ensure relevant bumps share the mutation's
+transaction, including direct group and `auto_inherit` edits.
+
+## Accepted residual risk
+
+- **Cross-database acceptance race.** Inventory and overrides are separate databases. The API's
+  read-only inventory mounts cannot take a cross-process lock spanning inventory checks and
+  the overrides commit. A merge acceptance can therefore rest on inventory checks that the
+  pipeline has since made stale. The pipeline revalidates on its next pass and flags conflicts;
+  acceptance does not provide a cross-database atomic snapshot through commit.
+- **Attach availability.** Relevant writes delay attaches by one pass; irrelevant writes do
+  not. Sustained relevant changes can keep invalidating plans despite per-token rate limits.

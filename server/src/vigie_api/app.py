@@ -275,7 +275,10 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         tags=["devices"],
         summary="Set or clear overrides",
         response_model=PatchResponse,
-        responses={200: ETAG_HEADER, **_errors(400, 401, 404, 409, 412, 413, 422, 428, 429, 503)},
+        responses={
+            200: ETAG_HEADER,
+            **_errors(400, 401, 403, 404, 409, 412, 413, 422, 428, 429, 503),
+        },
     )
     def patch_device(
         request: Request,
@@ -484,13 +487,20 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         tags=["identity"],
         response_model=RulesResponse,
         description=(
-            "Read-only list including revoked and expired rules with computed active "
-            "state. Authentication and rate limiting never write token-use stamps."
+            "Keyset-paginated rule history ordered by (created_at, id), including revoked "
+            "and expired rules with computed active state. Pass page.next_cursor as cursor. "
+            "Authentication and rate limiting never write token-use stamps."
         ),
-        responses=_errors(401, 422, 429),
+        responses=_errors(400, 401, 422, 429),
     )
-    def get_rules(_: Principal, ov: Ov):
-        return envelope(identity_writes.list_rules(ov, iso_utc(clock())))
+    def get_rules(
+        _: Principal,
+        ov: Ov,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    ):
+        items, nxt = identity_writes.list_rules(ov, iso_utc(clock()), limit=limit, cursor=cursor)
+        return envelope(items, page={"next_cursor": nxt})
 
     @app.post(
         "/identity/rules",

@@ -12,7 +12,7 @@ from typing import Any
 
 from vigie_api import writes
 from vigie_api.config import Settings
-from vigie_api.effective import link_map, resolve
+from vigie_api.effective import decode_cursor, encode_cursor, link_map, resolve
 from vigie_api.errors import ApiError
 from vigie_api.models import DevicePatch
 from vigie_api.textsafe import display_json, has_forbidden
@@ -714,9 +714,31 @@ def clear_veto(inv, ov, *, candidate_id, body, principal, now, request_id):
     )
 
 
-def list_rules(ov, now):
+def list_rules(ov, now, *, limit=50, cursor=None):
+    after = ("", "")
+    if cursor:
+        try:
+            value = json.loads(decode_cursor(cursor))
+        except (ValueError, TypeError) as exc:
+            raise ApiError(400, "invalid_cursor", "malformed cursor") from exc
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or not all(isinstance(part, str) and part for part in value)
+        ):
+            raise ApiError(400, "invalid_cursor", "malformed cursor")
+        try:
+            for part in value:
+                part.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ApiError(400, "invalid_cursor", "malformed cursor") from exc
+        after = tuple(value)
+    found = ov.execute(
+        "SELECT * FROM identity_rules WHERE (created_at,id) > (?,?) ORDER BY created_at,id LIMIT ?",
+        (*after, limit + 1),
+    ).fetchall()
     result = []
-    for row in ov.execute("SELECT * FROM identity_rules ORDER BY created_at,id"):
+    for row in found[:limit]:
         item = dict(row)
         try:
             item["signature"] = json.loads(row["signature"])
