@@ -80,123 +80,53 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         )""",
     ),
     (
-        # identity stitching: per-MAC activity intervals derived from the raw shards (7 d
-        # retention, like raw). `end` is quoted because END is an SQL keyword.
+        # Identity stitching (docs/stitching.md), one additive migration. Main's v3 has no
+        # stitching table, so nothing here has a legacy shape to migrate from.
+        # Per-MAC activity intervals derived from the raw shards (7 d retention, like raw); at
+        # most INTERVALS_PER_MAC rows per MAC. `end` is quoted because END is an SQL keyword.
         """CREATE TABLE IF NOT EXISTS mac_activity (
           mac TEXT NOT NULL, start INTEGER NOT NULL, "end" INTEGER NOT NULL,
           PRIMARY KEY (mac, start)
         )""",
         'CREATE INDEX IF NOT EXISTS idx_mac_activity_end ON mac_activity("end")',
-        # one candidate row per (from, into) pair
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
-        " ON identity_candidates(device_a, device_b)",
-    ),
-    (
-        # indexed once-only guard for stitching events (replaces an instr() scan of summaries)
+        # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity anchor
+        "CREATE TABLE IF NOT EXISTS mac_first_received ("
+        "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
+        # spans in which evidence from ANY collector is known to be missing (stamps dropped for
+        # the report lag); merged within one activity gap at write time, pruned with the activity
+        'CREATE TABLE IF NOT EXISTS evidence_gaps (start INTEGER NOT NULL, "end" INTEGER NOT NULL)',
+        'CREATE INDEX IF NOT EXISTS idx_evidence_gaps_end ON evidence_gaps("end")',
+        # What justified a rule attach, fixed at attach time: the fields each matched rule
+        # required (views) and the MAC's values then. The re-check uses these, so renaming an
+        # attached MAC (or revoking/expiring its rule) cannot erase the evidence of a later overlap.
+        "CREATE TABLE IF NOT EXISTS rule_attachments ("
+        "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
+        " hostname TEXT, mdns_name TEXT, opt55 TEXT, opt60 TEXT, views TEXT NOT NULL,"
+        " attached_at TEXT NOT NULL)",
+        # small key/value state of the stitcher (round-robin cursors)
+        "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        # indexed once-only guard for stitching events
         "ALTER TABLE events ADD COLUMN dedup TEXT",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
         " WHERE dedup IS NOT NULL",
-    ),
-    (
-        # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity
-        # anchor. Legacy rows fall back to their earliest stored stamp.
-        "CREATE TABLE IF NOT EXISTS mac_first_received ("
-        "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
-        "INSERT OR IGNORE INTO mac_first_received (mac, received)"
-        " SELECT mac, MIN(start) FROM mac_activity GROUP BY mac",
-        # small key/value state of the stitcher (re-check cursor)
-        "CREATE TABLE IF NOT EXISTS stitch_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        # suggestion look-ups are by (action, device_ids): no table scan inside the write lock
+        # one candidate row per (from, into) pair; vetoes looked up from either endpoint
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
+        " ON identity_candidates(device_a, device_b)",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b, device_a)",
+        # suggestion look-ups by pair and by target device: never a table scan inside the lock
         "CREATE INDEX IF NOT EXISTS idx_suggestions_pair"
         " ON suggestions(action, device_ids, expires_at)",
-        # Migration 5 added events.dedup but left it NULL on rows written before it: give the
-        # recognised stitching events their token (same format as the emit_once call sites) so the
-        # once-only guard keeps holding. UPDATE OR IGNORE: a legacy duplicate that would break the
-        # unique index keeps NULL (nothing is deleted).
-        "UPDATE OR IGNORE events SET dedup = substr(summary, length('identity overlap veto ') + 1)"
-        " WHERE dedup IS NULL AND kind = 'identity_overlap_veto'"
-        " AND summary LIKE 'identity overlap veto %'",
-        "UPDATE OR IGNORE events SET dedup = device_id"
-        " WHERE dedup IS NULL AND kind = 'identity_candidate_ambiguous' AND device_id IS NOT NULL",
-        "UPDATE OR IGNORE events SET dedup = substr(summary, length('identity candidate ') + 1,"
-        " instr(summary, ' score ') - length('identity candidate ') - 1)"
-        " WHERE dedup IS NULL AND kind = 'identity_candidate'"
-        " AND summary LIKE 'identity candidate % score %'",
-        "UPDATE OR IGNORE events SET dedup = substr(summary, length('rule attach suspect ') + 1, 8)"
-        " || '~' || device_id WHERE dedup IS NULL AND kind = 'rule_attach_suspect'"
-        " AND device_id IS NOT NULL AND summary LIKE 'rule attach suspect %'",
-        "UPDATE OR IGNORE events SET dedup = substr(summary, length('signature flood ') + 1, 8)"
-        " || ':' || substr(ts, 1, 10) WHERE dedup IS NULL AND kind = 'signature_flood'"
-        " AND summary LIKE 'signature flood %'",
-        "UPDATE OR IGNORE events SET dedup = substr(ts, 1, 10)"
-        " WHERE dedup IS NULL AND kind = 'stitch_budget_exhausted'",
-        "UPDATE OR IGNORE events SET dedup = 'summary:' || substr(ts, 1, 10)"
-        " WHERE dedup IS NULL AND kind = 'signature_flood_summary'",
-    ),
-    (
-        # What justified a rule attach, fixed at attach time: the name fields the rule required
-        # and the MAC's values then. The re-check uses these, so renaming an attached MAC (or
-        # revoking/expiring its rule) cannot erase the evidence of a later overlap.
-        "CREATE TABLE IF NOT EXISTS rule_attachments ("
-        "mac TEXT PRIMARY KEY, rule_id TEXT NOT NULL, target TEXT NOT NULL,"
-        " hostname TEXT, mdns_name TEXT, attached_at TEXT NOT NULL)",
-    ),
-    (
-        # the fingerprints at attach time too (the re-check searches the same buckets), and the
-        # evidence gaps: periods in which a collector's evidence is known to be missing
-        "ALTER TABLE rule_attachments ADD COLUMN opt55 TEXT",
-        "ALTER TABLE rule_attachments ADD COLUMN opt60 TEXT",
-        "CREATE TABLE IF NOT EXISTS collector_gaps ("
-        'collector_id TEXT NOT NULL, start INTEGER NOT NULL, "end" INTEGER NOT NULL,'
-        " recorded INTEGER NOT NULL)",
-        'CREATE INDEX IF NOT EXISTS idx_collector_gaps_end ON collector_gaps("end")',
-    ),
-    (
-        # Migration 6 anchored legacy MACs at their earliest stored COLLECTOR stamp (untrusted).
-        # Re-anchor those rows (anchor == earliest stored stamp) at the migration time on the
-        # server clock and mark them legacy; honest rows (a server receipt time) are untouched.
-        "ALTER TABLE mac_first_received ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
-        "UPDATE mac_first_received SET legacy = 1,"
-        " received = MAX(received, CAST(strftime('%s', 'now') AS INTEGER))"
-        " WHERE received = (SELECT MIN(start) FROM mac_activity a"
-        " WHERE a.mac = mac_first_received.mac)",
-    ),
-    (
-        # each matched rule's own field mask (JSON list of [hostname, mdns] booleans): the
-        # re-check rebuilds EVERY view separately instead of one stricter union
-        "ALTER TABLE rule_attachments ADD COLUMN views TEXT",
-        # permanent vetoes looked up from either endpoint without IN lists over a whole merge
-        # component (the other side, device_a, is the leading column of uq_candidates_pair)
-        "CREATE INDEX IF NOT EXISTS idx_candidates_vetoed_b ON identity_candidates(device_b,"
-        " device_a) WHERE state = 'vetoed'",
-        # historical fingerprint matches, independent of activity: oldest first per name
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_into"
+        " ON suggestions(action, json_extract(device_ids, '$[1]'), expires_at)",
+        # neighbourhood lookups: (fingerprint, name) buckets newest-last_seen first, the
+        # fingerprint by first sighting, and the rule-attached MACs
         "CREATE INDEX IF NOT EXISTS idx_obs_fp_host ON observations(dhcp_fingerprint,"
-        " vendor_class, hostname COLLATE NOCASE, first_seen)",
+        " vendor_class, hostname COLLATE NOCASE, last_seen)",
         "CREATE INDEX IF NOT EXISTS idx_obs_fp_mdns ON observations(dhcp_fingerprint,"
-        " vendor_class, mdns_name COLLATE NOCASE, first_seen)",
-        # active-MAC summary (kept by a trigger): enumeration never touches stale intervals
-        "CREATE TABLE IF NOT EXISTS mac_last_seen ("
-        "mac TEXT PRIMARY KEY, last_end INTEGER NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_mac_last_seen_end ON mac_last_seen(last_end, mac)",
-        'INSERT OR REPLACE INTO mac_last_seen (mac, last_end) SELECT mac, MAX("end")'
-        " FROM mac_activity GROUP BY mac",
-        "CREATE TRIGGER IF NOT EXISTS trg_mac_last_seen AFTER INSERT ON mac_activity BEGIN"
-        ' INSERT INTO mac_last_seen (mac, last_end) VALUES (NEW.mac, NEW."end")'
-        ' ON CONFLICT(mac) DO UPDATE SET last_end = MAX(last_end, NEW."end"); END',
-        # Provenance of anchors made before this point cannot be told apart (migration 6 used
-        # collector stamps; later ones server receipts, but the difference was never recorded).
-        # Conservative reset: EVERY existing anchor moves to max(anchor, migration time) and is
-        # marked legacy; only rows written after this migration count as server-receipt anchors.
-        "UPDATE mac_first_received SET legacy = 1,"
-        " received = MAX(received, CAST(strftime('%s', 'now') AS INTEGER))",
-    ),
-    (
-        # which collectors saw a MAC: an evidence gap of a collector only matters to the MACs that
-        # collector saw (a MAC with no row here is treated as seen by every collector)
-        "CREATE TABLE IF NOT EXISTS mac_collectors ("
-        "mac TEXT NOT NULL, collector_id TEXT NOT NULL, PRIMARY KEY (mac, collector_id))",
-        # suggestions that point INTO a retired orphan are found through the pair index
-        "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b)",
+        " vendor_class, mdns_name COLLATE NOCASE, last_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_first ON observations(dhcp_fingerprint,"
+        " vendor_class, first_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_rule ON observations(mac) WHERE link_source = 'rule'",
     ),
 )
 
@@ -210,11 +140,9 @@ PIPELINE_TABLES = (
     "suggestions",
     "mac_activity",
     "mac_first_received",
-    "stitch_state",
+    "evidence_gaps",
     "rule_attachments",
-    "collector_gaps",
-    "mac_last_seen",
-    "mac_collectors",
+    "stitch_state",
 )
 
 

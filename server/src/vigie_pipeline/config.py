@@ -32,33 +32,28 @@ ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (co
 # neither toward maturity nor toward the time apart from a peer.
 ACTIVITY_MAX_REPORT_LAG_S = 3600
 SUGGESTION_TTL_DEFAULT_S = 7 * 86400
-# Flood bounds (docs/stitching.md section 12): a signature (opt55, opt60) shared by more MACs than
-# this is skipped for the pass; at most this many candidate/suggestion rows are written per pass.
-MAX_SIGNATURE_BUCKET = 64
-MAX_ROWS_PER_PASS = 200
-# CPU bounds inside the stitching transaction (docs/stitching.md section 12): at most this many
-# most-recent activity intervals are considered per MAC, and at most this many interval-overlap
-# computations are charged per pass; when the budget runs out the pass stops stitching new
-# candidates (the rest resume next pass) and emits one stitch_budget_exhausted event per UTC day.
-MAX_INTERVALS_PER_MAC = 64
-MAX_OVERLAP_OPS_PER_PASS = 20000
-# The stitching transaction holds the inventory write lock: after this many seconds it stops at the
-# next safe point (before the write of the decision in flight) and emits stitch_budget_exhausted.
-STITCH_MAX_TXN_SECONDS = 3
-# Loading the inventory (setup) may take this long before the pass gives up and releases the lock;
-# the transaction time-box above is then split into equal slices, one per phase, after setup.
-STITCH_SETUP_MAX_SECONDS = 2
-# A merge component (devices that are one identity) whose smaller side of a pair is larger than
-# this is not decided automatically (deferred to a human, reported as alias_component_oversize).
+
+# ---- bounds (docs/stitching.md section 3; every one holds by construction) -----------------
+# Subjects (self MACs; rule-attached MACs) examined per round-robin per pass.
+MACS_PER_PASS = 256
+# Wall-clock budget of the read-only COMPUTE phase; it stops between subjects, the cursor persists.
+STITCH_COMPUTE_BUDGET_S = 5.0
+# Rows one indexed neighbourhood lookup may return; one more means the evidence is incomplete.
+BUCKET_ROWS = 1024
+# Distinct (opt55, opt60, name) keys a target identity may contribute; more is incomplete evidence.
+TARGET_KEYS = 16
+# mac_activity rows kept per MAC (the closest intervals are coalesced at fold time: conservative).
+INTERVALS_PER_MAC = 64
+# A merge component (devices that are one identity) larger than this is not decided automatically.
 MAX_ALIAS_IDS = 5000
-# Older identities without retained activity are looked up by (fingerprint, name), oldest first,
-# at most this many per key.
-HISTORIC_MATCH_LIMIT = 16
-# At most this many MACs (the newest active ones) are loaded per pass; a spray cannot make the
-# setup unbounded. With more, stitch_active_set_capped is emitted (once a day).
-MAX_ACTIVE_MACS = 20000
-# At most this many signature_flood events per pass; further new floods get one daily summary.
-MAX_FLOOD_EVENTS_PER_PASS = 20
+# A name group / compatible pool with more LIVE self MACs than this is a flood (nothing attaches).
+MAX_SIGNATURE_BUCKET = 64
+# Candidate + suggestion rows written per APPLY (a decision is reserved whole or not written).
+MAX_ROWS_PER_PASS = 200
+# Rule attaches per APPLY.
+MAX_ATTACHES_PER_PASS = 20
+# Open merge suggestions pointing INTO one device; more wait (bounds the orphan cleanup at attach).
+MAX_OPEN_SUGGESTIONS_PER_DEVICE = 64
 
 
 def _opt_path(value: str | None) -> Path | None:

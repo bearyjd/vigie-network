@@ -37,7 +37,7 @@ def test_upgrade_preserves_rows_in_rowid_order(tmp_path, monkeypatch):
     conn = open_pipeline_inventory(path)
     rows = conn.execute("SELECT seq, id, kind FROM events ORDER BY seq").fetchall()
     assert [(r[0], r[1]) for r in rows] == [(1, "zzz"), (2, "aaa"), (3, "mmm")]
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 4
     cols = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
     assert {"seq", "id", "device_id", "ts", "kind", "severity", "summary"} <= set(cols)
 
