@@ -11,6 +11,7 @@ from stitch_helpers import NOW_ABS, OLD, RULE_SNAP, inv  # noqa: F401
 from vigie_pipeline.config import MAX_ROWS_PER_PASS
 from vigie_pipeline.overrides import canonical_device
 from vigie_pipeline.snapshot import EMPTY, CandidateDecision, load_snapshot
+from vigie_pipeline.stitch_apply import apply_candidate_decisions
 
 
 def decision_snapshot(*, candidate="c1", a="A", b="D", decision="decision-1"):
@@ -51,9 +52,10 @@ def test_clear_consumes_read_only_decision_without_attaching(inv):
     )
     veto(inv)
     snap = decision_snapshot()
-    stats = inv.stitch(snap)
-    assert state(inv) == "dismissed"
-    assert stats.attached == 0
+    inv.commit()
+    apply_candidate_decisions(inv.db, snap)
+    assert state(inv) == "cleared"
+    assert inv.db.execute("SELECT COUNT(*) FROM rule_attachments").fetchone()[0] == 0
     assert inv.link_of(subject) == ("A", "self")
 
 
@@ -68,12 +70,12 @@ def test_consumed_clear_cannot_remove_a_later_veto(inv):
     veto(inv)
     snap = decision_snapshot()
     inv.stitch(snap)
-    assert state(inv) == "dismissed"
+    assert state(inv) == "cleared"
     inv.db.execute("UPDATE identity_candidates SET state='vetoed'")
     inv.stitch(snap)
     assert state(inv) == "vetoed"
     inv.stitch(decision_snapshot(decision="decision-2"))
-    assert state(inv) == "dismissed"
+    assert state(inv) == "cleared"
 
 
 def test_mismatched_decision_cannot_clear_a_future_matching_veto(inv):
@@ -101,7 +103,7 @@ def test_clear_work_is_bounded_and_remaining_decisions_progress_next_pass(inv):
     inv.stitch(snap)
     assert (
         inv.db.execute(
-            "SELECT COUNT(*) FROM identity_candidates WHERE state='dismissed'"
+            "SELECT COUNT(*) FROM identity_candidates WHERE state='cleared'"
         ).fetchone()[0]
         == limit
     )
@@ -135,6 +137,30 @@ def test_clear_does_not_bypass_real_overlap(inv):
     cleared = decision_snapshot()
     snap = replace(RULE_SNAP, candidate_decisions=cleared.candidate_decisions)
     assert inv.stitch(snap).attached == 0
+    assert state(inv) == "vetoed"
+    assert inv.link_of(subject) == ("A", "self")
+
+
+@pytest.mark.parametrize("fresh_rule", [False, True])
+def test_clear_then_fresh_overlap_remains_vetoed_after_activity_retention(inv, fresh_rule):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 6000, NOW_ABS)], rand=0)
+    subject = inv.mac(
+        "A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)]
+    )
+    veto(inv)
+    cleared = decision_snapshot()
+    snap = replace(RULE_SNAP, candidate_decisions=cleared.candidate_decisions)
+    inv.commit()
+    apply_candidate_decisions(inv.db, snap)
+    assert inv.stitch(snap if fresh_rule else cleared).attached == 0
+
+    later = NOW_ABS + inv.cfg.activity_retention_s + 6000
+    inv.db.execute(
+        'DELETE FROM mac_activity WHERE "end" < ?', (later - inv.cfg.activity_retention_s,)
+    )
+    inv.act(subject, [(later - 3000, later)])
+    assert inv.stitch(snap, now=later).attached == 0
+    assert state(inv) == "vetoed"
     assert inv.link_of(subject) == ("A", "self")
 
 

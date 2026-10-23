@@ -347,9 +347,11 @@ class Applier:
 def apply_candidate_decisions(inv: sqlite3.Connection, snap: Snapshot) -> None:
     """Consume human clears before COMPUTE, never attaching or changing observations.
 
-    A receipt in inventory makes each decision id one-shot, including stale decisions whose
-    candidate no longer matches. A later clear requires a new API decision id. Select outside
-    the writer lock, then recheck receipts and exact candidate id/pair/state under the lock.
+    A clear resets the veto to a nonsticky state so fresh overlap can veto it again; it does
+    not dismiss the candidate. A receipt makes each decision id one-shot, including stale
+    decisions whose candidate no longer matches. A later clear requires a new API decision id.
+    Select outside the writer lock, then recheck receipts and exact candidate id/pair/state
+    under the lock.
     At most MAX_ROWS_PER_PASS rows are written in this separate bounded transaction.
     """
     pending = []
@@ -366,7 +368,7 @@ def apply_candidate_decisions(inv: sqlite3.Connection, snap: Snapshot) -> None:
             if state_get(inv, key) is not None:
                 continue
             inv.execute(
-                "UPDATE identity_candidates SET state='dismissed'"
+                "UPDATE identity_candidates SET state='cleared'"
                 " WHERE id=? AND device_a=? AND device_b=? AND state='vetoed'",
                 (decision.candidate_id, decision.device_a, decision.device_b),
             )

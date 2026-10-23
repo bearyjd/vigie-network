@@ -85,8 +85,9 @@ def upsert_candidate(
     inv: sqlite3.Connection, a: str, b: str, score: float, evidence: dict, state: str, now: float
 ) -> tuple[str, bool]:
     """One row per (from, into). Returns (id, row_written). 'dismissed' and 'vetoed' are sticky
-    (no later evidence or capped window rewrites them) and an identical row is not rewritten, so
-    the write is the unit the per-pass cap charges."""
+    (no later evidence or capped window rewrites them). A human-cleared veto is 'cleared', which
+    fresh evidence can replace, including with another veto. An identical row is not rewritten,
+    so the write is the unit the per-pass cap charges."""
     text = json.dumps(evidence, sort_keys=True)
     row = _candidate_row(inv, a, b)
     if row is None:

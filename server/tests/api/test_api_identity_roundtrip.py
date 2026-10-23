@@ -275,7 +275,7 @@ def test_api_clear_needs_rule_and_fresh_nonoverlap_before_attachment(
         env.inv.execute("SELECT state FROM identity_candidates WHERE id='blocked-veto'").fetchone()[
             "state"
         ]
-        == "dismissed"
+        == ("vetoed" if active_rule_with_overlap else "suggested")
     )
     resolved = env.get(f"/macs/{ALIAS_MAC}").json()["data"]
     assert resolved["device_id"] == "alias" and resolved["link_source"] == "self"
