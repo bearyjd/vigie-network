@@ -150,15 +150,35 @@ fresh install; reapply is a no-op.
 | malformed rule on the target | target becomes suggestion-only | attach_rules: `test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion` |
 
 ## 9. Tests: deleted or replaced (by file)
-- `test_stitch_perf.py`, `test_stitch_review*.py` (1..7): split by topic into the six files
-  below; tests of removed machinery are dropped: per-phase budgets and time-box slices
-  (`FakeTime`, `Ticking`, `_charge` assertions), setup cap / partial setup, `mac_last_seen`
-  trigger/summary, `mac_collectors`, per-collector gap events, `MAX_GAPS_PER_COLLECTOR`,
-  `signature_flood_summary`, `stitch_active_set_capped`, legacy anchors / migration 6..11
-  shapes, `settle:` markers, HISTORIC_MATCH_LIMIT, interval-cap laundering (the cap is now at
-  write time and conservative). Every behavioural assertion is kept.
-- New files: `test_stitch_attach_rules.py`, `test_stitch_veto_overlap.py`,
-  `test_stitch_evidence_recheck.py`, `test_stitch_maturity_activity.py`,
-  `test_stitch_bounds_perf.py`, `test_stitch_migrations.py`; `test_stitching.py` and
-  `test_stitch_rules.py` are folded into them. `tools/trafficgen/tests/test_stitching.py` is kept
-  verbatim.
+`test_stitching.py`, `test_stitch_rules.py`, `test_stitch_perf.py` and `test_stitch_review.py`
+.. `test_stitch_review7.py` are replaced by six topic files (`test_stitch_attach_rules.py`,
+`test_stitch_veto_overlap.py`, `test_stitch_evidence_recheck.py`,
+`test_stitch_maturity_activity.py`, `test_stitch_bounds_perf.py`, `test_stitch_migrations.py`)
+sharing `stitch_helpers.py`. Every behavioural assertion was carried over; the tests below were
+dropped because the machinery they pinned no longer exists:
+- per-phase work budgets, time-box slices and the setup cap (`MAX_OVERLAP_OPS_PER_PASS`,
+  `STITCH_MAX_TXN_SECONDS`, `STITCH_SETUP_MAX_SECONDS`, `BudgetExhaustedError`, `_charge`,
+  `FakeTime`/`Ticking` clocks, `partial` setups, "only the re-check ran", "budget event names the
+  phase", "withdrawals charged before the first update", "lookups charged to the budget");
+- the active-set cap and the trigger-kept summary (`MAX_ACTIVE_MACS`, `mac_last_seen`,
+  `active_macs` paging, "newest first", "enumeration never touches stale rows");
+- per-collector gaps and `mac_collectors` ("a gap of a collector that saw neither side does not
+  block" is the one behaviour deliberately given up; `MAX_GAPS_PER_COLLECTOR`, the per-collector
+  `evidence_gap` event: replaced by `stitch_deferred (evidence_gap)`);
+- legacy anchors and the migration 6..11 shapes (there is one migration; main has no anchors);
+- `settle:` markers and the capped orphan cleanup (the cleanup is bounded by construction);
+- `HISTORIC_MATCH_LIMIT` ("historical matches are limited oldest first": a complete bucket holds
+  every older identity, a truncated one degrades);
+- the per-pass flood event cap and `signature_flood_summary`;
+- the read-time interval cap ("keeps the newest intervals", "cap cannot launder a veto": the cap is
+  now at fold time and only adds presence; sticky vetoes keep their own tests);
+- in-memory map bookkeeping after an attach (`_moved`, cache resets, "undecided MACs first");
+- the legacy re-check fallbacks for attachments without a `rule_attachments` row or without stored
+  views (a missing row is now itself flagged).
+`tools/trafficgen/tests/test_stitching.py` is kept verbatim and passes unchanged.
+
+## 10. Behaviour deliberately changed (addendum)
+7. A candidate subject whose neighbourhood is truncated writes nothing (the oldest identity may
+   be hidden) and raises the daily `stitch_deferred (truncated)` event.
+8. A rule-attached MAC without a `rule_attachments` row is flagged `rule_attach_suspect` (evidence
+   missing) rather than re-checked against guessed names.
