@@ -44,6 +44,8 @@ BUCKET_ROWS = 1024
 TARGET_KEYS = 16
 # mac_activity rows kept per MAC (the closest intervals are coalesced at fold time: conservative).
 INTERVALS_PER_MAC = 64
+# Maximum retention rows deleted (or maturity anchors examined) per table per pass.
+PRUNE_BATCH_ROWS = 1000
 # A merge component (devices that are one identity) larger than this is not decided automatically.
 MAX_ALIAS_IDS = 5000
 # A name group / compatible pool with more LIVE self MACs than this is a flood (nothing attaches).

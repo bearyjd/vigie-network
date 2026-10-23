@@ -203,7 +203,7 @@ def test_stored_folds_are_recomputed_when_the_fold_version_changes(tmp_path):
     assert conn.execute("SELECT hostname_fold FROM observations").fetchone()[0] == fold("ß́-PC")
 
 
-def test_a_fold_recompute_is_resumable_and_terminates_on_empty_names(tmp_path):
+def test_a_fold_recompute_is_resumable_and_terminates_on_empty_names(tmp_path, monkeypatch):
     from vigie_pipeline.schema import refresh_folds
     from vigie_pipeline.stitch_types import fold
 
@@ -217,7 +217,17 @@ def test_a_fold_recompute_is_resumable_and_terminates_on_empty_names(tmp_path):
     )
     conn.execute("UPDATE pipeline_meta SET value='stale' WHERE key='fold_version'")
     conn.execute("COMMIT")
-    assert refresh_folds(conn, chunk=2000) == 5000
+    write_folds = schema._write_folds
+
+    def interrupt_after_chunk(*args, **kwargs):
+        write_folds(*args, **kwargs)
+        raise RuntimeError("interrupted after a committed chunk")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(schema, "_write_folds", interrupt_after_chunk)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            refresh_folds(conn, chunk=2000)
+    assert refresh_folds(conn, chunk=2000) == 3000
     rows = conn.execute(
         "SELECT COUNT(*) FROM observations WHERE hostname_fold=?", (fold("Host7"),)
     ).fetchone()
@@ -229,3 +239,74 @@ def test_a_fold_recompute_is_resumable_and_terminates_on_empty_names(tmp_path):
         == 0
     )
     assert refresh_folds(conn) == 0
+
+
+@pytest.mark.parametrize("version_changed", ["fold", "unicode", "legacy", "rollback"])
+def test_interrupted_fold_recompute_restarts_when_target_version_changes(
+    tmp_path, monkeypatch, version_changed
+):
+    import unicodedata
+
+    from vigie_pipeline import stitch_types
+
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
+    conn.executemany(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen, hostname_fold, mdns_fold)"
+        " VALUES (?,'d',1,?,?,'self','t','t','stale','stale')",
+        [(f"m{i}", f"Host{i}", f"Name{i}") for i in range(4)],
+    )
+    completed = schema._fold_marker() if version_changed == "rollback" else "stale"
+    conn.execute("UPDATE pipeline_meta SET value=? WHERE key='fold_version'", (completed,))
+    write_folds = schema._write_folds
+
+    def interrupt_after_chunk(*args, **kwargs):
+        write_folds(*args, **kwargs)
+        raise RuntimeError("interrupted after a committed chunk")
+
+    with monkeypatch.context() as old_version:
+        if version_changed == "unicode":
+            old_version.setattr(unicodedata, "unidata_version", "old-unicode")
+        elif version_changed == "rollback":
+            old_version.setattr(schema, "FOLD_VERSION", schema.FOLD_VERSION + 1)
+        else:
+            old_version.setattr(schema, "FOLD_VERSION", schema.FOLD_VERSION - 1)
+        old_version.setattr(stitch_types, "fold", lambda name: f"old:{name}")
+        old_version.setattr(schema, "_write_folds", interrupt_after_chunk)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            schema.refresh_folds(conn, chunk=2)
+        assert (
+            conn.execute(
+                "SELECT value FROM pipeline_meta WHERE key='fold_cursor_version'"
+            ).fetchone()[0]
+            == schema._fold_marker()
+        )
+
+    if version_changed == "legacy":
+        conn.execute("DELETE FROM pipeline_meta WHERE key='fold_cursor_version'")
+    assert (
+        conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_cursor'").fetchone()[0]
+        == "m1"
+    )
+    assert (
+        conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()[0]
+        == completed
+    )
+    assert schema.refresh_folds(conn, chunk=2) == 4
+    rows = conn.execute(
+        "SELECT hostname, mdns_name, hostname_fold, mdns_fold FROM observations ORDER BY mac"
+    ).fetchall()
+    assert [(r[2], r[3]) for r in rows] == [
+        (stitch_types.fold(r[0]), stitch_types.fold(r[1])) for r in rows
+    ]
+    assert (
+        conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()[0]
+        == schema._fold_marker()
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM pipeline_meta WHERE key IN ('fold_cursor', 'fold_cursor_version')"
+        ).fetchone()[0]
+        == 0
+    )

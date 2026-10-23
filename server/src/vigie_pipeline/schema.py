@@ -92,6 +92,8 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         # SERVER time (batch receipt) a MAC was first folded into mac_activity: the maturity anchor
         "CREATE TABLE IF NOT EXISTS mac_first_received ("
         "mac TEXT PRIMARY KEY, received INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_mac_first_received_received"
+        " ON mac_first_received(received, mac)",
         # spans in which evidence from ANY collector is known to be missing (stamps dropped for
         # the report lag); merged within one activity gap at write time, pruned with the activity
         'CREATE TABLE IF NOT EXISTS evidence_gaps (start INTEGER NOT NULL, "end" INTEGER NOT NULL)',
@@ -118,6 +120,10 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
         " ON identity_candidates(device_a, device_b)",
         "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b, device_a)",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_open_a ON identity_candidates(device_a)"
+        " WHERE state IN ('open','suggested')",
+        "CREATE INDEX IF NOT EXISTS idx_candidates_open_b ON identity_candidates(device_b)"
+        " WHERE state IN ('open','suggested')",
         # suggestion look-ups by pair and by target device: never a table scan inside the lock
         "CREATE INDEX IF NOT EXISTS idx_suggestions_pair"
         " ON suggestions(action, device_ids, expires_at)",
@@ -236,7 +242,12 @@ def refresh_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
     if "hostname_fold" not in columns:  # a schema sliced below migration 4 (tests)
         return 0
     row = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_version'").fetchone()
-    if row is None or row[0] != _fold_marker():
+    pending = conn.execute(
+        "SELECT 1 FROM pipeline_meta WHERE key IN ('fold_cursor', 'fold_cursor_version') LIMIT 1"
+    ).fetchone()
+    # An interrupted upgrade may have overwritten rows even when rolling back to the last
+    # completed version. Its pending cursor takes precedence over that completion marker.
+    if pending is not None or row is None or row[0] != _fold_marker():
         return _recompute_folds(conn, chunk, fold)
     done = 0
     while True:
@@ -252,8 +263,20 @@ def refresh_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
 
 
 def _recompute_folds(conn: sqlite3.Connection, chunk: int, fold) -> int:
-    """All rows, by MAC order from the persisted cursor; the marker is written once the cursor
-    has passed the last MAC, so an interrupted recompute resumes where it stopped."""
+    """Resume a cursor only for its target fold/Unicode version. Publish the completed
+    version once the cursor has passed every row under that target."""
+    target = _fold_marker()
+    with immediate(conn):
+        version = conn.execute(
+            "SELECT value FROM pipeline_meta WHERE key='fold_cursor_version'"
+        ).fetchone()
+        if version is None or version[0] != target:
+            conn.execute("DELETE FROM pipeline_meta WHERE key='fold_cursor'")
+            conn.execute(
+                "INSERT OR REPLACE INTO pipeline_meta (key, value)"
+                " VALUES ('fold_cursor_version', ?)",
+                (target,),
+            )
     done = 0
     while True:
         cursor = conn.execute("SELECT value FROM pipeline_meta WHERE key='fold_cursor'").fetchone()
@@ -264,10 +287,12 @@ def _recompute_folds(conn: sqlite3.Connection, chunk: int, fold) -> int:
         ).fetchall()
         if not rows:
             with immediate(conn):
-                conn.execute("DELETE FROM pipeline_meta WHERE key='fold_cursor'")
+                conn.execute(
+                    "DELETE FROM pipeline_meta WHERE key IN ('fold_cursor', 'fold_cursor_version')"
+                )
                 conn.execute(
                     "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES ('fold_version', ?)",
-                    (_fold_marker(),),
+                    (target,),
                 )
             return done
         _write_folds(conn, rows, fold, cursor=rows[-1][0])

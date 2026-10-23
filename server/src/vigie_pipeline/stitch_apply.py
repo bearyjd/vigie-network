@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 
 from vigie_ingest.db import immediate
@@ -26,6 +26,7 @@ from vigie_pipeline.logs import log
 from vigie_pipeline.snapshot import Snapshot
 from vigie_pipeline.stitch_db import (
     Attachment,
+    SuggestionOutcome,
     candidate_state,
     candidate_write_needed,
     create_merge_suggestion,
@@ -35,6 +36,7 @@ from vigie_pipeline.stitch_db import (
     find_merge_suggestion,
     open_candidates_left,
     open_suggestions_into,
+    prepare_merge_decisions,
     save_attachment,
     state_get,
     state_set,
@@ -65,9 +67,11 @@ class Applier:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
         cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
+        merge_decisions: Mapping[str, SuggestionOutcome],
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.clock, self.stats = now, clock, stats
+        self.merge_decisions = merge_decisions
         self.at = clock()  # the clock under the lock; read again before each attach write
         self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
@@ -172,7 +176,9 @@ class Applier:
             return
         if self.snap.canonical(d.from_device) == self.snap.canonical(d.into):
             return  # already one identity
-        known = find_merge_suggestion(self.inv, self.snap, d.from_device, d.into, self.now)
+        known = find_merge_suggestion(
+            self.inv, self.merge_decisions, d.from_device, d.into, self.now
+        )
         create = known is None
         state = "dismissed" if known is not None and known.status == "rejected" else "suggested"
         if create and open_suggestions_into(self.inv, d.into, self.now) >= (
@@ -343,8 +349,13 @@ def apply_plan(
     clock: Callable[[], float], overrides: sqlite3.Connection | None, plan: Plan,
 ) -> StitchStats:  # fmt: skip
     stats = plan.stats
+    merge_decisions = (
+        prepare_merge_decisions(inv, snap)
+        if any(isinstance(d, Suggest) for d in plan.decisions)
+        else {}
+    )
     with immediate(inv):
-        applier = Applier(inv, snap, overrides, cfg, now, clock, stats)
+        applier = Applier(inv, snap, overrides, cfg, now, clock, stats, merge_decisions)
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

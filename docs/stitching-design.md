@@ -26,6 +26,8 @@ batches -> observations/devices (unchanged)        [BEGIN IMMEDIATE per batch, a
 COMPUTE  read-only transaction (BEGIN ... COMMIT, WAL reader, never blocks writers)
          robin over <= MACS_PER_PASS self MACs  + robin over <= MACS_PER_PASS rule-attached MACs
          each subject -> bounded Neighbourhood -> Decision (frozen dataclass) or Deferral(reason)
+PREPARE  resolve snapshot human-decision IDs through inventory primary keys to pair outcomes,
+         outside the inventory write transaction (including decisions on expired suggestions)
 APPLY    BEGIN IMMEDIATE, count-bounded (section 4), <~1 s:
          for each decision re-validate inventory-side preconditions with indexed point lookups;
          immediately before each attach write, PRAGMA data_version on the pipeline's overrides
@@ -79,13 +81,14 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; more = truncated = degrade |
 | `TARGET_KEYS` | 16 | distinct (fp, vc, name) keys of a target identity; more = degrade |
 | `INTERVALS_PER_MAC` | 64 | rows of `mac_activity` per MAC, enforced at fold time (closest pair coalesced) |
+| `PRUNE_BATCH_ROWS` | 1000 | per retention pass: activity rows deleted, gap rows deleted, and old receipt anchors examined, each separately limited and transacted; remainder on later passes |
 | `MAX_ALIAS_IDS` | 5000 | merge component expanded; more = degrade |
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before flood |
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion rows written per APPLY |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY (each <= ~12 statements + orphan cleanup) |
 | `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions INTO one device; limits pending suggestions |
 | orphan cleanup | `CLEANUP_ROWS_SHARE` x `MAX_ROWS_PER_PASS` | suggestion expiries + candidate dismissals per pass (keyset cursors, decided ids skipped in Python); `Settle` decisions finish the rest |
-| gaps | retention / gap_s (~2016) | `evidence_gaps` rows: merged within `activity_gap_s` at write time, pruned at retention |
+| gaps | retention / gap_s (~2016) | gaps in the retention window, merged within `activity_gap_s` at write time; expired backlog drains in bounded batches |
 
 Lock hold (APPLY) is therefore `<= MAX_ROWS_PER_PASS + MAX_ATTACHES_PER_PASS * (12 + 64 + 2) +
 widen + events` point writes, about 2,000, with bounded index pages. Each orphan cleanup call
@@ -96,6 +99,16 @@ remain untouched; accumulated history takes additional passes. This read bound i
 call; cleanup writes share the pass's row cap. Interval coalescing is conservative: bridging a
 MAC's own silence only ADDS presence (more overlap, never less), and maturity is anchored on the
 server clock, so it cannot help an attacker.
+
+Candidate dismissal and its remaining-work probe use partial indexes on both endpoints with
+`WHERE state IN ('open','suggested')`; dismissed history is absent from these indexes. Retention
+pruning uses expiry indexes with count limits, and a received-time/MAC cursor bounds anchor
+examination even when old anchors still have activity. Each retention transaction handles at most
+`PRUNE_BATCH_ROWS` rows (plus cursor bookkeeping); later passes drain accumulated expired rows.
+Suggestion-pair lookup checks prepared human outcomes in memory, otherwise seeks an unexpired
+row by `(action, device_ids, expires_at)` with `LIMIT 1`; expired undecided rows add no scan work.
+Preparing human outcomes costs one inventory primary-key probe per snapshot decision, outside
+the writer lock; no overrides reads move inside that transaction.
 
 ## 4. APPLY preconditions (indexed point lookups)
 - Every pair decision carries `expected`, the pair's candidate state at compute time; APPLY
@@ -137,7 +150,8 @@ memory bound on the decision list; not candidates for removal.
 ## 6. Migration plan
 Pipeline migration 4 (additive, on top of main's v3): `mac_activity`, `mac_first_received`,
 `evidence_gaps`, `rule_attachments`, `stitch_state`, `events.dedup` + unique index, candidate
-indexes, suggestion indexes (`idx_suggestions_pair`, expiry index on
+indexes (including partial open/suggested endpoint indexes), the receipt-time/MAC anchor index,
+suggestion indexes (`idx_suggestions_pair`, expiry index on
 `json_extract(device_ids,'$[1]')`, and direction/id expression indexes
 `idx_suggestions_from_id` / `idx_suggestions_into_id`), observation indexes (`idx_obs_fp_host`, `idx_obs_fp_mdns`,
 `idx_obs_fp_first`, partial `idx_obs_rule`). Tests: upgrade from a populated main v3 database;
@@ -169,6 +183,10 @@ fresh install; reapply is a no-op.
 | 1000+ look-alikes to hide the victim | truncation -> degrade, never attach | bounds_perf: `test_a_spray_beyond_the_bucket_bound_degrades_to_a_suggestion_never_attaches` |
 | spray to switch off the recheck | recheck robin over attached MACs only; truncation flags | bounds_perf: `test_a_spray_of_self_macs_does_not_delay_the_recheck`; evidence_recheck: `test_a_recheck_that_cannot_gather_complete_evidence_flags_the_attachment` |
 | hold the write lock | APPLY count-bounded, reads outside the lock | bounds_perf: `test_apply_holds_the_lock_under_a_second_with_a_full_action_list` |
+| dismissed history on either candidate endpoint | partial open/suggested endpoint indexes also serve remaining-work probes | bounds_perf: `test_candidate_cleanup_ignores_settled_endpoint_history`, `test_candidate_cleanup_production_queries_use_partial_endpoint_indexes` |
+| expired suggestion history on a repeatedly suggested pair | expiry range seek with `LIMIT 1`; resolve historical human decisions before APPLY's write transaction | bounds_perf: `test_merge_pair_lookup_ignores_expired_undecided_history`, `test_apply_pair_history_and_unrelated_decisions_stay_outside_writer_lock` |
+| accumulated expired activity, gaps and receipt anchors | count-limited indexed batches, separate transactions, anchor cursor advances past retained rows | maturity_activity: `test_purge_large_backlog_uses_bounded_transactions_and_eventually_finishes` |
+| different fold/Unicode version after interrupted backfill | cursor target is persisted; mismatch/missing target restarts all rows before publishing completion | migrations: `test_interrupted_fold_recompute_restarts_when_target_version_changes` |
 | unbounded memory/CPU | BUCKET_ROWS, INTERVALS_PER_MAC, MACS_PER_PASS, compute budget | bounds_perf: `test_compute_budget_stops_between_subjects_and_the_cursor_persists` |
 | late-collector gap restores maturity | one gap list, retention-pruned, all loaded | maturity_activity: `test_a_mac_whose_window_overlaps_a_gap_is_not_mature` |
 | human merges 100k devices | links read outside the lock; widen under the row cap | bounds_perf: `test_widening_is_count_bounded_per_pass` |
@@ -225,7 +243,9 @@ dropped because the machinery they pinned no longer exists:
 16. (round 4) `fold` is a fixpoint (NFKC, casefold, NFKC; property-tested over the BMP and all
     special x combining pairs); `Hood.add_name` takes an already-folded key and never folds again;
     stored folds carry a version marker (`pipeline_meta.fold_version` = `FOLD_VERSION/unidata`)
-    and are recomputed, chunked and resumable, when it changes; the orphan cleanup pages by keyset
+    and are recomputed, chunked and resumable, when it changes. The cursor's target version is
+    persisted separately; a missing/different target restarts at the beginning, and only a full
+    traversal publishes that target as complete. The orphan cleanup pages by keyset
     and skips decided ids in Python (cost independent of the number of decisions).
 15. (round 3) The known-name clause folds with `fold` (a lint test bans every other fold); a
     re-check cut by the budget is judged on everything gathered and flagged with its own reason;

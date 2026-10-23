@@ -40,7 +40,13 @@ from vigie_pipeline.config import MAX_ROWS_PER_PASS, PipelineConfig
 from vigie_pipeline.snapshot import EMPTY, Rule, Snapshot
 from vigie_pipeline.stitch_apply import apply_plan
 from vigie_pipeline.stitch_compute import RECHECK_CURSOR, SELF_CURSOR, compute_plan
-from vigie_pipeline.stitch_db import withdraw_orphan_suggestions
+from vigie_pipeline.stitch_db import (
+    dismiss_open_candidates,
+    find_merge_suggestion,
+    open_candidates_left,
+    prepare_merge_decisions,
+    withdraw_orphan_suggestions,
+)
 from vigie_pipeline.stitch_types import Veto
 
 # ---- floods ------------------------------------------------------------------------------------
@@ -338,6 +344,177 @@ def test_an_ambiguous_decision_is_written_whole_or_not_at_all(inv, monkeypatch):
 
 
 # ---- the per-target suggestion cap bounds the orphan cleanup -------------------------------------
+
+
+def _vm_steps(db, operation):
+    steps = 0
+
+    def tick():
+        nonlocal steps
+        steps += 1
+        return 0
+
+    db.set_progress_handler(tick, 1)
+    try:
+        result = operation()
+    finally:
+        db.set_progress_handler(None, 0)
+    return steps, result
+
+
+@pytest.mark.parametrize("direction", ["from", "into"])
+@pytest.mark.parametrize("operation", ["dismiss", "left"])
+@pytest.mark.parametrize("active", [False, True])
+def test_candidate_cleanup_ignores_settled_endpoint_history(inv, direction, operation, active):
+    def measure(size):
+        inv.db.execute("DELETE FROM identity_candidates")
+        rows = [(f"h{i}", "dismissed") for i in range(size)]
+        if active:
+            rows += [("live", "suggested")]
+        inv.db.executemany(
+            "INSERT INTO identity_candidates VALUES (?,?,?,0.8,'{}',?,'t')",
+            [
+                (
+                    sid,
+                    "orphan" if direction == "from" else sid,
+                    sid if direction == "from" else "orphan",
+                    state,
+                )
+                for sid, state in rows
+            ],
+        )
+        function = (
+            (lambda: dismiss_open_candidates(inv.db, "orphan", 2))
+            if operation == "dismiss"
+            else lambda: open_candidates_left(inv.db, "orphan")
+        )
+        steps, result = _vm_steps(inv.db, function)
+        assert result == active
+        assert inv.db.execute(
+            "SELECT COUNT(*) FROM identity_candidates WHERE state='dismissed'"
+        ).fetchone()[0] == size + (active and operation == "dismiss")
+        return steps
+
+    small, large = measure(400), measure(20000)
+    assert large <= 2 * small + 100, (small, large)
+
+
+def test_candidate_cleanup_production_queries_use_partial_endpoint_indexes(inv):
+    statements = []
+    inv.db.set_trace_callback(statements.append)
+    try:
+        dismiss_open_candidates(inv.db, "orphan", 2)
+        open_candidates_left(inv.db, "orphan")
+    finally:
+        inv.db.set_trace_callback(None)
+    for sql in statements:
+        plan = " ".join(row[3] for row in inv.db.execute("EXPLAIN QUERY PLAN " + sql))
+        assert "idx_candidates_open_a" in plan and "idx_candidates_open_b" in plan, (sql, plan)
+        assert "SCAN identity_candidates" not in plan, (sql, plan)
+
+
+@pytest.mark.parametrize("status", [None, "open", "accepted", "rejected"])
+def test_merge_pair_lookup_ignores_expired_undecided_history(inv, status):
+    pair = json.dumps(["from", "into"])
+
+    def measure(size):
+        inv.db.execute("DELETE FROM suggestions")
+        rows = [(f"h{i}", pair, iso_utc(NOW_ABS - 100)) for i in range(size)]
+        rows += [("other", json.dumps(["other", "pair"]), iso_utc(NOW_ABS - 100))]
+        if status:
+            rows += [("live", pair, iso_utc(NOW_ABS + 100))]
+        decisions = {"missing": "rejected", "other": "accepted"}
+        if status in ("accepted", "rejected"):
+            rows += [("human", pair, iso_utc(NOW_ABS - 200))]
+            decisions["human"] = status
+        inv.db.executemany(
+            "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, basis,"
+            " created_at, expires_at) VALUES (?,'merge_identity',?,'{}','x','{}','t',?)",
+            rows,
+        )
+        snap = Snapshot({}, (), {}, {}, decisions)
+        prepared = prepare_merge_decisions(inv.db, snap)
+        steps, result = _vm_steps(
+            inv.db, lambda: find_merge_suggestion(inv.db, prepared, "from", "into", NOW_ABS)
+        )
+        if status is None:
+            assert result is None
+        else:
+            assert result.status == status
+            assert result.suggestion_id == ("human" if status != "open" else "live")
+        return steps
+
+    small, large = measure(400), measure(8000)
+    assert large <= 2 * small + 100, (small, large)
+
+
+def test_merge_pair_current_lookup_uses_expiry_range_and_limit(inv):
+    statements = []
+    inv.db.set_trace_callback(statements.append)
+    try:
+        find_merge_suggestion(inv.db, {}, "from", "into", NOW_ABS)
+    finally:
+        inv.db.set_trace_callback(None)
+    assert len(statements) == 1
+    sql = statements[0]
+    plan = " ".join(row[3] for row in inv.db.execute("EXPLAIN QUERY PLAN " + sql))
+    assert "idx_suggestions_pair" in plan and "expires_at>?" in plan, (sql, plan)
+    assert "LIMIT 1" in sql
+
+
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+def test_apply_pair_history_and_unrelated_decisions_stay_outside_writer_lock(inv, status):
+    pair_world(inv, ["both"])
+    inv.commit()
+
+    def measure(size):
+        inv.db.execute("BEGIN")
+        inv.db.execute("DELETE FROM identity_candidates")
+        inv.db.execute("DELETE FROM suggestions")
+        rows = [(f"h{i}", json.dumps(["Y0", "O0"])) for i in range(size)]
+        rows += [(f"d{i}", json.dumps([f"other{i}", "O0"])) for i in range(size)]
+        rows += [("human", json.dumps(["Y0", "O0"]))]
+        inv.db.executemany(
+            "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, basis,"
+            " created_at, expires_at) VALUES (?,'merge_identity',?,'{}','x','{}','t',?)",
+            [
+                (sid, pair, iso_utc(NOW_ABS - (200 if sid == "human" else 100)))
+                for sid, pair in rows
+            ],
+        )
+        snap = Snapshot(
+            {}, (), {}, {}, {**{f"d{i}": "accepted" for i in range(size)}, "human": status}
+        )
+        inv.commit()
+        plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+        steps = 0
+        locked = False
+
+        def trace(sql):
+            nonlocal locked
+            if sql == "BEGIN IMMEDIATE":
+                locked = True
+            elif sql in ("COMMIT", "ROLLBACK"):
+                locked = False
+
+        def tick():
+            nonlocal steps
+            steps += int(locked)
+            return 0
+
+        inv.db.set_trace_callback(trace)
+        inv.db.set_progress_handler(tick, 1)
+        try:
+            stats = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+        finally:
+            inv.db.set_progress_handler(None, 0)
+            inv.db.set_trace_callback(None)
+        assert stats.suggestions == 0
+        assert inv.state("Y0") == [("O0", "dismissed" if status == "rejected" else "suggested")]
+        return steps
+
+    small, large = measure(400), measure(8000)
+    assert large <= 2 * small + 100, (small, large)
 
 
 def _cleanup_suggestions(inv, direction, decided, *, expired=False):

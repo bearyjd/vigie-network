@@ -113,7 +113,9 @@ def dismiss_open_candidates(inv: sqlite3.Connection, device_id: str, limit: int)
         return 0
     return inv.execute(
         "UPDATE identity_candidates SET state='dismissed' WHERE id IN (SELECT id FROM"
-        " identity_candidates WHERE (device_a=? OR device_b=?) AND state IN ('open','suggested')"
+        " identity_candidates WHERE device_a=? AND state IN ('open','suggested')"
+        " UNION ALL SELECT id FROM identity_candidates WHERE device_b=?"
+        " AND state IN ('open','suggested')"
         " LIMIT ?)",
         (device_id, device_id, limit),
     ).rowcount
@@ -122,7 +124,8 @@ def dismiss_open_candidates(inv: sqlite3.Connection, device_id: str, limit: int)
 def open_candidates_left(inv: sqlite3.Connection, device_id: str) -> bool:
     return (
         inv.execute(
-            "SELECT 1 FROM identity_candidates WHERE (device_a=? OR device_b=?)"
+            "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN ('open','suggested')"
+            " UNION ALL SELECT 1 FROM identity_candidates WHERE device_b=?"
             " AND state IN ('open','suggested') LIMIT 1",
             (device_id, device_id),
         ).fetchone()
@@ -164,22 +167,48 @@ class SuggestionOutcome:
     suggestion_id: str | None = None
 
 
+def prepare_merge_decisions(
+    inv: sqlite3.Connection, snap: Snapshot
+) -> dict[str, SuggestionOutcome]:
+    """Resolve snapshot decision IDs by inventory primary key BEFORE the writer lock.
+
+    Expired decisions remain binding. Work depends on the human decision snapshot, never on
+    expired undecided history. For conflicting decisions keep the pair index's original ordering.
+    """
+    outcomes: dict[str, SuggestionOutcome] = {}
+    ordering: dict[str, tuple[str, int]] = {}
+    for sid, status in snap.decisions.items():
+        row = inv.execute(
+            "SELECT device_ids, expires_at, rowid FROM suggestions"
+            " WHERE id=? AND action='merge_identity'",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            continue
+        pair, order = row["device_ids"], (row["expires_at"], row["rowid"])
+        if pair not in ordering or order < ordering[pair]:
+            ordering[pair] = order
+            outcomes[pair] = SuggestionOutcome(status, sid)
+    return outcomes
+
+
 def find_merge_suggestion(
-    inv: sqlite3.Connection, snap: Snapshot, frm: str, into: str, now: float
+    inv: sqlite3.Connection,
+    decisions: Mapping[str, SuggestionOutcome],
+    frm: str,
+    into: str,
+    now: float,
 ) -> SuggestionOutcome | None:
-    """The human decision on, or the still-open (unexpired) suggestion of, the pair; None when a
-    new one may be created. One indexed look-up (idx_suggestions_pair)."""
-    open_id = None
-    now_iso = iso_utc(now)
-    for row in inv.execute(
-        "SELECT id, expires_at FROM suggestions WHERE action='merge_identity' AND device_ids=?",
-        (json.dumps([frm, into]),),
-    ):
-        if row["id"] in snap.decisions:
-            return SuggestionOutcome(snap.decisions[row["id"]], row["id"])
-        if row["expires_at"] > now_iso:
-            open_id = row["id"]
-    return SuggestionOutcome("open", open_id) if open_id else None
+    """Prepared human outcome or one current pair lookup; no expired history under the lock."""
+    pair = json.dumps([frm, into])
+    if pair in decisions:
+        return decisions[pair]
+    row = inv.execute(
+        "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids=?"
+        " AND expires_at>? ORDER BY expires_at DESC, rowid DESC LIMIT 1",
+        (pair, iso_utc(now)),
+    ).fetchone()
+    return SuggestionOutcome("open", row["id"]) if row else None
 
 
 def open_suggestions_into(inv: sqlite3.Connection, into: str, now: float) -> int:

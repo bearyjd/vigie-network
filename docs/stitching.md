@@ -24,6 +24,8 @@ COMPUTE  one read-only transaction (a WAL reader; never blocks ingest or the API
          re-check robin: <= MACS_PER_PASS rule-attached MACs, from a persisted cursor
          self robin:     <= MACS_PER_PASS randomized self MACs, from a persisted cursor
          each subject -> bounded neighbourhood -> one DECISION or a deferral
+PREPARE  resolve snapshot human-decision IDs to suggestion pairs by inventory primary key,
+         before acquiring the inventory write lock (expired decisions remain binding)
 APPLY    one BEGIN IMMEDIATE, count-bounded, no scans: re-validates every decision with indexed
          point lookups (the pair's candidate state; for an attach that overrides.db is unchanged
          since the snapshot: PRAGMA data_version), drops the stale ones, writes.
@@ -43,12 +45,13 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; one more = incomplete evidence |
 | `TARGET_KEYS` | 16 | distinct (opt55, opt60, name) keys of a target identity; more = incomplete |
 | `INTERVALS_PER_MAC` | 64 | `mac_activity` rows per MAC, coalesced at fold time |
+| `PRUNE_BATCH_ROWS` | 1000 | per retention pass: activity rows deleted, gap rows deleted, and old receipt anchors examined, each with its own limit and short transaction; backlogs drain over later passes |
 | `MAX_ALIAS_IDS` | 5000 | merge component expanded; more = incomplete (a human decides) |
 | `MAX_SIGNATURE_BUCKET` | 64 | live self MACs per name group / compatible pool before a flood |
 | `MAX_ROWS_PER_PASS` | 200 | candidate + suggestion + widen + orphan-cleanup rows per APPLY (a decision fits whole or waits) |
 | `MAX_ATTACHES_PER_PASS` | 20 | attaches per APPLY |
 | `MAX_OPEN_SUGGESTIONS_PER_DEVICE` | 64 | open merge suggestions into one device (limits pending suggestions) |
-| evidence gaps | retention / `activity_gap_s` | rows of `evidence_gaps`: merged within one gap at write time, pruned at retention |
+| evidence gaps | retention / `activity_gap_s` | gaps in the retention window, merged within one gap at write time; expired backlog is pruned in batches |
 
 APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject,
 and its one read of `overrides.db` is `PRAGMA data_version`, whose cost does not depend on how
@@ -70,7 +73,9 @@ instance) drops the decision, which is recomputed against the new state on the n
 ### Activity
 Every raw row timestamp of a MAC is folded into closed intervals `[start, end]` in `mac_activity`;
 a silence longer than `VIGIE_ACTIVITY_GAP_S` (300 s) starts a new interval. Folding is idempotent and
-order independent. Rows whose `end` is older than 7 days are purged after each run. A MAC never holds
+order independent. Rows whose `end` is older than 7 days are pruned in indexed batches after each
+run; a backlog can take several passes. Old receipt anchors are examined in indexed cursor pages
+and deleted only when no activity remains for the MAC. A MAC never holds
 more than `INTERVALS_PER_MAC` rows: when a fold would exceed it, the smallest silences are bridged.
 Bridging a MAC's own silence only ADDS presence (more overlap, never less), so it cannot help an
 attacker; maturity is anchored on the server clock, not on covered time alone.
@@ -205,6 +210,12 @@ by direction and `id > cursor`, ordered by id. Each direction fetches at most it
 write allowance + 1 rows, at most `2 * (limit + 1)` rows per call. Expired and decided rows are
 skipped in Python; the persistent cursor advances past every examined row. Decided suggestions
 remain untouched. Accumulated history takes additional passes; the write cap is shared per pass.
+Candidate cleanup and its remaining-work check use partial endpoint indexes containing only
+`open` and `suggested` rows, so dismissed history does not lengthen those scans.
+Pair suggestion lookup first checks the prepared human outcomes; otherwise it seeks current
+rows through `(action, device_ids, expires_at)` with `expires_at > now` and `LIMIT 1`. Expired
+undecided history is skipped by the index. Preparing the outcomes costs one inventory primary-key
+probe per snapshot decision outside the writer lock.
 
 ## 7. One uncertainty rule
 Whenever a subject's evidence is incomplete it DEGRADES; it never attaches and never gets a silent
@@ -299,6 +310,10 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | `\|` in a name or vendor class to collide two flood tokens | tokens hash a JSON encoding of the key | `test_flood_tokens_of_different_groups_never_collide_on_a_pipe_in_a_name` |
 | decided suggestions crowding the orphan cleanup window | bounded id-ordered pages; cursor advances past decided rows in Python | `test_decided_suggestions_inside_the_scan_window_do_not_hide_undecided_ones` |
 | thousands of decided or expired suggestions on one orphan | indexed direction/id seek keeps each cleanup window bounded; later passes reach undecided rows | `test_orphan_cleanup_vm_work_is_bounded_by_the_window` |
+| dismissed candidate history on either orphan endpoint | partial open/suggested endpoint indexes for dismissal and the remaining-work check | `test_candidate_cleanup_ignores_settled_endpoint_history`, `test_candidate_cleanup_production_queries_use_partial_endpoint_indexes` |
+| repeated expiry and re-suggestion of one pair | current pair lookup seeks by expiry with `LIMIT 1`; historical human decisions are resolved before the write lock | `test_merge_pair_lookup_ignores_expired_undecided_history`, `test_apply_pair_history_and_unrelated_decisions_stay_outside_writer_lock` |
+| retention backlog after downtime | indexed count-limited activity/gap deletes and cursor-paged anchor cleanup in separate transactions; later passes finish | `test_purge_large_backlog_uses_bounded_transactions_and_eventually_finishes` |
+| restart during a fold backfill with a different fold/Unicode version | persist the cursor's target version; restart the full traversal on mismatch or a legacy cursor without a target | `test_interrupted_fold_recompute_restarts_when_target_version_changes` |
 | a malformed rule on another device whose signature could match | any malformed rule makes every rule hit suggestion-only | `test_any_malformed_rule_makes_every_rule_hit_a_suggestion` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
@@ -339,8 +354,10 @@ by the compute budget is judged on everything gathered up to the cut and flagged
   `observations.hostname_fold`/`mdns_fold`). The pipeline writes those columns; the stored values
   carry a version marker (`pipeline_meta.fold_version` = `FOLD_VERSION/<Unicode database
   version>`) and are recomputed, chunked in short transactions and resumable, whenever the fold
-  function or the interpreter's Unicode database changes. Turkish dotless i is its own letter
-  under Unicode casefold (locale-independent), as in Python.
+  function or the interpreter's Unicode database changes. The cursor also records its target
+  version; a missing or different target restarts the full recompute. The completion marker is
+  published only after every row has been processed under that target. Turkish dotless i is its
+  own letter under Unicode casefold (locale-independent), as in Python.
 - **Upgrade cost (operators).** Migration 4 itself takes about a second; the first open then
   folds every observation name (about 30 s at 600k observations, chunks of 2,000 in short
   transactions). Ingest waits at most about a second per chunk, which under load can exceed its

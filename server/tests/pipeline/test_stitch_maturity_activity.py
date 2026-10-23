@@ -245,6 +245,69 @@ def test_purge_forgets_first_received_of_a_mac_without_activity_only(tmp_path):
     assert [r[0] for r in conn.execute('SELECT "end" FROM evidence_gaps')] == [9000]
 
 
+def test_purge_large_backlog_uses_bounded_transactions_and_eventually_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    batch, expired = 257, 50_000
+    monkeypatch.setattr(activity, "PRUNE_BATCH_ROWS", batch, raising=False)
+    conn.execute("BEGIN")
+    conn.executemany(
+        'INSERT INTO mac_activity (mac, start, "end") VALUES (?, 1, 100)',
+        ((f"expired-{i:05}",) for i in range(expired)),
+    )
+    conn.executemany(
+        "INSERT INTO mac_first_received (mac, received) VALUES (?, 100)",
+        ((f"expired-{i:05}",) for i in range(expired)),
+    )
+    conn.executemany(
+        'INSERT INTO evidence_gaps (start, "end") VALUES (?, 100)',
+        ((i,) for i in range(expired)),
+    )
+    # More than a batch of live old anchors must not starve the orphans behind them.
+    active = {f"000-active-{i:05}" for i in range(batch + 2)}
+    for m in active:
+        conn.execute("INSERT INTO mac_first_received VALUES (?, 100)", (m,))
+        conn.execute("INSERT INTO mac_activity VALUES (?, 9000, 9000)", (m,))
+    conn.execute("INSERT INTO mac_first_received VALUES ('fresh', 9000)")
+    conn.execute("INSERT INTO evidence_gaps VALUES (9000, 9000)")
+    conn.execute("COMMIT")
+
+    transactions = []
+    begun_at = None
+
+    def trace(sql):
+        nonlocal begun_at
+        if sql.startswith("BEGIN"):
+            assert begun_at is None
+            begun_at = conn.total_changes
+        elif sql == "COMMIT":
+            assert begun_at is not None
+            transactions.append(conn.total_changes - begun_at)
+            begun_at = None
+
+    conn.set_trace_callback(trace)
+    total = purge_activity(conn, 10_000, 1000)
+    assert total == batch
+    assert not conn.in_transaction
+    assert len(transactions) == 3
+    conn.close()
+    conn = open_pipeline_inventory(tmp_path / "inventory.db")
+    conn.set_trace_callback(trace)  # continuation must work with a new connection each pass
+    for _ in range((expired + batch - 1) // batch + 2):
+        total += purge_activity(conn, 10_000, 1000)
+    conn.set_trace_callback(None)
+
+    assert total == expired
+    assert len(transactions) > expired // batch
+    assert all(changes <= batch + 1 for changes in transactions)  # one cursor write
+    assert {r[0] for r in conn.execute("SELECT mac FROM mac_activity")} == active
+    assert {r[0] for r in conn.execute("SELECT mac FROM mac_first_received")} == active | {"fresh"}
+    assert [r[0] for r in conn.execute('SELECT "end" FROM evidence_gaps')] == [9000]
+    conn.close()
+
+
 # ---- maturity is server-observed ------------------------------------------------------------
 
 

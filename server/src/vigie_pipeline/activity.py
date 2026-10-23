@@ -8,11 +8,18 @@ is derived and disposable (7 d retention, like raw).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 
-from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S, INTERVALS_PER_MAC
+from vigie_ingest.db import immediate
+from vigie_pipeline.config import (
+    ACTIVITY_MAX_REPORT_LAG_S,
+    ACTIVITY_SKEW_S,
+    INTERVALS_PER_MAC,
+    PRUNE_BATCH_ROWS,
+)
 from vigie_pipeline.sources import MacActivity
 
 Interval = tuple[int, int]
@@ -202,12 +209,46 @@ def load_activity(
 
 
 def purge_activity(inv: sqlite3.Connection, now: float, retention_s: int) -> int:
+    """Prune one indexed, count-limited batch per table, each in its own transaction.
+
+    Further expired rows wait for later passes. Anchor candidates advance in received/MAC
+    order so old anchors with surviving activity cannot starve orphaned anchors behind them.
+    The cursor persists across connections and wraps after the last expired candidate.
+    """
     cutoff = int(now) - retention_s
-    purged = inv.execute('DELETE FROM mac_activity WHERE "end" < ?', (cutoff,)).rowcount
-    inv.execute('DELETE FROM evidence_gaps WHERE "end" < ?', (cutoff,))
-    inv.execute(  # a MAC with no activity left starts over (like a new one) if it returns
-        "DELETE FROM mac_first_received WHERE received < ?"
-        " AND mac NOT IN (SELECT mac FROM mac_activity)",
-        (cutoff,),
-    )
+    with immediate(inv):
+        purged = inv.execute(
+            "DELETE FROM mac_activity WHERE rowid IN ("
+            'SELECT rowid FROM mac_activity WHERE "end" < ? ORDER BY "end" LIMIT ?)',
+            (cutoff, PRUNE_BATCH_ROWS),
+        ).rowcount
+    with immediate(inv):
+        inv.execute(
+            "DELETE FROM evidence_gaps WHERE rowid IN ("
+            'SELECT rowid FROM evidence_gaps WHERE "end" < ? ORDER BY "end" LIMIT ?)',
+            (cutoff, PRUNE_BATCH_ROWS),
+        )
+    with immediate(inv):
+        key = "activity_prune_anchor_cursor"
+        saved = inv.execute("SELECT value FROM pipeline_meta WHERE key=?", (key,)).fetchone()
+        after = " AND (received, mac) > (?, ?)" if saved else ""
+        params = [cutoff, *json.loads(saved[0])] if saved else [cutoff]
+        rows = inv.execute(
+            "SELECT received, mac FROM mac_first_received WHERE received < ?"  # noqa: S608
+            f"{after} ORDER BY received, mac LIMIT ?",
+            [*params, PRUNE_BATCH_ROWS],
+        ).fetchall()
+        # A MAC with no activity left starts over (like a new one) if it returns.
+        inv.executemany(
+            "DELETE FROM mac_first_received WHERE mac=? AND NOT EXISTS ("
+            "SELECT 1 FROM mac_activity WHERE mac=?)",
+            [(row[1], row[1]) for row in rows],
+        )
+        if len(rows) == PRUNE_BATCH_ROWS:
+            inv.execute(
+                "INSERT OR REPLACE INTO pipeline_meta (key, value) VALUES (?, ?)",
+                (key, json.dumps(tuple(rows[-1]))),
+            )
+        else:
+            inv.execute("DELETE FROM pipeline_meta WHERE key=?", (key,))
     return purged
