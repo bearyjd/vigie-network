@@ -46,7 +46,9 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
   activity window overlaps a gap is not mature. Setup work follows the active MACs (a trigger-kept
   `mac_last_seen` summary; older identities come from the fingerprint/name indexes of
   `observations`, a few per key), so a large `observations` table does not lengthen the stitch
-  transaction.
+  transaction; setup is capped (2 s, 20,000 newest active MACs) and loads the re-check's inputs
+  first, so a MAC spray cannot switch the post-attach re-check off. Evidence gaps are per
+  collector and merged; a deferred attach raises `evidence_gap` once a day.
   Derived data; safe to drop.
 - **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
   opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a

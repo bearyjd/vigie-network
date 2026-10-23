@@ -43,11 +43,20 @@ contract is unchanged.
 **Dropped stamps are missing evidence, not safe evidence.** A collector that was cut off for more
 than an hour delivers its backlog late, and the stamps older than the lag are dropped. That would
 erase a victim's presence while another collector sees a copy, so the span of the dropped stamps
-(inside retention; older junk is not counted) is recorded per batch in `collector_gaps (collector_id,
-start, end, recorded)` (pipeline schema v8). A MAC whose activity window overlaps any recorded gap is
-**not mature** (no rule attach, no permanent veto) until the gap leaves retention (7 d), so the human
-decides. Residual: a collector that is merely silent (down, unplugged) delivers nothing and leaves no
-trace; that cannot be told from an idle network, so the pipeline does not guess.
+(inside retention; older junk is not counted) is recorded in `collector_gaps (collector_id, start,
+end, recorded)` (schema v8), overlapping gaps of one collector merged into one row. `mac_collectors`
+(schema v11) records which collectors saw each MAC. A MAC is **not mature** (no rule attach, no
+permanent veto) while a gap overlaps its activity window and belongs to a collector that saw the MAC or
+saw the identity it would join (the victim's collector); a MAC with no recorded collector counts every
+collector (fail closed). A gap therefore never blocks MACs of unrelated collectors. A rule attach
+deferred only because of a gap raises one `evidence_gap` event per collector per UTC day (and a log
+line), so it is never silent; the human decides. Gaps are merged per collector, at most
+`MAX_GAPS_PER_COLLECTOR` (1000) newest are loaded, and the lookup is a binary search. They leave
+retention after 7 d. Residual: a late backlog from a routine outage longer than an hour (the collector
+spools and drains oldest-first) does record a gap for that collector, so MACs it saw during the
+outage wait for a human decision. A collector that is merely silent (down, unplugged) delivers
+nothing and leaves no trace; that cannot be told from an idle network, so the pipeline does not
+guess.
 
 **Collector timestamps are untrusted; maturity is server-observed.** `mac_first_received (mac,
 received)` (pipeline schema v6) records the SERVER receipt time (`batches.received_at`) of the
@@ -60,8 +69,10 @@ Every anchor that existed when migration 10 ran (migration 6 had backfilled lega
 earliest collector stamp; later anchors were server receipts, but the difference was never recorded)
 is moved to max(anchor, migration time) and marked `legacy = 1`: a deliberately conservative reset
 that does not guess provenance from timestamps. Those MACs mature one grace window after the
-upgrade; only rows written afterwards count as server-receipt anchors. A MAC with no anchor row at
-all is **not mature** (fail closed). Residual: a
+upgrade; only rows written afterwards count as server-receipt anchors. A legacy MAC's pre-upgrade
+activity is NOT clipped: it stays as evidence about its peers (a victim present for two days still
+vetoes a twin), and only its OWN covered time for maturity counts from its anchor minus the report
+lag. A MAC with no anchor row at all is **not mature** (fail closed). Residual: a
 legitimately long collector outage makes a MAC first reported after it mature more slowly (fail
 closed), and clipping applies to peers alike (a victim MAC first reported with hour-old backlog has
 that backlog clipped, which weakens the veto only if the collector itself misbehaves).
@@ -79,8 +90,8 @@ with any of those (a merge component over `MAX_ALIAS_IDS` is not expanded; vetoe
 (opt55, opt60, hostname) and (opt55, opt60, mDNS name), the oldest `HISTORIC_MATCH_LIMIT` (16)
 matching devices come from the `idx_obs_fp_host` / `idx_obs_fp_mdns` indexes (case-insensitive,
 oldest first) and are loaded with their merge components. They have no activity to overlap, but a
-suggestion may point into them. Only a device that is none of these is not loaded. Every loop checks
-the setup time cap (section 12).
+suggestion may point into them. Only a device that is none of these is not loaded. The setup is bounded by a time cap and an
+active-MAC cap with a re-check-first order (section 12).
 
 When the intervals are loaded for a pass, any interval shorter than `VIGIE_ACTIVITY_GAP_S` is widened
 symmetrically to that width (a stamp means "present around then"). A single stamp, or a burst of
@@ -256,8 +267,7 @@ sets the orphaned self device to `status='retired'` (devices are never deleted; 
 candidates become `dismissed`, and its open merge suggestions are expired at once by `expires_at`
 so nobody can accept one after the attach. The suggestion expiry is one uncharged pass over exactly
 the orphan's undecided suggestions (never limited by the row allowance); the candidate dismissal is
-under the row cap, the rest on later passes. Residual:
-suggestions that point INTO the orphan are not withdrawn), and writes
+under the row cap, the rest on later passes. (suggestions that point INTO the orphan are expired too, through the candidate rows that name it), and writes
 `mac_attached` on the target device. The event summary carries 8-hex hashes of the previous and
 new MAC only.
 
@@ -304,8 +314,10 @@ rule twice changes nothing. After each attach the canonical map is refreshed for
   by the next readable pass (idempotent, writes only where too narrow). Other missing tables are
   read as empty. Rule rows are validated field by field (non-blank string `id`/`device_id`, a
   signature that parses as a JSON object): a malformed row (a BLOB `device_id`, nesting deep enough to
-  exhaust the parser, ...) is skipped fail-closed, logged, and counted in one `rule_malformed` event
-  per UTC day; non-text ids anywhere in links, groups, overrides or decisions make the whole snapshot
+  exhaust the parser, invalid JSON, a signature that is not a JSON object, ...) is skipped fail-closed, logged, and counted in one `rule_malformed` event
+  per UTC day. A malformed rule whose target device is readable makes that TARGET (through merges)
+  a human decision: a matching valid rule only produces a `rule_hit_needs_confirm` suggestion for it,
+  never an attach, until the rule is fixed or removed; non-text ids anywhere in links, groups, overrides or decisions make the whole snapshot
   unreadable. Any unexpected exception while reading maps to `OverridesUnreadable`.
 - No attachment without a matching active, non-blank-creator rule (human-ness is the API's job,
   see the trust boundary above); no group or trust is created.
@@ -448,15 +460,23 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
   re-checking the same first ones; a pass that finishes no MAC moves the cursor past the head MAC
   so one slow MAC cannot pin it. A vetoed (candidate, target) pair is skipped without any overlap
   work (section 8).
-- Time-box: the stitch transaction holds the inventory write lock, so it is bounded in two parts.
-  Setup (loading observations, activity and anchors) may take `STITCH_SETUP_MAX_SECONDS` (2 s); if
-  it does not finish in that time the pass gives up, releases the lock and emits the once-per-day
-  `stitch_budget_exhausted` ("setup"), writing nothing. After setup the time-box
-  `STITCH_MAX_TXN_SECONDS` (3 s) is split into equal slices, one per phase (re-check, rules,
-  candidates), each starting when the phase starts: a slow setup can no longer exhaust every phase,
-  and the re-check always gets its slice. A phase stops at the next safe point (before the write of
-  the decision in flight, exactly like a spent work budget) and emits the same
-  once-per-day `stitch_budget_exhausted`. Suggestion look-ups (including the withdraw of open
+- Time-box and setup: the stitch transaction holds the inventory write lock, so it is bounded in
+  two parts. Setup runs in two stages, both ticking the setup cap `STITCH_SETUP_MAX_SECONDS` (2 s)
+  between MACs, chunks and pages, and between every MAC's interval fetch: (1) the CORE, loaded first:
+  the rule-attached MACs recorded in `rule_attachments`, their targets and the newest
+  `MAX_SIGNATURE_BUCKET + 1` devices sharing the attach-time fingerprint and a name with them; (2) the
+  BULK: the newest `MAX_ACTIVE_MACS` (20,000) active MACs (more are reported once a day as
+  `stitch_active_set_capped`), their devices, the rule targets and the historical matches, in batches
+  of 2,000 devices. If the cap is hit during the bulk the pass keeps what was loaded, emits the
+  once-per-day `stitch_budget_exhausted` ("only the re-check ... ran") and runs ONLY the re-check
+  phase, so a spray of active MACs cannot switch the post-attach guard off (rules and candidates wait
+  for a pass that fits). If it is hit during the core nothing runs and the lock is released at once.
+  After setup the time-box `STITCH_MAX_TXN_SECONDS` (3 s) is split into equal slices, one per phase
+  (re-check, rules, candidates), each starting when the phase starts. A phase stops at the next safe
+  point (before the write of the decision in flight, exactly like a spent work budget) and emits the
+  same once-per-day `stitch_budget_exhausted`. The heavy reads stay under the lock (no read
+  transaction before it), so the bound is setup cap plus time-box, about 5 s worst case, the
+  `busy_timeout`. Suggestion look-ups (including the withdraw of open
   suggestions) are charged to the work budget, and use the `idx_suggestions_pair` index on
   `suggestions(action, device_ids, expires_at)` (pipeline schema v6): measured, 200 suggested pairs
   beside 500,000 expired unrelated suggestions finish a pass in well under 2 s (before the index
@@ -487,7 +507,8 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
   and reported by their own events on later passes.
 - Activity lower bound: see section 1. Stamps older than the batch's own report lag (1 h) are
   ignored in every batch; `mac_first_received` is the server-clock maturity anchor.
-- Residual: the number of ACTIVE MACs is itself bounded only by the collectors' rate limits. If
-  more MACs are active inside retention than the 2 s setup cap can load, stitching stops for that
-  pass and the daily `stitch_budget_exhausted` event ("setup") says so; the lock is released at
-  once, so a writer waits at most about setup cap plus time-box (5 s worst case, the `busy_timeout`).
+- Residual: the pass reads at most `MAX_ACTIVE_MACS` (20,000) newest active MACs and 64 intervals
+  each, so the rows read are bounded however many MACs are sprayed; older active MACs are not looked
+  at in that pass (reported by `stitch_active_set_capped`, and a sustained spray can therefore hide an
+  older twin from the rules and candidate phases until it stops). With the bulk cut short only the
+  re-check runs, and its compatible-peer pool is limited to the core devices.

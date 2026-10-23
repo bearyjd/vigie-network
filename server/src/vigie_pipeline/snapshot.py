@@ -41,6 +41,7 @@ class Snapshot:
     overrides: Mapping[str, tuple[int, str | None]]  # device_id -> (version, group_id)
     decisions: Mapping[str, str]  # suggestion_id -> accepted|rejected
     malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
+    malformed_devices: frozenset[str] = frozenset()  # their targets: these need a human
 
     @cached_property
     def _canon(self) -> dict[str, str]:
@@ -81,7 +82,12 @@ def _text(value: object) -> str | None:
 
 
 class MalformedRule(ValueError):
-    """An identity_rules row whose fields have the wrong type or shape: never used."""
+    """An identity_rules row whose fields have the wrong type or shape: never used. `device_id`
+    is the rule's target when that much was readable (the target then needs a human)."""
+
+    def __init__(self, message: str, device_id: str | None = None) -> None:
+        super().__init__(message)
+        self.device_id = device_id
 
 
 def _ident(value: object, what: str) -> str:
@@ -122,14 +128,17 @@ def parse_rule(row: sqlite3.Row) -> Rule | None:
     rule_id, device_id = _ident(row["id"], "rule id"), _ident(row["device_id"], "rule device_id")
     try:
         sig = json.loads(row["signature"])
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise MalformedRule("signature is not valid JSON", device_id) from exc
     except RecursionError as exc:
-        raise MalformedRule("signature nesting too deep") from exc
+        raise MalformedRule("signature nesting too deep", device_id) from exc
     if not isinstance(sig, dict):
-        return None
-    opt55 = _sig_opt55(sig.get("opt55"))
-    opt60, host, mdns = (_sig_text(sig.get(k), k) for k in ("opt60", "hostname", "mdns_name"))
+        raise MalformedRule("signature is not a JSON object", device_id)
+    try:
+        opt55 = _sig_opt55(sig.get("opt55"))
+        opt60, host, mdns = (_sig_text(sig.get(k), k) for k in ("opt60", "hostname", "mdns_name"))
+    except MalformedRule as exc:
+        raise MalformedRule(str(exc), device_id) from exc
     if not (opt55 and opt60 and (host or mdns)):
         return None
     return Rule(rule_id, device_id, opt55, opt60, host, mdns, _expiry(row["expires_at"]))
@@ -190,7 +199,7 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
         for r in _rows(conn, "SELECT from_device, into_device FROM identity_links")
     }
-    rules, malformed = [], 0
+    rules, malformed, bad_devices = [], 0, set()
     for row in _rows(
         conn,
         "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM identity_rules"
@@ -202,6 +211,8 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
             rule = parse_rule(row)
         except MalformedRule as exc:  # fail closed: this row is never used
             malformed += 1
+            if exc.device_id:
+                bad_devices.add(exc.device_id)
             log(logger, logging.ERROR, "rule_malformed", error=str(exc))
             continue
         if rule:
@@ -228,7 +239,9 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
         for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
     }
-    return Snapshot(links, tuple(rules), groups, overrides, decisions, malformed)
+    return Snapshot(
+        links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices)
+    )
 
 
 def load_snapshot(conn: sqlite3.Connection, now: float) -> Snapshot:

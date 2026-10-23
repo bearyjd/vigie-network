@@ -22,6 +22,7 @@ from vigie_pipeline.activity import (
     active_macs,
     load_activity,
     load_first_received,
+    load_gaps,
     record_activity,
 )
 from vigie_pipeline.overrides import open_overrides_ro
@@ -62,7 +63,9 @@ def test_600k_observations_with_1k_active_macs_stitch_fast_and_hold_the_lock_bri
     start = time.perf_counter()
     st = Stitcher(inv.db, RULE_SNAP, inv.cfg, NOW)
     setup = time.perf_counter() - start
-    assert setup < 3.0 and len(st.act) == 1_000
+    # the REAL setup cap, not a looser number: setup finished inside it, uncut
+    assert not st.partial and setup < stitch_mod.STITCH_SETUP_MAX_SECONDS
+    assert len(st.act) == 1_000
     assert len(st.obs) == 1_000  # not the 600k: only devices that can matter are loaded
     inv.db.execute("ROLLBACK") if inv.db.in_transaction else None
     start = time.perf_counter()
@@ -118,8 +121,10 @@ def test_the_activity_scan_checks_the_time_between_pages_and_between_macs(inv, m
     inv.db.commit()
     ticks = []
     monkeypatch.setattr("vigie_pipeline.activity.PAGE", 2)
-    found = active_macs(inv.db, NOW - 1000, lambda: ticks.append(1))
-    assert len(found) == 5 and len(ticks) == 4  # pages of 2, 2, 1 and the final empty one
+    found, capped = active_macs(inv.db, NOW - 1000, lambda: ticks.append(1))
+    assert (
+        len(found) == 5 and not capped and len(ticks) == 4
+    )  # pages of 2, 2, 1 and the final empty one
     ticks.clear()
     load_activity(inv.db, 300, per_mac_limit=64, tick=lambda: ticks.append(1))
     assert len(ticks) == 4 + 5  # the 4 pages again, then one per MAC
@@ -139,9 +144,9 @@ def test_the_enumeration_never_touches_stale_rows(inv):
     inv.db.execute("COMMIT")
     steps = []
     inv.db.set_progress_handler(lambda: steps.append(1) or 0, 1000)  # one call per 1000 VM steps
-    found = active_macs(inv.db, NOW - 10_000, lambda: None)
+    found, _ = active_macs(inv.db, NOW - 10_000, lambda: None)
     inv.db.set_progress_handler(None, 0)
-    assert found == [f"ac:{i:06x}" for i in range(3)]
+    assert sorted(found) == [f"ac:{i:06x}" for i in range(3)]
     assert len(steps) < 5  # a scan of the 100k stale rows would take hundreds of thousands of steps
     plan = " ".join(
         r[3] for r in inv.db.execute(
@@ -285,22 +290,36 @@ def test_gap_rows_are_purged_with_the_activity(tmp_path):
     assert [r[0] for r in conn.execute('SELECT "end" FROM collector_gaps')] == [9000]
 
 
-@pytest.mark.parametrize(
-    ("gap", "expect"),
-    [((0, 10), False), ((-1, 10), True), ((-10, 0), False), ((-10, 1), True),
-     ((-10, -1), False), ((20, 30), True)],
-)  # fmt: skip
-def test_a_mac_whose_window_overlaps_a_gap_is_not_mature(inv, gap, expect):
+GAP_CASES = [
+    (lambda lo, hi: (hi + 300, hi + 400), True),  # starts within one activity gap of the window
+    (lambda lo, hi: (hi + 301, hi + 400), False),
+    (lambda lo, hi: (lo - 400, lo - 300), True),  # ends within one activity gap of the window
+    (lambda lo, hi: (lo - 400, lo - 301), False),
+    (lambda lo, hi: (lo - 2000, lo - 1000), False),
+    (lambda lo, hi: (lo + 20, lo + 30), True),
+]
+
+
+@pytest.mark.parametrize(("make", "blocked"), GAP_CASES)
+def test_a_mac_whose_window_overlaps_a_gap_of_its_collector_is_not_mature(inv, make, blocked):
     m = inv.mac("D", "h", None, "self", OLD, [(NOW - 2000, NOW - 1900), (NOW - 1700, NOW - 1000)])
     inv.db.commit()
     st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
     assert st.mature(m) is True
     lo, hi = st.act[m][0][0], st.act[m][-1][1]
-    # offsets: (0, 10) starts exactly at the window end, (-10, 0) ends exactly at its start
-    st.gaps = [(hi + gap[0], hi + gap[1])] if gap[0] >= -1 else [(lo + gap[0], lo + gap[1])]
-    if gap == (20, 30):
-        st.gaps = [(lo + 20, lo + 30)]
-    assert st.mature(m) is (not expect)
+    start, end = make(lo, hi)
+    st._gap_index = {"c1": ([start], [end])}
+    st.mac_collectors = {m: frozenset({"c1"})}
+    assert st.mature(m) is (not blocked)
+    st.mac_collectors = {m: frozenset({"other"})}  # a gap of a collector that never saw the MAC
+    assert st.mature(m) is True
+    st.mac_collectors = {}  # no collector recorded for the MAC: every collector counts
+    assert st.mature(m) is (not blocked)
+    st.mac_collectors = {m: frozenset({"other"})}
+    assert st.mature(m, "T") is True  # the joining identity is unknown to `by_canon`
+    st.by_canon["T"] = [next(iter(st.obs))]
+    st.mac_collectors = {m: frozenset({"other"}), next(iter(st.obs)).mac: frozenset({"c1"})}
+    assert st.mature(m, "T") is (not blocked)  # the victim's collector counts too
 
 
 def test_the_copy_beside_a_late_collectors_victim_does_not_attach(data):
@@ -567,7 +586,7 @@ def test_upgrading_a_version_6_database_resets_every_existing_anchor_conservativ
         "purged": 2,
         "multi": 9,
     }  # backfilled from the activity
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     record_activity(conn, {"fresh": MacActivity(1, 1)}, 300, 10**9, 7 * 86400)
     assert conn.execute(
         "SELECT received, legacy FROM mac_first_received WHERE mac='fresh'"
@@ -904,3 +923,479 @@ def test_canonical_resolution_reuses_the_resolved_tail_of_shared_chains():
     start = time.perf_counter()
     assert snap.canonical("l7999") == snap.canonical("l0") == "d8000"
     assert time.perf_counter() - start < 2.0  # 8000 leaves x 8000-link tail, if not memoised
+
+
+# ================= round 8 addendum =================
+
+
+class Ticking:
+    """A fake monotonic clock that advances every time the stitcher checks the time."""
+
+    def __init__(self, step: float) -> None:
+        self.t, self.step = 1000.0, step
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def tick_clock(monkeypatch, step: float) -> Ticking:
+    clock = Ticking(step)
+    monkeypatch.setattr(stitch_mod, "time", clock)
+    real = Stitcher._check_time
+
+    def advance(self):
+        clock.t += clock.step
+        real(self)
+
+    monkeypatch.setattr(Stitcher, "_check_time", advance)
+    return clock
+
+
+def attached_with_peer(inv: Inv) -> str:
+    """A rule-attached MAC (with stored attach evidence) and a peer overlapping it for hours."""
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 10000, NOW)],
+                newdev=False)  # fmt: skip
+    inv.db.execute("UPDATE observations SET link_rule_id='r1' WHERE mac=?", (a,))
+    inv.db.execute(
+        "INSERT INTO rule_attachments (mac, rule_id, target, hostname, mdns_name, attached_at,"
+        " opt55, opt60, views)"
+        " VALUES (?, 'r1', 'D', 'victim', NULL, 't', '1,2,3', 'x', '[[true,false]]')",
+        (a,),
+    )  # fmt: skip
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW - 10000, NOW)])
+    return a
+
+
+def spray(inv: Inv, count: int, intervals: int = 3) -> None:
+    for i in range(count):
+        inv.mac(f"S{i}", f"junk{i}", None, "self", "2026-06-01T00:00:00Z",
+                [(NOW - 5000 + k * 400,) * 2 for k in range(intervals)])  # fmt: skip
+
+
+def test_a_spray_cuts_the_bulk_setup_short_but_the_recheck_still_runs(inv, monkeypatch):
+    attached_with_peer(inv)
+    spray(inv, 400)
+    inv.db.commit()
+    clock = tick_clock(monkeypatch, 0.05)  # 2 s of cap = 40 time checks: far fewer than the work
+    start = clock.t
+    st = inv.stitch(RULE_SNAP)
+    assert inv.count("rule_attach_suspect") == 1 and st.suspect == 1
+    summary = inv.db.execute("SELECT summary FROM events WHERE kind='stitch_budget_exhausted'")
+    rows = [r[0] for r in summary]
+    assert len(rows) == 1 and "only the re-check" in rows[0]
+    # the lock was held for at most the setup cap plus the time-box (in the fake clock's time)
+    assert (
+        clock.t - start
+        <= stitch_mod.STITCH_SETUP_MAX_SECONDS + stitch_mod.STITCH_MAX_TXN_SECONDS + 1
+    )
+
+
+def test_a_cut_setup_skips_the_rules_and_candidate_phases(inv, monkeypatch):
+    attached_with_peer(inv)
+    pair_world_for_spray(inv)
+    spray(inv, 400)
+    inv.db.commit()
+    tick_clock(monkeypatch, 0.05)
+    st = Stitcher(inv.db, RULE_SNAP, inv.cfg, NOW)
+    assert st.partial is True and len(st.obs) < 800
+    ran = []
+    for name in ("_recheck_rule_attached", "apply_rules", "stitch_candidates"):
+        real = getattr(Stitcher, name)
+        monkeypatch.setattr(
+            Stitcher, name, lambda self, real=real, name=name: (ran.append(name), real(self))[1]
+        )
+    st.run()
+    assert ran == ["_recheck_rule_attached"]
+
+
+def pair_world_for_spray(inv: Inv) -> None:
+    inv.mac("O9", "pair", None, "self", OLD, [(NOW - 90000, NOW - 89000)])
+    inv.mac("Y9", "pair", None, "self", "2026-02-01T00:00:00Z", [(NOW - 500, NOW)])
+
+
+def test_an_uncut_setup_runs_every_phase(inv):
+    attached_with_peer(inv)
+    pair_world_for_spray(inv)
+    inv.db.commit()
+    st = Stitcher(inv.db, RULE_SNAP, inv.cfg, NOW)
+    assert st.partial is False
+    assert inv.stitch(RULE_SNAP).suggestions == 1  # the candidate phase ran
+
+
+def test_the_interval_fetch_of_every_mac_checks_the_time(inv, monkeypatch):
+    for i in range(30):
+        inv.mac(f"M{i}", f"h{i}", None, "self", OLD, [(NOW - 100 * k,) * 2 for k in range(1, 65)])
+    inv.db.commit()
+    seen = []
+    real = Stitcher._check_time
+    monkeypatch.setattr(Stitcher, "_check_time", lambda self: (seen.append(1), real(self))[1])
+    st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
+    assert len(seen) > 30 and len(st.act) == 30  # at least one check per MAC's interval fetch
+
+
+def test_the_active_set_is_capped_newest_first_and_reported_once_a_day(inv, monkeypatch):
+    monkeypatch.setattr(stitch_mod, "MAX_ACTIVE_MACS", 10)
+    macs = [inv.mac(f"M{i:02d}", f"h{i}", None, "self", OLD, [(NOW - 1000 + i, NOW - 1000 + i)])
+            for i in range(30)]  # fmt: skip
+    inv.db.commit()
+    st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
+    assert st.active_capped is True
+    assert set(st.act) == set(macs[-10:])  # the 10 newest
+    inv.stitch(EMPTY_SNAP)
+    inv.stitch(EMPTY_SNAP, NOW + 60)
+    assert inv.count("stitch_active_set_capped") == 1
+
+
+def test_the_active_set_cap_boundary_is_exact(inv):
+    for i in range(10):
+        inv.mac(f"M{i:02d}", f"h{i}", None, "self", OLD, [(NOW - 100 + i, NOW - 100 + i)])
+    inv.db.commit()
+    assert active_macs(inv.db, NOW - 1000, lambda: None, 10)[1] is False  # exactly the limit
+    got, capped = active_macs(inv.db, NOW - 1000, lambda: None, 9)
+    assert capped is True and len(got) == 9
+    assert active_macs(inv.db, NOW - 1000, lambda: None, 11)[1] is False
+
+
+def test_active_macs_come_newest_first_across_pages(inv, monkeypatch):
+    monkeypatch.setattr("vigie_pipeline.activity.PAGE", 3)
+    for i in range(8):
+        inv.mac(f"M{i}", f"h{i}", None, "self", OLD, [(NOW - 100 * (8 - i),) * 2])
+    inv.db.commit()
+    got, capped = active_macs(inv.db, NOW - 10_000, lambda: None)
+    ends = [
+        inv.db.execute("SELECT last_end FROM mac_last_seen WHERE mac=?", (m,)).fetchone()[0]
+        for m in got
+    ]
+    assert ends == sorted(ends, reverse=True) and len(got) == 8 and not capped
+    got5, capped5 = active_macs(inv.db, NOW - 10_000, lambda: None, 5)
+    assert got5 == got[:5] and capped5 is True
+
+
+# ---- evidence gaps are scoped to the collectors involved, merged, charged and reported ----
+
+
+def test_record_activity_remembers_which_collector_saw_a_mac(tmp_path):
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    record_activity(conn, {"m": MacActivity(1, 1)}, 300, 10**9, 7 * 86400, "c1")
+    record_activity(conn, {"m": MacActivity(1, 1)}, 300, 10**9, 7 * 86400, "c2")
+    record_activity(conn, {"m": MacActivity(1, 1)}, 300, 10**9, 7 * 86400, "c1")
+    got = conn.execute(
+        "SELECT collector_id FROM mac_collectors WHERE mac='m' ORDER BY 1"
+    ).fetchall()
+    assert [r[0] for r in got] == ["c1", "c2"]
+
+
+def test_overlapping_gaps_of_a_collector_are_merged_into_one_row(tmp_path):
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    rec = 10**9
+
+    def late(collector, stamps, received):
+        act = MacActivity(min(stamps), max(stamps), stamps=set(stamps))
+        record_activity(conn, {"m": act}, 300, received, 7 * 86400, collector)
+
+    late("c1", {rec - 9000}, rec)  # gap [rec-9000, rec-3600]
+    late("c1", {rec - 6000}, rec + 100)  # inside/overlapping: merges
+    only = conn.execute(
+        "SELECT start, \"end\" FROM collector_gaps WHERE collector_id='c1'"
+    ).fetchall()
+    assert [tuple(r) for r in only] == [(rec - 9000, rec - 3500)]  # both extents kept
+    late("c1", {rec - 20000}, rec + 200)  # extends it backwards
+    late("c2", {rec - 6000}, rec)  # another collector: its own row
+    rows = conn.execute(
+        'SELECT collector_id, start, "end" FROM collector_gaps ORDER BY 1, 2'
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("c1", rec - 20000, rec + 200 - 3600),
+        ("c2", rec - 6000, rec - 3600),
+    ]
+    late("c1", {rec + 450000}, rec + 500000)  # disjoint from the merged one: a second row
+    assert (
+        conn.execute("SELECT COUNT(*) FROM collector_gaps WHERE collector_id='c1'").fetchone()[0]
+        == 2
+    )
+
+
+def test_load_gaps_merges_and_caps_per_collector(tmp_path, monkeypatch):
+    conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    conn.executemany(
+        'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,0)',
+        [("c", 10, 20), ("c", 15, 30), ("c", 100, 110), ("c", 200, 210), ("d", 1, 2)],
+    )
+    assert load_gaps(conn, 0) == {"c": [(10, 30), (100, 110), (200, 210)], "d": [(1, 2)]}
+    assert load_gaps(conn, 105) == {"c": [(100, 110), (200, 210)]}
+    monkeypatch.setattr("vigie_pipeline.activity.MAX_GAPS_PER_COLLECTOR", 2)
+    assert load_gaps(conn, 0)["c"] == [(100, 110), (200, 210)]  # the newest two
+    ticks = []
+    load_gaps(conn, 0, lambda: ticks.append(1))
+    assert ticks == [1]
+
+
+def late_victim_world(data, gap_collector: str):
+    ov, dev = seeded_d(data, 300)
+    b = mac(2)
+    lease = [(b, "Daves-Phone", "[1,121,3,6,15,119,252]", "android-dhcp-14")]
+    data.add_batch(T0 + 2000, collector="rtr-2", received=T0 + 2000, leases=lease,
+                   sightings=[(b, "mdns", "Daves Phone")],
+                   dns=[(b, T0 + t) for t in range(1000, 2001, 60)])  # fmt: skip
+    data.add_batch(T0 + 5400, collector=gap_collector, received=T0 + 5400,
+                   dns=[(mac(1), T0 + t) for t in range(300, 5401, 60)])  # fmt: skip
+    return ov, b
+
+
+def test_a_deferred_attach_names_the_collector_once_a_day(data):
+    ov, b = late_victim_world(data, "rtr-1")
+    run_at(data, T0 + 6000)
+    run_at(data, T0 + 6100)
+    events = kinds(data, "evidence_gap")
+    assert len(events) == 1 and "rtr-1" in events[0]["summary"]
+    assert source_of(data, b) == "self"
+    run_at(data, T0 + 6000 + 86400)
+    assert len(kinds(data, "evidence_gap")) == 2
+    ov.close()
+
+
+def test_a_gap_of_a_collector_that_saw_neither_side_does_not_block(data):
+    ov, dev = seeded_d(data, 300)
+    b = mac(2)
+    lease = [(b, "Daves-Phone", "[1,121,3,6,15,119,252]", "android-dhcp-14")]
+    data.add_batch(T0 + 2000, collector="rtr-2", received=T0 + 2000, leases=lease,
+                   sightings=[(b, "mdns", "Daves Phone")],
+                   dns=[(b, T0 + t) for t in range(1000, 2001, 60)])  # fmt: skip
+    data.add_batch(T0 + 5400, collector="rtr-1", received=T0 + 5400,
+                   dns=[(mac(1), T0 + t) for t in range(1800, 5401, 60)])  # fmt: skip
+    data.inv.execute(
+        'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,0)',
+        ("rtr-9", T0, T0 + 6000),
+    )
+    run_at(data, T0 + 6000)
+    assert source_of(data, b) == "rule" and kinds(data, "evidence_gap") == []
+    ov.close()
+
+
+def test_the_gap_lookup_binary_searches_the_merged_gaps(inv):
+    m = inv.mac("D", "h", None, "self", OLD, [(NOW - 2000, NOW - 1000)])
+    inv.db.commit()
+    st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
+    lo, hi = st.act[m][0][0], st.act[m][-1][1]
+    starts = [lo - 5000 + 10 * i for i in range(400)]
+    st._gap_index = {"c": (starts, [x + 5 for x in starts])}  # 2000 disjoint gaps before the window
+    st.mac_collectors = {m: frozenset({"c"})}
+    assert st._gap_collectors(m) == []
+    st._gap_index = {"c": (starts + [hi - 1], [x + 5 for x in starts] + [hi + 5])}
+    assert st._gap_collectors(m) == ["c"]
+
+
+# ---- legacy anchors keep their activity as evidence ----
+
+
+def legacy_world(inv: Inv, legacy_victim: bool):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 170000, NOW - 7200)], rand=0)
+    inv.db.execute(
+        "INSERT OR REPLACE INTO mac_first_received (mac, received, legacy) VALUES"
+        " ((SELECT mac FROM observations WHERE device_id='D'), ?, ?)",
+        (NOW - 50, int(legacy_victim)),
+    )
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW - 90000, NOW - 80000)])
+    inv.db.execute("UPDATE mac_first_received SET received=? WHERE mac=?", (NOW - 95000, a))
+    return a
+
+
+def test_a_legacy_victims_old_activity_still_vetoes_a_twin(inv):
+    a = legacy_world(inv, legacy_victim=True)
+    st = inv.stitch(RULE_SNAP)
+    assert st.attached == 0 and link_of(inv, a) == ("A", "self")
+    assert ("D", "vetoed") in inv.state("A")
+
+
+def test_without_the_legacy_mark_the_clipped_activity_lets_the_twin_attach(inv):
+    a = legacy_world(inv, legacy_victim=False)
+    assert inv.stitch(RULE_SNAP).attached == 1 and link_of(inv, a) == ("D", "rule")
+
+
+def test_a_legacy_macs_own_covered_time_counts_only_after_its_anchor(inv):
+    m = inv.mac("D", "h", None, "self", OLD, [(NOW - 170000, NOW - 7200), (NOW - 400, NOW)])
+    inv.db.execute("UPDATE mac_first_received SET legacy=1, received=? WHERE mac=?", (NOW - 100, m))
+    inv.db.commit()
+    st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
+    assert len(st.act[m]) == 2 and m in st.legacy
+    horizon = NOW - 100 - 3600
+    assert horizon < NOW - 400
+    assert st.covered(m) == 400  # only the recent interval counts; the 2-day-old one is evidence
+    assert st.mature(m) is False
+
+
+# ---- a malformed rule makes its target a human decision ----
+
+
+def test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)])
+    snap = Snapshot({}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset({"D"}))
+    st = inv.stitch(snap)
+    assert st.attached == 0 and link_of(inv, a) == ("A", "self") and st.suggestions == 1
+    reason = inv.db.execute("SELECT reason_code FROM suggestions").fetchone()[0]
+    assert reason == "rule_hit_needs_confirm"
+
+
+def test_a_malformed_rule_on_another_device_changes_nothing(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)])
+    snap = Snapshot({}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset({"Z"}))
+    assert inv.stitch(snap).attached == 1 and link_of(inv, a) == ("D", "rule")
+
+
+def test_a_malformed_target_is_matched_through_merges(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 3000, NOW)])
+    inv.mac("E", "elsewhere", None, "self", OLD, [], rand=0)
+    snap = Snapshot(
+        {"E": "D"}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset({"E"})
+    )  # the malformed rule sits on E, which is merged into D
+    assert inv.stitch(snap).attached == 0 and link_of(inv, a) == ("A", "self")
+
+
+@pytest.mark.parametrize("raw", ["not json", '"a string"', "[1, 2]", "42", "null", ""])
+def test_a_signature_that_is_not_a_json_object_is_malformed_and_names_its_target(tmp_path, raw):
+    ov = Overrides(tmp_path)
+    ov.conn.execute(
+        "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+        " VALUES ('r','D',?,'t','owner')", (raw,),
+    )  # fmt: skip
+    ov.conn.commit()
+    conn = open_overrides_ro(tmp_path / "overrides.db")
+    snap = load_snapshot(conn, NOW)
+    assert snap.rules == () and snap.malformed_rules == 1 and snap.malformed_devices == {"D"}
+
+
+def test_a_wrong_typed_field_also_names_its_target(tmp_path):
+    snap = snapshot_with(tmp_path, {**BASE, "mdns_name": {"x": 1}})
+    assert snap.malformed_rules == 1 and snap.malformed_devices == {"D"}
+
+
+# ---- orphan suggestions in both directions ----
+
+
+def test_suggestions_pointing_into_the_orphan_are_expired_too(inv):
+    a = attach_unit(inv)
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('c1','X','A',0.9,'{}','suggested','t')"
+    )
+    suggestion(inv, "into", ["X", "A"], NOW + 10**6)
+    suggestion(inv, "from", ["A", "Y"], NOW + 10**6)
+    suggestion(inv, "other", ["X", "Q"], NOW + 10**6)
+    inv.db.commit()
+    assert inv.stitch(RULE_SNAP).attached == 1, a
+    rows = dict(inv.db.execute("SELECT id, expires_at FROM suggestions").fetchall())
+    assert rows["into"] < iso_utc(NOW) and rows["from"] < iso_utc(NOW)
+    assert rows["other"] == iso_utc(NOW + 10**6)
+
+
+def test_a_decided_suggestion_into_the_orphan_is_kept(inv):
+    attach_unit(inv)
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('c1','X','A',0.9,'{}','suggested','t')"
+    )
+    suggestion(inv, "into", ["X", "A"], NOW + 10**6)
+    inv.db.commit()
+    snap = Snapshot({}, (), {}, {}, {"into": "rejected"})
+    assert withdraw_orphan_suggestions(inv.db, snap, "A", NOW) == 0
+
+
+# ---- survivors: time check, cache reset, retention filter, component boundary ----
+
+
+def test_the_device_lookup_of_active_macs_checks_the_time(inv):
+    inv.mac("D", "h", None, "self", OLD, [(NOW - 100, NOW)])
+    inv.db.commit()
+    st = Stitcher(inv.db, EMPTY_SNAP, inv.cfg, NOW)
+    st.deadline = 0.0
+    with pytest.raises(BudgetExhaustedError):
+        st._device_ids_of(["x"])
+    assert st._device_ids_of([]) == set()  # nothing to look up: no check
+
+
+def test_an_attach_resets_the_cached_interval_union_of_its_target(inv):
+    a = attach_unit(inv)
+    st = Stitcher(inv.db, RULE_SNAP, inv.cfg, NOW)
+    before = list(st._canon_union("D"))
+    assert all(iv[1] < NOW - 1000 for iv in before)  # D alone: old activity only
+    st._attach(st.by_mac[a], "D", RULE_SNAP.rules[0], 1.0, [RULE_SNAP.rules[0]])
+    after = st._canon_union("D")
+    assert (
+        after != before and after[-1][1] >= NOW
+    )  # now includes the attached MAC's recent activity
+
+
+def test_the_per_mac_query_drops_intervals_before_the_retention_cutoff(inv):
+    m = inv.mac("D", "h", None, "self", OLD, [(100, 110), (1000, 1010)])
+    inv.db.execute("INSERT OR REPLACE INTO mac_first_received (mac, received) VALUES (?, 0)", (m,))
+    inv.db.commit()
+    got = load_activity(inv.db, 0, per_mac_limit=64, min_end=500, macs=[m])
+    assert got == {m: [(1000, 1010)]}
+    assert load_activity(inv.db, 0, per_mac_limit=64, min_end=0, macs=[m])[m] == [
+        (100, 110),
+        (1000, 1010),
+    ]
+
+
+def test_the_oversize_boundary_is_exact(inv, monkeypatch):
+    inv.mac("A", "victim", None, "self", OLD, [(NOW - 100, NOW)])
+    inv.db.commit()
+    monkeypatch.setattr(stitch_mod, "MAX_ALIAS_IDS", 3)
+    links = {"a1": "A", "a2": "A", "b1": "T", "b2": "T", "b3": "T"}  # |A side|=3, |T side|=4
+    st = Stitcher(inv.db, Snapshot(links, (), {}, {}, {}), inv.cfg, NOW)
+    me = next(o for o in st.obs if o.device_id == "A")
+    assert len(st.alias_ids("A")) == 3 and len(st.alias_ids("T")) == 4
+    assert st._vetoed(me, "T") is False  # the smaller side is exactly at the limit: decided
+    monkeypatch.setattr(stitch_mod, "MAX_ALIAS_IDS", 2)
+    assert st._vetoed(me, "T") is True  # one over: deferred
+
+
+def test_a_gap_on_the_candidates_own_collector_is_reported_as_well(data):
+    ov, dev = seeded_d(data, 300)
+    b = mac(2)
+    lease = [(b, "Daves-Phone", "[1,121,3,6,15,119,252]", "android-dhcp-14")]
+    data.add_batch(T0 + 5400, collector="rtr-2", received=T0 + 5400, leases=lease,
+                   sightings=[(b, "mdns", "Daves Phone")],
+                   dns=[(b, T0 + t) for t in range(1000, 5401, 60)])  # fmt: skip
+    run_at(data, T0 + 6500)
+    assert source_of(data, b) == "self" and len(kinds(data, "evidence_gap")) == 1
+    assert "rtr-2" in kinds(data, "evidence_gap")[0]["summary"]
+    ov.close()
+
+
+def test_a_victims_collector_gap_keeps_a_sustained_overlap_provisional(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 20000, NOW)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW - 5000, NOW)])
+    inv.db.execute("INSERT INTO mac_collectors (mac, collector_id) VALUES (?, 'c2')", (a,))
+    d_mac = inv.db.execute("SELECT mac FROM observations WHERE device_id='D'").fetchone()[0]
+    inv.db.execute("INSERT INTO mac_collectors (mac, collector_id) VALUES (?, 'c1')", (d_mac,))
+    inv.db.execute(
+        'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,0)',
+        ("c1", NOW - 8000, NOW - 3000),
+    )
+    st = inv.stitch(EMPTY_SNAP)
+    assert inv.state("A") == [("D", "open")] and st.vetoed == 0  # the victim's evidence is missing
+    inv.db.execute("DELETE FROM collector_gaps")
+    inv.db.execute("DELETE FROM identity_candidates")
+    assert inv.stitch(EMPTY_SNAP).vetoed == 1 and inv.state("A") == [("D", "vetoed")]
+
+
+def test_the_core_loads_the_newest_peers_of_an_attachments_name(inv, monkeypatch):
+    monkeypatch.setattr(stitch_mod, "MAX_SIGNATURE_BUCKET", 2)  # the limit is 3 devices
+    inv.mac("D", "victim", None, "self", OLD, [(NOW - 90000, NOW - 80000)], rand=0)
+    a = inv.mac("D", "victim", None, "rule", "2026-01-02T00:00:00Z", [(NOW - 100, NOW)],
+                newdev=False)  # fmt: skip
+    inv.db.execute(
+        "INSERT INTO rule_attachments (mac, rule_id, target, hostname, mdns_name, attached_at,"
+        " opt55, opt60) VALUES (?, 'r', 'D', 'victim', NULL, 't', '1,2,3', 'x')", (a,)
+    )  # fmt: skip
+    for i in range(6):
+        inv.mac(f"P{i}", "victim", None, "self", f"2026-02-0{i + 1}T00:00:00Z", [])
+    inv.db.commit()
+    tick_clock_none = Stitcher.__new__(Stitcher)
+    tick_clock_none.inv = inv.db
+    assert tick_clock_none._newest_devices("1,2,3", "x", "hostname", "victim") == {"P3", "P4", "P5"}

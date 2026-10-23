@@ -116,8 +116,7 @@ def test_the_setup_check_runs_inside_the_observation_loading(inv, monkeypatch):
     inv.stitcher()
     assert ticks and callable(ticks[0])
     monkeypatch.setattr(stitch_mod, "STITCH_SETUP_MAX_SECONDS", -1)
-    with pytest.raises(BudgetExhaustedError):
-        Stitcher(inv.db, EMPTY, inv.cfg, NOW)
+    assert Stitcher(inv.db, EMPTY, inv.cfg, NOW).partial is True  # the bulk was cut short
 
 
 def three_attached(inv: Inv) -> list[str]:

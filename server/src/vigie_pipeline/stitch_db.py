@@ -268,20 +268,36 @@ def save_attachment(inv: sqlite3.Connection, mac: str, att: Attachment, now: flo
 def withdraw_orphan_suggestions(
     inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float
 ) -> int:
-    """Expire (expires_at only) EVERY undecided merge suggestion that starts at the orphaned device
-    `device_id`, by index range, in one go. Deliberately not limited by the row allowance: an
-    orphan's suggestion must never stay actionable. Returns the rows expired."""
+    """Expire (expires_at only) EVERY undecided merge suggestion that starts at, or points into, the
+    orphaned device `device_id`, in one go. The 'from' direction is an index range; the 'into'
+    direction goes through the candidate rows that name the orphan (idx_candidates_b) and exact pair
+    look-ups. Deliberately not limited by the row allowance: an orphan's suggestion must never stay
+    actionable. Returns the rows expired."""
     prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
-    ids = [
+    now_iso = iso_utc(now)
+    ids = {
         r["id"]
         for r in inv.execute(
             "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
             " AND device_ids < ? AND expires_at >= ?",
-            (prefix, prefix + "\uffff", iso_utc(now)),
+            (prefix, prefix + "\uffff", now_iso),
         )
-        if r["id"] not in snap.decisions
-    ]
+    }
+    froms = [r[0] for r in inv.execute(
+        "SELECT DISTINCT device_a FROM identity_candidates WHERE device_b=?", (device_id,)
+    )]  # fmt: skip
+    for chunk in _chunks(froms):
+        pairs = [json.dumps([a, device_id]) for a in chunk]
+        ids.update(
+            r["id"]
+            for r in inv.execute(
+                "SELECT id FROM suggestions WHERE action='merge_identity'"  # noqa: S608
+                f" AND device_ids IN ({_marks(pairs)}) AND expires_at >= ?",
+                [*pairs, now_iso],
+            )
+        )
+    todo = sorted(i for i in ids if i not in snap.decisions)
     inv.executemany(
-        "UPDATE suggestions SET expires_at=? WHERE id=?", [(iso_utc(now - 1), i) for i in ids]
+        "UPDATE suggestions SET expires_at=? WHERE id=?", [(iso_utc(now - 1), i) for i in todo]
     )
-    return len(ids)
+    return len(todo)

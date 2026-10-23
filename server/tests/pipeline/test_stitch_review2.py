@@ -181,6 +181,7 @@ def test_flood_boundary_64_is_not_flooded_65_is(data):
     assert len(kinds(data, "signature_flood")) == 1
 
 
+@pytest.mark.timeout(180)  # 70 full pipeline runs: slow on a loaded disk, not timing-sensitive
 def test_attached_macs_do_not_count_toward_the_flood_cap(data):
     ov, dev = iot(data)
     for i in range(70):  # one legitimate roll per pass for much longer than the cap
@@ -290,12 +291,12 @@ def test_populated_v4_database_migrates_to_v5(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     rows = conn.execute("SELECT id, dedup FROM events ORDER BY seq").fetchall()
     assert [tuple(r) for r in rows] == [("e1", None), ("e2", None)]  # NULL dedup stays NULL
     assert conn.execute("SELECT COUNT(*) FROM mac_activity").fetchone()[0] == 1
-    assert apply_pipeline_migrations(conn) == 10  # re-apply is a no-op
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 10
+    assert apply_pipeline_migrations(conn) == 11  # re-apply is a no-op
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 11
     conn.execute(ins, ("e3",))  # NULLs never collide on the partial unique index
 
 

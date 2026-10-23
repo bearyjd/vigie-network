@@ -14,7 +14,7 @@ import hashlib
 import logging
 import sqlite3
 import time
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -25,6 +25,7 @@ from vigie_pipeline.activity import (
     Interval,
     active_macs,
     load_activity,
+    load_collectors,
     load_first_received,
     load_gaps,
     merge_intervals,
@@ -33,6 +34,7 @@ from vigie_pipeline.activity import (
 from vigie_pipeline.config import (
     ACTIVITY_MAX_REPORT_LAG_S,
     HISTORIC_MATCH_LIMIT,
+    MAX_ACTIVE_MACS,
     MAX_ALIAS_IDS,
     MAX_FLOOD_EVENTS_PER_PASS,
     MAX_INTERVALS_PER_MAC,
@@ -240,18 +242,18 @@ class Stitcher:
         self.overrides = overrides  # re-read under the lock before an attach
         self.deadline = time.monotonic() + STITCH_SETUP_MAX_SECONDS  # setup only; see run()
         self.components = _components(snap.links, self._check_time)
-        cutoff = int(now) - cfg.activity_retention_s
-        active = active_macs(inv, cutoff, self._check_time)  # only ACTIVE macs are ever examined
-        self.first_recv = load_first_received(inv, active, self._check_time)  # SERVER 1st receipt
-        self.act = {  # only active MACs; only the most recent intervals of a MAC are compared
-            m: ivs[-MAX_INTERVALS_PER_MAC:]
-            for m, ivs in load_activity(
-                inv, cfg.activity_gap_s, per_mac_limit=MAX_INTERVALS_PER_MAC,
-                first_received=self.first_recv, max_lag_s=ACTIVITY_MAX_REPORT_LAG_S,
-                min_end=cutoff, tick=self._check_time, macs=active,
-            ).items()
-        }  # fmt: skip
-        self.gaps = load_gaps(inv, cutoff)  # spans of missing evidence
+        self.malformed_targets = frozenset(snap.canonical(d) for d in snap.malformed_devices)
+        self.cutoff = int(now) - cfg.activity_retention_s
+        self.obs: list[Obs] = []
+        self.act: dict[str, list[Interval]] = {}
+        self.first_recv: dict[str, int] = {}  # SERVER time each MAC was first received
+        self.legacy: set[str] = set()  # anchored at a migration, not at a real first receipt
+        self.mac_collectors: dict[str, frozenset[str]] = {}
+        self._loaded: set[str] = set()
+        self.gaps = load_gaps(inv, self.cutoff, self._check_time)  # spans of missing evidence
+        self._gap_index = {
+            c: ([g[0] for g in gs], [g[1] for g in gs]) for c, gs in self.gaps.items()
+        }
         self.ops = 0  # overlap-computation budget spent this pass
         self.flood_events = 0
         self.flood_suppressed = 0
@@ -260,15 +262,91 @@ class Stitcher:
         self.flooded_keys: set[GroupKey] = set()
         self.writes = 0  # candidate/suggestion rows written this pass
         self.attachments = load_attachments(inv)  # immutable evidence of each rule attach
-        devices = self._relevant_devices()
-        self.obs = _load_obs(inv, snap, self._check_time, devices)
-        history = self._historical_devices() - devices
-        if history:  # older matching identities without retained activity
-            self.obs = sorted(
-                self.obs + _load_obs(inv, snap, self._check_time, history),
-                key=lambda o: (o.first_seen, o.mac),
-            )
+        self.partial = False  # the bulk of the setup hit its cap: only the re-check runs
+        self.active_capped = False  # more active MACs than MAX_ACTIVE_MACS: the newest were taken
+        self._load_core()  # the re-check's inputs first: attached MACs, their targets and peers
+        try:
+            self._load_bulk()
+        except BudgetExhaustedError:
+            self.partial = True
+        self.obs.sort(key=lambda o: (o.first_seen, o.mac))
         self._index()
+
+    def _add_devices(self, devices: Iterable[str]) -> None:
+        """Load the observations of devices not loaded yet, with the first receipts, activity and
+        collectors of their MACs (all-or-nothing per call; every loop ticks the setup cap)."""
+        new = sorted(set(devices) - self._loaded)
+        if not new:
+            return
+        obs = _load_obs(self.inv, self.snap, self._check_time, new)
+        macs = [o.mac for o in obs]
+        legacy: set[str] = set()
+        first = load_first_received(self.inv, macs, self._check_time, legacy)
+        acts = load_activity(
+            self.inv, self.cfg.activity_gap_s, per_mac_limit=MAX_INTERVALS_PER_MAC,
+            first_received=first, max_lag_s=ACTIVITY_MAX_REPORT_LAG_S, min_end=self.cutoff,
+            tick=self._check_time, macs=macs, clip_exempt=legacy,
+        )  # fmt: skip
+        collectors = load_collectors(self.inv, list(acts), self._check_time)
+        self.obs.extend(obs)
+        self.first_recv.update(first)
+        self.legacy |= legacy
+        self.act.update({m: ivs[-MAX_INTERVALS_PER_MAC:] for m, ivs in acts.items()})
+        self.mac_collectors.update(collectors)
+        self._loaded |= set(new)
+
+    def _device_ids_of(self, macs: list[str]) -> set[str]:
+        out: set[str] = set()
+        for chunk in _chunked(macs):
+            self._check_time()
+            marks = ",".join("?" * len(chunk))
+            out.update(
+                r[0] for r in self.inv.execute(
+                    f"SELECT DISTINCT device_id FROM observations WHERE mac IN ({marks})",  # noqa: S608
+                    chunk,
+                )
+            )  # fmt: skip
+        return out
+
+    def _load_core(self) -> None:
+        """What the post-attach re-check needs, loaded BEFORE the bulk of the setup so that the
+        re-check still runs when the bulk is cut short: the rule-attached MACs, their targets and
+        the devices of the MACs that share the attach-time fingerprint and a name with them
+        (newest first, at most MAX_SIGNATURE_BUCKET + 1 per name)."""
+        if not self.attachments:
+            return
+        devices = self._device_ids_of(sorted(self.attachments))
+        for att in self.attachments.values():
+            devices.add(att.target)
+            if att.opt55 and att.opt60:
+                for column, name in (("hostname", att.hostname), ("mdns_name", att.mdns_name)):
+                    if name:
+                        self._check_time()
+                        devices.update(self._newest_devices(att.opt55, att.opt60, column, name))
+        self._add_devices(self._expand(devices))
+
+    def _newest_devices(self, opt55: str, opt60: str, column: str, name: str) -> set[str]:
+        return {
+            r[0] for r in self.inv.execute(
+                "SELECT device_id FROM observations WHERE dhcp_fingerprint=?"  # noqa: S608
+                f" AND vendor_class=? AND {column} = ? COLLATE NOCASE"
+                " ORDER BY first_seen DESC LIMIT ?",
+                (opt55, opt60, name, MAX_SIGNATURE_BUCKET + 1),
+            )
+        }  # fmt: skip
+
+    def _load_bulk(self) -> None:
+        """Everything else the decisions depend on, newest active MACs first and in batches, so a
+        cut-off keeps what was loaded: devices with an active MAC (all their MACs), the rule
+        targets, merged devices, then older matching identities without retained activity."""
+        macs, self.active_capped = active_macs(
+            self.inv, self.cutoff, self._check_time, MAX_ACTIVE_MACS
+        )
+        devices = self._device_ids_of(macs) | {r.device_id for r in self.snap.rules}
+        batch = sorted(self._expand(devices) - self._loaded)
+        for chunk in _chunked(batch, 2000):
+            self._add_devices(chunk)
+        self._add_devices(self._historical_devices())
 
     def _expand(self, devices: Iterable[str]) -> set[str]:
         """The devices and everything merged with them (a component over MAX_ALIAS_IDS is not
@@ -278,24 +356,6 @@ class Stitcher:
             members = self.alias_ids(device)
             out |= members if len(members) <= MAX_ALIAS_IDS else {device}
         return out
-
-    def _relevant_devices(self) -> set[str]:
-        """Every device the decisions can depend on: devices with an active MAC (all their MACs),
-        the rule targets, and everything merged with them (the target of an attach that is still
-        active is loaded through the attached MAC's own device)."""
-        devices: set[str] = set()
-        active = sorted(self.act)
-        for chunk in _chunked(active):
-            self._check_time()
-            marks = ",".join("?" * len(chunk))
-            devices.update(
-                r[0] for r in self.inv.execute(
-                    f"SELECT DISTINCT device_id FROM observations WHERE mac IN ({marks})",  # noqa: S608
-                    chunk,
-                )
-            )  # fmt: skip
-        devices.update(r.device_id for r in self.snap.rules)
-        return self._expand(devices)
 
     def _historical_devices(self) -> set[str]:
         """Older identities that match an active candidate's fingerprint and a name but have no
@@ -383,30 +443,50 @@ class Stitcher:
     def covered(self, mac: str) -> int:
         """Seconds of observed activity (sum of the widened intervals): sparse stamps count only
         for the time they cover, not for the span between them."""
-        return sum(end - start for start, end in self.act.get(mac, ()))
+        ivs = self.act.get(mac, ())
+        if mac in self.legacy and mac in self.first_recv:
+            # a legacy MAC keeps its pre-upgrade activity as EVIDENCE about peers, but only the time
+            # after its (migration-time) anchor minus the report lag counts for its OWN maturity
+            horizon = self.first_recv[mac] - ACTIVITY_MAX_REPORT_LAG_S
+            return sum(end - max(start, horizon) for start, end in ivs if end > horizon)
+        return sum(end - start for start, end in ivs)
 
-    def mature(self, mac: str) -> bool:
+    def age_ok(self, mac: str) -> bool:
+        """More than the grace window of own covered time and of SERVER age (no anchor: unknown,
+        so not old enough)."""
+        grace = self.cfg.overlap_grace_s
+        first = self.first_recv.get(mac)
+        return self.covered(mac) > grace and first is not None and self.now - first > grace
+
+    def mature(self, mac: str, joining: str | None = None) -> bool:
         """Enough TRUSTED history to rule out an overlapping twin: more than the grace window of
         covered time (stamps back-filled earlier than the report lag are already clipped away) AND
         first received by the server more than the grace window ago (the server clock, not a
-        collector stamp)."""
-        grace = self.cfg.overlap_grace_s
-        first = self.first_recv.get(mac)  # no anchor: unknown age, so not mature (fail closed)
-        return (
-            self.covered(mac) > grace
-            and first is not None
-            and self.now - first > grace
-            and not self._in_gap(mac)
-        )
+        collector stamp) AND no evidence gap of a collector that saw the MAC overlaps its
+        activity window."""
+        return self.age_ok(mac) and not self._gap_collectors(mac, joining)
 
-    def _in_gap(self, mac: str) -> bool:
-        """Does the MAC's activity window overlap a span in which some collector's evidence is
-        known to be missing (stamps dropped for the report lag, or a long silence)?"""
+    def _gap_collectors(self, mac: str, joining: str | None = None) -> list[str]:
+        """The collectors whose recorded evidence gap overlaps the MAC's activity window, among
+        those that saw the MAC and, with `joining`, those that saw the identity it would join (a
+        copy seen by one collector must not hide the victim's missing evidence on another). Every
+        collector counts if none is recorded for the MAC: fail closed."""
         ivs = self.act.get(mac)
-        if not ivs:
-            return False
-        lo, hi = ivs[0][0], ivs[-1][1]
-        return any(start < hi and end > lo for start, end in self.gaps)
+        if not ivs or not self._gap_index:
+            return []
+        slack = self.cfg.activity_gap_s  # a gap within one activity gap of the window counts
+        lo, hi = ivs[0][0] - slack, ivs[-1][1] + slack
+        out = []
+        own = self.mac_collectors.get(mac)
+        relevant = set(own or self._gap_index)
+        if own and joining is not None:
+            relevant |= self._collectors_of(joining)
+        for collector in sorted(relevant):
+            starts, ends = self._gap_index.get(collector, ([], []))
+            i = bisect_left(ends, lo)  # merged gaps: sorted and disjoint
+            if i < len(starts) and starts[i] <= hi:
+                out.append(collector)
+        return out
 
     def sustained(self, mac: str, others: Iterable[str]) -> bool:
         """Concurrent activity that rules out a rolling twin. Sustained = overlap longer than the
@@ -697,7 +777,9 @@ class Stitcher:
         """Three phases, each with its OWN overlap budget, so a phase that runs out never starves
         the next: the post-attach re-check first (it is the only guard on trust already given),
         then standing rules, then fingerprint candidates."""
-        for phase in (self._recheck_rule_attached, self.apply_rules, self.stitch_candidates):
+        phases = [self._recheck_rule_attached, self.apply_rules, self.stitch_candidates]
+        self._report_setup()
+        for phase in phases[:1] if self.partial else phases:
             self.ops = 0  # each phase also gets an equal slice of the transaction time-box,
             self.deadline = time.monotonic() + STITCH_MAX_TXN_SECONDS / 3  # after setup
             try:
@@ -714,6 +796,17 @@ class Stitcher:
             emit_once(self.inv, None, "signature_flood_summary", "warn",
                       f"{self.flood_suppressed} further signature floods not reported this pass",
                       f"summary:{self.day()}", self.now)  # fmt: skip
+
+    def _report_setup(self) -> None:
+        if self.partial:
+            emit_once(self.inv, None, "stitch_budget_exhausted", "warn",
+                      "stitching setup exceeded its time cap: only the re-check of rule-attached"
+                      " MACs ran this pass", self.day(), self.now)  # fmt: skip
+            log(logger, logging.WARNING, "stitch_budget_exhausted", phase="setup_partial")
+        if self.active_capped:
+            emit_once(self.inv, None, "stitch_active_set_capped", "warn",
+                      f"more than {MAX_ACTIVE_MACS} MACs are active: the newest were loaded",
+                      self.day(), self.now)  # fmt: skip
 
     def apply_rules(self) -> None:
         self._settle_attached()
@@ -806,8 +899,24 @@ class Stitcher:
         ).fetchone()
         return bool(row) and row[0] == "ok"
 
+    def _collectors_of(self, canon: str) -> set[str]:
+        return {k for o in self.by_canon.get(canon, []) for k in self.mac_collectors.get(o.mac, ())}
+
+    def _note_gap_deferral(self, c: Obs, joining: str | None = None) -> None:
+        """An attach deferred only because of an evidence gap is reported (once a day per
+        collector), never silent."""
+        if not self.age_ok(c.mac):
+            return
+        for collector in self._gap_collectors(c.mac, joining):
+            emit_once(self.inv, None, "evidence_gap", "warn",
+                      f"rule attach deferred: collector {collector} has a gap in its evidence"
+                      " overlapping a MAC's activity; a human decides",
+                      f"{collector}:{self.day()}", self.now)  # fmt: skip
+            log(logger, logging.WARNING, "evidence_gap", collector=collector)
+
     def _apply_rule(self, c: Obs) -> None:
         if not self.mature(c.mac):
+            self._note_gap_deferral(c)
             return  # too little trusted history to rule out an overlapping twin: defer quietly
         matched = [r for r in self.snap.rules if rule_matches(r, c) and self._rule_live(r)]
         targets = sorted({self.snap.canonical(r.device_id) for r in matched})
@@ -821,6 +930,9 @@ class Stitcher:
         target = targets[0]
         if not self.inv.execute("SELECT 1 FROM devices WHERE id=?", (target,)).fetchone():
             log(logger, logging.WARNING, "rule_device_missing", device_id=target)
+            return
+        if not self.mature(c.mac, target):  # the victim's collector may have a gap too
+            self._note_gap_deferral(c, target)
             return
         self.handled.add(c.mac)
         if self._vetoed(c, target):
@@ -839,7 +951,12 @@ class Stitcher:
             return
         group = self.snap.overrides.get(target, (0, None))[1]
         trusted_state = self._state_ok(target) and self._state_ok(c.device_id)
-        if trusted_state and group is not None and self.snap.group_auto_inherit.get(group) == 1:
+        if (
+            trusted_state
+            and group is not None
+            and self.snap.group_auto_inherit.get(group) == 1
+            and target not in self.malformed_targets  # a malformed rule on it: a human decides
+        ):
             self._attach(c, target, rule, score, matched)
         else:  # unassigned, auto_inherit=0, unknown group or identity_state != 'ok': human confirms
             found = ["opt55", "opt60", *(n for n in ("hostname", "mdns_name") if getattr(rule, n))]
@@ -992,7 +1109,7 @@ class Stitcher:
         if self._has_concurrent_pair(c, canons):
             self._ambiguous(c, canons, score, evidence)
         elif self.sustained(c.mac, self._canon_macs(canons)):
-            if self.mature(c.mac):
+            if self.mature(c.mac, into):
                 self._veto(c, into, score, evidence)
             elif candidate_state(self.inv, c.device_id, into) is None:
                 # not enough trusted history to tell a hand-over from a twin: the overlap is

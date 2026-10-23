@@ -8,7 +8,7 @@ like raw).
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
 from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S
 from vigie_pipeline.sources import MacActivity
@@ -68,6 +68,10 @@ def record_activity(
     lo_ok = int(received_ts) - min(retention_s, ACTIVITY_MAX_REPORT_LAG_S)
     if collector is not None:
         _record_gaps(inv, acts, collector, int(received_ts), lo_ok, retention_s)
+        inv.executemany(
+            "INSERT OR IGNORE INTO mac_collectors (mac, collector_id) VALUES (?,?)",
+            [(mac, collector) for mac in acts],
+        )
     for mac, act in acts.items():
         stamps = sorted(t for t in act.stamps if lo_ok <= t <= hi_ok)
         if not stamps:
@@ -96,23 +100,71 @@ def _record_gaps(
     """Evidence this collector could not deliver in time: the span of the stamps dropped for being
     older than the report lag (but inside retention)."""
     late = [t for act in acts.values() for t in act.stamps if received - retention_s <= t < lo_ok]
-    if late:
+    if not late:
+        return
+    start, end = min(late), lo_ok
+    for (
+        row
+    ) in inv.execute(  # merge into the collector's overlapping gaps: few rows, not one per batch
+        'SELECT start, "end" FROM collector_gaps'
+        ' WHERE collector_id=? AND "end" >= ? AND start <= ?',
+        (collector, start, end),
+    ).fetchall():
+        start, end = min(start, row[0]), max(end, row[1])
+    inv.execute(
+        'DELETE FROM collector_gaps WHERE collector_id=? AND "end" >= ? AND start <= ?',
+        (collector, start, end),
+    )
+    inv.execute(
+        'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,?)',
+        (collector, start, end, received),
+    )
+
+
+def load_gaps(
+    inv: sqlite3.Connection, since: int, tick: Callable[[], None] = lambda: None
+) -> dict[str, list[Interval]]:
+    """Evidence gaps that end no earlier than `since`, per collector, merged (overlapping gaps
+    become one) and sorted, at most MAX_GAPS_PER_COLLECTOR newest per collector."""
+    raw: dict[str, list[Interval]] = {}
+    for i, r in enumerate(
         inv.execute(
-            'INSERT INTO collector_gaps (collector_id, start, "end", recorded) VALUES (?,?,?,?)',
-            (collector, min(late), lo_ok, received),
+            'SELECT collector_id, start, "end" FROM collector_gaps WHERE "end" >= ?'
+            " ORDER BY collector_id, start",
+            (since,),
         )
+    ):
+        if not i % 4096:
+            tick()
+        raw.setdefault(r[0], []).append((r[1], r[2]))
+    return {c: merge_intervals(g)[-MAX_GAPS_PER_COLLECTOR:] for c, g in raw.items()}
 
 
-def load_gaps(inv: sqlite3.Connection, since: int) -> list[Interval]:
-    """Evidence gaps that end no earlier than `since`."""
-    return [
-        (r[0], r[1])
-        for r in inv.execute('SELECT start, "end" FROM collector_gaps WHERE "end" >= ?', (since,))
-    ]
+def load_collectors(
+    inv: sqlite3.Connection, macs: Sequence[str], tick: Callable[[], None] = lambda: None
+) -> dict[str, frozenset[str]]:
+    """The collectors that saw each of the given MACs (primary-key seeks, in chunks)."""
+    out: dict[str, set[str]] = {}
+    for i in range(0, len(macs), 400):
+        tick()
+        chunk = list(macs[i : i + 400])
+        for r in inv.execute(
+            "SELECT mac, collector_id FROM mac_collectors"  # noqa: S608
+            f" WHERE mac IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ):
+            out.setdefault(r[0], set()).add(r[1])
+    return {m: frozenset(c) for m, c in out.items()}
+
+
+MAX_GAPS_PER_COLLECTOR = 1000
 
 
 def load_first_received(
-    inv: sqlite3.Connection, macs: Sequence[str], tick: Callable[[], None] = lambda: None
+    inv: sqlite3.Connection,
+    macs: Sequence[str],
+    tick: Callable[[], None] = lambda: None,
+    legacy: set[str] | None = None,
 ) -> dict[str, int]:
     """SERVER time (batch receipt, epoch s) each of the given MACs was first folded into
     mac_activity (primary-key seeks, in chunks, with a time check between chunks)."""
@@ -120,36 +172,51 @@ def load_first_received(
     for i in range(0, len(macs), 400):
         tick()
         chunk = list(macs[i : i + 400])
-        out.update(
-            (r[0], r[1])
-            for r in inv.execute(
-                "SELECT mac, received FROM mac_first_received"  # noqa: S608
-                f" WHERE mac IN ({','.join('?' * len(chunk))})",
-                chunk,
-            )
-        )
+        for r in inv.execute(
+            "SELECT mac, received, legacy FROM mac_first_received"  # noqa: S608
+            f" WHERE mac IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ):
+            out[r[0]] = r[1]
+            if legacy is not None and r[2]:
+                legacy.add(r[0])
     return out
 
 
 PAGE = 1000
 
 
-def active_macs(inv: sqlite3.Connection, min_end: int, tick: Callable[[], None]) -> list[str]:
-    """MACs with activity ending no earlier than `min_end`, from the small `mac_last_seen`
-    summary (kept by a trigger on mac_activity) through its `last_end` index in keyset pages:
-    only ACTIVE MACs are ever examined, never stale rows, and `tick` runs between pages."""
+def active_macs(
+    inv: sqlite3.Connection, min_end: int, tick: Callable[[], None], limit: int | None = None
+) -> tuple[list[str], bool]:
+    """MACs with activity ending no earlier than `min_end`, NEWEST first, from the small
+    `mac_last_seen` summary (kept by a trigger on mac_activity) through its `last_end` index in
+    keyset pages: only ACTIVE MACs are ever examined, never stale rows, and `tick` runs between
+    pages. With `limit`, stops after that many MACs and reports that the set was capped."""
     macs: list[str] = []
-    last_end, last_mac = min_end, ""
+    last_end, last_mac = 2**62, "\U0010ffff"
     while True:
         tick()
         rows = inv.execute(
             "SELECT mac, last_end FROM mac_last_seen WHERE last_end >= ?"
-            " AND (last_end > ? OR mac > ?) ORDER BY last_end, mac LIMIT ?",
-            (last_end, last_end, last_mac, PAGE),
+            " AND (last_end < ? OR (last_end = ? AND mac < ?)) ORDER BY last_end DESC, mac DESC"
+            " LIMIT ?",
+            (min_end, last_end, last_end, last_mac, PAGE),
         ).fetchall()
         if not rows:
-            return sorted(macs)
+            return macs, False
         macs.extend(r[0] for r in rows)
+        if limit is not None and len(macs) >= limit:
+            capped = (
+                len(macs) > limit
+                or inv.execute(
+                    "SELECT 1 FROM mac_last_seen WHERE last_end >= ? AND (last_end < ?"
+                    " OR (last_end = ? AND mac < ?)) LIMIT 1",
+                    (min_end, rows[-1][1], rows[-1][1], rows[-1][0]),
+                ).fetchone()
+                is not None
+            )
+            return macs[:limit], capped
         last_mac, last_end = rows[-1][0], rows[-1][1]
 
 
@@ -169,6 +236,7 @@ def load_activity(
     min_end: int = 0,
     tick: Callable[[], None] = lambda: None,
     macs: Sequence[str] | None = None,
+    clip_exempt: Collection[str] = (),
 ) -> dict[str, list[Interval]]:
     """Per-MAC merged intervals. An interval shorter than min_width_s is widened symmetrically to
     that width: a stamp means "present around then", so a single-stamp or zero-length interval
@@ -186,7 +254,9 @@ def load_activity(
     else:
         rows = (
             row
-            for mac in _ticked(macs if macs is not None else active_macs(inv, min_end, tick), tick)
+            for mac in _ticked(
+                macs if macs is not None else active_macs(inv, min_end, tick)[0], tick
+            )
             for row in inv.execute(
                 'SELECT mac, start, "end" FROM (SELECT mac, start, "end" FROM mac_activity'
                 ' WHERE mac=? AND "end" >= ? ORDER BY start DESC LIMIT ?) ORDER BY start',
@@ -199,7 +269,7 @@ def load_activity(
         short = min_width_s - (end - start)
         if short > 0:
             start, end = start - short // 2, end + short - short // 2
-        if first_received is not None and row[0] in first_received:
+        if first_received is not None and row[0] in first_received and row[0] not in clip_exempt:
             horizon = first_received[row[0]] - max_lag_s
             if end < horizon:
                 continue  # wholly before the trusted horizon

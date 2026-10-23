@@ -43,6 +43,7 @@ class Data:
         head = (batch_id, collector, ts)
         shard = ensure_shard(self.root, utc_day(ts))
         conn = connect(shard)
+        conn.execute("BEGIN")  # one fsync per batch, not per row: the large fixtures stay fast
         for mac, host, opt55, opt60 in leases:
             conn.execute(
                 "INSERT INTO raw_lease (batch_id, collector_id, ts, mac, ip, hostname, opt55,"
@@ -73,6 +74,7 @@ class Data:
                 " bytes_down, flows) VALUES (?,?,?,?,?,?,?,?)",
                 (batch_id, collector, ts, mac, "tcp", 1, 2, 1),
             )
+        conn.execute("COMMIT")
         conn.close()
         if record:
             self.inv.execute(

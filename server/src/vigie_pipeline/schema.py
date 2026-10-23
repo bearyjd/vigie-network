@@ -190,6 +190,14 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "UPDATE mac_first_received SET legacy = 1,"
         " received = MAX(received, CAST(strftime('%s', 'now') AS INTEGER))",
     ),
+    (
+        # which collectors saw a MAC: an evidence gap of a collector only matters to the MACs that
+        # collector saw (a MAC with no row here is treated as seen by every collector)
+        "CREATE TABLE IF NOT EXISTS mac_collectors ("
+        "mac TEXT NOT NULL, collector_id TEXT NOT NULL, PRIMARY KEY (mac, collector_id))",
+        # suggestions that point INTO a retired orphan are found through the pair index
+        "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b)",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -206,6 +214,7 @@ PIPELINE_TABLES = (
     "rule_attachments",
     "collector_gaps",
     "mac_last_seen",
+    "mac_collectors",
 )
 
 

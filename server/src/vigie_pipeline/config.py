@@ -54,6 +54,9 @@ MAX_ALIAS_IDS = 5000
 # Older identities without retained activity are looked up by (fingerprint, name), oldest first,
 # at most this many per key.
 HISTORIC_MATCH_LIMIT = 16
+# At most this many MACs (the newest active ones) are loaded per pass; a spray cannot make the
+# setup unbounded. With more, stitch_active_set_capped is emitted (once a day).
+MAX_ACTIVE_MACS = 20000
 # At most this many signature_flood events per pass; further new floods get one daily summary.
 MAX_FLOOD_EVENTS_PER_PASS = 20
 
