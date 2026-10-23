@@ -20,8 +20,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
-from vigie_pipeline.overrides import canonical_device
-from vigie_pipeline.snapshot import MalformedRule, Snapshot, parse_rule, rule_active
+from vigie_pipeline.snapshot import Snapshot
 from vigie_pipeline.stitch_db import (
     Attachment,
     candidate_state,
@@ -65,6 +64,7 @@ class Applier:
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
+        self.version: int | None = None  # overrides.db data_version, read once under the lock
         self.writes = 0
         self.attaches = 0
         self.day = datetime.fromtimestamp(now, tz=UTC).strftime("%Y-%m-%d")
@@ -173,6 +173,7 @@ class Applier:
             MAX_OPEN_SUGGESTIONS_PER_DEVICE
         ):
             create, state = False, "open"  # the human already has a flood of these to decide
+            self.stats.deferred += 1
             self._flag(Flag("stitch_deferred", d.into, f"suggestion_cap:{self.day}",
                             "stitching deferred (suggestion_cap): too many open suggestions"
                             " into one device"))  # fmt: skip
@@ -224,24 +225,37 @@ class Applier:
     # ---- the attach: T1 re-validated under the lock ----------------------------------------
 
     def _authorised(self, d: Attach) -> bool:
-        """T1 re-validated under the inventory lock with primary-key lookups in overrides.db (the
-        rule row, the target's links, its override row, its group): the rule must still be the
-        same active rule pointing at the same canonical target in the same explicit auto_inherit=1
-        group, and the candidate's device must not have been merged away. Any read problem fails
-        closed. Without an overrides connection (tests) the compute snapshot stands in."""
+        """T1 re-validated under the inventory lock: the rule is unexpired at the clock read under
+        the lock, and overrides.db has not been written since the snapshot was read (its
+        PRAGMA data_version is unchanged on the pipeline's connection), so the snapshot's rule,
+        links, group and malformed-rule facts are exactly the current ones. ANY write in between (a
+        merge, a new or revoked rule, a regroup) drops every attach of this pass; they are
+        recomputed against a fresh snapshot next pass. O(1), whatever the size of overrides.db.
+        Without an overrides connection (tests) the compute snapshot stands in."""
         if d.rule.expires_at is not None and d.rule.expires_at <= self.at:
             return False
         group = self.snap.overrides.get(d.target, (0, None))[1]
-        if self.overrides is None:
-            return (
-                d.rule in self.snap.rules and self.snap.canonical(d.rule.device_id) == d.target
-                and group is not None and self.snap.group_auto_inherit.get(group) == 1
-            )  # fmt: skip
-        try:
-            return _rule_lookup(self.overrides, d, group, self.at)
-        except (sqlite3.Error, MalformedRule, TypeError, ValueError) as exc:
-            log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
+        if not (
+            d.rule in self.snap.rules and self.snap.canonical(d.rule.device_id) == d.target
+            and group is not None and self.snap.group_auto_inherit.get(group) == 1
+        ):  # fmt: skip
             return False
+        if self.overrides is None:
+            return True
+        if self.snap.data_version is None or self._overrides_version() != self.snap.data_version:
+            self.stats.stale += 1
+            return False
+        return True
+
+    def _overrides_version(self) -> int:
+        if self.version is None:
+            try:
+                row = self.overrides.execute("PRAGMA data_version").fetchone()  # type: ignore[union-attr]
+                self.version = int(row[0])
+            except (sqlite3.Error, TypeError, ValueError) as exc:  # unreadable: fail closed
+                log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
+                self.version = -1
+        return self.version
 
     def _state_ok(self, device_id: str) -> bool:
         row = self.inv.execute(
@@ -259,7 +273,6 @@ class Applier:
             and self._state_ok(d.target)
             and self._state_ok(d.from_device)
             and self._unchanged(d.from_device, d.target, d.expected)
-            and d.expected != "vetoed"
         ):
             return  # expired, revoked, regrouped, vetoed or moved while the plan was computed
         old = self.inv.execute(
@@ -303,33 +316,6 @@ class Applier:
         self.stats.attached += 1
         self.attaches += 1
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(d.mac))
-
-
-def _rule_lookup(overrides: sqlite3.Connection, d: Attach, group: str | None, at: float) -> bool:
-    """Primary-key reads of exactly the rows the attach depends on, in one read transaction."""
-    overrides.execute("BEGIN")
-    try:
-        row = overrides.execute(
-            "SELECT id, device_id, signature, created_by, expires_at, revoked_at FROM"
-            " identity_rules WHERE id=?",
-            (d.rule.id,),
-        ).fetchone()
-        if row is None or not rule_active(row, at) or parse_rule(row) != d.rule:
-            return False
-        if canonical_device(overrides, d.rule.device_id) != d.target:
-            return False
-        if canonical_device(overrides, d.from_device) != d.from_device:
-            return False  # the candidate's device was merged away in the meantime
-        over = overrides.execute(
-            "SELECT group_id FROM device_overrides WHERE device_id=?", (d.target,)
-        ).fetchone()
-        if over is None or over[0] is None or over[0] != group:
-            return False
-        grp = overrides.execute("SELECT auto_inherit FROM groups WHERE id=?", (over[0],)).fetchone()
-        return grp is not None and grp[0] == 1 and not isinstance(grp[0], bool)
-    finally:
-        if overrides.in_transaction:
-            overrides.execute("COMMIT")
 
 
 def apply_plan(

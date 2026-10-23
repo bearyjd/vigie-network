@@ -43,6 +43,9 @@ class Snapshot:
     malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
     malformed_devices: frozenset[str] = frozenset()  # their targets: these need a human
     unknown_target: bool = False  # a malformed rule whose target is unreadable: every hit needs one
+    data_version: int | None = (
+        None  # PRAGMA data_version when read: APPLY drops attaches if changed
+    )
 
     @cached_property
     def _canon(self) -> dict[str, str]:
@@ -246,16 +249,11 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         )
         for r in _rows(conn, "SELECT suggestion_id, state FROM suggestion_decisions")
     }
+    version = _int(conn.execute("PRAGMA data_version").fetchone()[0], "data_version")
     return Snapshot(
-        links,
-        tuple(rules),
-        groups,
-        overrides,
-        decisions,
-        malformed,
-        frozenset(bad_devices),
-        unknown,
-    )
+        links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices),
+        unknown, version,
+    )  # fmt: skip
 
 
 def load_snapshot(conn: sqlite3.Connection, now: float) -> Snapshot:

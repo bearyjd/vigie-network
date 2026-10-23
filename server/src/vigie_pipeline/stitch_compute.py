@@ -25,6 +25,7 @@ from vigie_pipeline.config import (
     MAX_ROWS_PER_PASS,
     MAX_SIGNATURE_BUCKET,
     PEER_TAIL_MIN_GRACE_MULT,
+    RECHECK_BUDGET_SHARE,
     STITCH_COMPUTE_BUDGET_S,
     PipelineConfig,
 )
@@ -57,6 +58,7 @@ from vigie_pipeline.stitch_types import (
     evidence_of,
     group_keys,
     is_candidate_match,
+    long_hash,
     rule_matches,
     rule_score,
     same,
@@ -88,7 +90,9 @@ class Compute:
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.cfg, self.now = inv, snap, cfg, now
         self.monotonic = monotonic or time.monotonic
-        self.deadline = self.monotonic() + STITCH_COMPUTE_BUDGET_S
+        start = self.monotonic()
+        self.deadline = start + STITCH_COMPUTE_BUDGET_S
+        self.recheck_deadline = start + STITCH_COMPUTE_BUDGET_S * RECHECK_BUDGET_SHARE
         self.components = components(snap.links)
         self.malformed_targets = frozenset(snap.canonical(d) for d in snap.malformed_devices)
         self.cutoff = int(now) - cfg.activity_retention_s
@@ -104,8 +108,12 @@ class Compute:
         then the bounded range catch-up of merged devices."""
         self._settle()
         cursors = {
-            RECHECK_CURSOR: self._robin(RECHECK_CURSOR, self._rule_subjects, self._recheck),
-            SELF_CURSOR: self._robin(SELF_CURSOR, self._self_subjects, self._examine),
+            RECHECK_CURSOR: self._robin(
+                RECHECK_CURSOR, self._rule_subjects, self._recheck, self.recheck_deadline
+            ),
+            SELF_CURSOR: self._robin(
+                SELF_CURSOR, self._self_subjects, self._examine, self.deadline
+            ),
         }
         self._widen()
         return Plan(tuple(self.decisions), cursors, self.stats)
@@ -113,15 +121,16 @@ class Compute:
     # ---- subjects --------------------------------------------------------------------------
 
     def _robin(
-        self, key: str, fetch: Callable[[str], list[str]], handle: Callable[[str], None]
-    ) -> str | None:
+        self, key: str, fetch: Callable[[str], list[str]], handle: Callable[[str], None],
+        deadline: float,
+    ) -> str | None:  # fmt: skip
         """Up to MACS_PER_PASS subjects after the persisted cursor; stops between subjects when
-        the compute budget is spent (the cursor then stays on the last finished one). Returns the
-        new cursor, None once the robin wrapped."""
+        the robin's share of the compute budget is spent (the cursor then stays on the last
+        finished one). Returns the new cursor, None once the robin wrapped."""
         after = state_get(self.inv, key) or ""
         macs = fetch(after)
         for i, mac in enumerate(macs):
-            if self.monotonic() > self.deadline:
+            if self.monotonic() > deadline:
                 self._defer("budget")
                 return macs[i - 1] if i else (after or None)
             handle(mac)
@@ -482,15 +491,12 @@ class Compute:
         """A rule-attached MAC that overlaps its peers beyond the veto limit, or whose evidence
         cannot be gathered completely, is FLAGGED once (rule_attach_suspect): never detached."""
         o = load_obs(self.inv, self.snap, mac)
-        if o is None or o.source != "rule":
-            return
-        token = f"{short_hash(mac)}~{o.canon}"
-        if event_exists(self.inv, SUSPECT, token) or not self._has_activity(mac):
+        if o is None or o.source != "rule" or not self._has_activity(mac):
             return
         self.stats.examined += 1
         att = load_attachment(self.inv, mac)
         if att is None:
-            self._suspect(o, token, "attach evidence missing")
+            self._suspect(o, "attach evidence missing")
             return
         base = replace(o, opt55=att.opt55 or o.opt55, opt60=att.opt60 or o.opt60)
         views = [replace(base, hostname=att.hostname if h else None,
@@ -501,16 +507,22 @@ class Compute:
         if flooded:  # a dropped compatible pool is incomplete evidence, never a free pass
             hood.truncated.add("compatible_flood")
         if hood.truncated:
-            self._suspect(o, token, "evidence incomplete, " + sorted(hood.truncated)[0])
+            self._suspect(o, "evidence incomplete, " + sorted(hood.truncated)[0])
         elif self.sustained(hood, mac, peers - {mac}):
-            self._suspect(o, token, "sustained overlap with peers")
+            self._suspect(o, "sustained overlap with peers")
 
     def _has_activity(self, mac: str) -> bool:
         return self.inv.execute(
             'SELECT 1 FROM mac_activity WHERE mac=? AND "end">=? LIMIT 1', (mac, self.cutoff)
         ).fetchone() is not None  # fmt: skip
 
-    def _suspect(self, o: Obs, token: str, why: str) -> None:
+    def _suspect(self, o: Obs, why: str) -> None:
+        """One flag per (MAC, device, reason): a later, different reason raises a fresh flag. The
+        dedup token carries a 128-bit hash of the MAC (a chosen local MAC cannot collide with a
+        32-bit one) and the reason's first word."""
+        token = f"{long_hash(o.mac)}~{o.canon}~{why.split()[0]}"
+        if event_exists(self.inv, SUSPECT, token):
+            return
         self.stats.suspect += 1
         self.decisions.append(Flag(SUSPECT, o.canon, token,
                                    f"rule attach suspect {short_hash(o.mac)}: {why}"))  # fmt: skip

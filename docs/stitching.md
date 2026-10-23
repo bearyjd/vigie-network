@@ -25,8 +25,8 @@ COMPUTE  one read-only transaction (a WAL reader; never blocks ingest or the API
          self robin:     <= MACS_PER_PASS randomized self MACs, from a persisted cursor
          each subject -> bounded neighbourhood -> one DECISION or a deferral
 APPLY    one BEGIN IMMEDIATE, count-bounded, no scans: re-validates every decision with indexed
-         point lookups (the pair's candidate state; for an attach the rule, link, override and
-         group rows of overrides.db by primary key), drops the stale ones, writes.
+         point lookups (the pair's candidate state; for an attach that overrides.db is unchanged
+         since the snapshot: PRAGMA data_version), drops the stale ones, writes.
 ```
 
 The pipeline is the only writer of the tables the decisions read (ingest writes only
@@ -39,6 +39,7 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 |---|---|---|
 | `MACS_PER_PASS` | 256 | subjects per robin per pass; every MAC gets its turn as the cursor advances and wraps |
 | `STITCH_COMPUTE_BUDGET_S` | 5 s | wall time of COMPUTE; stops between subjects, the cursor stays on the last finished one |
+| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of the budget; the self robin always keeps the rest |
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; one more = incomplete evidence |
 | `TARGET_KEYS` | 16 | distinct (opt55, opt60, name) keys of a target identity; more = incomplete |
 | `INTERVALS_PER_MAC` | 64 | `mac_activity` rows per MAC, coalesced at fold time |
@@ -50,8 +51,8 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 | evidence gaps | retention / `activity_gap_s` | rows of `evidence_gaps`: merged within one gap at write time, pruned at retention |
 
 APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject,
-and its reads of `overrides.db` are primary-key lookups whose cost does not depend on how many
-overrides, rules or links exist: well under a second on the server
+and its one read of `overrides.db` is `PRAGMA data_version`, whose cost does not depend on how
+many overrides, rules or links exist: well under a second on the server
 (`test_apply_holds_the_lock_under_a_second_with_a_full_action_list`,
 `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides`). Every decision carries
 the candidate state of its pair as computed; a human change in between (a `dismissed` row, for
@@ -170,14 +171,22 @@ suggestion-only. For a mature randomized self MAC whose signature matches:
 4. Both devices `identity_state='ok'` and the target in an EXPLICIT `auto_inherit=1` group;
    otherwise a `rule_hit_needs_confirm` suggestion.
 
-The APPLY phase re-reads, by primary key under the inventory lock, the rule row (still present,
-active and byte-for-byte the same rule, unexpired at the clock read under the lock), the target's
-`identity_links` chain (still the same canonical device; the candidate's own device not merged
-away), its `device_overrides` row (same explicit group) and that group's `auto_inherit` (1); it
-also re-checks that the MAC is still a self MAC of the same device, both states `ok`, and that the
-pair's candidate row is as it was when computed and not `vetoed`. Otherwise nothing attaches that
-pass. A rule row whose target cannot even be read (a malformed `device_id`) makes EVERY rule hit
-of that snapshot a `rule_hit_needs_confirm` suggestion.
+The snapshot records `PRAGMA data_version` of the pipeline's `overrides.db` connection inside its
+read transaction. Under the inventory lock the APPLY phase re-reads it: if anything was committed
+to `overrides.db` since (a merge, a new, revoked or malformed rule, a regroup), every attach of the
+pass is dropped and recomputed against a fresh snapshot next pass, so a merge can never launder a
+veto and a second rule can never appear unseen. The check is deliberately coarse: `vigie-api`
+writes `overrides.db` only on human actions (overrides, rules, links, token create/revoke and their
+`audit_log` rows; reads, including token verification, write nothing), so a commit in between
+costs one pass, never liveness (`test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only`).
+`data_version` is per connection: the snapshot and the check use the pipeline's one long-lived
+read-only connection. It also re-checks that the rule is unexpired at the
+clock read under the lock, that the MAC is still a self MAC of the same device, both states `ok`,
+and that the pair's candidate row is as it was when computed. Otherwise nothing attaches that pass.
+A rule row whose target cannot even be read (a malformed `device_id`) makes EVERY rule hit of that
+snapshot a `rule_hit_needs_confirm` suggestion. A young rule hit (immature MAC) is deferred by the
+rule path without noise; the candidate path still runs for it exactly as it would without a rule,
+so it may carry a `fingerprint_match` suggestion or an `open` row meanwhile.
 
 **Attach** sets `observations.device_id` to the target with `link_source='rule'`, `link_rule_id`,
 `link_score`; widens the target's `first_seen`/`last_seen`; retires the orphaned self device
@@ -212,8 +221,9 @@ robin so a spray of new MACs cannot delay it). The peers are derived from the at
 in `rule_attachments` (each matched rule's view, the attach-time fingerprints), never from what the
 MAC calls itself now, so renaming or re-fingerprinting an attached copy, or revoking its rule, cannot
 hide a later overlap. On sustained overlap, on incomplete evidence, or on a missing evidence row the
-attachment is FLAGGED once (`rule_attach_suspect`, warn, on the target device); the pipeline does
-not detach and creates no suggestion. Detaching waits for the API (`mac_detached`).
+attachment is FLAGGED once per reason (`rule_attach_suspect`, warn, on the target device; the dedup
+token is a 128-bit hash of the MAC, the device and the reason, so a later different reason raises
+a fresh flag); the pipeline does not detach and creates no suggestion. Detaching waits for the API (`mac_detached`).
 
 ## 9. Safety properties (each has a test)
 - `overrides.db` is opened `mode=ro` + `query_only`; its bytes are identical before and after. A
@@ -250,7 +260,12 @@ not detach and creates no suggestion. Detaching waits for the API (`mac_detached
 | 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later; suggestions expired at once | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
 | grow overrides.db to lengthen the lock | point lookups only under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
-| rule revoked / regrouped while the pass runs | fresh snapshot and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
+| rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
+| merge a vetoed device into the target between COMPUTE and APPLY | data_version drops the attach; the next pass vetoes through the fresh components | `test_a_merge_between_compute_and_apply_cannot_launder_a_veto`, `test_any_overrides_change_between_compute_and_apply_drops_the_attach` |
+| change identity_state or write a veto row between COMPUTE and APPLY | inventory-side preconditions | `test_an_identity_state_change_between_compute_and_apply_drops_the_attach`, `test_a_veto_row_written_between_compute_and_apply_drops_the_attach` |
+| expensive re-checks to starve the self robin (or the reverse) | `RECHECK_BUDGET_SHARE` | `test_the_self_robin_keeps_a_share_of_the_budget_whatever_the_recheck_costs` |
+| an early "incomplete" flag to hide a later overlap; a chosen MAC to collide a dedup token | one flag per reason, 128-bit token hash | `test_a_later_different_reason_raises_a_fresh_flag_and_tokens_are_long` |
+| a matching device with hundreds of MACs or an oversize component around a candidate / re-check | component lookups bounded; overflow degrades / flags | `test_a_candidate_whose_matching_device_has_too_many_macs_is_incomplete_evidence`, `test_an_oversize_target_component_is_incomplete_evidence_for_the_recheck` |
 
 ## 11. Accepted residual risk (asserted in tests)
 - **Fingerprint copy after the victim left** (`rolling_fingerprint_copy_away`): no overlap to veto.

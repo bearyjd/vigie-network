@@ -314,3 +314,29 @@ def test_the_recheck_robin_cycles_through_every_attached_mac(inv, monkeypatch):
         )
     assert examined == [10, 10, 5] and cursors[-1] is None and all(c for c in cursors[:2])
     assert inv.count("rule_attach_suspect") == 0
+
+
+def test_an_oversize_target_component_is_incomplete_evidence_for_the_recheck(inv, monkeypatch):
+    monkeypatch.setattr(stitch_hood, "MAX_ALIAS_IDS", 2)
+    a = attached(inv)
+    snap = Snapshot({"X": "D", "Y": "D"}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {})
+    st = inv.stitch(snap)
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete, component_oversize" in row[0]
+
+
+def test_a_later_different_reason_raises_a_fresh_flag_and_tokens_are_long(inv):
+    a = attached(inv)
+    junk_pool(inv, 65, "2026-01-02T00:02:00Z")  # incomplete evidence first
+    assert inv.stitch(RULE_SNAP).suspect == 1
+    inv.db.execute("DELETE FROM observations WHERE device_id LIKE 'J%'")
+    inv.db.execute("DELETE FROM mac_activity WHERE mac NOT IN (SELECT mac FROM observations)")
+    inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    assert inv.stitch(RULE_SNAP, NOW_ABS + 1).suspect == 1  # a different reason: a fresh flag
+    rows = inv.db.execute(
+        "SELECT summary, dedup FROM events WHERE kind='rule_attach_suspect'"
+    ).fetchall()
+    assert len(rows) == 2 and {r[0].split(": ")[1][:9] for r in rows} == {"evidence ", "sustained"}
+    assert all(len(r[1].split("~")[0]) >= 32 for r in rows)  # not a brute-forceable 32-bit hash
+    assert inv.stitch(RULE_SNAP, NOW_ABS + 2).suspect == 0 and inv.link_of(a) == ("D", "rule")

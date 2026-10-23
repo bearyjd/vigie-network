@@ -42,6 +42,11 @@ def short_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:8]
 
 
+def long_hash(value: str) -> str:
+    """128 bits: for dedup tokens, where a chosen value must not be able to collide."""
+    return hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
 def same(a: str | None, b: str | None) -> bool:
     return bool(a) and bool(b) and a.casefold() == b.casefold()  # type: ignore[union-attr]
 

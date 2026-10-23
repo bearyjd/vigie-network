@@ -1109,3 +1109,122 @@ def test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides(dat
     big = measure()
     assert small > 0 and big <= small * 2 + 2_000, (small, big)
     ov.close()
+
+
+# ---- fix round 1, opus addendum: any write to overrides.db since the snapshot drops attaches
+
+
+def snapshot_world(tmp_path):
+    """A real overrides.db (rule r1 on D in iot) read through the pipeline's ro connection."""
+    ov = Overrides(tmp_path)
+    ov.rule("r1", "D", {"opt55": "1,2,3", "opt60": "x", "hostname": "victim"})
+    ov.override("D", "iot", version=1)
+    ov.conn.commit()
+    conn = ro(tmp_path / "overrides.db")
+    return ov, conn
+
+
+def test_the_snapshot_records_the_overrides_data_version(tmp_path):
+    ov, conn = snapshot_world(tmp_path)
+    snap = load_snapshot(conn, NOW)
+    assert isinstance(snap.data_version, int)
+    assert load_snapshot(conn, NOW).data_version == snap.data_version  # nothing changed
+    ov.override("Z", "guest", version=1)
+    ov.conn.commit()
+    assert load_snapshot(conn, NOW).data_version != snap.data_version  # another writer committed
+    ov.close()
+
+
+def test_a_merge_between_compute_and_apply_cannot_launder_a_veto(inv, tmp_path):
+    """Opus M2: a veto (B, X) exists; a human merges X into D after the plan was computed."""
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("X", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    b = inv.mac("B", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('v','B','X',0.8,'{}','vetoed','t')"
+    )
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    assert any(isinstance(d, Attach) for d in plan.decisions)
+    ov.link("X", "D")  # the human merge lands between COMPUTE and APPLY
+    ov.conn.commit()
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(b) == ("B", "self")
+    fresh = load_snapshot(conn, NOW_ABS)  # the next pass sees the merge: the veto now covers D
+    assert stitch(inv.db, fresh, inv.cfg, NOW_ABS + 1, None, conn).attached == 0
+    assert inv.link_of(b) == ("B", "self")
+    ov.close()
+
+
+@pytest.mark.parametrize("change", [
+    "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+    " VALUES ('r2','E','{\"opt55\":\"1,2,3\",\"opt60\":\"x\",\"hostname\":\"victim\"}','t','o')",
+    "INSERT INTO identity_links VALUES ('D','E','m','t','o')",
+    "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
+    " VALUES ('bad','D','not json','t','o')",
+    "UPDATE device_overrides SET group_id='trusted' WHERE device_id='D'",
+])  # fmt: skip
+def test_any_overrides_change_between_compute_and_apply_drops_the_attach(inv, tmp_path, change):
+    """A second matching rule, a merge of the target, a malformed rule on it, a regroup: each
+    appears after the snapshot and must not be applied against the old one (opus L4, A03)."""
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("E", "elsewhere", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    ov.conn.execute(change)
+    ov.conn.commit()
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
+    ov.close()
+
+
+@pytest.mark.parametrize("device", ["D", "A"])
+def test_an_identity_state_change_between_compute_and_apply_drops_the_attach(inv, device):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    plan = compute_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS)
+    inv.db.execute("UPDATE devices SET identity_state='conflict' WHERE id=?", (device,))
+    st = apply_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert st.attached == 0 and inv.link_of(a) == ("A", "self")
+
+
+def test_a_veto_row_written_between_compute_and_apply_drops_the_attach(inv):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    plan = compute_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS)
+    inv.db.execute(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES ('v','A','D',0.8,'{}','vetoed','t')"
+    )
+    st = apply_plan(inv.db, RULE_SNAP, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
+
+
+def test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only(inv, tmp_path):
+    """The data_version check is coarse by design: overrides.db is written only on human actions
+    (overrides, rules, links, token lifecycle and their audit rows; never on reads), so a commit in
+    between costs one pass, not liveness."""
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    ov.conn.execute(
+        "INSERT INTO audit_log (id, ts, principal, action, target) VALUES ('x','t','o','a','t')"
+    )
+    ov.conn.commit()
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
+    fresh = load_snapshot(conn, NOW_ABS)  # the next pass, with a fresh snapshot, attaches
+    assert stitch(inv.db, fresh, inv.cfg, NOW_ABS + 1, None, conn).attached == 1
+    assert inv.link_of(a) == ("D", "rule")
+    ov.close()

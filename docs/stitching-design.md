@@ -61,7 +61,7 @@ Whenever evidence is incomplete the subject DEGRADES, never attaches, never gets
 | neighbourhood truncated / target component > ALIAS_IDS / > TARGET_KEYS | `rule_hit_needs_confirm` suggestion with `reason_text=<reason>` | candidate `open`, no suggestion | `rule_attach_suspect` ("evidence incomplete") |
 | evidence gap overlaps the MAC's window | same | (maturity only matters for a permanent veto: `open`) | n/a |
 | malformed rule on the target | same (`malformed_target`) | n/a | n/a |
-| young / sparse MAC (immature) | silent defer (resolves itself) | `open` | n/a |
+| young / sparse MAC (immature) | the rule path defers silently; the candidate path still runs exactly as without a rule (a `fingerprint_match` suggestion or an `open` row) | `open` if overlapping | n/a |
 | name group / compatible pool flooded | nothing + `signature_flood` once per group per day | nothing | pool ignored |
 | compute time budget hit | subjects not reached wait; robin cursor persists | same | same |
 | row cap / suggestion cap hit | decision dropped, recomputed next cycle | same | n/a |
@@ -74,6 +74,7 @@ Every degrade except "immature" also writes one `stitch_deferred` event per reas
 |---|---|---|
 | `MACS_PER_PASS` | 256 | subjects examined per robin per pass (self robin, recheck robin) |
 | `STITCH_COMPUTE_BUDGET_S` | 5 | wall time of COMPUTE (read-only); stops between subjects |
+| `RECHECK_BUDGET_SHARE` | 0.5 | the re-check robin's share of it; the self robin always keeps the rest |
 | `BUCKET_ROWS` | 1024 | rows per indexed lookup; more = truncated = degrade |
 | `TARGET_KEYS` | 16 | distinct (fp, vc, name) keys of a target identity; more = degrade |
 | `INTERVALS_PER_MAC` | 64 | rows of `mac_activity` per MAC, enforced at fold time (closest pair coalesced) |
@@ -93,11 +94,12 @@ server clock, so it cannot help an attacker.
 ## 4. APPLY preconditions (indexed point lookups)
 - Every pair decision carries `expected`, the pair's candidate state at compute time; APPLY
   re-reads the row and drops the decision when it differs (a human dismissal in between).
-- Attach: `observations.mac` still `('self', from_device)`; both `identity_state='ok'`; target
-  exists; by primary key in overrides.db: the rule row still active and equal to the computed rule,
-  unexpired at the clock read under the lock, `canonical(rule.device_id) == target`, the candidate's
-  device not linked away, the target's override row in the same explicit group, that group
-  `auto_inherit=1`; pair state unchanged and not `vetoed`. No snapshot is loaded under the lock.
+- Attach: `observations.mac` still `('self', from_device)`; both `identity_state='ok'`; the
+  rule unexpired at the clock read under the lock; the pair's candidate state unchanged; and
+  overrides.db NOT written since the snapshot (`PRAGMA data_version` on the pipeline's connection,
+  recorded in the snapshot, equal under the lock). Any write to overrides.db in between (a merge,
+  a new, revoked or malformed rule, a regroup) drops every attach of the pass; they are recomputed
+  against a fresh snapshot next pass. O(1) under the lock, whatever the size of overrides.db.
 - Candidate: row re-read; identical or sticky (`dismissed`, `vetoed`) rows are not written.
 - Settle: an orphan's remaining candidate rows are dismissed under the pass's row cap.
 - Suggest: no open/decided suggestion for the pair; devices not linked; target below the cap.
@@ -148,7 +150,7 @@ fresh install; reapply is a no-op.
 | extra names on the applicant | rule views only | veto_overlap: `test_an_extra_applicant_name_cannot_exclude_the_real_device_from_the_veto` |
 | nameless/junk MAC veto or flood | compatible pool rules, retired excluded | veto_overlap: `test_a_nameless_mac_is_a_peer_only_within_a_gap_of_the_candidate` |
 | 1000+ look-alikes to hide the victim | truncation -> degrade, never attach | bounds_perf: `test_a_spray_beyond_the_bucket_bound_degrades_to_a_suggestion_never_attaches` |
-| spray to switch off the recheck | recheck robin over attached MACs only; truncation flags | bounds_perf: `test_a_spray_cannot_hide_an_overlapping_peer_from_the_recheck` |
+| spray to switch off the recheck | recheck robin over attached MACs only; truncation flags | bounds_perf: `test_a_spray_of_self_macs_does_not_delay_the_recheck`; evidence_recheck: `test_a_recheck_that_cannot_gather_complete_evidence_flags_the_attachment` |
 | hold the write lock | APPLY count-bounded, reads outside the lock | bounds_perf: `test_apply_holds_the_lock_under_a_second_with_a_full_action_list` |
 | unbounded memory/CPU | BUCKET_ROWS, INTERVALS_PER_MAC, MACS_PER_PASS, compute budget | bounds_perf: `test_compute_budget_stops_between_subjects_and_the_cursor_persists` |
 | late-collector gap restores maturity | one gap list, retention-pruned, all loaded | maturity_activity: `test_a_mac_whose_window_overlaps_a_gap_is_not_mature` |
@@ -198,3 +200,10 @@ dropped because the machinery they pinned no longer exists:
    flags a re-checked attachment as incomplete evidence.
 10. (fix round 1) A decision whose pair's candidate row changed between COMPUTE and APPLY is
     dropped (`stats.stale`), not applied.
+11. (fix round 1) Any commit to overrides.db between the snapshot and APPLY drops every attach of
+    that pass (`PRAGMA data_version`), closing merge/veto laundering, late second rules and late
+    malformed rules at once. The point lookups of the first fix commit were replaced by this O(1)
+    check.
+12. (fix round 1) A re-checked attachment is flagged once per REASON (`evidence incomplete`,
+    `sustained overlap`, `evidence missing`); a later different reason raises a fresh flag. Dedup
+    tokens carry a 128-bit hash of the MAC.

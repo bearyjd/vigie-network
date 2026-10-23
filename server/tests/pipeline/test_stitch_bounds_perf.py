@@ -347,7 +347,7 @@ def test_open_suggestions_into_one_device_are_capped_and_the_cap_is_reported(inv
     inv.stitch()
     st = inv.stitch()
     assert inv.db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0] == 64
-    assert st.deferred >= 0 and inv.count("stitch_deferred") == 1
+    assert st.deferred == 6 and inv.count("stitch_deferred") == 1
     row = inv.db.execute("SELECT summary FROM events WHERE kind='stitch_deferred'").fetchone()
     assert "suggestion_cap" in row[0]
     states = [r[0] for r in inv.db.execute("SELECT state FROM identity_candidates")]
@@ -435,9 +435,9 @@ def test_the_recheck_robin_runs_first_so_a_spent_budget_never_switches_it_off(in
     inv.mac("V", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 10000, NOW_ABS)])
     pair_world(inv, ["both"] * 3)
     inv.commit()
-    monkeypatch.setattr(compute_mod, "time", Ticking(3.0))
+    monkeypatch.setattr(compute_mod, "time", Ticking(1.0))  # a budget of a handful of checks
     st = inv.stitch(RULE_SNAP)
-    assert st.suspect == 1 and st.candidates == 0
+    assert st.suspect == 1  # the re-check ran first, within its own share of the budget
 
 
 # ---- bounded neighbourhoods: incomplete evidence degrades, never attaches ------------------------
@@ -770,3 +770,29 @@ def test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion(
     row = inv.db.execute("SELECT reason_code, reason_text FROM suggestions").fetchone()
     assert tuple(row) == ("rule_hit_needs_confirm", "compatible_flood")
     assert inv.count("signature_flood") == 1 and inv.count("stitch_deferred") == 1
+
+
+def test_a_candidate_whose_matching_device_has_too_many_macs_is_incomplete_evidence(
+    inv, monkeypatch
+):
+    monkeypatch.setattr(hood_mod, "BUCKET_ROWS", 5)
+    inv.mac("O", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(6):  # the matching device also owns six MACs with other names
+        inv.mac("O", f"other{k}", None, "rule", OLD, [], newdev=False)
+    inv.mac("Y", "victim", None, "self", "2026-01-04T00:00:00Z", [(NOW_ABS - 5000, NOW_ABS)])
+    st = inv.stitch()
+    assert inv.totals() == (0, 0) and st.deferred == 1 and inv.count("stitch_deferred") == 1
+
+
+def test_the_self_robin_keeps_a_share_of_the_budget_whatever_the_recheck_costs(inv, monkeypatch):
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(40):  # forty quiet rule-attached MACs: more than the recheck can do in its share
+        ivs = [(NOW_ABS - 80000 + k * 1000, NOW_ABS - 79500 + k * 1000)]
+        m = inv.mac("D", "victim", None, "rule", f"2026-01-{k % 28 + 1:02d}T00:{k:02d}:00Z", ivs,
+                    newdev=False)  # fmt: skip
+        inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
+    pair_world(inv, ["both"] * 6)
+    inv.commit()
+    monkeypatch.setattr(compute_mod, "time", Ticking(0.5))  # ten budget checks a pass
+    st = inv.stitch(RULE_SNAP)
+    assert 0 < st.candidates and st.examined > st.candidates  # both robins made progress
