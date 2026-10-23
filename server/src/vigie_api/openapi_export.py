@@ -27,7 +27,12 @@ def render() -> str:
     spec.setdefault("components", {}).setdefault("securitySchemes", {})["bearer"] = {
         "type": "http",
         "scheme": "bearer",
-        "description": "App token from `python -m vigie_api tokens create`.",
+        "description": (
+            "App token from `python -m vigie_api tokens create`. Rule approval requires "
+            "the control app's explicit --rules-write grant (rules:write). The control app "
+            "obtains human approval; person-id semantics remain pending (D6). Service, "
+            "integration, and read-only tokens cannot approve rules."
+        ),
     }
     for path, item in spec["paths"].items():
         if path == "/healthz":

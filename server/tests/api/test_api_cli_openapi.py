@@ -94,6 +94,9 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
     assert spec["openapi"].startswith("3.1")
     assert set(spec["paths"]) == {
         "/healthz", "/devices", "/devices/{device_id}", "/macs/{mac}", "/events", "/suggestions",
+        "/suggestions/{suggestion_id}/accept", "/suggestions/{suggestion_id}/reject",
+        "/identity/merges/{merge_id}/undo", "/identity/rules", "/identity/rules/{rule_id}",
+        "/identity/candidates/{candidate_id}/clear-veto",
     }  # fmt: skip
     patch = spec["paths"]["/devices/{device_id}"]["patch"]
     assert any(p["name"] == "if-match" and p["required"] for p in patch["parameters"])

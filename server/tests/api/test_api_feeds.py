@@ -162,7 +162,7 @@ def test_suggestions_are_read_only_and_parsed(env: Env) -> None:
     for method in ("post", "patch", "delete", "put"):
         r = getattr(env.client, method)("/suggestions", headers=env.auth)
         assert r.status_code == 405
-    assert env.client.post("/suggestions/s1/accept", headers=env.auth).status_code == 404
+    assert env.client.post("/suggestions/s1/accept", headers=env.auth).status_code == 422
 
 
 def test_prose_hidden_for_trust_changing_actions(env: Env) -> None:
