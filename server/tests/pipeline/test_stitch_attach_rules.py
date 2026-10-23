@@ -1160,7 +1160,8 @@ def test_a_merge_between_compute_and_apply_cannot_launder_a_veto(inv, tmp_path):
 @pytest.mark.parametrize("change", [
     "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
     " VALUES ('r2','E','{\"opt55\":\"1,2,3\",\"opt60\":\"x\",\"hostname\":\"victim\"}','t','o')",
-    "INSERT INTO identity_links VALUES ('D','E','m','t','o')",
+    "INSERT INTO identity_links (from_device,into_device,merge_id,created_at,created_by)"
+    " VALUES ('D','E','m','t','o')",
     "INSERT INTO identity_rules (id, device_id, signature, created_at, created_by)"
     " VALUES ('bad','D','not json','t','o')",
     "UPDATE device_overrides SET group_id='trusted' WHERE device_id='D'",

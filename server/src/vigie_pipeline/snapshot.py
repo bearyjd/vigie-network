@@ -272,14 +272,23 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
     ):
         values = {
             name: _ident(row[name], f"candidate_decisions.{name}")
-            for name in ("id", "candidate_id", "device_a", "device_b", "action",
-                         "decided_by", "decided_at")
+            for name in (
+                "id",
+                "candidate_id",
+                "device_a",
+                "device_b",
+                "action",
+                "decided_by",
+                "decided_at",
+            )
         }
         if values["action"] != "clear_veto":
             raise OverridesUnreadable("candidate_decisions.action is not clear_veto")
-        candidate_decisions.append(CandidateDecision(
-            values["id"], values["candidate_id"], values["device_a"], values["device_b"]
-        ))
+        candidate_decisions.append(
+            CandidateDecision(
+                values["id"], values["candidate_id"], values["device_a"], values["device_b"]
+            )
+        )
     version = _int(conn.execute("PRAGMA data_version").fetchone()[0], "data_version")
     return Snapshot(
         links, tuple(rules), groups, overrides, decisions, malformed, frozenset(bad_devices),

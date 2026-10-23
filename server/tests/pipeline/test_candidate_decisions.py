@@ -46,8 +46,9 @@ def state(inv):
 
 def test_clear_consumes_read_only_decision_without_attaching(inv):
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
-    subject = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z",
-                      [(NOW_ABS - 3000, NOW_ABS)])
+    subject = inv.mac(
+        "A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)]
+    )
     veto(inv)
     snap = decision_snapshot()
     stats = inv.stitch(snap)
@@ -98,19 +99,26 @@ def test_clear_work_is_bounded_and_remaining_decisions_progress_next_pass(inv):
         decisions.append(CandidateDecision(f"clear-{number}", candidate, a, "D"))
     snap = replace(EMPTY, candidate_decisions=tuple(decisions))
     inv.stitch(snap)
-    assert inv.db.execute(
-        "SELECT COUNT(*) FROM identity_candidates WHERE state='dismissed'"
-    ).fetchone()[0] == limit
+    assert (
+        inv.db.execute(
+            "SELECT COUNT(*) FROM identity_candidates WHERE state='dismissed'"
+        ).fetchone()[0]
+        == limit
+    )
     inv.stitch(snap)
-    assert inv.db.execute(
-        "SELECT COUNT(*) FROM identity_candidates WHERE state='vetoed'"
-    ).fetchone()[0] == 0
+    assert (
+        inv.db.execute("SELECT COUNT(*) FROM identity_candidates WHERE state='vetoed'").fetchone()[
+            0
+        ]
+        == 0
+    )
 
 
 def test_clear_recomputes_evidence_before_rule_attach(inv):
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
-    subject = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z",
-                      [(NOW_ABS - 3000, NOW_ABS)])
+    subject = inv.mac(
+        "A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)]
+    )
     veto(inv)
     cleared = decision_snapshot()
     snap = replace(RULE_SNAP, candidate_decisions=cleared.candidate_decisions)
@@ -120,8 +128,9 @@ def test_clear_recomputes_evidence_before_rule_attach(inv):
 
 def test_clear_does_not_bypass_real_overlap(inv):
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 6000, NOW_ABS)], rand=0)
-    subject = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z",
-                      [(NOW_ABS - 3000, NOW_ABS)])
+    subject = inv.mac(
+        "A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)]
+    )
     veto(inv)
     cleared = decision_snapshot()
     snap = replace(RULE_SNAP, candidate_decisions=cleared.candidate_decisions)
