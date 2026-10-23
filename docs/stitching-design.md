@@ -27,8 +27,9 @@ COMPUTE  read-only transaction (BEGIN ... COMMIT, WAL reader, never blocks write
          robin over <= MACS_PER_PASS self MACs  + robin over <= MACS_PER_PASS rule-attached MACs
          each subject -> bounded Neighbourhood -> Decision (frozen dataclass) or Deferral(reason)
 APPLY    BEGIN IMMEDIATE, count-bounded (section 4), <~1 s:
-         re-read overrides.db snapshot once; for each decision re-validate preconditions with
-         indexed point lookups; drop stale ones; write.
+         for each decision re-validate inventory-side preconditions with indexed point lookups;
+         immediately before each attach write, PRAGMA data_version on the pipeline's overrides
+         connection must equal the snapshot's (never cached); drop stale ones; write.
 ```
 
 The pipeline is the ONLY writer of the tables the decisions read (`observations`, `devices`,
@@ -105,6 +106,14 @@ server clock, so it cannot help an attacker.
 - Suggest: no open/decided suggestion for the pair; devices not linked; target below the cap.
 - Event: `INSERT OR IGNORE` on `(kind, dedup)`.
 
+### Intentional redundancy on the trust path
+Two guards are kept although a mutation check cannot kill them in isolation: the APPLY phase
+re-checks the snapshot's T1 facts for an attach (rule active, canonical target, explicit
+`auto_inherit=1` group) although the decision was computed from that same snapshot and
+`data_version` catches every change to it; and the compute phase caps `Widen` decisions at
+`MAX_ROWS_PER_PASS` although APPLY reserves each under the same cap. Defence in depth on T1 and a
+memory bound on the decision list; not candidates for removal.
+
 ## 5. Deleted (with the defect each removal closes)
 - `mac_last_seen` + trigger, `active_macs` paging, `MAX_ACTIVE_MACS` newest-first cap (defect 1, 6).
 - `mac_collectors`, per-collector gap scoping, `MAX_GAPS_PER_COLLECTOR` (defects 2, 3): one merged
@@ -113,8 +122,9 @@ server clock, so it cannot help an attacker.
 - Two-stage core/bulk loader, `STITCH_SETUP_MAX_SECONDS`, `partial`, per-phase `MAX_OVERLAP_OPS`
   and time-box slices, `BudgetExhaustedError`, `_charge` (defect 4, lock hold).
 - `widen_linked_devices` unbounded UPDATE loop (defect 5): now `Widen` decisions under the row cap.
-- `HISTORIC_MATCH_LIMIT`, `MAX_FLOOD_EVENTS_PER_PASS` + `signature_flood_summary`, `settle:` state
-  keys and `_settle_*`, `legacy` anchors, `evidence_gap`/`stitch_budget_exhausted`/
+- `HISTORIC_MATCH_LIMIT`, `MAX_FLOOD_EVENTS_PER_PASS` + `signature_flood_summary`, the old
+  `_settle_*` loop (a bounded `Settle` decision with the same `settle:<device>` key replaces it,
+  fix round 1), `legacy` anchors, `evidence_gap`/`stitch_budget_exhausted`/
   `stitch_active_set_capped`/`alias_component_oversize` events (replaced by `stitch_deferred`).
 - Migrations 4..11 squashed into ONE migration (#4). Main's pipeline schema (v3) has no stitching
   table and no anchor of any provenance, so no legacy heuristics are needed.
@@ -179,7 +189,8 @@ dropped because the machinery they pinned no longer exists:
   block" is the one behaviour deliberately given up; `MAX_GAPS_PER_COLLECTOR`, the per-collector
   `evidence_gap` event: replaced by `stitch_deferred (evidence_gap)`);
 - legacy anchors and the migration 6..11 shapes (there is one migration; main has no anchors);
-- `settle:` markers and the capped orphan cleanup (the cleanup is bounded by construction);
+- the old settle loop's tests (the cleanup is now a `Settle` decision under `CLEANUP_ROWS_SHARE`
+  of the row cap, with its own tests);
 - `HISTORIC_MATCH_LIMIT` ("historical matches are limited oldest first": a complete bucket holds
   every older identity, a truncated one degrades);
 - the per-pass flood event cap and `signature_flood_summary`;
@@ -204,6 +215,12 @@ dropped because the machinery they pinned no longer exists:
     that pass (`PRAGMA data_version`), closing merge/veto laundering, late second rules and late
     malformed rules at once. The point lookups of the first fix commit were replaced by this O(1)
     check.
+14. (fix round 2, opus) Names are compared through ONE fold (NFKC + Unicode casefold) stored in
+    `observations.hostname_fold`/`mdns_fold` (pipeline-written, back-filled at upgrade); the compute
+    budget ticks per lookup inside a subject (a cut subject is deferred or flagged, the cursor
+    moves past it); the re-check always evaluates the overlap it can see; any malformed rule makes
+    every rule hit suggestion-only; the orphan cleanup keeps `CLEANUP_ROWS_SHARE` of the row cap and
+    also settles rows where the orphan is the target; flood tokens use the 128-bit hash.
 13. (fix round 2) `data_version` is re-read immediately before every attach write; the orphan's
     suggestion expiry is under the row cap (`Settle` finishes it); the re-check also flags an
     attachment whose rule is no longer active or whose device left its `auto_inherit=1` group

@@ -1,8 +1,9 @@
 """APPLY phase of identity stitching (docs/stitching-design.md section 4): one short
 BEGIN IMMEDIATE that re-validates every decision of the plan with indexed point lookups (the
-pair's candidate state; for an attach the rule, links and group rows of overrides.db by primary
-key), drops what went stale, and writes a count-bounded number of rows: at most MAX_ROWS_PER_PASS
-candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_PASS attaches.
+pair's candidate state, the MAC's link, both identity states) and, immediately before each attach
+write, that overrides.db is unwritten since the snapshot (PRAGMA data_version on the pipeline's
+own connection); drops what went stale; writes a count-bounded number of rows: at most
+MAX_ROWS_PER_PASS candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_PASS attaches.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from datetime import UTC, datetime
 
 from vigie_ingest.db import immediate
 from vigie_pipeline.config import (
+    CLEANUP_ROWS_SHARE,
     MAX_ATTACHES_PER_PASS,
     MAX_OPEN_SUGGESTIONS_PER_DEVICE,
     MAX_ROWS_PER_PASS,
@@ -65,6 +67,7 @@ class Applier:
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
         self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
+        self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
         self.writes = 0
         self.attaches = 0
         self.day = datetime.fromtimestamp(now, tz=UTC).strftime("%Y-%m-%d")
@@ -210,11 +213,16 @@ class Applier:
     def _cleanup(self, device_id: str) -> None:
         """Expire the orphan's undecided suggestions (both directions) and dismiss its candidate
         rows, each charged to the row cap; a `settle:` key keeps whatever did not fit for later."""
-        written, more = withdraw_orphan_suggestions(
-            self.inv, self.snap, device_id, self.now, MAX_ROWS_PER_PASS - self.writes
+        allowance = min(
+            int(MAX_ROWS_PER_PASS * CLEANUP_ROWS_SHARE) - self.cleanup_writes,
+            MAX_ROWS_PER_PASS - self.writes,
         )
+        written, more = withdraw_orphan_suggestions(
+            self.inv, self.snap, device_id, self.now, allowance
+        )
+        written += dismiss_open_candidates(self.inv, device_id, allowance - written)
         self.writes += written
-        self.writes += dismiss_open_candidates(self.inv, device_id, MAX_ROWS_PER_PASS - self.writes)
+        self.cleanup_writes += written
         left = more or open_candidates_left(self.inv, device_id)
         state_set(self.inv, f"settle:{device_id}", "1" if left else None)
 

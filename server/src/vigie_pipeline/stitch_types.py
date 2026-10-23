@@ -4,6 +4,7 @@ the DECISIONS the read-only compute phase hands to the apply phase (docs/stitchi
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -47,15 +48,22 @@ def long_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
+def fold(name: str) -> str:
+    """THE name fold, used identically in Python and as the stored indexed column: NFKC (full-width
+    and compatibility forms, NFD vs NFC) then Unicode casefold (ß -> ss, final sigma, dotless i).
+    SQLite's NOCASE folds ASCII only and is never used on names."""
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
 def same(a: str | None, b: str | None) -> bool:
-    return bool(a) and bool(b) and a.casefold() == b.casefold()  # type: ignore[union-attr]
+    return bool(a) and bool(b) and fold(a) == fold(b)  # type: ignore[arg-type]
 
 
 def group_keys(o: Obs) -> list[GroupKey]:
-    """Name groups of a MAC: (opt55, opt60, kind, casefolded name) per available name."""
+    """Name groups of a MAC: (opt55, opt60, kind, folded name) per available name."""
     if not (o.opt55 and o.opt60):
         return []
-    return [(o.opt55, o.opt60, kind, name.casefold())
+    return [(o.opt55, o.opt60, kind, fold(name))
             for kind, name in (("h", o.hostname), ("m", o.mdns)) if name]  # fmt: skip
 
 
@@ -134,7 +142,9 @@ def components(links: Mapping[str, str]) -> dict[str, frozenset[str]]:
 @dataclass(frozen=True)
 class Attach:
     """Attach `mac` (now a self MAC of `from_device`) to `target` under `rule`. Re-validated under
-    the lock: still self, both devices ok, rule/group unchanged in a fresh overrides snapshot."""
+    the lock: still self, both devices ok, the pair's candidate state unchanged, the rule unexpired
+    at the clock read under the lock, and overrides.db unwritten since the snapshot (data_version,
+    read fresh immediately before the write)."""
 
     mac: str
     from_device: str

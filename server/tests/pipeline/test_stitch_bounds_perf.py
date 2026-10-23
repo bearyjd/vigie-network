@@ -408,15 +408,16 @@ class Ticking:
 def test_compute_budget_stops_between_subjects_and_the_cursor_persists(inv, monkeypatch):
     pair_world(inv, ["both"] * 6)
     inv.commit()
-    monkeypatch.setattr(compute_mod, "time", Ticking(3.0))  # 5 s budget: one subject per pass
+    monkeypatch.setattr(compute_mod, "time", Ticking(0.6))  # 5 s budget: a few lookups' worth
     st = inv.stitch()
-    assert st.examined == 1 and st.deferred >= 1 and inv.count("stitch_deferred") == 1
+    assert 0 < st.examined < 6 and st.deferred >= 1 and inv.count("stitch_deferred") == 1
     cursor = inv.db.execute("SELECT value FROM stitch_state WHERE key=?", (SELF_CURSOR,)).fetchone()
     assert cursor is not None
     inv.stitch(EMPTY, NOW_ABS + 60)
     assert inv.count("stitch_deferred") == 1  # once per UTC day
     monkeypatch.setattr(compute_mod, "time", Ticking(0.0))
     inv.stitch(EMPTY, NOW_ABS + 120)
+    inv.stitch(EMPTY, NOW_ABS + 180)  # subjects cut mid-way wait for the next robin cycle
     assert inv.totals() == (6, 6)
 
 
@@ -690,10 +691,10 @@ def test_the_neighbourhood_queries_use_indexes(inv):
         "self": (compute_mod.SELF_SUBJECTS, ("", 0, 5)),
         "rule": (compute_mod.RULE_SUBJECTS, ("", 5)),
         "name": (f"SELECT {hood_mod.OBS_COLUMNS} {hood_mod.OBS_FROM} WHERE o.dhcp_fingerprint=?"  # noqa: S608
-                 " AND o.vendor_class=? AND o.hostname = ? COLLATE NOCASE ORDER BY o.last_seen DESC"
+                 " AND o.vendor_class=? AND o.hostname_fold = ? ORDER BY o.last_seen DESC"
                  " LIMIT ?", ("a", "b", "c", 5)),
         "mdns": (f"SELECT {hood_mod.OBS_COLUMNS} {hood_mod.OBS_FROM} WHERE o.dhcp_fingerprint=?"  # noqa: S608
-                 " AND o.vendor_class=? AND o.mdns_name = ? COLLATE NOCASE ORDER BY o.last_seen"
+                 " AND o.vendor_class=? AND o.mdns_fold = ? ORDER BY o.last_seen"
                  " DESC LIMIT ?", ("a", "b", "c", 5)),
         "close": (f"SELECT {hood_mod.OBS_COLUMNS} {hood_mod.OBS_FROM} WHERE o.dhcp_fingerprint=?"  # noqa: S608
                   " AND o.vendor_class=? AND o.first_seen BETWEEN ? AND ? ORDER BY o.first_seen"
@@ -793,6 +794,17 @@ def test_the_self_robin_keeps_a_share_of_the_budget_whatever_the_recheck_costs(i
         inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
     pair_world(inv, ["both"] * 6)
     inv.commit()
-    monkeypatch.setattr(compute_mod, "time", Ticking(0.5))  # ten budget checks a pass
+    monkeypatch.setattr(compute_mod, "time", Ticking(0.1))  # fifty budget ticks a pass
     st = inv.stitch(RULE_SNAP)
     assert 0 < st.candidates and st.examined > st.candidates  # both robins made progress
+
+
+def test_flood_tokens_are_not_brute_forceable_short_hashes(inv, monkeypatch):
+    monkeypatch.setattr(compute_mod, "MAX_SIGNATURE_BUCKET", 2)
+    for k in range(4):
+        inv.mac(f"F{k}", "swarm", None, "self", "2026-02-01T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.stitch()
+    (token,) = [
+        r[0] for r in inv.db.execute("SELECT dedup FROM events WHERE kind='signature_flood'")
+    ]
+    assert len(token.split(":")[0]) >= 32

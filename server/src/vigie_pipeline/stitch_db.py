@@ -107,23 +107,24 @@ def upsert_candidate(
 
 
 def dismiss_open_candidates(inv: sqlite3.Connection, device_id: str, limit: int) -> int:
-    """A rule settled the device's MAC: up to `limit` of its undecided candidate rows are dismissed
-    (one indexed statement). Returns the rows written."""
+    """A rule settled the device's MAC: up to `limit` of the undecided candidate rows naming it on
+    either side are dismissed (one indexed statement). Returns the rows written."""
     if limit <= 0:
         return 0
     return inv.execute(
         "UPDATE identity_candidates SET state='dismissed' WHERE id IN (SELECT id FROM"
-        " identity_candidates WHERE device_a=? AND state IN ('open','suggested') LIMIT ?)",
-        (device_id, limit),
+        " identity_candidates WHERE (device_a=? OR device_b=?) AND state IN ('open','suggested')"
+        " LIMIT ?)",
+        (device_id, device_id, limit),
     ).rowcount
 
 
 def open_candidates_left(inv: sqlite3.Connection, device_id: str) -> bool:
     return (
         inv.execute(
-            "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN ('open','suggested')"
-            " LIMIT 1",
-            (device_id,),
+            "SELECT 1 FROM identity_candidates WHERE (device_a=? OR device_b=?)"
+            " AND state IN ('open','suggested') LIMIT 1",
+            (device_id, device_id),
         ).fetchone()
         is not None
     )

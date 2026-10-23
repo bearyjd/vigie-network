@@ -7,20 +7,20 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from vigie_ingest.db import iso_utc
 from vigie_pipeline.activity import Interval, load_activity, load_first_received
 from vigie_pipeline.config import BUCKET_ROWS, MAX_ALIAS_IDS, TARGET_KEYS, PipelineConfig
 from vigie_pipeline.snapshot import Snapshot
-from vigie_pipeline.stitch_types import GroupKey, Obs, epoch, group_keys
+from vigie_pipeline.stitch_types import GroupKey, Obs, epoch, fold, group_keys
 
 OBS_COLUMNS = (
     "o.mac, o.device_id, o.is_randomized, o.dhcp_fingerprint, o.vendor_class, o.hostname,"
     " o.mdns_name, o.link_source, o.first_seen, o.link_rule_id, d.status"
 )
 OBS_FROM = "FROM observations o JOIN devices d ON d.id = o.device_id"
-NAME_COLUMNS = {"h": "hostname", "m": "mdns_name"}
+FOLD_COLUMNS = {"h": "hostname_fold", "m": "mdns_fold"}
 
 
 def obs_from_row(snap: Snapshot, r: sqlite3.Row) -> Obs:
@@ -41,9 +41,10 @@ class Hood:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig,
         components: dict[str, frozenset[str]], cutoff: int,
+        tick: Callable[[], None] = lambda: None,
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.cfg = inv, snap, cfg
-        self.components, self.cutoff = components, cutoff
+        self.components, self.cutoff, self.tick = components, cutoff, tick
         self.obs: dict[str, Obs] = {}
         self.act: dict[str, list[Interval]] = {}
         self.first_recv: dict[str, int] = {}
@@ -56,6 +57,7 @@ class Hood:
     def _rows(self, key: tuple, sql: str, params: tuple) -> None:
         if key in self._done:
             return
+        self.tick()  # the compute budget is charged per lookup, inside a subject
         self._done.add(key)
         rows = self.inv.execute(sql, (*params, BUCKET_ROWS + 1)).fetchall()
         if len(rows) > BUCKET_ROWS:
@@ -64,13 +66,14 @@ class Hood:
             self.obs.setdefault(r["mac"], obs_from_row(self.snap, r))
 
     def add_name(self, opt55: str, opt60: str, kind: str, name: str) -> None:
-        """Every MAC with this fingerprint and this hostname ('h') or mDNS name ('m')."""
-        column = NAME_COLUMNS[kind]
+        """Every MAC with this fingerprint and this hostname ('h') or mDNS name ('m'), compared
+        on the stored fold (the same `fold` as in Python)."""
+        column = FOLD_COLUMNS[kind]
         self._rows(
-            ("name", opt55, opt60, kind, name.casefold()),
+            ("name", opt55, opt60, kind, fold(name)),
             f"SELECT {OBS_COLUMNS} {OBS_FROM} WHERE o.dhcp_fingerprint=? AND o.vendor_class=?"  # noqa: S608
-            f" AND o.{column} = ? COLLATE NOCASE ORDER BY o.last_seen DESC LIMIT ?",
-            (opt55, opt60, name),
+            f" AND o.{column} = ? ORDER BY o.last_seen DESC LIMIT ?",
+            (opt55, opt60, fold(name)),
         )
 
     def add_keys(self, o: Obs) -> None:
@@ -121,12 +124,21 @@ class Hood:
         for opt55, opt60, kind, name in sorted(keys)[:TARGET_KEYS]:
             self.add_name(opt55, opt60, kind, name)
 
+    def known_names(self, canon: str) -> set[str]:
+        """The folded names of a target identity, at most TARGET_KEYS of them (more is incomplete
+        evidence): what bounds the per-view known-name lookups."""
+        names = self.names_of(canon)
+        if len(names) > TARGET_KEYS:
+            self.truncated.add("target_keys")
+        return set(sorted(names)[:TARGET_KEYS])
+
     def load(self, *extra: str) -> None:
         """Activity (widened, clipped, inside retention) and first receipts of every MAC gathered
         so far plus `extra`: primary-key reads, at most INTERVALS_PER_MAC rows each."""
         macs = sorted((set(self.obs) | set(extra)) - self._loaded)
         if not macs:
             return
+        self.tick()
         self._loaded.update(macs)
         first = load_first_received(self.inv, macs)
         self.first_recv.update(first)
@@ -150,8 +162,8 @@ class Hood:
         return {o.mac for o in self.obs.values() if o.canon in wanted}
 
     def names_of(self, canon: str) -> set[str]:
-        """Casefolded hostnames and mDNS names seen on any MAC of a device."""
-        return {n.casefold() for o in self.by_canon(canon) for n in (o.hostname, o.mdns) if n}
+        """Folded hostnames and mDNS names seen on any MAC of a device."""
+        return {fold(n) for o in self.by_canon(canon) for n in (o.hostname, o.mdns) if n}
 
     def groups(self) -> dict[GroupKey, list[Obs]]:
         out: dict[GroupKey, list[Obs]] = defaultdict(list)
@@ -160,10 +172,11 @@ class Hood:
                 out[key].append(o)
         return out
 
-    def name_peers(self, c: Obs) -> list[Obs]:
-        """Every other MAC with c's opt55 and opt60 and an agreeing hostname or mDNS name."""
-        keys = set(group_keys(c))
-        return [o for o in self.obs.values() if o.mac != c.mac and keys & set(group_keys(o))]
+    def name_peers(self, c: Obs, groups: dict[GroupKey, list[Obs]] | None = None) -> list[Obs]:
+        """Every other MAC with c's opt55 and opt60 and an agreeing hostname or mDNS name (through
+        a precomputed `groups()` map when a caller has one: linear, not quadratic)."""
+        groups = self.groups() if groups is None else groups
+        return [o for k in group_keys(c) for o in groups.get(k, ()) if o.mac != c.mac]
 
     def live(self, o: Obs) -> bool:
         """Still a self MAC with activity inside the retention window."""

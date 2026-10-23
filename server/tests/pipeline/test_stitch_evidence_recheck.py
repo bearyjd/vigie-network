@@ -340,3 +340,94 @@ def test_a_later_different_reason_raises_a_fresh_flag_and_tokens_are_long(inv):
     assert len(rows) == 2 and {r[0].split(": ")[1][:9] for r in rows} == {"evidence ", "sustained"}
     assert all(len(r[1].split("~")[0]) >= 32 for r in rows)  # not a brute-forceable 32-bit hash
     assert inv.stitch(RULE_SNAP, NOW_ABS + 2).suspect == 0 and inv.link_of(a) == ("D", "rule")
+
+
+# ---- fix round 2 (opus) -------------------------------------------------------------------------
+
+
+def test_an_overlap_seen_in_a_truncated_hood_is_still_flagged(inv, monkeypatch):
+    """Opus M2: while a spray persists, the overlap flag must still fire beside the truncation."""
+    monkeypatch.setattr(stitch_hood, "BUCKET_ROWS", 10)
+    a = attached(inv)
+    inv.mac(
+        "V",
+        "victim",
+        None,
+        "self",
+        "2026-01-03T00:00:00Z",
+        [(NOW_ABS - 5000, NOW_ABS)],
+        last_seen="2026-09-02T00:00:00Z",
+    )  # the victim is among the newest rows: visible
+    for i in range(12):
+        inv.mac(
+            f"S{i}",
+            "victim",
+            None,
+            "self",
+            "2026-06-01T00:00:00Z",
+            [],
+            last_seen="2026-09-01T00:00:00Z",
+        )
+    st = inv.stitch(RULE_SNAP)
+    rows = [
+        r[0] for r in inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'")
+    ]
+    assert (
+        st.suspect == 2
+        and any("sustained" in r for r in rows)
+        and any("incomplete" in r for r in rows)
+    )
+    assert inv.link_of(a) == ("D", "rule")
+
+
+def test_one_huge_recheck_subject_cannot_exceed_its_budget_share(inv, monkeypatch):
+    """Opus M1: 300 target MACs with distinct names used to cost two lookups each inside one
+    subject, far beyond the budget; the known names are capped and the budget ticks per lookup."""
+    import time as real_time
+
+    from vigie_pipeline import stitch_compute as compute_mod
+
+    a = attached(inv)
+    for k in range(300):
+        inv.mac("D", f"name{k}", f"mdns{k}", "rule", OLD, [], newdev=False)
+    inv.commit()
+    monkeypatch.setattr(compute_mod, "STITCH_COMPUTE_BUDGET_S", 0.4)
+    start = real_time.perf_counter()
+    st = inv.stitch(RULE_SNAP)
+    assert real_time.perf_counter() - start < 2.0
+    assert st.suspect == 1 and inv.link_of(a) == ("D", "rule")  # incomplete evidence is flagged
+    row = inv.db.execute("SELECT summary FROM events WHERE kind='rule_attach_suspect'").fetchone()
+    assert "evidence incomplete" in row[0]
+
+
+def test_a_subject_cut_by_the_budget_does_not_pin_the_robin(inv, monkeypatch):
+    from vigie_pipeline import stitch_compute as compute_mod
+    from vigie_pipeline.stitch_compute import RECHECK_CURSOR
+
+    class Slow:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def monotonic(self) -> float:
+            self.t += 1.0  # every budget check costs a second: the first lookup already overruns
+            return self.t
+
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    for k in range(3):
+        ivs = [(NOW_ABS - 80000 + k * 1000, NOW_ABS - 79500 + k * 1000)]
+        m = inv.mac("D", "victim", None, "rule", f"2026-01-0{k + 2}T00:00:00Z", ivs, newdev=False)
+        inv.attachment(m, "r1", "D", "victim", None, [[True, False]])
+    inv.commit()
+    monkeypatch.setattr(compute_mod, "time", Slow())
+    monkeypatch.setattr(compute_mod, "STITCH_COMPUTE_BUDGET_S", 3.0)
+    cursors = []
+    for i in range(4):
+        inv.stitch(RULE_SNAP, NOW_ABS + i)
+        cursors.append(
+            inv.db.execute(
+                "SELECT value FROM stitch_state WHERE key=?", (RECHECK_CURSOR,)
+            ).fetchone()
+        )
+    assert (
+        len({c[0] if c else None for c in cursors}) >= 3
+    )  # the cursor moved past each cut subject

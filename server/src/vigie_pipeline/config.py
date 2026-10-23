@@ -54,6 +54,9 @@ MAX_ROWS_PER_PASS = 200
 MAX_ATTACHES_PER_PASS = 20
 # Open merge suggestions pointing INTO one device; more wait (bounds the orphan cleanup at attach).
 MAX_OPEN_SUGGESTIONS_PER_DEVICE = 64
+# The orphan cleanup after an attach (dismissals, suggestion expiry) may use at most this share
+# of MAX_ROWS_PER_PASS per pass; the rest stays for vetoes, candidates and suggestions.
+CLEANUP_ROWS_SHARE = 0.5
 # The re-check robin may use at most this share of the compute budget; the rest is the self
 # robin's, so expensive re-checks never starve rules and candidates (and vice versa).
 RECHECK_BUDGET_SHARE = 0.5

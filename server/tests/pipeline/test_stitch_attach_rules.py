@@ -815,13 +815,6 @@ def test_a_malformed_rule_on_a_target_turns_a_valid_attach_into_a_suggestion(inv
     assert inv.count("stitch_deferred") == 1
 
 
-def test_a_malformed_rule_on_another_device_changes_nothing(inv):
-    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
-    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
-    snap = Snapshot({}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset({"Z"}))
-    assert inv.stitch(snap).attached == 1 and inv.link_of(a) == ("D", "rule")
-
-
 def test_a_malformed_target_is_matched_through_merges(inv):
     inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
     a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
@@ -1059,7 +1052,7 @@ def test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later
     open_q = "SELECT COUNT(*) FROM identity_candidates WHERE state='open'"
     st = inv.stitch(RULE_SNAP)
     assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
-    assert 800 <= inv.db.execute(open_q).fetchone()[0] < 1000  # at most the budget per pass
+    assert 900 <= inv.db.execute(open_q).fetchone()[0] < 1000  # at most half the cap per pass
     rows = inv.db.execute(
         "SELECT COUNT(*) FROM suggestions WHERE expires_at >= ?", (iso_utc(NOW_ABS),)
     )
@@ -1068,7 +1061,7 @@ def test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later
         inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
         == 1
     )
-    for i in range(6):
+    for i in range(12):
         inv.stitch(RULE_SNAP, NOW_ABS + i + 1)
     assert inv.db.execute(open_q).fetchone()[0] == 0
     assert (
@@ -1307,15 +1300,82 @@ def test_orphan_suggestion_expiry_is_bounded_per_pass_and_finishes_later(inv, mo
     st = inv.stitch(RULE_SNAP)
     assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
     left = inv.db.execute(live, (iso_utc(NOW_ABS + 100),)).fetchone()[0]
-    assert 805 <= left <= 1005  # at most the row budget of one pass was spent
+    assert 905 <= left <= 1005  # at most half the row cap of one pass was spent
     assert (
         inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
         == 1
     )
-    for i in range(7):
+    for i in range(12):
         inv.stitch(RULE_SNAP, NOW_ABS + i + 1)
     assert inv.db.execute(live, (iso_utc(NOW_ABS + 100),)).fetchone()[0] == 0
     assert (
         inv.db.execute("SELECT COUNT(*) FROM stitch_state WHERE key LIKE 'settle:%'").fetchone()[0]
         == 0
     )
+
+
+# ---- fix round 2 (opus) -------------------------------------------------------------------------
+
+
+def test_an_unreadable_data_version_fails_closed(inv, tmp_path):
+    ov, conn = snapshot_world(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    inv.commit()
+    snap = load_snapshot(conn, NOW_ABS)
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    conn.close()  # the PRAGMA cannot be read any more
+    st = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, conn, plan)
+    assert st.attached == 0 and st.stale == 1 and inv.link_of(a) == ("A", "self")
+    ov.close()
+
+
+def test_any_malformed_rule_makes_every_rule_hit_a_suggestion(inv):
+    """A malformed rule on ANOTHER device could have named this signature too: conservative."""
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    a = inv.mac("A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 3000, NOW_ABS)])
+    snap = Snapshot({}, RULE_SNAP.rules, {"iot": 1}, {"D": (1, "iot")}, {}, 1, frozenset({"Z"}))
+    st = inv.stitch(snap)
+    assert st.attached == 0 and st.suggestions == 1 and inv.link_of(a) == ("A", "self")
+    assert inv.db.execute("SELECT reason_text FROM suggestions").fetchone()[0] == "malformed_target"
+
+
+def test_the_orphan_cleanup_keeps_half_the_row_cap_for_decisions(inv, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MAX_ROWS_PER_PASS", 20)
+    a = attach_unit(inv)
+    inv.db.execute("BEGIN")
+    inv.db.executemany(
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES (?, 'A', ?, 0.8, '{}', 'open', 't')",
+        ((f"c{i}", f"X{i}") for i in range(100)),
+    )
+    inv.db.executemany(  # rows where the orphan is the TARGET are settled too
+        "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+        " created_at) VALUES (?, ?, 'A', 0.8, '{}', 'suggested', 't')",
+        ((f"b{i}", f"Y{i}") for i in range(5)),
+    )
+    for i in range(6):  # six fresh pairs that need their own rows this pass
+        inv.mac(f"O{i}", f"h{i}", None, "self", OLD, [(NOW_ABS - 90000 + i,) * 2])
+        inv.mac(
+            f"P{i}",
+            f"h{i}",
+            None,
+            "self",
+            f"2026-02-01T00:00:{i:02d}Z",
+            [(NOW_ABS - 5000 + i,) * 2],
+        )
+    inv.commit()
+    st = inv.stitch(RULE_SNAP)
+    assert st.attached == 1 and inv.link_of(a) == ("D", "rule")
+    dismissed = inv.db.execute(
+        "SELECT COUNT(*) FROM identity_candidates WHERE state='dismissed'"
+    ).fetchone()[0]
+    assert dismissed <= 10  # the cleanup took at most half the cap ...
+    assert st.candidates >= 5  # ... and the fresh decisions still got rows
+    for i in range(14):
+        inv.stitch(RULE_SNAP, NOW_ABS + i + 1)
+    open_rows = inv.db.execute(
+        "SELECT COUNT(*) FROM identity_candidates WHERE (device_a='A' OR device_b='A')"
+        " AND state IN ('open','suggested')"
+    ).fetchone()[0]
+    assert open_rows == 0

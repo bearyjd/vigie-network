@@ -19,7 +19,7 @@ from vigie_pipeline.snapshot import EMPTY, Rule, Snapshot
 from vigie_pipeline.stitch import stitch
 from vigie_pipeline.stitch_compute import Compute
 from vigie_pipeline.stitch_hood import Hood, load_obs
-from vigie_pipeline.stitch_types import Obs
+from vigie_pipeline.stitch_types import Obs, fold
 
 OPT55 = "[1,121,3,6,15,119,252]"
 OPT60 = "android-dhcp-14"
@@ -192,10 +192,11 @@ class Inv:
             )
         self.db.execute(
             "INSERT INTO observations (mac, device_id, is_randomized, dhcp_fingerprint,"
-            " vendor_class, hostname, mdns_name, link_source, first_seen, last_seen)"
-            " VALUES (?,?,?,?,'x',?,?,?,?,?)",
-            (m, dev, rand, fp, host, mdns, src, fs, last_seen or fs),
-        )
+            " vendor_class, hostname, mdns_name, link_source, first_seen, last_seen,"
+            " hostname_fold, mdns_fold) VALUES (?,?,?,?,'x',?,?,?,?,?,?,?)",
+            (m, dev, rand, fp, host, mdns, src, fs, last_seen or fs,
+             fold(host) if host else None, fold(mdns) if mdns else None),
+        )  # fmt: skip
         self.act(m, ivs)
         self.db.execute(  # the server-clock anchor a real fold records (long ago by default)
             "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",

@@ -109,7 +109,10 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "ALTER TABLE events ADD COLUMN dedup TEXT",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_dedup ON events(kind, dedup)"
         " WHERE dedup IS NOT NULL",
-        # one candidate row per (from, into) pair; vetoes looked up from either endpoint
+        # one candidate row per (from, into) pair (main never wrote the table; any duplicate pair
+        # keeps its newest row so the unique index cannot abort the upgrade)
+        "DELETE FROM identity_candidates WHERE rowid NOT IN (SELECT MAX(rowid) FROM"
+        " identity_candidates GROUP BY device_a, device_b)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_candidates_pair"
         " ON identity_candidates(device_a, device_b)",
         "CREATE INDEX IF NOT EXISTS idx_candidates_b ON identity_candidates(device_b, device_a)",
@@ -118,12 +121,16 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " ON suggestions(action, device_ids, expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_suggestions_into"
         " ON suggestions(action, json_extract(device_ids, '$[1]'), expires_at)",
-        # neighbourhood lookups: (fingerprint, name) buckets newest-last_seen first, the
+        # the ONE name fold (NFKC + Unicode casefold, computed in Python: stitch_types.fold),
+        # stored and indexed; back-filled for existing rows by open_pipeline_inventory
+        "ALTER TABLE observations ADD COLUMN hostname_fold TEXT",
+        "ALTER TABLE observations ADD COLUMN mdns_fold TEXT",
+        # neighbourhood lookups: (fingerprint, folded name) buckets newest-last_seen first, the
         # fingerprint by first sighting, and the rule-attached MACs
         "CREATE INDEX IF NOT EXISTS idx_obs_fp_host ON observations(dhcp_fingerprint,"
-        " vendor_class, hostname COLLATE NOCASE, last_seen)",
+        " vendor_class, hostname_fold, last_seen)",
         "CREATE INDEX IF NOT EXISTS idx_obs_fp_mdns ON observations(dhcp_fingerprint,"
-        " vendor_class, mdns_name COLLATE NOCASE, last_seen)",
+        " vendor_class, mdns_fold, last_seen)",
         "CREATE INDEX IF NOT EXISTS idx_obs_fp_first ON observations(dhcp_fingerprint,"
         " vendor_class, first_seen)",
         "CREATE INDEX IF NOT EXISTS idx_obs_rule ON observations(mac) WHERE link_source = 'rule'",
@@ -194,4 +201,30 @@ def open_pipeline_inventory(path: Path, migrate: bool = False) -> sqlite3.Connec
         )
     conn = open_inventory(path) if version < expected else connect(path)
     apply_pipeline_migrations(conn)
+    backfill_folds(conn)
     return conn
+
+
+def backfill_folds(conn: sqlite3.Connection, chunk: int = 2000) -> int:
+    """Store the fold of every observation name that has none yet (rows written before the
+    pipeline knew the column); chunked, idempotent, one short transaction per chunk."""
+    from vigie_pipeline.stitch_types import fold  # noqa: PLC0415 - avoid an import cycle
+
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(observations)")}
+    if "hostname_fold" not in columns:  # a schema sliced below migration 4 (tests)
+        return 0
+    done = 0
+    while True:
+        rows = conn.execute(
+            "SELECT mac, hostname, mdns_name FROM observations WHERE (hostname IS NOT NULL AND"
+            " hostname_fold IS NULL) OR (mdns_name IS NOT NULL AND mdns_fold IS NULL) LIMIT ?",
+            (chunk,),
+        ).fetchall()
+        if not rows:
+            return done
+        with immediate(conn):
+            conn.executemany(
+                "UPDATE observations SET hostname_fold=?, mdns_fold=? WHERE mac=?",
+                [(fold(r[1]) if r[1] else None, fold(r[2]) if r[2] else None, r[0]) for r in rows],
+            )
+        done += len(rows)

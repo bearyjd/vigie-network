@@ -68,6 +68,12 @@ from vigie_pipeline.stitch_types import (
 )
 
 logger = logging.getLogger("vigie_pipeline")
+
+
+class BudgetSpent(Exception):
+    """The robin's share of the compute budget ran out inside a subject (per lookup)."""
+
+
 SELF_CURSOR = "cursor:self"
 RECHECK_CURSOR = "cursor:recheck"
 SUSPECT = "rule_attach_suspect"
@@ -93,6 +99,7 @@ class Compute:
         start = self.monotonic()
         self.deadline = start + STITCH_COMPUTE_BUDGET_S
         self.recheck_deadline = start + STITCH_COMPUTE_BUDGET_S * RECHECK_BUDGET_SHARE
+        self._active_deadline = self.deadline  # the current robin's share
         self.components = components(snap.links)
         self.malformed_targets = frozenset(snap.canonical(d) for d in snap.malformed_devices)
         self.cutoff = int(now) - cfg.activity_retention_s
@@ -128,13 +135,19 @@ class Compute:
         the robin's share of the compute budget is spent (the cursor then stays on the last
         finished one). Returns the new cursor, None once the robin wrapped."""
         after = state_get(self.inv, key) or ""
+        self._active_deadline = deadline
         macs = fetch(after)
         for i, mac in enumerate(macs):
             if self.monotonic() > deadline:
                 self._defer("budget")
                 return macs[i - 1] if i else (after or None)
-            handle(mac)
+            handle(mac)  # a subject cut mid-way is reported inside and the cursor moves past it
         return macs[-1] if len(macs) >= MACS_PER_PASS else None
+
+    def _tick(self) -> None:
+        """Charged per neighbourhood lookup: one huge subject cannot outlive its robin's share."""
+        if self.monotonic() > self._active_deadline:
+            raise BudgetSpent
 
     def _self_subjects(self, after: str) -> list[str]:
         rows = self.inv.execute(SELF_SUBJECTS, (after, self.cutoff, MACS_PER_PASS))
@@ -159,7 +172,7 @@ class Compute:
         return candidate_state(self.inv, a, b)
 
     def _hood(self) -> Hood:
-        return Hood(self.inv, self.snap, self.cfg, self.components, self.cutoff)
+        return Hood(self.inv, self.snap, self.cfg, self.components, self.cutoff, self._tick)
 
     def _defer(self, reason: str, device_id: str | None = None) -> None:
         """One stitch_deferred event per reason per UTC day: a degrade is never silent."""
@@ -232,7 +245,7 @@ class Compute:
 
     def _flood(self, over: list[tuple[GroupKey, int]], device_id: str) -> None:
         """One signature_flood event for the whole flooded population (however many names it
-        shares), once per group per UTC day."""
+        shares), once per group per UTC day (128-bit token: a chosen name cannot collide)."""
         self.stats.flooded += 1
         fresh = [(key, size) for key, size in over if key not in self.flooded]
         self.flooded.update(key for key, _ in over)
@@ -240,7 +253,8 @@ class Compute:
             return
         key, size = fresh[0]
         token = short_hash("|".join(key))
-        self.decisions.append(Flag("signature_flood", device_id, f"{token}:{self.day}",
+        self.decisions.append(Flag("signature_flood", device_id,
+                                   f"{long_hash('|'.join(key))}:{self.day}",
                                    f"signature flood {token}: {size} MACs skipped"))  # fmt: skip
         log(logger, logging.WARNING, "signature_flood", signature=token, macs=size)
 
@@ -274,7 +288,7 @@ class Compute:
 
     def _gather_peers(self, hood: Hood, target: str, views: list[Obs]) -> None:
         hood.add_target(target)
-        known = hood.names_of(target)
+        known = hood.known_names(target)  # at most TARGET_KEYS: bounds the lookups per view
         for view in views:
             hood.add_keys(view)
             if view.opt55 and view.opt60:
@@ -291,11 +305,12 @@ class Compute:
         compatible peers. Returns (peers, compatible_pool_flooded)."""
         self._gather_peers(hood, target, views)
         peers, flooded = hood.canon_macs([target]), False
-        known = hood.names_of(target)
+        known = hood.known_names(target)
+        groups = hood.groups()  # once: the peer derivation is linear in the neighbourhood
         for t in hood.by_canon(target):
-            peers |= {p.mac for p in hood.name_peers(t)}
+            peers |= {p.mac for p in hood.name_peers(t, groups)}
         for view in views:
-            peers |= {p.mac for p in hood.name_peers(view)}
+            peers |= {p.mac for p in hood.name_peers(view, groups)}
             compat = self._compatible(hood, view, known)
             size = sum(1 for m in compat if hood.counted(hood.obs[m]))
             if size > MAX_SIGNATURE_BUCKET:
@@ -321,6 +336,12 @@ class Compute:
         c = load_obs(self.inv, self.snap, mac)
         if c is None or c.source != "self" or c.canon != c.device_id:
             return
+        try:
+            self._examine_self(mac, c)
+        except BudgetSpent:  # cut mid-subject: nothing decided for it, retried on the next cycle
+            self._defer("budget", c.device_id)
+
+    def _examine_self(self, mac: str, c: Obs) -> None:
         hood = self._hood()
         hood.add_keys(c)
         hood.load(mac)
@@ -406,8 +427,12 @@ class Compute:
             return "component_oversize"
         if maturity == "gap":
             return "evidence_gap"
-        if target in self.malformed_targets or self.snap.unknown_target:
-            return "malformed_target"
+        if (
+            self.snap.malformed_rules
+            or self.snap.unknown_target
+            or target in self.malformed_targets
+        ):
+            return "malformed_target"  # a malformed rule anywhere could have named this signature
         return None
 
     def _state_ok(self, device_id: str) -> bool:
@@ -502,15 +527,24 @@ class Compute:
         views = [replace(base, hostname=att.hostname if h else None,
                          mdns=att.mdns_name if m else None) for h, m in att.views]  # fmt: skip
         hood = self._hood()
-        hood.load(mac)
-        peers, flooded = self._safety_peers(hood, o.canon, views)
+        try:
+            hood.load(mac)
+            peers, flooded = self._safety_peers(hood, o.canon, views)
+        except BudgetSpent:  # cut mid-subject: incomplete evidence, judged on what was gathered
+            hood.tick = lambda: None
+            hood.load(mac)
+            peers, flooded = hood.canon_macs([o.canon]), False
+            hood.truncated.add("budget")
         if flooded:  # a dropped compatible pool is incomplete evidence, never a free pass
             hood.truncated.add("compatible_flood")
+        # an overlap seen in a partial neighbourhood is still proof: both flags can fire; the
+        # authorisation flag is the quiet case's only signal and is not added on top of them
+        overlap = self.sustained(hood, mac, peers - {mac})
+        if overlap:
+            self._suspect(o, "sustained overlap with peers")
         if hood.truncated:
             self._suspect(o, "evidence incomplete, " + sorted(hood.truncated)[0])
-        elif self.sustained(hood, mac, peers - {mac}):
-            self._suspect(o, "sustained overlap with peers")
-        elif not self._still_authorises(att.rule_id, o.canon):
+        elif not overlap and not self._still_authorises(att.rule_id, o.canon):
             self._suspect(o, "rule or group no longer authorises this attach")
 
     def _still_authorises(self, rule_id: str, canon: str) -> bool:

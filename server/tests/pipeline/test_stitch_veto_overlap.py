@@ -867,3 +867,69 @@ def test_obs_view_of_a_mac(inv):
         False,
     )
     assert load_obs(inv.db, EMPTY, "no:such:mac") is None
+
+
+# ---- fix round 2 (opus): one Unicode fold everywhere --------------------------------------------
+
+NAMES = [
+    ("Éloïse-iPhone", "éloïse-iphone"),
+    ("Straße-PC", "STRASSE-PC"),
+    ("Ødegaard", "ødegaard"),
+    ("Σίσυφος", "ΣΊΣΥΦΟΣ"),  # final sigma folds like the others
+    ("Yılmaz", "YıLMAZ"),  # dotless i is its own letter under Unicode casefold (not an I)
+    ("Café", "Café"),  # NFC vs NFD
+    ("Ｄaves-Phone", "daves-phone"),  # full-width D (NFKC)
+]
+
+
+@pytest.mark.parametrize(("stored", "seen"), NAMES)
+def test_non_ascii_names_match_exactly_like_ascii_ones(data, stored, seen):
+    appear(data, 1, 0, 300, host=stored, mdns=None)
+    appear(data, 2, 400, 700, host=seen, mdns=None)
+    run(data)
+    assert [c["state"] for c in candidates(data)] == ["suggested"], (stored, seen)
+
+
+@pytest.mark.parametrize(("stored", "seen"), NAMES)
+def test_a_present_non_ascii_victim_still_vetoes_the_copy(data, stored, seen):
+    appear(data, 1, 0, 1500, host=stored, mdns=None)
+    appear(data, 2, 100, 1500, host=seen, mdns=None)  # 1400 s concurrent > grace
+    run(data)
+    assert [c["state"] for c in candidates(data)] == ["vetoed"], (stored, seen)
+
+
+def test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule(data):
+    """Opus H1 e2e: the copy attached beside the present victim because every name-bucket lookup
+    missed the Unicode name; the ASCII control was vetoed."""
+    host = "Éloïse-iPhone"
+    ov, dev = seeded(data, a_end=300, rule_sig=sig(hostname=host))
+    data.inv.execute("UPDATE observations SET hostname=?", (host,))  # the seeded device too
+    v = appear(data, 3, 1000, 4000, host=host, mdns=None)  # the victim's fresh roll
+    b = appear(data, 2, 1400, 2400, host=host.lower(), mdns=None)  # the copy, beside it
+    run(data)
+    assert source_of(data, b) == "self" and device_of(data, b) != dev
+    assert ("vetoed" in {c["state"] for c in candidates(data)}) or kinds(
+        data, "rule_attach_suspect"
+    )
+    assert source_of(data, v) in ("self", "rule")
+    ov.close()
+
+
+def test_fold_is_one_function_for_python_and_sql(inv):
+    from vigie_pipeline.stitch_types import fold
+
+    for stored, seen in NAMES:
+        assert fold(stored) == fold(seen), (stored, seen)
+    m = inv.mac("D", "Éloïse-iPhone", "Straße", "self", OLD, [(NOW_ABS - 100, NOW_ABS)])
+    inv.commit()
+    row = inv.db.execute(
+        "SELECT hostname_fold, mdns_fold FROM observations WHERE mac=?", (m,)
+    ).fetchone()
+    assert tuple(row) == (fold("Éloïse-iPhone"), fold("Straße"))
+    sql = (
+        "EXPLAIN QUERY PLAN SELECT mac FROM observations WHERE dhcp_fingerprint=?"
+        " AND vendor_class=? AND hostname_fold=? ORDER BY last_seen DESC"
+    )
+    plan = " ".join(r[3] for r in inv.db.execute(sql, ("a", "b", "c")))
+    assert "idx_obs_fp_host" in plan and "SCAN" not in plan
+    assert "NOCASE" not in open("src/vigie_pipeline/stitch_hood.py").read()

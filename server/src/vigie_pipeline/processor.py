@@ -21,6 +21,7 @@ from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_s
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
 from vigie_pipeline.stitch import StitchStats, stitch
 from vigie_pipeline.stitch_db import emit_once
+from vigie_pipeline.stitch_types import fold
 
 logger = logging.getLogger("vigie_pipeline")
 
@@ -227,10 +228,10 @@ def _create_device(inv: sqlite3.Connection, mac: str, act: MacActivity, received
         )
     inv.execute(
         "INSERT INTO observations (mac, device_id, is_randomized, dhcp_fingerprint, vendor_class,"
-        " hostname, mdns_name, link_source, first_seen, last_seen)"
-        " VALUES (?,?,?,?,?,?,?,'self',?,?)",
+        " hostname, mdns_name, link_source, first_seen, last_seen, hostname_fold, mdns_fold)"
+        " VALUES (?,?,?,?,?,?,?,'self',?,?,?,?)",
         (mac, device_id, int(randomized), act.opt55, act.opt60, act.hostname, act.mdns_name,
-         first, last),
+         first, last, _fold(act.hostname), _fold(act.mdns_name)),
     )  # fmt: skip
     inv.execute(
         "INSERT OR IGNORE INTO events (id, device_id, ts, kind, severity, summary)"
@@ -307,13 +308,18 @@ def _update_observation(inv: sqlite3.Connection, row: sqlite3.Row, act: MacActiv
         _flag_conflict(inv, row, field, new, last)
         return old
 
+    host, mdns = pick(row["hostname"], act.hostname), pick(row["mdns_name"], act.mdns_name)
     inv.execute(
         "UPDATE observations SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?),"
-        " hostname=?, dhcp_fingerprint=?, vendor_class=?, mdns_name=? WHERE mac=?",
-        (first, last, pick(row["hostname"], act.hostname),
-         first_wins("dhcp_fingerprint", act.opt55), first_wins("vendor_class", act.opt60),
-         pick(row["mdns_name"], act.mdns_name), row["mac"]),
+        " hostname=?, dhcp_fingerprint=?, vendor_class=?, mdns_name=?, hostname_fold=?,"
+        " mdns_fold=? WHERE mac=?",
+        (first, last, host, first_wins("dhcp_fingerprint", act.opt55),
+         first_wins("vendor_class", act.opt60), mdns, _fold(host), _fold(mdns), row["mac"]),
     )  # fmt: skip
+
+
+def _fold(name: str | None) -> str | None:
+    return fold(name) if name else None
 
 
 def _touch_devices(

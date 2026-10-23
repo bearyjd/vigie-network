@@ -69,8 +69,10 @@ IMMEDIATE` APPLY that re-reads `overrides.db` and re-validates every decision be
   over `MAX_ALIAS_IDS`, a target with over `TARGET_KEYS` signatures, an evidence gap or a malformed
   rule on the target turn a rule hit into a `rule_hit_needs_confirm` suggestion (`reason_text`
   names the cause) or a provisional row, never an attach; one `stitch_deferred` event per reason
-  per UTC day. The post-attach re-check flags (`rule_attach_suspect`, once per MAC) on sustained
-  overlap with the peers of its attach-time evidence, and on incomplete evidence.
+  per UTC day. The post-attach re-check flags (`rule_attach_suspect`, once per MAC and reason) on
+  sustained overlap with the peers of its attach-time evidence, on incomplete evidence, and when
+  the rule or group no longer authorises the attachment. Names are compared through one Unicode
+  fold stored in `observations.hostname_fold`/`mdns_fold`.
 - **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable or
   malformed: stitching is skipped for the run (`stitching_skipped`, once a day), the batches are
   processed with no identity links and the cursor advances.

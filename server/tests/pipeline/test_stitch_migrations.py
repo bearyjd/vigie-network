@@ -117,3 +117,35 @@ def test_the_into_index_serves_the_orphan_lookup(tmp_path):
         )
     )  # fmt: skip
     assert "idx_suggestions_into" in plan
+
+
+def test_upgrade_from_mains_frozen_schema_text_survives_duplicate_candidate_rows(
+    tmp_path, monkeypatch
+):
+    """main's migrations as committed on main (a frozen copy, not this branch's own list), with
+    rows in every table and a duplicate (device_a, device_b) pair that the unique index must not
+    abort on."""
+    from fixtures.main_pipeline_schema import MAIN_PIPELINE_MIGRATIONS
+
+    assert MAIN_PIPELINE_MIGRATIONS == schema.PIPELINE_MIGRATIONS[:3]  # migrations 1-3 unchanged
+    path = tmp_path / "inventory.db"
+    monkeypatch.setattr(schema, "PIPELINE_MIGRATIONS", MAIN_PIPELINE_MIGRATIONS)
+    conn = open_pipeline_inventory(path, migrate=True)
+    conn.execute("INSERT INTO devices (id, first_seen, last_seen) VALUES ('d','t','t')")
+    conn.execute(
+        "INSERT INTO observations (mac, device_id, is_randomized, hostname, mdns_name, link_source,"
+        " first_seen, last_seen) VALUES ('m','d',1,'Éloïse','Straße','self','t','t')"
+    )
+    for cid in ("c1", "c2"):
+        conn.execute(
+            "INSERT INTO identity_candidates (id, device_a, device_b, score, evidence, state,"
+            " created_at) VALUES (?,'a','b',0.8,'{}','open',?)", (cid, cid),
+        )  # fmt: skip
+    conn.close()
+    monkeypatch.undo()
+    conn = open_pipeline_inventory(path)
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 4
+    rows = conn.execute("SELECT id FROM identity_candidates ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["c2"]  # the newest of the duplicates is kept
+    folds = conn.execute("SELECT hostname_fold, mdns_fold FROM observations").fetchone()
+    assert tuple(folds) == ("éloïse", "strasse")  # back-filled for main's rows

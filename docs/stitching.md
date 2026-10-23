@@ -206,10 +206,10 @@ veto. Every degrade except "immature" also writes one `stitch_deferred` event pe
 
 | cause | rule path | candidate path | re-check |
 |---|---|---|---|
-| neighbourhood truncated, target with > `TARGET_KEYS` signatures | overlap visible: provisional `open`; else `rule_hit_needs_confirm` with `reason_text` naming the cause | nothing written (the oldest device may be hidden) | `rule_attach_suspect` ("evidence incomplete") |
+| neighbourhood truncated, target with > `TARGET_KEYS` signatures, subject cut by the budget | overlap visible: `vetoed` (an overlap seen in a partial neighbourhood is still proof; a veto is the conservative outcome for trust); else `rule_hit_needs_confirm` with `reason_text` naming the cause | nothing written (the oldest device may be hidden) | `rule_attach_suspect` ("evidence incomplete"), AND the overlap flag when one is seen |
 | merge component > `MAX_ALIAS_IDS` | provisional `open` (a veto row may be unreachable: no suggestion) | nothing | flag |
 | evidence gap in the MAC's window | overlap visible: `open`; else `rule_hit_needs_confirm (evidence_gap)` | `open` if overlapping (maturity only matters for permanence) | n/a |
-| malformed rule on the target | `rule_hit_needs_confirm (malformed_target)` | n/a | n/a |
+| any malformed rule in the snapshot (it could have named this signature) | `rule_hit_needs_confirm (malformed_target)` | n/a | n/a |
 | young / sparse MAC | silent defer | `open` if overlapping | n/a |
 | name group flooded | nothing + `signature_flood` once per group per day | nothing | n/a |
 | compatible pool flooded | `signature_flood` + `rule_hit_needs_confirm (compatible_flood)` | n/a | `rule_attach_suspect` ("evidence incomplete") |
@@ -278,7 +278,11 @@ a fresh flag); the pipeline does not detach and creates no suggestion. Detaching
 | 65 compatible junk MACs around an attached copy | a flooded pool is incomplete evidence: flag / confirm, never silence | `test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag`, `test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion` |
 | dismiss or decide a pair between COMPUTE and APPLY | candidate-state preconditions drop the decision | `test_a_dismissal_between_compute_and_apply_cancels_the_attach`, `test_a_dismissal_between_compute_and_apply_cancels_the_suggestion` |
 | 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later; suggestions expired at once | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
-| grow overrides.db to lengthen the lock | point lookups only under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
+| grow overrides.db to lengthen the lock | one PRAGMA data_version per attach under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
+| Unicode names (É, ß, ς, full-width, NFD) to dodge the name buckets | one fold (NFKC + casefold) in Python and in the stored indexed `*_fold` columns; no NOCASE on names | `test_non_ascii_names_match_exactly_like_ascii_ones`, `test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule` |
+| one enormous subject to eat the compute budget | the budget ticks per lookup inside a subject; known names capped; a cut subject is deferred/flagged and the cursor moves past it | `test_one_huge_recheck_subject_cannot_exceed_its_budget_share`, `test_a_subject_cut_by_the_budget_does_not_pin_the_robin` |
+| a persistent spray to mask the overlap flag behind the truncation flag | overlap always evaluated on the peers at hand; both flags fire | `test_an_overlap_seen_in_a_truncated_hood_is_still_flagged` |
+| a malformed rule on another device whose signature could match | any malformed rule makes every rule hit suggestion-only | `test_any_malformed_rule_makes_every_rule_hit_a_suggestion` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
 | rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
 | merge a vetoed device into the target between COMPUTE and APPLY | data_version drops the attach; the next pass vetoes through the fresh components | `test_a_merge_between_compute_and_apply_cannot_launder_a_veto`, `test_any_overrides_change_between_compute_and_apply_drops_the_attach` |
@@ -309,6 +313,17 @@ a fresh flag); the pipeline does not detach and creates no suggestion. Detaching
   over days (200 rows a pass). Pruning of candidate rows is not done.
 - **Compromised collector** (holds the ingest credential) is outside this threat model: it can
   withhold or invent stamps inside the accepted window.
+- **Attach availability under API traffic.** Any app-scope token may `PATCH /devices` and each
+  such write (and a `wal_checkpoint(TRUNCATE)` on `overrides.db`) bumps `data_version`, dropping
+  that pass's attaches (one pass of delay each, never a wrong attach). The API's rate limit bounds
+  it; requirement for the API round: keep write endpoints rate-limited per token.
+- **Names and the fold.** Hostnames and mDNS names are compared through one Unicode fold
+  (`stitch_types.fold`: NFKC + casefold, stored as `observations.hostname_fold`/`mdns_fold`); the
+  pipeline writes those columns and back-fills them once at upgrade. Turkish dotless i is its own
+  letter under Unicode casefold (locale-independent), as in Python.
+- **`canonical_device` in batch processing** (main code) walks at most 32 links when widening a
+  device's range per batch; stitching uses the full-chain snapshot resolution. A chain longer than
+  32 only delays the range widening to the stitching pass (`Widen` decisions).
 - **iOS sends no opt60**: iOS devices can never be stitched or covered by a rule as specified; the
   ground-truth tests inject a constant opt60 to exercise the behaviour (decision for the owner).
 
