@@ -615,6 +615,7 @@ def test_rule_attachments_table_exists_after_migration(tmp_path):
         "attached_at",
         "opt55",
         "opt60",
+        "views",
     ]
 
 

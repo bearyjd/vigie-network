@@ -43,8 +43,10 @@ transaction (full design, formula and limits: [`docs/stitching.md`](../../../doc
   first received, activity earlier than that minus 1 h is clipped when loaded, and every batch drops
   stamps older than its own receipt minus 1 h, so back-filled stamps cannot mature a MAC. Stamps
   dropped for the lag are recorded as evidence gaps (`collector_gaps`, schema v8): a MAC whose
-  activity window overlaps a gap is not mature. Setup work (activity and observations) follows the
-  active MACs, so a large `observations` table does not lengthen the stitch transaction.
+  activity window overlaps a gap is not mature. Setup work follows the active MACs (a trigger-kept
+  `mac_last_seen` summary; older identities come from the fingerprint/name indexes of
+  `observations`, a few per key), so a large `observations` table does not lengthen the stitch
+  transaction.
   Derived data; safe to drop.
 - **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
   opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a

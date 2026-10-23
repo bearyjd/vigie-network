@@ -188,16 +188,21 @@ def _chunks(ids: Collection[str]) -> list[list[str]]:
 
 def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Collection[str]) -> bool:
     """Is any (a, b) pair of the two alias sets recorded as vetoed? A permanent veto keyed by a
-    device id must survive that device being merged into another. The id lists are chunked, so
-    the number of merged devices is not limited by SQLite's variable count."""
-    for a in _chunks(a_ids):
-        for b in _chunks(b_ids):
-            if inv.execute(
-                "SELECT 1 FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
-                f" AND device_a IN ({_marks(a)}) AND device_b IN ({_marks(b)}) LIMIT 1",
-                [*a, *b],
-            ).fetchone():
-                return True
+    device id must survive that device being merged into another. The vetoes are looked up by the
+    ids of the SMALLER side (chunked, through the index of that side) and checked by set membership
+    against the larger one, so a huge merge component never becomes an IN list."""
+    if len(a_ids) <= len(b_ids):
+        column, other, small, large = "device_a", "device_b", a_ids, set(b_ids)
+    else:
+        column, other, small, large = "device_b", "device_a", b_ids, set(a_ids)
+    for chunk in _chunks(small):
+        rows = inv.execute(
+            f"SELECT {other} FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
+            f" AND {column} IN ({_marks(chunk)})",
+            chunk,
+        )
+        if any(r[0] in large for r in rows):
+            return True
     return False
 
 
@@ -224,15 +229,29 @@ class Attachment:
     mdns_name: str | None
     opt55: str | None = None  # None: attached before the fingerprints were recorded
     opt60: str | None = None
+    views: tuple[tuple[bool, bool], ...] | None = None  # each matched rule's (hostname, mdns)
+
+
+def _views(text: str | None) -> tuple[tuple[bool, bool], ...] | None:
+    if text is None:
+        return None
+    return tuple((bool(h), bool(m)) for h, m in json.loads(text))
 
 
 def load_attachments(inv: sqlite3.Connection) -> dict[str, Attachment]:
     return {
         r["mac"]: Attachment(
-            r["rule_id"], r["target"], r["hostname"], r["mdns_name"], r["opt55"], r["opt60"]
+            r["rule_id"],
+            r["target"],
+            r["hostname"],
+            r["mdns_name"],
+            r["opt55"],
+            r["opt60"],
+            _views(r["views"]),
         )
         for r in inv.execute(
-            "SELECT mac, rule_id, target, hostname, mdns_name, opt55, opt60 FROM rule_attachments"
+            "SELECT mac, rule_id, target, hostname, mdns_name, opt55, opt60, views"
+            " FROM rule_attachments"
         )
     }
 
@@ -240,17 +259,18 @@ def load_attachments(inv: sqlite3.Connection) -> dict[str, Attachment]:
 def save_attachment(inv: sqlite3.Connection, mac: str, att: Attachment, now: float) -> None:
     inv.execute(
         "INSERT OR REPLACE INTO rule_attachments (mac, rule_id, target, hostname, mdns_name,"
-        " attached_at, opt55, opt60) VALUES (?,?,?,?,?,?,?,?)",
+        " attached_at, opt55, opt60, views) VALUES (?,?,?,?,?,?,?,?,?)",
         (mac, att.rule_id, att.target, att.hostname, att.mdns_name, iso_utc(now), att.opt55,
-         att.opt60),
+         att.opt60, None if att.views is None else json.dumps(att.views)),
     )  # fmt: skip
 
 
 def withdraw_orphan_suggestions(
-    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float, limit: int
+    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float
 ) -> int:
-    """Expire (expires_at only) up to `limit` undecided merge suggestions that start at the
-    orphaned device `device_id`, by index range. Returns the rows expired."""
+    """Expire (expires_at only) EVERY undecided merge suggestion that starts at the orphaned device
+    `device_id`, by index range, in one go. Deliberately not limited by the row allowance: an
+    orphan's suggestion must never stay actionable. Returns the rows expired."""
     prefix = json.dumps([device_id, ""])[:-2]  # '["<id>", "'
     ids = [
         r["id"]
@@ -260,22 +280,8 @@ def withdraw_orphan_suggestions(
             (prefix, prefix + "\uffff", iso_utc(now)),
         )
         if r["id"] not in snap.decisions
-    ][: max(limit, 0)]
+    ]
     inv.executemany(
         "UPDATE suggestions SET expires_at=? WHERE id=?", [(iso_utc(now - 1), i) for i in ids]
     )
     return len(ids)
-
-
-def has_open_orphan_suggestions(
-    inv: sqlite3.Connection, snap: Snapshot, device_id: str, now: float
-) -> bool:
-    prefix = json.dumps([device_id, ""])[:-2]
-    return any(
-        r["id"] not in snap.decisions
-        for r in inv.execute(
-            "SELECT id FROM suggestions WHERE action='merge_identity' AND device_ids >= ?"
-            " AND device_ids < ? AND expires_at >= ?",
-            (prefix, prefix + "\uffff", iso_utc(now)),
-        )
-    )

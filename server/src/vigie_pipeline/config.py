@@ -48,9 +48,12 @@ STITCH_MAX_TXN_SECONDS = 3
 # Loading the inventory (setup) may take this long before the pass gives up and releases the lock;
 # the transaction time-box above is then split into equal slices, one per phase, after setup.
 STITCH_SETUP_MAX_SECONDS = 2
-# A merge component (devices that are one identity) larger than this cannot be checked for old
-# vetoes within the lock: the pair is then treated as vetoed (fail closed).
+# A merge component (devices that are one identity) whose smaller side of a pair is larger than
+# this is not decided automatically (deferred to a human, reported as alias_component_oversize).
 MAX_ALIAS_IDS = 5000
+# Older identities without retained activity are looked up by (fingerprint, name), oldest first,
+# at most this many per key.
+HISTORIC_MATCH_LIMIT = 16
 # At most this many signature_flood events per pass; further new floods get one daily summary.
 MAX_FLOOD_EVENTS_PER_PASS = 20
 

@@ -8,7 +8,7 @@ like raw).
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S
 from vigie_pipeline.sources import MacActivity
@@ -112,31 +112,51 @@ def load_gaps(inv: sqlite3.Connection, since: int) -> list[Interval]:
 
 
 def load_first_received(
-    inv: sqlite3.Connection, tick: Callable[[], None] = lambda: None
+    inv: sqlite3.Connection, macs: Sequence[str], tick: Callable[[], None] = lambda: None
 ) -> dict[str, int]:
-    """SERVER time (batch receipt, epoch s) each MAC was first folded into mac_activity."""
-    out = {}
-    for i, r in enumerate(inv.execute("SELECT mac, received FROM mac_first_received")):
-        if not i % 4096:
-            tick()
-        out[r[0]] = r[1]
+    """SERVER time (batch receipt, epoch s) each of the given MACs was first folded into
+    mac_activity (primary-key seeks, in chunks, with a time check between chunks)."""
+    out: dict[str, int] = {}
+    for i in range(0, len(macs), 400):
+        tick()
+        chunk = list(macs[i : i + 400])
+        out.update(
+            (r[0], r[1])
+            for r in inv.execute(
+                "SELECT mac, received FROM mac_first_received"  # noqa: S608
+                f" WHERE mac IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+        )
     return out
 
 
-def _active_macs(inv: sqlite3.Connection, min_end: int, tick: Callable[[], None]) -> list[str]:
-    """MACs with activity ending no earlier than `min_end`, by index skip-scan: one seek per MAC
-    (never a scan of the intervals), so the work is proportional to the ACTIVE MACs and `tick`
-    can interrupt it."""
-    macs, last = [], ""
+PAGE = 1000
+
+
+def active_macs(inv: sqlite3.Connection, min_end: int, tick: Callable[[], None]) -> list[str]:
+    """MACs with activity ending no earlier than `min_end`, from the small `mac_last_seen`
+    summary (kept by a trigger on mac_activity) through its `last_end` index in keyset pages:
+    only ACTIVE MACs are ever examined, never stale rows, and `tick` runs between pages."""
+    macs: list[str] = []
+    last_end, last_mac = min_end, ""
     while True:
         tick()
-        row = inv.execute(
-            'SELECT mac FROM mac_activity WHERE mac > ? AND "end" >= ? ORDER BY mac LIMIT 1',
-            (last, min_end),
-        ).fetchone()
-        if row is None:
-            return macs
-        macs.append(last := row[0])
+        rows = inv.execute(
+            "SELECT mac, last_end FROM mac_last_seen WHERE last_end >= ?"
+            " AND (last_end > ? OR mac > ?) ORDER BY last_end, mac LIMIT ?",
+            (last_end, last_end, last_mac, PAGE),
+        ).fetchall()
+        if not rows:
+            return sorted(macs)
+        macs.extend(r[0] for r in rows)
+        last_mac, last_end = rows[-1][0], rows[-1][1]
+
+
+def _ticked(macs: Iterable[str], tick: Callable[[], None]) -> Iterable[str]:
+    for mac in macs:
+        tick()
+        yield mac
 
 
 def load_activity(
@@ -148,13 +168,14 @@ def load_activity(
     max_lag_s: int = 0,
     min_end: int = 0,
     tick: Callable[[], None] = lambda: None,
+    macs: Sequence[str] | None = None,
 ) -> dict[str, list[Interval]]:
     """Per-MAC merged intervals. An interval shorter than min_width_s is widened symmetrically to
     that width: a stamp means "present around then", so a single-stamp or zero-length interval
     must still be able to overlap (otherwise sparse stamps dodge the overlap veto).
 
-    per_mac_limit reads only the newest raw intervals of each MAC that has activity ending at or
-    after `min_end` (the retention cutoff): MACs come from an index skip-scan of mac_activity and
+    per_mac_limit reads only the newest raw intervals of each MAC with activity ending at or
+    after `min_end` (the retention cutoff): the MACs are `macs` or, by default, `active_macs`, and
     `tick` runs between MACs, so the rows loaded are bounded by the ACTIVE MACs, not by every MAC
     ever observed. Raw intervals more than a gap apart never merge after widening, so this is the
     same set as the newest merged ones. With first_received, a MAC's activity earlier than its
@@ -165,7 +186,7 @@ def load_activity(
     else:
         rows = (
             row
-            for mac in _active_macs(inv, min_end, tick)
+            for mac in _ticked(macs if macs is not None else active_macs(inv, min_end, tick), tick)
             for row in inv.execute(
                 'SELECT mac, start, "end" FROM (SELECT mac, start, "end" FROM mac_activity'
                 ' WHERE mac=? AND "end" >= ? ORDER BY start DESC LIMIT ?) ORDER BY start',
@@ -192,6 +213,7 @@ def purge_activity(inv: sqlite3.Connection, now: float, retention_s: int) -> int
         'DELETE FROM mac_activity WHERE "end" < ?', (int(now) - retention_s,)
     ).rowcount
     inv.execute('DELETE FROM collector_gaps WHERE "end" < ?', (int(now) - retention_s,))
+    inv.execute("DELETE FROM mac_last_seen WHERE last_end < ?", (int(now) - retention_s,))
     inv.execute(  # a MAC with no activity left starts over (like a new one) if it returns
         "DELETE FROM mac_first_received WHERE received < ?"
         " AND mac NOT IN (SELECT mac FROM mac_activity)",

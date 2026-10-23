@@ -290,12 +290,12 @@ def test_populated_v4_database_migrates_to_v5(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 9
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
     rows = conn.execute("SELECT id, dedup FROM events ORDER BY seq").fetchall()
     assert [tuple(r) for r in rows] == [("e1", None), ("e2", None)]  # NULL dedup stays NULL
     assert conn.execute("SELECT COUNT(*) FROM mac_activity").fetchone()[0] == 1
-    assert apply_pipeline_migrations(conn) == 9  # re-apply is a no-op
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 9
+    assert apply_pipeline_migrations(conn) == 10  # re-apply is a no-op
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 10
     conn.execute(ins, ("e3",))  # NULLs never collide on the partial unique index
 
 

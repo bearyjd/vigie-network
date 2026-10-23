@@ -10,11 +10,11 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cached_property
 
 from vigie_pipeline.logs import log
 
 logger = logging.getLogger("vigie_pipeline")
-MAX_LINK_DEPTH = 32
 OPT55_RE = re.compile(r"[0-9]+(,[0-9]+)*")
 
 
@@ -42,15 +42,32 @@ class Snapshot:
     decisions: Mapping[str, str]  # suggestion_id -> accepted|rejected
     malformed_rules: int = 0  # active-looking identity_rules rows skipped as malformed
 
+    @cached_property
+    def _canon(self) -> dict[str, str]:
+        """Canonical device of every linked device, through the COMPLETE chain (any length),
+        iteratively with a visited set (cycle-safe) and memoised along the path."""
+        memo: dict[str, str] = {}
+        for start in self.links:
+            if start in memo:
+                continue
+            path, seen, current = [start], {start}, start
+            while True:
+                nxt = self.links.get(current)
+                if nxt is None or nxt in seen:
+                    canon = current
+                    break
+                if nxt in memo:
+                    canon = memo[nxt]
+                    break
+                path.append(nxt)
+                seen.add(nxt)
+                current = nxt
+            for device in path:
+                memo[device] = canon
+        return memo
+
     def canonical(self, device_id: str) -> str:
-        seen, current = {device_id}, device_id
-        for _ in range(MAX_LINK_DEPTH):
-            nxt = self.links.get(current)
-            if nxt is None or nxt in seen:
-                return current
-            current = nxt
-            seen.add(current)
-        return current
+        return self._canon.get(device_id, device_id)
 
     def version(self, device_id: str) -> int:
         return self.overrides[device_id][0] if device_id in self.overrides else 0

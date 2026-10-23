@@ -161,6 +161,35 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " WHERE received = (SELECT MIN(start) FROM mac_activity a"
         " WHERE a.mac = mac_first_received.mac)",
     ),
+    (
+        # each matched rule's own field mask (JSON list of [hostname, mdns] booleans): the
+        # re-check rebuilds EVERY view separately instead of one stricter union
+        "ALTER TABLE rule_attachments ADD COLUMN views TEXT",
+        # permanent vetoes looked up from either endpoint without IN lists over a whole merge
+        # component (the other side, device_a, is the leading column of uq_candidates_pair)
+        "CREATE INDEX IF NOT EXISTS idx_candidates_vetoed_b ON identity_candidates(device_b,"
+        " device_a) WHERE state = 'vetoed'",
+        # historical fingerprint matches, independent of activity: oldest first per name
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_host ON observations(dhcp_fingerprint,"
+        " vendor_class, hostname COLLATE NOCASE, first_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_obs_fp_mdns ON observations(dhcp_fingerprint,"
+        " vendor_class, mdns_name COLLATE NOCASE, first_seen)",
+        # active-MAC summary (kept by a trigger): enumeration never touches stale intervals
+        "CREATE TABLE IF NOT EXISTS mac_last_seen ("
+        "mac TEXT PRIMARY KEY, last_end INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_mac_last_seen_end ON mac_last_seen(last_end, mac)",
+        'INSERT OR REPLACE INTO mac_last_seen (mac, last_end) SELECT mac, MAX("end")'
+        " FROM mac_activity GROUP BY mac",
+        "CREATE TRIGGER IF NOT EXISTS trg_mac_last_seen AFTER INSERT ON mac_activity BEGIN"
+        ' INSERT INTO mac_last_seen (mac, last_end) VALUES (NEW.mac, NEW."end")'
+        ' ON CONFLICT(mac) DO UPDATE SET last_end = MAX(last_end, NEW."end"); END',
+        # Provenance of anchors made before this point cannot be told apart (migration 6 used
+        # collector stamps; later ones server receipts, but the difference was never recorded).
+        # Conservative reset: EVERY existing anchor moves to max(anchor, migration time) and is
+        # marked legacy; only rows written after this migration count as server-receipt anchors.
+        "UPDATE mac_first_received SET legacy = 1,"
+        " received = MAX(received, CAST(strftime('%s', 'now') AS INTEGER))",
+    ),
 )
 
 PIPELINE_TABLES = (
@@ -176,6 +205,7 @@ PIPELINE_TABLES = (
     "stitch_state",
     "rule_attachments",
     "collector_gaps",
+    "mac_last_seen",
 )
 
 

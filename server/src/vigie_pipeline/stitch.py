@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from vigie_ingest.db import immediate
 from vigie_pipeline.activity import (
     Interval,
+    active_macs,
     load_activity,
     load_first_received,
     load_gaps,
@@ -31,6 +32,7 @@ from vigie_pipeline.activity import (
 )
 from vigie_pipeline.config import (
     ACTIVITY_MAX_REPORT_LAG_S,
+    HISTORIC_MATCH_LIMIT,
     MAX_ALIAS_IDS,
     MAX_FLOOD_EVENTS_PER_PASS,
     MAX_INTERVALS_PER_MAC,
@@ -54,7 +56,6 @@ from vigie_pipeline.stitch_db import (
     emit_once,
     event_exists,
     find_merge_suggestion,
-    has_open_orphan_suggestions,
     load_attachments,
     save_attachment,
     state_get,
@@ -160,9 +161,12 @@ def rule_score(rule: Rule) -> float:
     return score_of(["opt55", "opt60", *named])
 
 
-def _components(links: Mapping[str, str]) -> dict[str, frozenset[str]]:
+def _components(
+    links: Mapping[str, str], tick: Callable[[], None] = lambda: None
+) -> dict[str, frozenset[str]]:
     """Connected components of the merge links (undirected, iterative, any chain length): the
-    set of device ids that are one identity."""
+    set of device ids that are one identity. All members of a component share ONE frozenset
+    (memory is linear in the devices), and `tick` runs every few thousand steps."""
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -174,12 +178,21 @@ def _components(links: Mapping[str, str]) -> dict[str, frozenset[str]]:
             parent[x], x = root, parent[x]
         return root
 
-    for src, dst in links.items():
+    for i, (src, dst) in enumerate(links.items()):
+        if not i % 4096:
+            tick()
         parent[find(src)] = find(dst)
     groups: dict[str, set[str]] = defaultdict(set)
-    for device in list(parent):
+    for i, device in enumerate(list(parent)):
+        if not i % 4096:
+            tick()
         groups[find(device)].add(device)
-    return {d: frozenset(g) for g in groups.values() for d in g}
+    out: dict[str, frozenset[str]] = {}
+    for group in groups.values():
+        shared = frozenset(group)
+        out.update(dict.fromkeys(group, shared))
+        tick()
+    return out
 
 
 def _epoch(iso: str) -> float:
@@ -226,17 +239,19 @@ class Stitcher:
         self.clock = clock or (lambda: now)  # rule expiry is re-checked against this
         self.overrides = overrides  # re-read under the lock before an attach
         self.deadline = time.monotonic() + STITCH_SETUP_MAX_SECONDS  # setup only; see run()
-        self.components = _components(snap.links)
-        self.first_recv = load_first_received(inv, self._check_time)  # SERVER first receipt
+        self.components = _components(snap.links, self._check_time)
+        cutoff = int(now) - cfg.activity_retention_s
+        active = active_macs(inv, cutoff, self._check_time)  # only ACTIVE macs are ever examined
+        self.first_recv = load_first_received(inv, active, self._check_time)  # SERVER 1st receipt
         self.act = {  # only active MACs; only the most recent intervals of a MAC are compared
             m: ivs[-MAX_INTERVALS_PER_MAC:]
             for m, ivs in load_activity(
                 inv, cfg.activity_gap_s, per_mac_limit=MAX_INTERVALS_PER_MAC,
                 first_received=self.first_recv, max_lag_s=ACTIVITY_MAX_REPORT_LAG_S,
-                min_end=int(now) - cfg.activity_retention_s, tick=self._check_time,
+                min_end=cutoff, tick=self._check_time, macs=active,
             ).items()
         }  # fmt: skip
-        self.gaps = load_gaps(inv, int(now) - cfg.activity_retention_s)  # missing evidence
+        self.gaps = load_gaps(inv, cutoff)  # spans of missing evidence
         self.ops = 0  # overlap-computation budget spent this pass
         self.flood_events = 0
         self.flood_suppressed = 0
@@ -245,15 +260,29 @@ class Stitcher:
         self.flooded_keys: set[GroupKey] = set()
         self.writes = 0  # candidate/suggestion rows written this pass
         self.attachments = load_attachments(inv)  # immutable evidence of each rule attach
-        self.obs = _load_obs(inv, snap, self._check_time, self._relevant_devices())
+        devices = self._relevant_devices()
+        self.obs = _load_obs(inv, snap, self._check_time, devices)
+        history = self._historical_devices() - devices
+        if history:  # older matching identities without retained activity
+            self.obs = sorted(
+                self.obs + _load_obs(inv, snap, self._check_time, history),
+                key=lambda o: (o.first_seen, o.mac),
+            )
         self._index()
+
+    def _expand(self, devices: Iterable[str]) -> set[str]:
+        """The devices and everything merged with them (a component over MAX_ALIAS_IDS is not
+        expanded: it is only a memory/time guard, vetoes are looked up by index regardless)."""
+        out: set[str] = set()
+        for device in devices:
+            members = self.alias_ids(device)
+            out |= members if len(members) <= MAX_ALIAS_IDS else {device}
+        return out
 
     def _relevant_devices(self) -> set[str]:
         """Every device the decisions can depend on: devices with an active MAC (all their MACs),
         the rule targets, and everything merged with them (the target of an attach that is still
-        active is loaded through the attached MAC's own device).
-        A device with no active MAC that is none of these cannot overlap anything and is not a
-        peer; it is not loaded."""
+        active is loaded through the attached MAC's own device)."""
         devices: set[str] = set()
         active = sorted(self.act)
         for chunk in _chunked(active):
@@ -266,9 +295,31 @@ class Stitcher:
                 )
             )  # fmt: skip
         devices.update(r.device_id for r in self.snap.rules)
-        for device in list(devices):
-            devices |= self.alias_ids(device)
-        return devices
+        return self._expand(devices)
+
+    def _historical_devices(self) -> set[str]:
+        """Older identities that match an active candidate's fingerprint and a name but have no
+        retained activity: found by the (fingerprint, name) indexes of `observations`, oldest
+        first, at most HISTORIC_MATCH_LIMIT per key. They have no activity to overlap, but a
+        suggestion may still point at them."""
+        keys: set[tuple[str, str, str, str]] = set()
+        for o in self.obs:
+            if o.opt55 and o.opt60 and o.mac in self.act:
+                for column, name in (("hostname", o.hostname), ("mdns_name", o.mdns)):
+                    if name:
+                        keys.add((o.opt55, o.opt60, column, name))
+        found: set[str] = set()
+        for fingerprint, vendor, column, name in sorted(keys):
+            self._check_time()
+            found.update(
+                r[0] for r in self.inv.execute(
+                    "SELECT device_id FROM observations WHERE dhcp_fingerprint=?"  # noqa: S608
+                    f" AND vendor_class=? AND {column} = ? COLLATE NOCASE"
+                    " ORDER BY first_seen LIMIT ?",
+                    (fingerprint, vendor, name, HISTORIC_MATCH_LIMIT),
+                )
+            )  # fmt: skip
+        return self._expand(found)
 
     def alias_ids(self, device_id: str) -> frozenset[str]:
         """Every device id of the same identity (the connected component of the merge links)."""
@@ -701,19 +752,23 @@ class Stitcher:
         if event_exists(self.inv, "rule_attach_suspect", token):
             return  # already flagged: costs the budget nothing
         att = self.attachments.get(o.mac)
-        if att:  # the values and rule fields that justified the attach, immune to renames
-            view = replace(
-                o, hostname=att.hostname, mdns=att.mdns_name,
-                opt55=att.opt55 or o.opt55, opt60=att.opt60 or o.opt60,
-            )  # fmt: skip
+        if att:  # the values and each matched rule's fields at attach time, immune to renames
+            base = replace(o, opt55=att.opt55 or o.opt55, opt60=att.opt60 or o.opt60)
+            masks = att.views or ((att.hostname is not None, att.mdns_name is not None),)
+            views = [
+                replace(
+                    base, hostname=att.hostname if h else None, mdns=att.mdns_name if m else None
+                )
+                for h, m in masks
+            ]
         else:  # attached before attachments were recorded: the names shared with the target
             others = [t for t in self.by_canon.get(o.canon, []) if t.mac != o.mac]
-            view = self._restrict(
+            views = [self._restrict(
                 o,
                 any(_same(t.hostname, o.hostname) for t in others),
                 any(_same(t.mdns, o.mdns) for t in others),
-            )
-        peers, _ = self._safety_peers(o.canon, [view])
+            )]  # fmt: skip
+        peers, _ = self._safety_peers(o.canon, views)
         if not self.sustained(o.mac, peers - {o.mac}):
             return
         if emit_once(self.inv, o.canon, "rule_attach_suspect", "warn",
@@ -723,13 +778,22 @@ class Stitcher:
             log(logger, logging.WARNING, "rule_attach_suspect", mac=short_hash(o.mac))
 
     def _vetoed(self, c: Obs, into: str) -> bool:
-        """A (candidate, target) pair once vetoed stays vetoed: re-evaluating it would only let
-        the interval cap or fresh lone stamps launder the overlap that justified the veto. Only a
-        human dismissal (the state `dismissed`, written through the API) clears it. Both endpoints
-        are resolved through the current merges, so a veto survives its target being merged."""
+        """Is (candidate, target) blocked? A pair once vetoed stays vetoed: re-evaluating it would
+        only let the interval cap or fresh lone stamps launder the overlap that justified the veto.
+        Only a human dismissal (the state `dismissed`, written through the API) clears it. Both
+        endpoints are resolved through the current merges (vetoes are looked up by index from the
+        smaller side). If even the smaller merge component exceeds MAX_ALIAS_IDS the pair is
+        DEFERRED to a human (no decision, no attach), reported once a day as
+        `alias_component_oversize`; that is not recorded as a veto."""
         a, b = self.alias_ids(c.device_id), self.alias_ids(into)
-        if len(a) > MAX_ALIAS_IDS or len(b) > MAX_ALIAS_IDS:
-            return True  # an absurd merge component cannot be checked: fail closed
+        if min(len(a), len(b)) > MAX_ALIAS_IDS:
+            big = b if len(b) >= len(a) else a
+            rep = self.snap.canonical(next(iter(sorted(big))))
+            emit_once(self.inv, None, "alias_component_oversize", "warn",
+                      f"merge component of {rep} has {len(big)} devices (limit {MAX_ALIAS_IDS}):"
+                      " no automatic decision for it, a human decides",
+                      f"{rep}:{self.day()}", self.now)  # fmt: skip
+            return True
         return vetoed_between(self.inv, a, b)
 
     def _rule_live(self, rule: Rule) -> bool:
@@ -829,22 +893,16 @@ class Stitcher:
             self._settle_device(device_id)
 
     def _settle_device(self, device_id: str) -> None:
-        """Expire the orphan's open suggestions, then dismiss its open candidate rows, within the
-        row allowance of this pass; the settle marker stays until nothing is left."""
-        self.writes += withdraw_orphan_suggestions(
-            self.inv, self.snap, device_id, self.now, MAX_ROWS_PER_PASS - self.writes
-        )
+        """Expire ALL of the orphan's open suggestions (not limited by the row allowance: none may
+        stay actionable), then dismiss its open candidate rows within the row allowance of this
+        pass; the settle marker stays until no candidate row is left."""
+        withdraw_orphan_suggestions(self.inv, self.snap, device_id, self.now)
         self.writes += self._dismiss_open_candidates(device_id, MAX_ROWS_PER_PASS - self.writes)
         left = self.inv.execute(
             "SELECT 1 FROM identity_candidates WHERE device_a=? AND state IN"
             " ('open','suggested') LIMIT 1", (device_id,),
         ).fetchone()  # fmt: skip
-        if left is None and not has_open_orphan_suggestions(
-            self.inv, self.snap, device_id, self.now
-        ):
-            state_set(self.inv, f"settle:{device_id}", None)
-        else:
-            state_set(self.inv, f"settle:{device_id}", "1")
+        state_set(self.inv, f"settle:{device_id}", None if left is None else "1")
 
     def _attach(self, c: Obs, target: str, rule: Rule, score: float, matched: list[Rule]) -> None:
         if not self._rule_live(rule) or not self._still_authorised(rule, target):
@@ -866,7 +924,9 @@ class Stitcher:
             Attachment(rule.id, target,
                        c.hostname if any(r.hostname for r in matched) else None,
                        c.mdns if any(r.mdns_name for r in matched) else None,
-                       c.opt55, c.opt60), self.now,
+                       c.opt55, c.opt60,
+                       tuple(sorted({(bool(r.hostname), bool(r.mdns_name)) for r in matched}))),
+            self.now,
         )  # fmt: skip
         self.inv.execute(
             "UPDATE devices SET first_seen=MIN(first_seen,(SELECT first_seen FROM devices"

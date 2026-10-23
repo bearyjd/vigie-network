@@ -56,27 +56,31 @@ has no activity left after retention). When the intervals are loaded for a pass,
 earlier than `first received - ACTIVITY_MAX_REPORT_LAG_S` (3600 s) is **clipped away**: a collector
 that back-fills stamps older than the report lag cannot thereby fabricate covered time or time
 apart. Honest delayed reporting (a batch is received up to an hour after its rows) is unaffected.
-Legacy MACs (activity stored before v6) were first anchored at their earliest stored collector
-stamp (migration 6, kept as it was applied); migration 9 re-anchors exactly those rows (anchor equal to
-the earliest stored stamp) at the **migration time** (server clock), marks them `legacy = 1`, and
-leaves honest server receipt times alone. They therefore mature one grace window after the upgrade;
-a MAC with no anchor row at all is **not mature** (fail closed). Residual: a
+Every anchor that existed when migration 10 ran (migration 6 had backfilled legacy MACs from their
+earliest collector stamp; later anchors were server receipts, but the difference was never recorded)
+is moved to max(anchor, migration time) and marked `legacy = 1`: a deliberately conservative reset
+that does not guess provenance from timestamps. Those MACs mature one grace window after the
+upgrade; only rows written afterwards count as server-receipt anchors. A MAC with no anchor row at
+all is **not mature** (fail closed). Residual: a
 legitimately long collector outage makes a MAC first reported after it mature more slowly (fail
 closed), and clipping applies to peers alike (a victim MAC first reported with hour-old backlog has
 that backlog clipped, which weakens the veto only if the collector itself misbehaves).
 
 **What is loaded (the setup bound).** Setup work follows the ACTIVE MACs, never the number of
-observations ever recorded. (1) The MACs with activity ending inside retention come from an index
-skip-scan of `mac_activity` (one seek per MAC, a time check between MACs); at most the newest
-`MAX_INTERVALS_PER_MAC` (64) intervals of each are read (raw intervals more than a gap apart never merge
-after widening, so these are the same intervals the cap always kept). (2) Observations are loaded by
-device, in chunks, only for the devices the decisions can depend on: every device that has an active
-MAC (all of its MACs, active or not), the rule targets, and every device merged with any of those
-(an attached MAC's own device is its target, so it is loaded whenever the MAC is active). A device with no active MAC that is none
-of these cannot overlap anything and is not a peer; it is not loaded. Consequence: a suggestion's
-`into` device is the oldest matching device among the loaded ones, so after a roller's oldest device
-has gone silent for the whole retention window and was never merged, the suggestion points at the
-oldest still-active device of the chain. Every loop checks the setup time cap (section 12).
+observations ever recorded. (1) The MACs with activity ending inside retention come from the small
+`mac_last_seen (mac, last_end)` summary (pipeline schema v10, kept by a trigger on `mac_activity`)
+through its `last_end` index in keyset pages, so stale intervals are never examined; their first
+receipts are read by primary key, only for those MACs; at most the newest `MAX_INTERVALS_PER_MAC` (64)
+intervals of each are read (raw intervals more than a gap apart never merge after widening, so these
+are the same intervals the cap always kept). (2) Observations are loaded by device, in chunks: every
+device with an active MAC (all of its MACs, active or not), the rule targets, and every device merged
+with any of those (a merge component over `MAX_ALIAS_IDS` is not expanded; vetoes do not need it).
+(3) Older identities with NO retained activity are still found: for each active candidate's
+(opt55, opt60, hostname) and (opt55, opt60, mDNS name), the oldest `HISTORIC_MATCH_LIMIT` (16)
+matching devices come from the `idx_obs_fp_host` / `idx_obs_fp_mdns` indexes (case-insensitive,
+oldest first) and are loaded with their merge components. They have no activity to overlap, but a
+suggestion may point into them. Only a device that is none of these is not loaded. Every loop checks
+the setup time cap (section 12).
 
 When the intervals are loaded for a pass, any interval shorter than `VIGIE_ACTIVITY_GAP_S` is widened
 symmetrically to that width (a stamp means "present around then"). A single stamp, or a burst of
@@ -237,10 +241,11 @@ Immediately before the attach the pipeline re-reads overrides.db (read-only, und
 lock): the rule must still be active and unchanged and the target's group must still be the same
 explicit `auto_inherit=1` group, otherwise nothing attaches that pass (revocation and regrouping
 are seen at attach time, not only expiry). The attach also records `rule_attachments (mac, rule_id,
-target, hostname, mdns_name, opt55, opt60)`: the name fields required by ANY of the matching rules
-(their union) with the MAC's values at that moment, and its fingerprints then (pipeline schema v7, v8).
-The post-attach re-check (section 8) derives its peers from these immutable
-values (the fingerprint bucket is searched with the attach-time opt55/opt60 too), so renaming the
+target, hostname, mdns_name, opt55, opt60, views)`: the name fields required by ANY of the matching
+rules with the MAC's values at that moment, its fingerprints then, and EACH matching rule's own field
+mask as a separate view (pipeline schema v7, v8, v10). The post-attach re-check (section 8) rebuilds
+every view separately from these immutable values and unions their peers (a peer that satisfies one
+rule's view is found even if it contradicts the stricter combination) (the fingerprint bucket is searched with the attach-time opt55/opt60 too), so renaming the
 attached MAC, changing its fingerprint, or revoking/expiring the rule cannot erase the evidence of a
 later overlap. MACs attached before v7 fall back to the names they share with the target's other
 MACs; those attached before v8 have no stored fingerprints and use the current ones.
@@ -249,7 +254,9 @@ MACs; those attached before v8 have no stored fingerprints and use the current o
 `link_rule_id`, `link_score` (the rule's score), widens that device's `first_seen`/`last_seen`,
 sets the orphaned self device to `status='retired'` (devices are never deleted; its earlier
 candidates become `dismissed`, and its open merge suggestions are expired at once by `expires_at`
-so nobody can accept one after the attach; both under the row cap, the rest on later passes. Residual:
+so nobody can accept one after the attach. The suggestion expiry is one uncharged pass over exactly
+the orphan's undecided suggestions (never limited by the row allowance); the candidate dismissal is
+under the row cap, the rest on later passes. Residual:
 suggestions that point INTO the orphan are not withdrawn), and writes
 `mac_attached` on the target device. The event summary carries 8-hex hashes of the previous and
 new MAC only.
@@ -464,9 +471,16 @@ Everything below runs inside `BEGIN IMMEDIATE`, so CPU is bounded as well:
   under 2 s (tested, with the query plans asserted). The `sustained` work on a single peer set is
   charged at one unit per 256 intervals, and the scan of the compatible-peer pool at one unit per
   1,024 MACs (first-seen times are parsed once at load). A committed attach updates the in-memory maps
-  in place, so no deadline can interrupt the bookkeeping halfway. `vetoed_between` chunks its id lists
-  (400 per query); the merge component of a device is resolved iteratively (any chain length) and one
-  larger than `MAX_ALIAS_IDS` (5000) is treated as vetoed (fail closed).
+  in place, so no deadline can interrupt the bookkeeping halfway. Canonical devices are resolved
+  through the COMPLETE merge chain (iterative, memoised, cycle-safe; no depth limit) and one
+  resolution is used for grouping, safety checks, vetoes and the attach target. Merge components are
+  built once (all members share one set) with deadline checks. Vetoes are looked up by index from the
+  SMALLER side of the pair (`identity_candidates` has `uq_candidates_pair` for `device_a` and
+  `idx_candidates_vetoed_b` for `device_b`, queries chunked at 400 ids) and tested by set membership
+  against the larger side, so a huge component never becomes an IN list. If even the smaller side
+  exceeds `MAX_ALIAS_IDS` (5000) the pair is DEFERRED to a human: no attach, no suggestion, no veto
+  row, and one `alias_component_oversize` event per component per UTC day naming the canonical device
+  (the API can surface it); the cap is a time/memory guard only.
 - The candidate loop stops as soon as `MAX_ROWS_PER_PASS` is reached.
 - At most `MAX_FLOOD_EVENTS_PER_PASS` (20) new `signature_flood` events are written per pass; any
   further flooded groups that pass are counted in one `signature_flood_summary` event per UTC day
