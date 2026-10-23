@@ -30,12 +30,21 @@ def merge_intervals(intervals: Iterable[Interval], gap_s: int = 0) -> list[Inter
 
 
 def coalesce_to(intervals: list[Interval], limit: int) -> list[Interval]:
-    """At most `limit` intervals: the smallest silences are bridged first (one pass over the
-    sorted silences, ties bridged together). Bridging a MAC's own silence only adds presence."""
+    """At most `limit` intervals: exactly the smallest silences are bridged (earliest first on a
+    tie). Bridging a MAC's own silence only adds presence."""
     if len(intervals) <= limit:
         return intervals
-    silences = sorted(b[0] - a[1] for a, b in zip(intervals, intervals[1:], strict=False))
-    return merge_intervals(intervals, silences[len(intervals) - limit - 1])
+    by_size = sorted(
+        range(len(intervals) - 1), key=lambda i: (intervals[i + 1][0] - intervals[i][1], i)
+    )
+    bridged = set(by_size[: len(intervals) - limit])
+    out = [intervals[0]]
+    for i in range(1, len(intervals)):
+        if i - 1 in bridged:
+            out[-1] = (out[-1][0], max(out[-1][1], intervals[i][1]))
+        else:
+            out.append(intervals[i])
+    return out
 
 
 def overlap_seconds(a: list[Interval], b: list[Interval]) -> int:

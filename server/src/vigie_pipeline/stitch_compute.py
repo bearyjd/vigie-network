@@ -76,11 +76,11 @@ RULE_SUBJECTS = (
 class Compute:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
-        monotonic: Callable[[], float] = time.monotonic,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.cfg, self.now = inv, snap, cfg, now
-        self.monotonic = monotonic
-        self.deadline = monotonic() + STITCH_COMPUTE_BUDGET_S
+        self.monotonic = monotonic or time.monotonic
+        self.deadline = self.monotonic() + STITCH_COMPUTE_BUDGET_S
         self.components = components(snap.links)
         self.malformed_targets = frozenset(snap.canonical(d) for d in snap.malformed_devices)
         self.cutoff = int(now) - cfg.activity_retention_s
@@ -198,11 +198,15 @@ class Compute:
 
     # ---- floods and peers ------------------------------------------------------------------
 
-    def _flood(self, hood: Hood, key: GroupKey, size: int, device_id: str) -> None:
+    def _flood(self, over: list[tuple[GroupKey, int]], device_id: str) -> None:
+        """One signature_flood event for the whole flooded population (however many names it
+        shares), once per group per UTC day."""
         self.stats.flooded += 1
-        if key in self.flooded:
+        fresh = [(key, size) for key, size in over if key not in self.flooded]
+        self.flooded.update(key for key, _ in over)
+        if not fresh:
             return
-        self.flooded.add(key)
+        key, size = fresh[0]
         token = short_hash("|".join(key))
         self.decisions.append(Flag("signature_flood", device_id, f"{token}:{self.day}",
                                    f"signature flood {token}: {size} MACs skipped"))  # fmt: skip
@@ -212,13 +216,15 @@ class Compute:
         """A name group (opt55, opt60, one name) with more than MAX_SIGNATURE_BUCKET live MACs
         (attached, retired and silent MACs do not count) attaches nothing and is not compared."""
         groups = hood.groups()
-        over = False
-        for key in group_keys(c):
-            size = sum(1 for o in groups.get(key, ()) if hood.counted(o))
-            if size > MAX_SIGNATURE_BUCKET:
-                self._flood(hood, key, size, c.device_id)
-                over = True
-        return over
+        over = [
+            (key, size)
+            for key in group_keys(c)
+            if (size := sum(1 for o in groups.get(key, ()) if hood.counted(o)))
+            > MAX_SIGNATURE_BUCKET
+        ]
+        if over:
+            self._flood(over, c.device_id)
+        return bool(over)
 
     def _compatible(self, hood: Hood, c: Obs, known: set[str]) -> set[str]:
         """Live self MACs with c's opt55 and opt60 whose names do not contradict c's AND that share
@@ -261,9 +267,8 @@ class Compute:
             compat = self._compatible(hood, view, known)
             size = sum(1 for m in compat if hood.counted(hood.obs[m]))
             if size > MAX_SIGNATURE_BUCKET:
-                self._flood(
-                    hood, (view.opt55 or "", view.opt60 or "", "p", ""), size, view.device_id
-                )
+                key: GroupKey = (view.opt55 or "", view.opt60 or "", "p", "")
+                self._flood([(key, size)], view.device_id)
                 flooded = True
             else:
                 peers |= compat
@@ -395,13 +400,13 @@ class Compute:
 
     def _candidate_path(self, hood: Hood, c: Obs) -> None:
         """Fingerprint candidates (docs/stitching.md sections 2-5)."""
+        if hood.truncated:  # the oldest identity, or a concurrent one, may be hidden
+            self._defer("truncated", c.device_id)
+            return
         peers = [(o, f) for o in hood.name_peers(c) if o.canon != c.canon
                  if is_candidate_match(f := signals(c, o))]  # fmt: skip
         older = [(o, f) for o, f in peers if self._older(hood, o, c)]
         if not older:
-            return
-        if hood.truncated:  # the oldest identity, or a concurrent one, may be hidden
-            self._defer("truncated", c.device_id)
             return
         by_dev: dict[str, list[tuple[Obs, list[str]]]] = defaultdict(list)
         for o, f in peers:
@@ -414,6 +419,11 @@ class Compute:
         score = score_of(best_f)
         evidence = {**evidence_of(c), "into_mac": best_o.mac, "signals": best_f}
         canons = sorted(by_dev)
+        hood.add_components(canons)  # every MAC of every matching device counts in the union
+        hood.load()
+        if hood.truncated:
+            self._defer(self._incomplete(hood, None, "ok", into) or "truncated", c.device_id)
+            return
         if self._concurrent(hood, canons):
             self.decisions.append(Ambiguous(c.mac, c.device_id, tuple(canons), score, evidence))
         elif self.sustained(hood, c.mac, hood.canon_macs(canons)):
@@ -497,7 +507,7 @@ class Compute:
 
 def compute_plan(
     inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
-    monotonic: Callable[[], float] = time.monotonic,
+    monotonic: Callable[[], float] | None = None,
 ) -> Plan:  # fmt: skip
     """One read-only transaction (a WAL reader never blocks writers)."""
     inv.execute("BEGIN")

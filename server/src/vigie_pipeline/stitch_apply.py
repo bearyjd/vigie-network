@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 from vigie_ingest.db import immediate
 from vigie_pipeline.config import (
@@ -56,17 +57,13 @@ logger = logging.getLogger("vigie_pipeline")
 class Applier:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, fresh: Snapshot | None,
-        cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
+        cfg: PipelineConfig, now: float, at: float, stats: StitchStats,
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.fresh, self.cfg = inv, snap, fresh, cfg
-        self.now, self.clock, self.stats = now, clock, stats
+        self.now, self.at, self.stats = now, at, stats  # `at`: the clock read under the lock
         self.writes = 0
         self.attaches = 0
-        self.day = (
-            __import__("datetime")
-            .datetime.fromtimestamp(now, tz=__import__("datetime").UTC)
-            .strftime("%Y-%m-%d")
-        )
+        self.day = datetime.fromtimestamp(now, tz=UTC).strftime("%Y-%m-%d")
 
     def apply(self, d: Decision) -> None:
         handler = {
@@ -204,7 +201,7 @@ class Applier:
         fresh = self.fresh
         if fresh is None or d.rule not in fresh.rules:
             return False
-        if d.rule.expires_at is not None and d.rule.expires_at <= self.clock():
+        if d.rule.expires_at is not None and d.rule.expires_at <= self.at:
             return False
         group = fresh.overrides.get(d.target, (0, None))[1]
         return (
@@ -270,13 +267,13 @@ class Applier:
 
 
 def _fresh_snapshot(
-    overrides: sqlite3.Connection | None, snap: Snapshot, clock: Callable[[], float]
+    overrides: sqlite3.Connection | None, snap: Snapshot, at: float
 ) -> Snapshot | None:
     """overrides.db re-read under the inventory lock; None (no attach) when it cannot be read."""
     if overrides is None:
         return snap
     try:
-        return load_snapshot(overrides, clock())
+        return load_snapshot(overrides, at)
     except OverridesUnreadable:
         return None
 
@@ -287,12 +284,13 @@ def apply_plan(
 ) -> StitchStats:  # fmt: skip
     stats = plan.stats
     with immediate(inv):
+        at = clock()  # read once the lock is held: rule expiry is judged against it
         fresh = (
-            _fresh_snapshot(overrides, snap, clock)
+            _fresh_snapshot(overrides, snap, at)
             if any(isinstance(d, Attach) for d in plan.decisions)
             else snap
         )
-        applier = Applier(inv, snap, fresh, cfg, now, clock, stats)
+        applier = Applier(inv, snap, fresh, cfg, now, at, stats)
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

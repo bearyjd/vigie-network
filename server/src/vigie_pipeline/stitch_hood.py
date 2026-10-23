@@ -90,22 +90,31 @@ class Hood:
     def alias_ids(self, device_id: str) -> frozenset[str]:
         return self.components.get(device_id) or frozenset({device_id})
 
-    def add_target(self, canon: str) -> None:
-        """The MACs of a target identity (its whole merge component) and the MACs sharing a
-        fingerprint and a name with any of them (its known signatures, at most TARGET_KEYS)."""
-        ids = sorted(self.alias_ids(canon))
-        if len(ids) > MAX_ALIAS_IDS:
-            self.truncated.add("component_oversize")
-            ids = [canon]
-        for i in range(0, len(ids), 400):
-            chunk = ids[i : i + 400]
+    def add_components(self, canons: Iterable[str]) -> None:
+        """Every MAC of the given identities (their whole merge components), chunked by device id
+        so a long list of singleton devices costs one lookup per 400 of them. A component over
+        MAX_ALIAS_IDS is not expanded (incomplete evidence)."""
+        ids: set[str] = set()
+        for canon in canons:
+            members = self.alias_ids(canon)
+            if len(members) > MAX_ALIAS_IDS:
+                self.truncated.add("component_oversize")
+                members = frozenset({canon})
+            ids |= members
+        chunks = sorted(ids)
+        for i in range(0, len(chunks), 400):
+            chunk = chunks[i : i + 400]
             self._rows(
                 ("devices", tuple(chunk)),
                 f"SELECT {OBS_COLUMNS} {OBS_FROM}"  # noqa: S608
-                f" WHERE o.device_id IN ({','.join('?' * len(chunk))})"
-                " ORDER BY o.last_seen DESC LIMIT ?",
+                f" WHERE o.device_id IN ({','.join('?' * len(chunk))}) LIMIT ?",
                 tuple(chunk),
             )
+
+    def add_target(self, canon: str) -> None:
+        """The MACs of a target identity and the MACs sharing a fingerprint and a name with any
+        of them (its known signatures, at most TARGET_KEYS)."""
+        self.add_components([canon])
         keys = {k for o in self.by_canon(canon) for k in group_keys(o)}
         if len(keys) > TARGET_KEYS:
             self.truncated.add("target_keys")

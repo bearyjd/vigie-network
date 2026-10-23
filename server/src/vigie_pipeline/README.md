@@ -33,70 +33,56 @@ are SQLite bookkeeping, not data. Each run reads its snapshot inside one `BEGIN`
 transaction, so rules, groups, versions and decisions are mutually consistent.
 
 ## Identity stitching
-After each `run_once` has folded new batches into `observations`, a stitching stage runs in one
-transaction (full design, formula and limits: [`docs/stitching.md`](../../../docs/stitching.md)).
+After each `run_once` has folded new batches into `observations`, a stitching pass runs in two
+phases (full design, formula, bounds and threat table: [`docs/stitching.md`](../../../docs/stitching.md);
+rationale: [`docs/stitching-design.md`](../../../docs/stitching-design.md)): a read-only COMPUTE
+that never blocks writers and turns at most `MACS_PER_PASS` (256) rule-attached MACs and 256 self
+MACs (round-robin, persisted cursors) into decisions, then one short, count-bounded `BEGIN
+IMMEDIATE` APPLY that re-reads `overrides.db` and re-validates every decision before writing.
 
 - **Activity.** Row timestamps (leases, neighbours, DNS, flows) are folded per MAC into
   `mac_activity (mac, start, end)` intervals (a silence over 5 min splits an interval; 7 d
-  retention; pipeline schema v4). Stamps outside [received - 1 h, received + 300 s] are ignored.
-  Collector stamps are untrusted: `mac_first_received` (schema v6) holds the SERVER time a MAC was
-  first received, activity earlier than that minus 1 h is clipped when loaded, and every batch drops
-  stamps older than its own receipt minus 1 h, so back-filled stamps cannot mature a MAC. Stamps
-  dropped for the lag are recorded as evidence gaps (`collector_gaps`, schema v8): a MAC whose
-  activity window overlaps a gap is not mature. Setup work follows the active MACs (a trigger-kept
-  `mac_last_seen` summary; older identities come from the fingerprint/name indexes of
-  `observations`, a few per key), so a large `observations` table does not lengthen the stitch
-  transaction; setup is capped (2 s, 20,000 newest active MACs) and loads the re-check's inputs
-  first, so a MAC spray cannot switch the post-attach re-check off. Evidence gaps are per
-  collector and merged; a deferred attach raises `evidence_gap` once a day.
-  Derived data; safe to drop.
-- **Candidates.** A randomized, self-linked MAC is compared with every other MAC. Required:
-  opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal. Anything weaker is not a
-  candidate, so a hostname alone never is. Rows go to `identity_candidates`
-  (`open|suggested|ambiguous|vetoed|dismissed`); full values only in its `evidence` column.
-- **Ambiguity / veto.** Two matching devices that were active together beyond the grace window
-  (default 600 s) make the signature `ambiguous`; a **mature** candidate whose overlap with the
-  matching devices exceeds the grace, or covers all of its own observed time, is `vetoed`
-  (permanent; only a human `dismissed` state, to be exposed by the API, clears it). Mature = more
-  than the grace of covered activity time (sum of intervals, not first-to-last span) AND first
-  received by the server more than the grace ago; an immature MAC is never rule-attached and its
-  overlap stays provisional (`open`, no veto). Neither veto nor ambiguity produces a suggestion.
-- **Sticky veto, compatible peers, flags.** A `vetoed` pair is never re-evaluated; only a human
-  `dismissed` state clears it. The overlap peers of a rule attach are derived from the rule and the
-  target device (target MACs, MACs sharing a name with them, and compatible peers: same
-  opt55/opt60, non-contradicting names, and a shared or target-known name or a first sighting
-  within one gap). A rule-attached MAC that later overlaps its peers is only flagged with one
-  `rule_attach_suspect` event (never detached, no suggestion).
-- **Suggestions.** A unique, non-vetoed candidate scoring >= 0.8 gets one immutable
-  `merge_identity` suggestion (`fingerprint_match`, basis = current override versions from
-  overrides.db). Nothing is merged: a human accepts via the API (next round).
-- **Standing rules.** `identity_rules` (read-only) attach a randomized self MAC to the rule's
-  canonical device (`link_source='rule'`, `mac_attached` event, orphan device retired) only if
-  exactly one device's active rule matches, there is no sustained overlap with the peers derived
-  from the rule and the target identity (names the applicant adds beyond the rule never exclude a
-  peer), the rule is still unexpired when it is applied (re-checked at attach time), and the device
-  has an explicit group with `auto_inherit=1`. An unassigned device or `auto_inherit=0` raises a
-  `rule_hit_needs_confirm` suggestion instead. The pipeline enforces only "active rule with a
-  non-blank creator in overrides.db"; that the creator is a human is enforced by the API alone,
-  which MUST be the sole writer of `identity_rules` and reject non-human principals (rule API not
-  built yet). Revoking or expiring a rule never detaches an existing attachment.
-- **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable (also: a
-  missing column, a non-integer `auto_inherit`/`version`, or active rules without a
-  `device_overrides` table): the snapshot is validated before any batch is read; on failure
-  stitching is skipped for that run (`stitching_skipped` at ERROR, once), the batches are processed
-  with no identity links and the cursor advances, and the rest of the run goes on.
-- **Flood bounds.** A name group (opt55, opt60, one name) with more than 64 live self-linked MACs
-  (retired devices excluded) is skipped (one `signature_flood` event per group per UTC day); at most
-  200 changed candidate rows plus created suggestions are written per pass, a two-row decision
-  fitting whole or not at all (`MAX_SIGNATURE_BUCKET`, `MAX_ROWS_PER_PASS` in `config.py`). The
-  stitch transaction also stops at a safe point after `STITCH_MAX_TXN_SECONDS` (3 s) and emits
-  `stitch_budget_exhausted`.
+  retention; at most 64 rows per MAC, the smallest silences coalesced). Stamps outside
+  [received - 1 h, received + 300 s] are ignored in every batch. `mac_first_received` holds the
+  SERVER time a MAC was first received; activity earlier than that minus 1 h is clipped when loaded.
+  Stamps dropped for the lag are recorded in one merged `evidence_gaps` list (any collector): a MAC
+  whose activity window overlaps a gap is not mature. Derived data; safe to drop.
+- **Candidates.** A randomized, self-linked MAC is compared with the MACs of its (opt55, opt60,
+  name) buckets. Required: opt55 AND opt60 equal and non-empty, plus hostname OR mDNS name equal.
+  Rows go to `identity_candidates` (`open|suggested|ambiguous|vetoed|dismissed`); full values only
+  in its `evidence` column.
+- **Ambiguity / veto.** Two matching devices active together beyond the grace window (default
+  600 s) make the signature `ambiguous`; a **mature** candidate whose overlap with the matching
+  devices exceeds the grace, covers all of its own time, or leaves it under half a gap of its own
+  is `vetoed` (permanent; only a human `dismissed` state clears it). Mature = more than the grace
+  of covered time AND first received by the server more than the grace ago AND no evidence gap in
+  its window; an immature MAC is never rule-attached and its overlap stays provisional (`open`).
+- **Standing rules.** `identity_rules` (read-only) attach a mature randomized self MAC to the
+  rule's canonical device (`link_source='rule'`, `mac_attached`, orphan retired, its candidate rows
+  dismissed and its suggestions expired) only if exactly one device's active rule matches, there is
+  no sustained overlap with the peers derived from the rule and the target identity, the rule is
+  still active and the target still in an explicit `auto_inherit=1` group when re-read under the
+  lock, and both devices are `identity_state='ok'`. Otherwise a `rule_hit_needs_confirm`
+  suggestion. Human-ness of a rule is enforced by the API alone (sole writer of `identity_rules`).
+  Revoking or expiring a rule never detaches.
+- **Incomplete evidence degrades.** A lookup over `BUCKET_ROWS` (1024) rows, a merge component
+  over `MAX_ALIAS_IDS`, a target with over `TARGET_KEYS` signatures, an evidence gap or a malformed
+  rule on the target turn a rule hit into a `rule_hit_needs_confirm` suggestion (`reason_text`
+  names the cause) or a provisional row, never an attach; one `stitch_deferred` event per reason
+  per UTC day. The post-attach re-check flags (`rule_attach_suspect`, once per MAC) on sustained
+  overlap with the peers of its attach-time evidence, and on incomplete evidence.
+- **Fail closed.** overrides.db absent: no rules, basis versions 0. Present but unreadable or
+  malformed: stitching is skipped for the run (`stitching_skipped`, once a day), the batches are
+  processed with no identity links and the cursor advances.
+- **Bounds.** Name groups and compatible pools over 64 live self MACs are floods
+  (`signature_flood`, once per group per day); at most 200 candidate/suggestion/widen rows, 20
+  attaches and 64 open suggestions per target device per pass; the compute phase stops between
+  subjects after 5 s. All constants are in `config.py`.
 - **Config.** `VIGIE_STITCH_THRESHOLD` (0.8), `VIGIE_OVERLAP_GRACE_S` (600), `VIGIE_ACTIVITY_GAP_S`
   (300); weights are the constants `SIGNAL_WEIGHTS` in `config.py`.
 - **Events.** `identity_candidate`, `identity_candidate_ambiguous`, `identity_overlap_veto`,
-  `mac_attached`, `rule_attach_suspect`, `signature_flood` (once per group per UTC day),
-  `signature_flood_summary` (over 20 new floods in a pass), `stitch_budget_exhausted` (once per UTC
-  day, names the phase). Hostnames, fingerprints and MACs appear only as short hashes.
+  `mac_attached`, `rule_attach_suspect`, `signature_flood`, `stitch_deferred`, `rule_malformed`,
+  `stitching_skipped`. Hostnames, fingerprints and MACs appear only as short hashes.
 
 ## Known gaps
 - 90-day pruning/aggregation of retired transient MAC rows (PRP section 8 housekeeping) is NOT
