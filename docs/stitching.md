@@ -1,4 +1,4 @@
-# Identity stitching (P2, pipeline only)
+# Identity stitching (P2)
 
 Implements PRP-001 section 8 in `server/src/vigie_pipeline/` (`stitch.py`, `stitch_compute.py`,
 `stitch_apply.py`, `stitch_hood.py`, `stitch_types.py`, `stitch_db.py`, `activity.py`,
@@ -142,7 +142,7 @@ provisional `open` row (written once, never over a `suggested` row), no event, n
 **Vetoes are permanent with one human recovery.** A `vetoed` row is never rewritten by the
 pipeline and is looked up through the COMPLETE merge chains of both endpoints (cycle-safe, from the
 smaller side's index), so merging the vetoed target into another device does not launder it. The
-recovery is `state='dismissed'` (to be exposed by the API as "clear this veto"); the overlap is
+recovery is `state='dismissed'` (the API's "clear this veto" action); the overlap is
 still evaluated afterwards and a real one still blocks the attach. When a pair becomes `vetoed` or
 `ambiguous` its open suggestion is withdrawn (`expires_at` set to just before now).
 
@@ -251,6 +251,7 @@ attachment stays (section 6) and the owner sees the event.
 can still look open to a reader that trusts `expires_at` alone. Requirement for the API round: the
 accept path MUST refuse a `merge_identity` suggestion whose `from_device` (or `into_device`) is
 retired with no observations, whatever `expires_at` says, and the suggestion feed SHOULD hide them.
+The API implementation and human-action contract are documented in [api.md](api.md).
 
 ## 8. Post-attach re-check
 Every pass re-checks up to `MACS_PER_PASS` rule-attached MACs (its own robin, run before the self
@@ -370,10 +371,11 @@ by the compute budget is judged on everything gathered up to the cut and flagged
   ground-truth tests inject a constant opt60 to exercise the behaviour (decision for the owner).
 
 ## 12. Not done (explicitly)
-Behavioural demotion; `identity_state='conflict'|'pending_confirm'` side effects; the API: accept,
-reject, merge, undo, rule creation/revocation, `mac_detached`, clearing a veto (`dismissed`);
+Behavioural demotion; `identity_state='conflict'|'pending_confirm'` side effects; `mac_detached`;
 classification rules; a rate limit on attachments per hour beyond `MAX_ATTACHES_PER_PASS`; pruning
-of candidate rows.
+of candidate rows. The API now records accept/reject, merges and undo, rules and revocation,
+and veto-clear decisions; see [api.md](api.md). Veto clearing is consumed once by the pipeline
+before fresh COMPUTE/APPLY, using an inventory-side receipt. It does not grant an attachment.
 
 ## 13. Tests
 `server/tests/pipeline/test_stitch_attach_rules.py` (T1/T2, rule parsing, gating, the lock-time
