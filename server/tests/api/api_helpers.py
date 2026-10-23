@@ -99,7 +99,8 @@ class Env:
 
     def link(self, from_device: str, into_device: str) -> None:
         self.ov.execute(
-            "INSERT INTO identity_links VALUES (?,?,?,?,?)",
+            "INSERT INTO identity_links (from_device,into_device,merge_id,created_at,created_by)"
+            " VALUES (?,?,?,?,?)",
             (from_device, into_device, "m1", ts(), "test"),
         )
 

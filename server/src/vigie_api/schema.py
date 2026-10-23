@@ -99,6 +99,17 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "ALTER TABLE audit_log_new RENAME TO audit_log",
         "CREATE INDEX idx_audit_ts ON audit_log(ts, id)",
     ),
+    (
+        "ALTER TABLE identity_links ADD COLUMN revoked_at TEXT",
+        """CREATE TABLE candidate_decisions (
+          candidate_id TEXT PRIMARY KEY, device_a TEXT NOT NULL, device_b TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (action='clear_veto'), decided_by TEXT NOT NULL,
+          decided_at TEXT NOT NULL, id TEXT NOT NULL UNIQUE
+        )""",
+        """CREATE TABLE api_write_receipts (
+          id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL
+        )""",
+    ),
 )
 
 
