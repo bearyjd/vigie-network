@@ -1,10 +1,11 @@
 #!/bin/sh
 # Manage the Vigie dnsmasq drop-in. Runs as root (init script at start, cron every 5 min).
 # /tmp/dnsmasq.d is tmpfs, so the drop-in must be recreated after every boot, and GL.iNet
-# reloads may clear it. Reloads dnsmasq only when the drop-in actually changed.
+# reloads may clear it. Reloads until the desired drop-in has a successful reload confirmation.
 #
-#   ensure   create/repair the drop-in and log file; reload dnsmasq if changed
-#   check    exit 0 ok, 1 missing, 2 differs or unsafe (no changes made)
+#   ensure   create/repair the drop-in and log file; reload if changed or unconfirmed
+#   check    exit 0 confirmed, 1 missing/unconfirmed, 2 differs or unsafe config/marker;
+#            directory/file trust failures exit 70 (no changes made)
 #
 # Runs as root inside world-writable /tmp, so every path is verified first (vigie-lib.sh): no
 # symlinks, trusted owner, private directories. Any failed check exits 70 with a message.
@@ -34,6 +35,10 @@ if vtest; then
 fi
 FILE="$DROPIN_DIR/vigie.conf"
 LOG="$LOG_DIR/dnsmasq.log"
+# Root-owned confirmation outside dnsmasq's conf-dir; never parsed as dnsmasq configuration.
+# It confirms command success, not DNS traffic or effective daemon configuration.
+# Absence is conservative across upgrade/crash: retry, even if the drop-in already matches.
+APPLIED="$LOG_DIR/.dnsmasq-applied"
 
 want() {
 	printf 'log-queries=extra\nlog-dhcp\nlog-facility=%s/dnsmasq.log\n' "$LOG_DIR"
@@ -46,9 +51,22 @@ state() {
 	return 0
 }
 
+applied_state() {
+	[ -L "$APPLIED" ] && return 2
+	[ -e "$APPLIED" ] || return 1
+	[ -f "$APPLIED" ] &&
+		[ "$(stat -c %u "$APPLIED")" = "$VIGIE_TRUSTED_UID" ] &&
+		[ "$(stat -c %a "$APPLIED")" = 600 ] || return 2
+	[ "$(cat "$APPLIED")" = "$(want)" ] || return 2
+}
+
 case "${1:-}" in
 check)
-	state
+	state || exit $?
+	require_dir "$DROPIN_DIR"
+	require_dir "$LOG_DIR"
+	require_file "$FILE" "$VIGIE_TRUSTED_UID"
+	applied_state
 	exit $?
 	;;
 ensure)
@@ -63,13 +81,28 @@ ensure)
 	[ -f "$LOG" ] || refuse "$LOG could not be created"
 	chmod 0640 "$LOG" || exit 1
 	require_file "$FILE" "$VIGIE_TRUSTED_UID"
-	if state; then
+	require_file "$APPLIED" "$VIGIE_TRUSTED_UID"
+	if [ -e "$APPLIED" ] && [ "$(stat -c %a "$APPLIED")" != 600 ]; then
+		refuse "$APPLIED must have mode 600"
+	fi
+	if state && applied_state; then
 		exit 0
 	fi
-	# Random name inside the verified directory (never a predictable $FILE.tmp.$$).
-	tmp=$(umask 077 && mktemp "$DROPIN_DIR/vigie.conf.XXXXXX") || exit 1
-	if want >"$tmp" && chmod 644 "$tmp" && mv "$tmp" "$FILE"; then
-		sh -c "$RELOAD_CMD"
+	# Invalidate BEFORE publication/reload. A crash anywhere before confirmation retries.
+	rm -f "$APPLIED" || exit 1
+	if ! state; then
+		# Random name inside the verified directory (never a predictable $FILE.tmp.$$).
+		tmp=$(umask 077 && mktemp "$DROPIN_DIR/vigie.conf.XXXXXX") || exit 1
+		if ! { want >"$tmp" && chmod 644 "$tmp" && mv "$tmp" "$FILE"; }; then
+			rm -f "$tmp"
+			exit 1
+		fi
+	fi
+	sh -c "$RELOAD_CMD" || exit $?
+	# Only the successful reload path may publish confirmation; atomic rename prevents
+	# a killed writer from leaving a partial confirmation that check could accept.
+	tmp=$(umask 077 && mktemp "$LOG_DIR/.dnsmasq-applied.XXXXXX") || exit 1
+	if want >"$tmp" && mv "$tmp" "$APPLIED"; then
 		exit 0
 	fi
 	rm -f "$tmp"

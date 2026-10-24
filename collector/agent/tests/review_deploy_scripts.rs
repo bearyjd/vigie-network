@@ -205,14 +205,31 @@ fn ensure_uses_an_unpredictable_temp_name_inside_the_verified_dir() {
         .lines()
         .map(String::from)
         .collect();
-    assert_eq!(names.len(), 2);
-    assert_ne!(names[0], names[1], "temp name is random per run");
+    assert_eq!(
+        names.len(),
+        4,
+        "config and reload confirmation publish atomically"
+    );
+    assert_eq!(
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        4,
+        "temp names are unique"
+    );
     for n in &names {
         let p = Path::new(n);
         assert_eq!(
             p.parent().unwrap(),
-            dd,
-            "temp file lives in the verified dir"
+            if p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("vigie.conf.")
+            {
+                &dd
+            } else {
+                &ld
+            },
+            "temp file lives in its verified destination directory"
         );
         let base = p.file_name().unwrap().to_str().unwrap();
         assert!(!base.contains(".tmp."), "predictable pattern: {base}");
@@ -352,4 +369,144 @@ fn install_helper_prints_user_creation_commands_and_changes_nothing() {
         .output()
         .unwrap();
     assert!(!bad.status.success(), "non-numeric uid is rejected");
+}
+
+// A published config is not proof that dnsmasq accepted its reload.
+#[test]
+fn reload_failure_is_propagated_and_matching_file_retried_until_confirmed() {
+    let d = tmpdir();
+    let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
+    let calls = d.join("reload-calls");
+    let fail = format!("echo x >> '{}'; exit 37", calls.display());
+    let o = dropin(&["ensure"], &dd, &ld, &[("VIGIE_RELOAD_CMD", fail.clone())]);
+    assert_eq!(o.status.code(), Some(37), "{}", err(&o));
+    assert!(
+        dd.join("vigie.conf").is_file(),
+        "config publication preceded reload"
+    );
+    assert!(
+        !dropin(&["check"], &dd, &ld, &[]).status.success(),
+        "failed reload cannot be healthy"
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    let o = dropin(&["ensure"], &dd, &ld, &[("VIGIE_RELOAD_CMD", fail)]);
+    assert_eq!(
+        o.status.code(),
+        Some(37),
+        "matching config still requires reload"
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    let success = format!("echo x >> '{}'", calls.display());
+    assert!(dropin(
+        &["ensure"],
+        &dd,
+        &ld,
+        &[("VIGIE_RELOAD_CMD", success.clone())]
+    )
+    .status
+    .success());
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 3);
+    assert!(dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert!(
+        dropin(&["ensure"], &dd, &ld, &[("VIGIE_RELOAD_CMD", success)])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap().lines().count(),
+        3,
+        "confirmed application avoids redundant reload"
+    );
+}
+
+#[test]
+fn matching_config_without_confirmation_requires_reload() {
+    let d = tmpdir();
+    let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
+    assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    // Simulate a process dying after reload or config publication but before confirmation.
+    let applied = ld.join(".dnsmasq-applied");
+    if applied.exists() {
+        fs::remove_file(&applied).unwrap();
+    }
+    assert!(!dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert_eq!(
+        dropin(
+            &["ensure"],
+            &dd,
+            &ld,
+            &[("VIGIE_RELOAD_CMD", "exit 37".into())]
+        )
+        .status
+        .code(),
+        Some(37)
+    );
+}
+
+#[test]
+fn applied_confirmation_cannot_be_symlinked_or_writable_by_untrusted_users() {
+    let d = tmpdir();
+    let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
+    assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    let applied = ld.join(".dnsmasq-applied");
+    let victim = d.join("confirmation-victim");
+    fs::write(&victim, "precious").unwrap();
+    if applied.exists() {
+        fs::remove_file(&applied).unwrap();
+    }
+    symlink(&victim, &applied).unwrap();
+    assert!(!dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert!(!dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+    fs::remove_file(&applied).unwrap();
+    fs::write(&applied, fs::read(dd.join("vigie.conf")).unwrap()).unwrap();
+    fs::set_permissions(&applied, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(!dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert!(!dropin(&["ensure"], &dd, &ld, &[]).status.success());
+}
+
+#[test]
+fn changed_config_invalidates_prior_confirmation_before_failed_reload() {
+    let d = tmpdir();
+    let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
+    assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    assert_eq!(mode(&ld.join(".dnsmasq-applied")), 0o600);
+    fs::write(dd.join("vigie.conf"), "# replaced by firmware\n").unwrap();
+    assert_eq!(
+        dropin(
+            &["ensure"],
+            &dd,
+            &ld,
+            &[("VIGIE_RELOAD_CMD", "exit 37".into())]
+        )
+        .status
+        .code(),
+        Some(37)
+    );
+    assert!(
+        !ld.join(".dnsmasq-applied").exists(),
+        "old confirmation cannot survive publication"
+    );
+    assert!(!dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    assert!(dropin(&["check"], &dd, &ld, &[]).status.success());
+}
+
+#[test]
+fn killed_reload_process_leaves_no_success_confirmation() {
+    let d = tmpdir();
+    let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
+    // The substituted reload child kills only its own invoking ensure process.
+    let o = dropin(
+        &["ensure"],
+        &dd,
+        &ld,
+        &[("VIGIE_RELOAD_CMD", "kill -KILL \"$PPID\"".into())],
+    );
+    assert!(!o.status.success());
+    assert!(dd.join("vigie.conf").is_file());
+    assert!(!ld.join(".dnsmasq-applied").exists());
+    assert!(!dropin(&["check"], &dd, &ld, &[]).status.success());
+    assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
+    assert!(dropin(&["check"], &dd, &ld, &[]).status.success());
 }
