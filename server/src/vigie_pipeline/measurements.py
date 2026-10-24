@@ -137,7 +137,7 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         if m.start is not None and m.end is not None and m.end > m.start
         else None
     )
-    if hour is not None and "cross_hour" not in reasons:
+    if hour is not None and "cross_hour" not in reasons and "probe" not in reasons:
         overlap = inv.execute(
             "SELECT 1 FROM measurement_batches WHERE collector_id=? AND hour=? "
             "AND window_start<? AND window_end>? AND quality NOT LIKE ? LIMIT 1",
@@ -145,7 +145,7 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         ).fetchone()
         if overlap:
             reasons.append("overlapping_window")
-    if "overlapping_window" in reasons:
+    if "overlapping_window" in reasons and "probe" not in reasons:
         prior = inv.execute(
             "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
             (m.collector, hour),

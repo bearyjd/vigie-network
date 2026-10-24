@@ -206,3 +206,29 @@ def test_oversized_identity_cannot_starve_later_independent_upload_scope(tmp_pat
     finally:
         inv.close()
         ov.close()
+
+
+def test_probe_cannot_invalidate_a_frozen_training_reference(tmp_path):
+    from vigie_pipeline.measurements import Measurements, apply_measurements
+
+    inv, ov = seeded(tmp_path)
+    try:
+        history(inv)
+        inv.execute(
+            "INSERT INTO measurement_batches VALUES ('c1','observation',?,?,?,?,'[]')",
+            (HOUR, HOUR + 3600, iso_utc(HOUR + 3600), HOUR),
+        )
+        now = HOUR + 20 * 86400
+        analyze_monitoring(inv, ov, BaselineConfig(), now)
+        model = inv.execute("SELECT baseline_id FROM monitoring_profiles").fetchone()[0]
+        assert model is not None
+        apply_measurements(
+            inv, Measurements("c1", "probe", HOUR + 3400, HOUR + 3600, iso_utc(now), ("probe",), {})
+        )
+        analyze_monitoring(inv, ov, BaselineConfig(), now + 10)
+        assert tuple(
+            inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
+        ) == ("mature", model)
+    finally:
+        inv.close()
+        ov.close()

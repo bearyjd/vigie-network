@@ -294,3 +294,27 @@ def test_retired_query_day_is_unknown_quality_even_when_flow_day_survives(tmp_pa
     row = inv.execute("SELECT qualified_seconds,reasons FROM coverage_hourly").fetchone()
     assert row[0] == 0 and "raw_missing" in row[1]
     inv.close()
+
+
+@pytest.mark.parametrize("probe_first", [False, True])
+def test_probe_arrival_order_never_degrades_observation_coverage(tmp_path, probe_first):
+    from vigie_pipeline.measurements import Measurements, apply_measurements
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    observation = Measurements(
+        "c1", "observation", HOUR, HOUR + 3500, "2026-10-24T00:00:00Z", (), {MAC: (100, 0, 1, 0)}
+    )
+    probe = Measurements(
+        "c1", "probe", HOUR + 3400, HOUR + 3600, "2026-10-24T00:01:00Z", ("probe",), {}
+    )
+    for item in [probe, observation] if probe_first else [observation, probe]:
+        apply_measurements(inv, item)
+    assert tuple(
+        inv.execute(
+            "SELECT observed_seconds,qualified_seconds,reasons FROM coverage_hourly"
+        ).fetchone()
+    ) == (3500, 3500, "[]")
+    assert inv.execute("SELECT bytes_up FROM measurements_hourly").fetchone()[0] == 100
+    assert inv.execute("SELECT COUNT(*) FROM monitoring_quality_work").fetchone()[0] == 0
+    inv.close()
