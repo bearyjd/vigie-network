@@ -41,6 +41,7 @@ from vigie_pipeline.stitch_db import (
     state_get,
     state_set,
     upsert_candidate,
+    veto_generation,
     withdraw_open_suggestions,
     withdraw_orphan_suggestions,
 )
@@ -57,6 +58,7 @@ from vigie_pipeline.stitch_types import (
     Suggest,
     Veto,
     Widen,
+    fold,
     short_hash,
 )
 
@@ -67,11 +69,12 @@ class Applier:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
         cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
-        merge_decisions: Mapping[str, SuggestionOutcome],
+        merge_decisions: Mapping[str, SuggestionOutcome], veto_stamp: int,
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.clock, self.stats = now, clock, stats
         self.merge_decisions = merge_decisions
+        self.veto_stamp = veto_stamp
         self.at = clock()  # the clock under the lock; read again before each attach write
         self.dirty = False  # identity inputs changed since snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
@@ -170,6 +173,8 @@ class Applier:
             log(logger, logging.INFO, "identity_candidate_ambiguous", mac=short_hash(d.mac))
 
     def _suggest(self, d: Suggest) -> None:
+        if not self._vetoes_unchanged():
+            return
         if not self._still_self(d.mac, d.from_device):
             return
         if not self._unchanged(d.from_device, d.into, d.expected):
@@ -198,7 +203,11 @@ class Applier:
         summary = {
             "candidate_id": cid,
             "signals": list(d.signals),
-            "hashes": {k: short_hash(str(v)) for k, v in evidence.items() if k in HASHED and v},
+            "hashes": {
+                k: short_hash(fold(str(v)) if k in ("hostname", "mdns_name") else str(v))
+                for k, v in evidence.items()
+                if k in HASHED and v
+            },
         }
         create_merge_suggestion(
             self.inv, self.snap, d.from_device, d.into, score=d.score, reason_code=d.reason_code,
@@ -297,7 +306,17 @@ class Applier:
         ).fetchone()
         return bool(row) and row[0] == "ok"
 
+    def _vetoes_unchanged(self) -> bool:
+        # This point read is under BEGIN IMMEDIATE, so a merged alias cannot gain
+        # a veto between validation and attachment. No alias traversal under the lock.
+        if veto_generation(self.inv) != self.veto_stamp:
+            self.stats.stale += 1
+            return False
+        return True
+
     def _attach(self, d: Attach) -> None:
+        if not self._vetoes_unchanged():
+            return
         if self.attaches >= MAX_ATTACHES_PER_PASS:
             self.stats.capped += 1
             return
@@ -391,7 +410,9 @@ def apply_plan(
         else {}
     )
     with immediate(inv):
-        applier = Applier(inv, snap, overrides, cfg, now, clock, stats, merge_decisions)
+        applier = Applier(
+            inv, snap, overrides, cfg, now, clock, stats, merge_decisions, plan.veto_generation
+        )
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

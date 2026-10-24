@@ -25,6 +25,11 @@
             "title": "Id",
             "type": "string"
           },
+          "identity_override_version": {
+            "description": "The requested_id's own override version for identity expected_versions, including merge undo. override_version and ETag describe the effective canonical device.",
+            "title": "Identity Override Version",
+            "type": "integer"
+          },
           "identity_state": {
             "enum": [
               "ok",
@@ -132,6 +137,7 @@
           "override_version",
           "merged_into",
           "requested_id",
+          "identity_override_version",
           "macs",
           "recent_events",
           "explanation"
@@ -2068,7 +2074,7 @@
     },
     "/identity/candidates/{candidate_id}/clear-veto": {
       "post": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Record an overrides-side clear_veto decision for the exact candidate pair. The API keeps inventory.db read-only. The pipeline consumes this once on its next pass, dismisses the veto, and recomputes/revalidates evidence. Clearing alone never attaches; current overlap still blocks attachment.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Record an overrides-side clear_veto decision for the exact candidate pair. The API keeps inventory.db read-only. The pipeline consumes this once on its next pass, dismisses the veto, and recomputes/revalidates evidence. Clearing alone never attaches; current overlap still blocks attachment.",
         "operationId": "clear_candidate_identity_candidates__candidate_id__clear_veto_post",
         "parameters": [
           {
@@ -2243,7 +2249,7 @@
     },
     "/identity/merges/{merge_id}/undo": {
       "post": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Revoke the link without deleting it and restore prior overrides. Refuse intervening human changes. Repeating an already completed undo is a no-op.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Revoke the link without deleting it and restore prior overrides. Refuse intervening human changes. Repeating an already completed undo is a no-op.",
         "operationId": "undo_merge_identity_merges__merge_id__undo_post",
         "parameters": [
           {
@@ -2530,7 +2536,7 @@
         ]
       },
       "post": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Requires rules:write, granted only to control-app tokens. The control app is responsible for obtaining human approval; person-id semantics are unresolved (D6 pending). Created_by is app:<token_id>. Rules may target any group, but automatic attachment requires an explicit auto_inherit=1 group and all pipeline safety checks. Signatures use the shared pipeline parser and Unicode fold. Rules expire by expires_at (180 days by default); revocation retains the row and does not detach MACs.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Requires rules:write, granted only to control-app tokens. The control app is responsible for obtaining human approval; person-id semantics are unresolved (D6 pending). Created_by is app:<token_id>. Rules may target any group, but automatic attachment requires an explicit auto_inherit=1 group and all pipeline safety checks. Signatures use the shared pipeline parser and Unicode fold. Rules expire by expires_at (180 days by default); revocation retains the row and does not detach MACs.",
         "operationId": "add_rule_identity_rules_post",
         "parameters": [
           {
@@ -2694,7 +2700,7 @@
     },
     "/identity/rules/{rule_id}": {
       "delete": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Requires rules:write, granted only to control-app tokens. The control app is responsible for obtaining human approval; person-id semantics are unresolved (D6 pending). Created_by is app:<token_id>. Rules may target any group, but automatic attachment requires an explicit auto_inherit=1 group and all pipeline safety checks. Signatures use the shared pipeline parser and Unicode fold. Rules expire by expires_at (180 days by default); revocation retains the row and does not detach MACs.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Requires rules:write, granted only to control-app tokens. The control app is responsible for obtaining human approval; person-id semantics are unresolved (D6 pending). Created_by is app:<token_id>. Rules may target any group, but automatic attachment requires an explicit auto_inherit=1 group and all pipeline safety checks. Signatures use the shared pipeline parser and Unicode fold. Rules expire by expires_at (180 days by default); revocation retains the row and does not detach MACs.",
         "operationId": "delete_rule_identity_rules__rule_id__delete",
         "parameters": [
           {
@@ -3119,7 +3125,7 @@
     },
     "/suggestions/{suggestion_id}/accept": {
       "post": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Accept label, move_group, quarantine, or merge_identity. Both caller versions and suggestion basis must match. Expired suggestions return 410; retired/orphaned devices and stale candidates return 409. Merge decisions, links, history, and audit commit atomically. remember=true requires control-app rules:write and human approval of the evidence signature. An already accepted suggestion returns its original result.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Accept label, move_group, quarantine, or merge_identity. Both caller versions and suggestion basis must match. Expired suggestions return 410; retired/orphaned devices and stale candidates return 409. Merge decisions, links, history, and audit commit atomically. remember=true requires control-app rules:write and human approval of the evidence signature. An already accepted suggestion returns its original result.",
         "operationId": "accept_suggestion_suggestions__suggestion_id__accept_post",
         "parameters": [
           {
@@ -3294,7 +3300,7 @@
     },
     "/suggestions/{suggestion_id}/reject": {
       "post": {
-        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device override versions in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Record a rejection; repeating it is a no-op.",
+        "description": "Authenticated human action, audited with X-Request-ID. Supply the current device identity_override_version values from device detail in expected_versions (or expected_version for one device). Stale versions return 409. Body and per-token rate limits apply. Every actual overrides.db commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. Record a rejection; repeating it is a no-op.",
         "operationId": "reject_suggestion_suggestions__suggestion_id__reject_post",
         "parameters": [
           {

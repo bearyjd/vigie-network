@@ -139,6 +139,14 @@ def _chunks(ids: Collection[str]) -> list[list[str]]:
     return [items[i : i + CHUNK] for i in range(0, len(items), CHUNK)]
 
 
+def veto_generation(inv: sqlite3.Connection) -> int:
+    """Inventory-local stamp; read inside the compute snapshot and apply writer lock."""
+    row = inv.execute("SELECT value FROM pipeline_meta WHERE key='veto_generation'").fetchone()
+    if row is None:
+        raise RuntimeError("inventory veto generation is missing")
+    return int(row[0])
+
+
 def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Collection[str]) -> bool:
     """Is any (a, b) pair of the two alias sets recorded as vetoed? A permanent veto keyed by a
     device id must survive that device being merged into another. The vetoes are looked up by the

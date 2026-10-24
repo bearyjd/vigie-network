@@ -1,4 +1,8 @@
-# Whole-chain smoke test (`tests/e2e/run_e2e.sh`)
+# Whole-chain test (`tests/e2e/run_e2e.sh`)
+
+The full CI gate is `scripts/ci.sh`; its `e2e` stage invokes this test and rebuilds the collector
+from the current checkout. Selecting only `e2e` does not run the unit, lint or contract stages.
+CI retains stage output and whole-chain logs as workflow artifacts.
 
 Runs the real components end to end on one host, as a normal user, bound to 127.0.0.1 on random
 high ports. No podman, no root, no router.
@@ -48,7 +52,7 @@ Devices: a stable laptop (`alice-laptop`), a camera (`cam-front`, a DNS query ev
 phone (`Pixel-8`, same opt55 and vendor class) that rolls through three locally administered MACs
 (`c2:11:22:33:44:01..03`, one per 10 s step, all on 192.168.1.50).
 
-## Result of the reference run (all stages PASS)
+## Historical reference run (before stitching and human identity APIs)
 
 * ingest: 11 batches (seq 1..11, no gaps), `parse_failures` 0, 0 dropped.
 * raw shard: 51 `raw_dns` (camera 30, laptop 9, phone MACs 4+4+4), 12 `raw_flow`, 10 `raw_lease`,
@@ -62,7 +66,9 @@ phone (`Pixel-8`, same opt55 and vendor class) that rolls through three locally 
 
 ## Findings
 
-Severity is my judgement. F1, F3, F4 were fixed afterwards in `collector/agent`; F2 and F5-F8 remain open.
+F1, F3 and F4 were fixed afterwards in `collector/agent`. F2 describes the historical
+pre-stitching smoke test, not the current pipeline capability. F5–F8 record operational
+observations and remaining test limits.
 
 **F1 (HIGH, collector) FIXED. DHCP fingerprints (opt55, vendor class) were never captured from a log
 that contains dnsmasq's `tags:` line.** `raw_lease.opt55` was `[]` and `opt60` NULL on every row.
@@ -80,11 +86,16 @@ for the phones and the camera (ingest raw rows and pipeline `observations`), in 
 Still unverified: what the GL-XE3000's dnsmasq really prints; the fixture is the only evidence. Other
 per-transaction lines (`next server:`, `sent size:`) are not recognised and still break context.
 
-**F2 (INFO, pipeline) Rolling-MAC grouping is not exercised.** Even with correct fingerprints
-(control run) the three Pixel-8 MACs stay three separate `transient` devices; `identity_candidates`
-and `suggestions` are empty. The pipeline README lists no linking stage, so this is the current
-design, not a regression. The chain can only assert "hidden by default, visible with
-`include_transient=1`, correct hostname per MAC".
+**F2 (historical test gap).** The original short fixture run left the three Pixel-8 MACs as
+separate transient devices. Identity stitching and the human decision API now exist; the old
+result above must not be used as evidence that merge approval, standing rules, veto clearance
+or undo work through the real HTTP chain. Those behaviors require explicit identity lifecycle
+assertions in the whole-chain test, beyond inventory GET/PATCH checks. The separate API integration lifecycle in
+`server/tests/api/test_api_mvp_lifecycle.py` exercises human approval, remembered standing rules,
+automatic attachment of a later MAC, and merge undo through the real FastAPI application in process,
+with real pipeline passes and temporary SQLite databases. It runs in the server CI stage.
+It does not send real collector traffic or open a TLS listener; the collector smoke above
+is a separate layer. Additional coverage is in `server/tests/api/` and `server/tests/pipeline/`.
 
 **F3 (LOW, collector) FIXED. Lease-file rows carried no fingerprint** and could shadow one captured from
 the log. `Window::add_lease` now never overwrites a non-empty opt55/opt60 with an empty one, within the

@@ -20,8 +20,10 @@ No generated TypeScript client exists in `api/`.
 
 Write bodies carry `expected_versions: {"device-id": 3, ...}` for exactly the involved devices.
 For a single device, `expected_version: 3` is also accepted. Supply exactly one form. Versions
-come from device reads (`override_version`, also returned as the device's ETag); a device with
-no override has version 0. Rule creation also requires `device_id` and `signature`, and accepts
+come from `GET /devices/{id}` detail's `identity_override_version`, keyed by its `requested_id`;
+a device with no own override has version 0. This also exposes an alias's own version for merge
+undo. The effective `override_version` and ETag continue to describe the canonical device and
+are used for PATCH. Rule creation also requires `device_id` and `signature`, and accepts
 `expires_at`. For example:
 
 ```json
@@ -75,6 +77,9 @@ The defaults in API `config.py` are 256 combined component IDs (`MAX_MERGE_ALIAS
 1024 observations (`MAX_MERGE_OBSERVATIONS`), 8192 activity rows
 (`MAX_MERGE_ACTIVITY_ROWS`), and 256 link writes (`MAX_MERGE_FLATTEN_WRITES`).
 Operators can set the corresponding `VIGIE_API_MAX_MERGE_*` environment variables.
+Activity overlap is checked in both component directions, so a short interval fully contained
+in its peer's activity cannot pass by choosing the merge direction. Canonical write lookups use
+at most 33 primary-key link reads; cycles and chains beyond 32 links return 409 without mutation.
 
 Merge acceptance records one identity link, merge history, the suggestion decision, version
 increments, and an audit entry together. Repeating an accepted request returns its recorded

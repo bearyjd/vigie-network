@@ -83,7 +83,14 @@ def record_activity(
     same for a new and a known MAC and for every batch, so a later batch cannot back-fill the
     absence of a peer either. Stamps dropped for the lag are MISSING evidence, not safe evidence:
     their span is recorded in `evidence_gaps` (section 1 of docs/stitching.md)."""
-    inv.executemany(  # the server-clock maturity anchor: set once, never moved
+    # Cleanup is paged: an expired anchor can outlive its activity rows. Check the
+    # retained evidence before adding fresh rows, including rows awaiting pruning.
+    inv.executemany(
+        "DELETE FROM mac_first_received WHERE mac=? AND NOT EXISTS ("
+        'SELECT 1 FROM mac_activity WHERE mac=? AND "end">=?)',
+        [(mac, mac, int(received_ts) - retention_s) for mac in acts],
+    )
+    inv.executemany(  # server-clock anchor, stable while retained activity survives
         "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",
         [(mac, int(received_ts)) for mac in acts],
     )

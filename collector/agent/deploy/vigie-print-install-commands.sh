@@ -59,6 +59,10 @@ if in_use "$GROUP" "$GID_N"; then
 	echo "gid $GID_N is already used in $GROUP" >&2
 	exit 64
 fi
+if ! [ "$GID_N" -ge 1000 ] || ! [ "$GID_N" -le 4294967295 ]; then
+	echo "gid must be a dedicated gid in 1000..4294967295" >&2
+	exit 64
+fi
 
 cat <<COMMANDS
 # --- run on the router, as root, after reviewing ---
@@ -67,14 +71,19 @@ cat <<COMMANDS
 grep -q '^vigie:' /etc/group  || echo 'vigie:x:${GID_N}:' >> /etc/group
 grep -q '^vigie:' /etc/passwd || echo 'vigie:x:${UID_N}:${GID_N}:vigie collector:/var/empty:/bin/false' >> /etc/passwd
 grep -q '^vigie:' /etc/shadow || echo 'vigie:x:0:0:99999:7:::' >> /etc/shadow
-id vigie    # expect uid=${UID_N} gid=${GID_N}
+# Verify the selected account before installing files or changing key ownership.
+test "\$(id -u vigie)" = "${UID_N}" || exit 1
+test "\$(id -g vigie)" = "${GID_N}" || exit 1
 
 # 2. install the files (binary, scripts, init, config) under root ownership
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie
-# install -m 0755 vigie-collector /usr/bin/vigie-collector
-# install -m 0755 vigie-lib.sh vigie-dnsmasq-dropin.sh vigie-log-watchdog.sh vigie-run.sh /usr/libexec/vigie/
-# install -m 0755 vigie-collector.init /etc/init.d/vigie-collector
-# install -m 0644 collector.conf.example /etc/vigie/collector.conf   # then edit it
+install -m 0755 -o root -g root /tmp/vigie-collector /usr/bin/vigie-collector
+install -m 0755 -o root -g root /tmp/vigie-conntrack /usr/bin/vigie-conntrack
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /usr/libexec/vigie/
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-collector.init /etc/init.d/vigie-collector
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-conntrack.init /etc/init.d/vigie-conntrack
+# First install only: copy collector.conf.example to /etc/vigie/collector.conf (0644 root:root)
+# and edit it using the provisioner's output. Keep an existing configured file.
 
 # 3. the HMAC key: owned by vigie, readable by nobody else
 # (write the hex key to /etc/vigie/key first; do not paste it into shell history)
@@ -88,11 +97,28 @@ chmod 0600 /etc/vigie/key
 # 5. start, then VERIFY the assumptions the scripts rely on
 /etc/init.d/vigie-collector enable
 /etc/init.d/vigie-collector start
+# The collector/drop-in creates root:vigie 0751 first; the helper accepts that existing
+# directory unchanged. Its init resolves --uid / --gid from the existing vigie account;
+# starting the helper binary directly first would create a root:root 0755 directory.
+/etc/init.d/vigie-conntrack enable
+/etc/init.d/vigie-conntrack start
 ls -ln /tmp/vigie /tmp/vigie/dnsmasq.log   # dir: uid 0, group ${GID_N}, drwxr-x--x; log: group ${GID_N}, -rw-r-----
+ls -ln /tmp/vigie/conntrack.sock         # socket: uid ${UID_N}, gid ${GID_N}, srw-------
 /etc/init.d/dnsmasq restart; sleep 2; logread | grep dnsmasq | tail   # no log-file errors
-ps | grep -E 'dnsmasq|vigie-collector'  # collector runs as vigie, not root/nobody
+ps | grep -E 'dnsmasq|vigie-collector|vigie-conntrack'  # collector: vigie; conntrack: root
 
-# 6. the conntrack helper (separate branch) runs as root and creates a 0600 socket owned by the
-#    agent's uid; access is restricted by that file ownership alone. Pass it the uid:
-#      <conntrack-helper> --uid ${UID_N}
+# 6. Firmware validation remains pending: verify real proc parsing, procd uid/respawn,
+# dnsmasq ownership and reboot recovery before leaving these services unattended.
+
+# Rollback: run separately, as root. Stop/disable before removing installed service files.
+# /etc/init.d/vigie-conntrack stop
+# /etc/init.d/vigie-conntrack disable
+# /etc/init.d/vigie-collector stop
+# /etc/init.d/vigie-collector disable
+# Remove Vigie watchdog/drop-in entries from root's crontab if you installed them.
+# rm -f /tmp/dnsmasq.d/vigie.conf
+# /etc/init.d/dnsmasq reload
+# rm -f /etc/init.d/vigie-conntrack /etc/init.d/vigie-collector /usr/bin/vigie-conntrack /usr/bin/vigie-collector
+# rm -f /usr/libexec/vigie/vigie-lib.sh /usr/libexec/vigie/vigie-dnsmasq-dropin.sh /usr/libexec/vigie/vigie-log-watchdog.sh /usr/libexec/vigie/vigie-run.sh
+# /etc/vigie (including its key/config) and tmpfs logs are retained for inspection/re-provisioning.
 COMMANDS

@@ -59,9 +59,9 @@ def fold(name: str) -> str:
     for _ in range(3):
         again = unicodedata.normalize("NFKC", out.casefold())
         if again == out:
-            break
+            return out
         out = again
-    return out
+    raise ValueError("Unicode name fold did not converge")
 
 
 def same(a: str | None, b: str | None) -> bool:
@@ -269,3 +269,4 @@ class Plan:
     decisions: tuple[Decision, ...] = ()
     cursors: Mapping[str, str | None] = field(default_factory=dict)
     stats: StitchStats = field(default_factory=StitchStats)
+    veto_generation: int = 0

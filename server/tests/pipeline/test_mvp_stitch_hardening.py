@@ -1,0 +1,125 @@
+"""Regressions for post-merge identity hardening, at real SQLite seams."""
+
+import json
+import sqlite3
+from dataclasses import replace
+
+import pytest
+from stitch_helpers import NOW_ABS, OLD, RULE_SNAP, Inv
+
+from vigie_pipeline import activity, stitch_types
+from vigie_pipeline.activity import purge_activity, record_activity
+from vigie_pipeline.schema import apply_pipeline_migrations, open_pipeline_inventory
+from vigie_pipeline.snapshot import EMPTY
+from vigie_pipeline.sources import MacActivity
+from vigie_pipeline.stitch_apply import apply_plan
+from vigie_pipeline.stitch_compute import compute_plan
+from vigie_pipeline.stitch_db import veto_generation
+from vigie_pipeline.stitch_types import Attach, fold, short_hash
+
+
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("expired_rows_pending", [False, True])
+def test_returning_mac_anchor_is_validated_before_fresh_activity(
+    tmp_path, monkeypatch, retained, expired_rows_pending
+):
+    db = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    monkeypatch.setattr(activity, "PRUNE_BATCH_ROWS", 1)
+    now, retention = NOW_ABS, 86400
+    db.executemany(
+        "INSERT INTO mac_first_received VALUES (?,?)",
+        [("a", now - 3 * retention), ("z", now - 2 * retention)],
+    )
+    db.execute(
+        "INSERT INTO mac_activity VALUES (?,?,?)",
+        (
+            "z",
+            now - retention if retained else now - 2 * retention,
+            now - retention if retained else now - 2 * retention,
+        ),
+    )
+    if expired_rows_pending:
+        db.execute(
+            "INSERT INTO mac_activity VALUES (?,?,?)",
+            ("a", now - 3 * retention, now - 3 * retention),
+        )
+    purge_activity(db, now, retention)
+    assert db.execute("SELECT received FROM mac_first_received WHERE mac='z'").fetchone()
+    record_activity(
+        db, {"z": MacActivity(now - 600, now, stamps={now - 600, now})}, 300, now, retention
+    )
+    anchor = db.execute("SELECT received FROM mac_first_received WHERE mac='z'").fetchone()[0]
+    assert anchor == (now - 2 * retention if retained else now)
+    db.close()
+
+
+def test_merged_alias_veto_inserted_after_compute_blocks_attach(tmp_path):
+    inv = Inv(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    m = inv.mac(
+        "A", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 4000)]
+    )
+    snap = replace(RULE_SNAP, links={"alias": "D"})
+    inv.commit()
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    assert any(isinstance(d, Attach) and d.mac == m for d in plan.decisions)
+    with sqlite3.connect(tmp_path / "inventory.db") as writer:
+        writer.execute(
+            "INSERT INTO identity_candidates"
+            " (id,device_a,device_b,score,evidence,state,created_at)"
+            " VALUES ('race','A','alias',1,'{}','vetoed','t')"
+        )
+    stats = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert stats.attached == 0
+    assert inv.link_of(m) == ("A", "self")
+    inv.db.close()
+
+
+@pytest.mark.parametrize("name_field", ["hostname", "mdns_name"])
+def test_suggestion_hashes_use_equivalent_name_fold(tmp_path, name_field):
+    inv = Inv(tmp_path)
+    old_names = ("Straße", None) if name_field == "hostname" else (None, "Straße")
+    new_names = ("ＳＴＲＡＳＳＥ", None) if name_field == "hostname" else (None, "ＳＴＲＡＳＳＥ")
+    inv.mac("D", *old_names, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("A", *new_names, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 4000)])
+    assert inv.stitch(EMPTY).suggestions == 1
+    row = inv.db.execute("SELECT payload FROM suggestions").fetchone()
+    summary = json.loads(row[0])["evidence_summary"]
+    assert summary["hashes"][name_field] == short_hash("strasse")
+    assert summary["hashes"]["opt55"] == short_hash("1,2,3")
+    inv.db.close()
+
+
+def test_fold_exhaustion_cannot_persist_unchecked_key(tmp_path, monkeypatch):
+    inv = Inv(tmp_path)
+    monkeypatch.setattr(stitch_types.unicodedata, "normalize", lambda _form, value: value + "x")
+    with pytest.raises(ValueError, match="converg"):
+        inv.db.execute("INSERT INTO pipeline_meta VALUES ('bad-fold',?)", (fold("name"),))
+    assert inv.db.execute("SELECT value FROM pipeline_meta WHERE key='bad-fold'").fetchone() is None
+    inv.db.close()
+
+
+def test_veto_stamp_tracks_all_mutations_but_not_unrelated_candidates(tmp_path):
+    inv = Inv(tmp_path)
+    inv.commit()
+    assert veto_generation(inv.db) == 0
+    inv.db.execute(
+        "INSERT INTO identity_candidates"
+        " (id,device_a,device_b,score,evidence,state,created_at)"
+        " VALUES ('c','A','B',1,'{}','open','t')"
+    )
+    assert veto_generation(inv.db) == 0
+    inv.db.execute("UPDATE identity_candidates SET state='vetoed' WHERE id='c'")
+    assert veto_generation(inv.db) == 1
+    inv.db.execute("BEGIN")
+    inv.db.execute("UPDATE identity_candidates SET device_b='C' WHERE id='c'")
+    assert veto_generation(inv.db) == 2
+    inv.db.execute("ROLLBACK")
+    assert veto_generation(inv.db) == 1
+    apply_pipeline_migrations(inv.db)
+    assert veto_generation(inv.db) == 1
+    inv.db.execute("UPDATE identity_candidates SET device_b='C' WHERE id='c'")
+    assert veto_generation(inv.db) == 2
+    inv.db.execute("DELETE FROM identity_candidates WHERE id='c'")
+    assert veto_generation(inv.db) == 3
+    inv.db.close()

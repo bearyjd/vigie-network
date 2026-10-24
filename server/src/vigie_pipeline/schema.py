@@ -148,6 +148,19 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " vendor_class, first_seen)",
         "CREATE INDEX IF NOT EXISTS idx_obs_rule ON observations(mac) WHERE link_source = 'rule'",
     ),
+    (
+        # A veto on any merged alias invalidates plans computed before this write.
+        "INSERT INTO pipeline_meta (key,value) VALUES ('veto_generation','0')",
+        "CREATE TRIGGER veto_generation_insert AFTER INSERT ON identity_candidates"
+        " WHEN NEW.state='vetoed' BEGIN UPDATE pipeline_meta"
+        " SET value=CAST(value AS INTEGER)+1 WHERE key='veto_generation'; END",
+        "CREATE TRIGGER veto_generation_update AFTER UPDATE ON identity_candidates"
+        " WHEN OLD.state='vetoed' OR NEW.state='vetoed' BEGIN UPDATE pipeline_meta"
+        " SET value=CAST(value AS INTEGER)+1 WHERE key='veto_generation'; END",
+        "CREATE TRIGGER veto_generation_delete AFTER DELETE ON identity_candidates"
+        " WHEN OLD.state='vetoed' BEGIN UPDATE pipeline_meta"
+        " SET value=CAST(value AS INTEGER)+1 WHERE key='veto_generation'; END",
+    ),
 )
 
 PIPELINE_TABLES = (

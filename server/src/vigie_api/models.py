@@ -134,6 +134,10 @@ class Explanation(BaseModel):
 
 class DeviceDetail(DeviceOut):
     requested_id: str
+    identity_override_version: int = Field(
+        description="The requested_id's own override version for identity expected_versions, "
+        "including merge undo. override_version and ETag describe the effective canonical device."
+    )
     macs: list[MacOut]
     recent_events: list[RecentEvent]
     explanation: Explanation

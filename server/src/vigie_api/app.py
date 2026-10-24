@@ -370,7 +370,8 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     pipeline_config = PipelineConfig.from_env()
     write_description = (
         "Authenticated human action, audited with X-Request-ID. Supply the current device "
-        "override versions in expected_versions (or expected_version for one device). Stale "
+        "identity_override_version values from device detail in expected_versions "
+        "(or expected_version for one device). Stale "
         "versions return 409. Body and per-token rate limits apply. Every actual overrides.db "
         "commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. "
     )

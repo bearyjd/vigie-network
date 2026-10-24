@@ -37,6 +37,7 @@ from vigie_pipeline.stitch_db import (
     event_exists,
     load_attachment,
     state_get,
+    veto_generation,
     vetoed_between,
 )
 from vigie_pipeline.stitch_hood import Hood, load_obs
@@ -125,7 +126,7 @@ class Compute:
             ),
         }
         self._widen()
-        return Plan(tuple(self.decisions), cursors, self.stats)
+        return Plan(tuple(self.decisions), cursors, self.stats, veto_generation(self.inv))
 
     # ---- subjects --------------------------------------------------------------------------
 

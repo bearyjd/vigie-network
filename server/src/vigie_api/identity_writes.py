@@ -12,7 +12,7 @@ from typing import Any
 
 from vigie_api import writes
 from vigie_api.config import Settings
-from vigie_api.effective import decode_cursor, encode_cursor, link_map, resolve
+from vigie_api.effective import MAX_LINK_DEPTH, decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.models import DevicePatch
 from vigie_api.textsafe import display_json, has_forbidden
@@ -96,13 +96,29 @@ def _versions(ov, ids, body, *, basis=None):
     return current
 
 
+def _canonical(ov, device):
+    """Resolve one identity with bounded primary-key seeks, failing closed on bad graphs."""
+    seen = set()
+    current = device
+    for _ in range(MAX_LINK_DEPTH + 1):
+        if current in seen:
+            raise ApiError(409, "invalid_identity", "identity links contain a cycle")
+        seen.add(current)
+        row = ov.execute(
+            "SELECT into_device,revoked_at FROM identity_links WHERE from_device=?", (current,)
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            return current
+        current = row["into_device"]
+    raise ApiError(409, "identity_too_large", "identity link traversal exceeds the depth limit")
+
+
 def _targets(inv, ov, ids, *, canonical=True):
-    links = link_map(ov) if canonical else {}
     for device in ids:
         row = inv.execute("SELECT status FROM devices WHERE id=?", (device,)).fetchone()
         if row is None or row["status"] == "retired":
             raise ApiError(409, "orphaned_device", "a device is missing or retired")
-        if canonical and resolve(links, device) != device:
+        if canonical and _canonical(ov, device) != device:
             raise ApiError(409, "device_merged", "a device is no longer canonical")
 
 
@@ -249,27 +265,30 @@ def _overlap(inv, component, source, target, config, now, limits):
         min_end=int(_date(now)) - config.activity_retention_s,
         first_received=load_first_received(inv, macs),
     )
-    peer = []
-    for mac in b:
-        for start, end in activity.get(mac, []):
-            tail = config.activity_gap_s if end - start > 2 * config.overlap_grace_s else 0
-            peer.append((start, end + tail))
-    peers = merge_intervals(peer)
-    for mac in a:
-        own = activity.get(mac, [])
-        duration = sum(end - start for start, end in own)
-        overlap = overlap_seconds(own, peers)
-        if overlap > config.overlap_grace_s or (
-            overlap
-            and (
-                overlap >= duration
-                or (
-                    duration > config.overlap_grace_s
-                    and 2 * (duration - overlap) < config.activity_gap_s
+    for own_macs, peer_macs in ((a, b), (b, a)):
+        peer = []
+        for mac in peer_macs:
+            for start, end in activity.get(mac, []):
+                tail = config.activity_gap_s if end - start > 2 * config.overlap_grace_s else 0
+                peer.append((start, end + tail))
+        peers = merge_intervals(peer)
+        for mac in own_macs:
+            own = activity.get(mac, [])
+            duration = sum(end - start for start, end in own)
+            overlap = overlap_seconds(own, peers)
+            if overlap > config.overlap_grace_s or (
+                overlap
+                and (
+                    overlap >= duration
+                    or (
+                        duration > config.overlap_grace_s
+                        and 2 * (duration - overlap) < config.activity_gap_s
+                    )
                 )
-            )
-        ):
-            raise ApiError(409, "active_overlap", "devices have conflicting concurrent activity")
+            ):
+                raise ApiError(
+                    409, "active_overlap", "devices have conflicting concurrent activity"
+                )
 
 
 @contextmanager
@@ -530,7 +549,7 @@ def undo(inv, ov, *, merge_id, body, principal, now, request_id):
             or link is None
             or link["merge_id"] != merge_id
             or link["revoked_at"] is not None
-            or resolve(link_map(ov), target) != target
+            or _canonical(ov, target) != target
         ):
             raise ApiError(409, "merge_changed", "merge or overrides changed after approval")
         for device in prior["flattened_links"]:
@@ -640,7 +659,7 @@ def revoke_rule(inv, ov, *, rule_id, body, principal, now, request_id):
         row = ov.execute("SELECT * FROM identity_rules WHERE id=?", (rule_id,)).fetchone()
         if row is None:
             raise ApiError(404, "not_found", "rule not found")
-        device = resolve(link_map(ov), row["device_id"])
+        device = _canonical(ov, row["device_id"])
         _versions(ov, [device], body)
         if row["revoked_at"] is not None:
             raise ApiError(409, "rule_revoked", "rule already revoked")

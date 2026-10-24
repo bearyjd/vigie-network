@@ -9,7 +9,8 @@ separate control app reads that inventory through a token-protected API and reco
 labels. Nothing leaves the LAN.
 
 The design is in [`docs/prp/001-vigie-architecture.md`](docs/prp/001-vigie-architecture.md). That
-file is **rev 2**; the current design (sections 4, 6, 9, 17) is **rev 3** on branch `docs/prp-rev3`.
+file is **rev 3**. Human identity actions and standing-rule permissions are described in
+[`docs/api.md`](docs/api.md).
 
 ```mermaid
 flowchart LR
@@ -38,18 +39,19 @@ reviewer (PRP section 17), not run in production.
 | Component | Where | State |
 |---|---|---|
 | Ingest service (`vigie_ingest`) | `server/` | Built, 4 review rounds, tests pass |
-| Pipeline core (`vigie_pipeline`) | `server/` | Built, reviewed. **No LLM or ML stage**, rules only |
-| App API (`vigie_api`) | `server/` | Built, 2 review rounds. Not yet: accept/reject/merge/undo, identity rules, SSE, metrics |
+| Pipeline core (`vigie_pipeline`) | `server/` | Built, with bounded identity stitching and overlap vetoes. Classification rules and behavioral demotion remain incomplete; no LLM or ML stage |
+| App API (`vigie_api`) | `server/` | Inventory reads and overrides, accept/reject/merge/undo, standing rules and audited veto clearance. See `docs/api.md`; SSE and metrics remain deferred |
 | Container image, compose, cert and provisioning scripts | `deploy/` | Written; scripts tested with a stub podman. **The image has never been built and the stack never started** (no container runtime in the authoring sandbox) |
-| Router collector agent (`vigie-collector`) | branch `feat/collector` | Built, reviewed, host-tested. **No HTTPS client and no SPKI pinning: it ships a `NoTransport` that refuses to send, so the collector cannot push to the server yet** |
-| Conntrack root helper (`vigie-conntrack`) | branch `feat/conntrack-helper` | Built, reviewed, host-tested. **The collector does not read its socket yet** |
+| Router collector agent (`vigie-collector`) | `collector/agent/` | Built, reviewed, host-tested; HTTPS transport with SPKI pinning and HMAC exercised against the real ingest service on localhost |
+| Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Built, wired to the collector socket reader, host-tested; root daemon and router behavior remain unverified |
 | DHCP log, conntrack and `ubus` output formats | router | **Unverified on the router.** Parsers are written against assumed formats and fixtures (PRP section 17, spikes) |
-| Router-side scripts (dnsmasq drop-in, watchdog, procd init) | branch `feat/collector` | Never run on the router; procd retry semantics and dnsmasq log ownership are assumptions |
+| Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Never run on the router; procd retry semantics and dnsmasq log ownership are assumptions |
 | LLM / ML classification stages | none | **Not built** |
 | Control app | separate project | Out of scope here |
 
-Consequence: the server side can be brought up and exercised with `curl` today, but no real data
-will arrive from the router until the collector gets its HTTPS client.
+The real collector, ingest, pipeline and API can be exercised together on localhost with
+[`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). Router observations, deployment and resource soak
+still require owner validation. No container stack or real-router deployment is claimed.
 
 ## Server quick start
 
@@ -152,36 +154,49 @@ Design notes that affect operation:
 Local development without containers: `cd server && uv sync && uv run pytest`
 (see [`server/README.md`](server/README.md)).
 
+## Local and hosted checks
+
+Run `scripts/ci.sh` from any directory to run the complete gate: Python tests with coverage,
+ruff lint/format checks, Rust workspace tests, deployment checks, protocol contracts and the real whole-chain
+localhost test. It stops on the first failed stage and prints the retained log path.
+`scripts/ci.sh --list` lists stages; names select a subset, for example `scripts/ci.sh server contracts`.
+Only the default full invocation represents the full gate.
+
+Requirements: Python 3.12, uv, a host Rust toolchain with a C compiler, OpenSSL, Bash and standard
+Linux utilities. uv installs locked development dependencies; the deploy checker additionally uses
+PyYAML 6.0.3 as test tooling. Override `VIGIE_CI_SERVER_ENV`, `VIGIE_CI_TRAFFICGEN_ENV`,
+`CARGO_TARGET_DIR`, `UV_CACHE_DIR`, `TMPDIR` and `VIGIE_CI_LOG_DIR` for local environments/caches.
+For an already provisioned offline environment, `UV_NO_SYNC=1` skips dependency installation;
+that run does not verify that installed versions match the locks. Whole-chain scratch storage uses
+the `VIGIE_E2E_*` variables documented in `docs/e2e.md`.
+The gate builds host binaries and makes no router, firewall or container deployment changes.
+`.github/workflows/ci.yml` runs the same gate on pushes, pull requests and manual dispatch;
+a hosted result exists only after the workflow actually runs.
+
 ## Router install (GL-XE3000, OpenWrt 21.02, aarch64)
 
-**Read the Status table first: until the HTTPS client exists, these steps install a collector that
-parses and spools but never sends.** They are still useful to verify the router-side assumptions
-(log ownership, DHCP and conntrack formats). Everything here is run by you, as root, by hand;
+**Owner gate: these are reference installation steps, pending the couvre-feu integration
+decisions D1–D6.** In particular, D2 must settle permission to change dnsmasq before starting
+the collector service or running any logging/drop-in script (including `logging-on.sh`).
+The current service changes dnsmasq configuration; a lease-only coexistence mode is still planned.
+Everything here is run by you, as root, by hand;
 nothing is executed for you. Every command below that reads like a fact about the router is an
 assumption until you have seen its output.
 
 Assumptions: router LAN address `192.168.8.1` (GL.iNet default; PRP examples use other values, use
-yours), SSH as root works, and the files come from the branches named below.
+yours), SSH as root works, and the files come from this checkout.
 
-1. **Build** on your workstation (needs a Rust toolchain and the musl target; rustls additionally
-   needs a C cross compiler, see the p2 spike). The two binaries live on different branches, so use
-   one checkout per branch; a branch already checked out in another worktree cannot be checked out
-   again (see `git worktree list`). From the repository root:
+1. **Build** on your workstation from this repository root (Rust, clang and the musl target
+   are required; cross-compilation settings are in `collector/.cargo/config.toml`):
    ```sh
-   git worktree add ../vigie-collector-src feat/collector
-   git worktree add ../vigie-conntrack-src feat/conntrack-helper
-   (cd ../vigie-collector-src/collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-collector)
-   (cd ../vigie-conntrack-src/collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-conntrack)
+   rustup target add aarch64-unknown-linux-musl
+   (cd collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-collector -p vigie-conntrack)
    ```
-   Without worktrees, `git archive feat/collector collector | tar -x -C "$(mktemp -d)"` gives a
-   clean source tree per branch instead. The binaries land in each tree's `target/` directory (the
-   cargo workspace root; check with `find ../vigie-*-src -name vigie-collector -o -name vigie-conntrack`);
-   adjust the `scp` paths in step 3 to match. Remove the trees later with `git worktree remove`.
-   Only **two** binaries run on the router: `vigie-collector` and `vigie-conntrack`. (`net-spike`
-   is a test tool, not a deployable.) The deploy scripts live in `collector/agent/deploy/` on
-   `feat/collector`, so below, run them from `../vigie-collector-src`.
+   Both binaries land in collector/target/aarch64-unknown-linux-musl/release/, unless
+   `CARGO_TARGET_DIR` overrides the location. Only `vigie-collector` and `vigie-conntrack` run
+   on the router; `net-spike` is a test tool. Deploy scripts live in `collector/agent/deploy/`.
 2. **Create the `vigie` user.** Run the printer locally; it executes nothing:
-   `(cd ../vigie-collector-src && sh collector/agent/deploy/vigie-print-install-commands.sh)`. Review the output and run it on the
+   `sh collector/agent/deploy/vigie-print-install-commands.sh`. Review the output and run it on the
    router. It picks a free uid in 6700-6799. **Use that uid** for the conntrack helper
    (`--uid N --gid N`); the conntrack spike's `10001` is only an example.
    Validate: `id vigie` shows the printed uid; `ps | grep vigie-collector` later shows it is
@@ -189,10 +204,10 @@ yours), SSH as root works, and the files come from the branches named below.
 3. **Copy the files** (`scp -O`, the legacy protocol, because OpenWrt has no sftp-server):
    ```sh
    ssh root@192.168.8.1 mkdir -p /tmp/vigie-deploy
-   scp -O ../vigie-collector-src/collector/target/aarch64-unknown-linux-musl/release/vigie-collector \
-          ../vigie-conntrack-src/collector/target/aarch64-unknown-linux-musl/release/vigie-conntrack \
+   scp -O collector/target/aarch64-unknown-linux-musl/release/vigie-collector \
+          collector/target/aarch64-unknown-linux-musl/release/vigie-conntrack \
           root@192.168.8.1:/tmp/
-   scp -O ../vigie-collector-src/collector/agent/deploy/* root@192.168.8.1:/tmp/vigie-deploy/
+   scp -O collector/agent/deploy/* root@192.168.8.1:/tmp/vigie-deploy/
    ```
    Then on the router install them root-owned, as listed in the printer's step 2:
    `/usr/bin/vigie-collector`, `/usr/bin/vigie-conntrack`, the scripts in `/usr/libexec/vigie/`,
@@ -213,15 +228,15 @@ yours), SSH as root works, and the files come from the branches named below.
    `ls -ln /tmp/vigie /tmp/vigie/dnsmasq.log`, then
    `/etc/init.d/dnsmasq restart; sleep 2; logread | grep dnsmasq | tail` (no "cannot open log"),
    and `tail -n1 /tmp/vigie/dnsmasq.log` shows new lines.
-6. **Conntrack helper** (separate procd service; the spike gives only a sketch,
-   `docs/spikes/conntrack-helper.md` on `feat/conntrack-helper`). Write
-   `/etc/init.d/vigie-conntrack` from that sketch with `--socket /tmp/vigie/conntrack.sock --uid N
-   --gid N --interval 60`, `enable`, `start`. Validate with the spike's router steps first: capture
-   `head -5 /proc/net/nf_conntrack` and run `/tmp/vigie-conntrack --once --file
-   /proc/net/nf_conntrack` and check `skipped_lines` is near zero. The helper and the drop-in script
-   both want `/tmp/vigie` (drop-in script: `root:vigie 0751`; helper: creates `0755` root if absent and
-   refuses a wrong one). **Whether they accept each other's directory is unverified**; start the
-   collector service first and run `ls -ld /tmp/vigie` after the helper starts.
+6. **Conntrack helper.** Install the checked-in `collector/agent/deploy/vigie-conntrack.init`
+   as `/etc/init.d/vigie-conntrack` with mode 755, following the install printer's exact commands.
+   The service resolves the dedicated `vigie` user's uid/gid and starts the helper on
+   `/tmp/vigie/conntrack.sock`. Start the collector/drop-in service first so the shared
+   `/tmp/vigie` directory has root ownership and the vigie group with mode 0751; then enable
+   and start the helper. Verify `ls -ld /tmp/vigie` and service processes before collecting.
+   Actual OpenWrt procd behavior, privileges and reboot recovery still require owner validation.
+   First capture a masked `/proc/net/nf_conntrack` sample and follow
+   `docs/spikes/conntrack-helper.md` to check the real parser's `skipped_lines`.
 7. **Force DNS through dnsmasq and block DoT bypass** (PRP section 9). Without this, devices
    using DoH/DoT are invisible to the DNS log. OpenWrt 21.02 uses fw3 over iptables. Use UCI
    `redirect`/`rule` sections (named, so they can be deleted exactly; GL.iNet's firewall UI may still
@@ -306,7 +321,7 @@ None of this has been observed on a real GL-XE3000 yet.
 - **Conntrack sample**: `head -5 /proc/net/nf_conntrack` and `grep -m2 ipv6 /proc/net/nf_conntrack`
   (mask IPs); then the helper's `--once` run and its `skipped_lines`.
 - **Root-lane test**: the root scripts refuse unsafe paths and report with exit 70. Test command
-  (on a development host with a checkout of `feat/collector`, as an unprivileged user):
+  (on a development host with this checkout, as an unprivileged user):
   `cd collector/agent && cargo test --test review_deploy_scripts --test review_deploy_v2 --test review4_deploy`.
   On the router, run `/usr/libexec/vigie/vigie-dnsmasq-dropin.sh check` (exit 0 ok, 1 missing,
   2 differs or unsafe) and `/usr/libexec/vigie/vigie-log-watchdog.sh`, then `logread -e vigie`.
@@ -321,10 +336,9 @@ None of this has been observed on a real GL-XE3000 yet.
 
 - Operations (backups, retention, upgrades, key and pin rotation, permission model):
   [`docs/deploy.md`](docs/deploy.md)
-- Architecture: [`docs/prp/001-vigie-architecture.md`](docs/prp/001-vigie-architecture.md) (rev 2
-  here; rev 3 on branch `docs/prp-rev3`)
-- Spikes: [`docs/spikes/p0-router.md`](docs/spikes/p0-router.md) (router facts, this branch);
-  `docs/spikes/p2-collector-agent.md` (branch `feat/collector`);
-  `docs/spikes/conntrack-helper.md` (branch `feat/conntrack-helper`);
-  `docs/spikes/p1-collector-net.md` (branch `spike/p1-collector-net`)
+- Architecture: [`docs/prp/001-vigie-architecture.md`](docs/prp/001-vigie-architecture.md) (rev 3)
+- Spikes: [`docs/spikes/p0-router.md`](docs/spikes/p0-router.md) (router facts);
+  `docs/spikes/p2-collector-agent.md`;
+  `docs/spikes/conntrack-helper.md`;
+  `docs/spikes/p1-collector-net.md`
 - Server details and wire contract: [`server/README.md`](server/README.md)

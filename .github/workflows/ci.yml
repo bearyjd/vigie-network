@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: '3.12'
+      VIGIE_CI_LOG_DIR: ${{ runner.temp }}/vigie-ci-logs
+      VIGIE_E2E_BASE: ${{ runner.temp }}/vigie-e2e
+      VIGIE_E2E_TMP: ${{ runner.temp }}/vigie-e2e-tmp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.6'
+          enable-cache: true
+          cache-dependency-glob: '**/uv.lock'
+      - name: Install host Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Run the full local gate
+        run: scripts/ci.sh
+      - name: Upload gate and whole-chain logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            ${{ runner.temp }}/vigie-ci-logs
+            ${{ runner.temp }}/vigie-e2e/run-*/logs

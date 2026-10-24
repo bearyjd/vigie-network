@@ -331,7 +331,9 @@ def device_detail(
     links = link_map(ov)
     canonical = resolve(links, device_id)
     row = _device_row(inv, canonical)
-    item = effective_device(row, override_map(ov), links)
+    overrides = override_map(ov)
+    item = effective_device(row, overrides, links)
+    identity_override = overrides.get(device_id)
     members = [canonical, *(f for f in links if f != canonical and resolve(links, f) == canonical)]
     marks = ",".join("?" * len(members))
     states = rows(
@@ -357,6 +359,7 @@ def device_detail(
         **item,
         "merged_into": canonical if canonical != device_id else None,
         "requested_id": device_id,
+        "identity_override_version": identity_override["version"] if identity_override else 0,
         "macs": [
             {
                 "mac": o["mac"],
