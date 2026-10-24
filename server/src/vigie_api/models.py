@@ -134,6 +134,10 @@ class Explanation(BaseModel):
 
 class DeviceDetail(DeviceOut):
     requested_id: str
+    identity_override_version: int = Field(
+        description="The requested_id's own override version for identity expected_versions, "
+        "including merge undo. override_version and ETag describe the effective canonical device."
+    )
     macs: list[MacOut]
     recent_events: list[RecentEvent]
     explanation: Explanation
@@ -211,3 +215,46 @@ class EventsResponse(_Envelope):
 
 class SuggestionsResponse(_Envelope):
     data: list[SuggestionOut]
+
+
+Version = Annotated[int, Field(strict=True, ge=0, le=10**12)]
+IdentityId = Annotated[str, Field(strict=True, min_length=1, max_length=64)]
+
+
+class VersionedWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: Version | None = None
+    expected_versions: dict[IdentityId, Version] | None = Field(default=None, max_length=5000)
+
+    @model_validator(mode="after")
+    def _version_required(self) -> Self:
+        if (self.expected_version is None) == (self.expected_versions is None):
+            raise ValueError("supply exactly one of expected_version or expected_versions")
+        if self.expected_versions is not None and not self.expected_versions:
+            raise ValueError("expected_versions must not be empty")
+        return self
+
+
+class SuggestionDecision(VersionedWrite):
+    remember: bool = Field(default=False, strict=True)
+
+
+class RuleCreate(VersionedWrite):
+    device_id: IdentityId
+    signature: dict[str, Any]
+    expires_at: Annotated[str | None, Field(strict=True, max_length=64)] = None
+
+    @model_validator(mode="after")
+    def _signature(self) -> Self:
+        from vigie_api.identity_writes import validate_signature
+
+        self.signature = validate_signature(self.signature)
+        return self
+
+
+class WriteResultResponse(_Envelope):
+    data: dict[str, Any]
+
+
+class RulesResponse(_Envelope):
+    data: list[dict[str, Any]]

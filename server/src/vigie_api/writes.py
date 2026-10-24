@@ -67,6 +67,7 @@ def patch_override(
     changes: dict[str, Any],
     principal: str,
     now_iso: str,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply `changes` (None clears a field) iff the override version still matches."""
     ov.execute("BEGIN IMMEDIATE")
@@ -85,7 +86,7 @@ def patch_override(
         before = _before(ov, device_id)
         new_version = current + 1
         _apply(ov, device_id, changes, new_version, principal, now_iso)
-        _audit(ov, device_id, changes, before, new_version, principal, now_iso)
+        _audit(ov, device_id, changes, before, new_version, principal, now_iso, request_id)
         ov.execute("COMMIT")
     except BaseException:
         if ov.in_transaction:
@@ -116,8 +117,11 @@ def _apply(conn, device_id, changes, version, principal, now_iso) -> None:  # no
     )
 
 
-def _audit(conn, device_id, changes, before, version, principal, now_iso) -> None:  # noqa: ANN001
+def _audit(conn, device_id, changes, before, version, principal, now_iso, request_id=None) -> None:  # noqa: ANN001
     detail = {
+        "request_id": request_id or str(uuid.uuid4()),
+        "before": before,
+        "after": {**before, **changes},
         "version": version,
         "changes": {f: {"from": before[f], "to": v} for f, v in changes.items()},
     }

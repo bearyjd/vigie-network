@@ -43,7 +43,11 @@ def test_merge_landing_between_check_and_write_is_409_not_a_stale_write(env: Env
 
     def concurrent_merge() -> None:
         other = open_overrides(env.root / "overrides.db")
-        other.execute("INSERT INTO identity_links VALUES ('a','c','m',?,'t')", (ts(),))
+        other.execute(
+            "INSERT INTO identity_links (from_device,into_device,merge_id,created_at,created_by)"
+            " VALUES ('a','c','m',?,'t')",
+            (ts(),),
+        )
         other.close()
 
     with pytest.raises(ApiError) as caught:

@@ -18,7 +18,7 @@ from collections.abc import Callable
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
 from vigie_pipeline.snapshot import Snapshot
-from vigie_pipeline.stitch_apply import apply_plan
+from vigie_pipeline.stitch_apply import apply_candidate_decisions, apply_plan
 from vigie_pipeline.stitch_compute import compute_plan
 from vigie_pipeline.stitch_types import StitchStats
 
@@ -35,6 +35,7 @@ def stitch(
     expiry is re-checked against it under the lock; `overrides` (read-only) is re-read under the
     lock before any attach."""
     stamp = clock() if clock else now
+    apply_candidate_decisions(inv, snap)
     plan = compute_plan(inv, snap, cfg, stamp)
     stats = apply_plan(inv, snap, cfg, stamp, clock or (lambda: stamp), overrides, plan)
     log(logger, logging.INFO, "stitch_complete", **stats.__dict__)

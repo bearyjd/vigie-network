@@ -1,4 +1,4 @@
-# Identity stitching (P2, pipeline only)
+# Identity stitching (P2)
 
 Implements PRP-001 section 8 in `server/src/vigie_pipeline/` (`stitch.py`, `stitch_compute.py`,
 `stitch_apply.py`, `stitch_hood.py`, `stitch_types.py`, `stitch_db.py`, `activity.py`,
@@ -28,7 +28,7 @@ PREPARE  resolve snapshot human-decision IDs to suggestion pairs by inventory pr
          before acquiring the inventory write lock (expired decisions remain binding)
 APPLY    one BEGIN IMMEDIATE, count-bounded, no scans: re-validates every decision with indexed
          point lookups (the pair's candidate state; for an attach that overrides.db is unchanged
-         since the snapshot: PRAGMA data_version), drops the stale ones, writes.
+         since the snapshot: identity_version), drops the stale ones, writes.
 ```
 
 The pipeline is the only writer of the tables the decisions read (ingest writes only
@@ -54,7 +54,7 @@ Bounds (constants in `config.py`; each holds by construction, not by a deadline)
 | evidence gaps | retention / `activity_gap_s` | gaps in the retention window, merged within one gap at write time; expired backlog is pruned in batches |
 
 APPLY therefore executes at most about 200 + 20 x (12 + 64) point writes plus one event per subject,
-and its one read of `overrides.db` is `PRAGMA data_version`, whose cost does not depend on how
+and its read of `overrides.db` per attach is one `identity_version` point lookup, whose cost does not depend on how
 many overrides, rules or links exist: well under a second on the server
 (`test_apply_holds_the_lock_under_a_second_with_a_full_action_list`,
 `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides`). Every decision carries
@@ -84,7 +84,10 @@ Row timestamps are collector-supplied and untrusted. A stamp outside
 `[batch received_at - ACTIVITY_MAX_REPORT_LAG_S (1 h), received_at + ACTIVITY_SKEW_S (300 s)]` is
 ignored in every batch (epoch-near stamps from a router without an RTC, far-future stamps, back-fill
 over a peer's absence). `mac_first_received` records the SERVER receipt of the first batch carrying
-the MAC, set once; when intervals are loaded, activity earlier than `first received - 1 h` is clipped
+the MAC, set once while its receipt or activity remains within retention. When a MAC returns with
+an expired receipt anchor and no retained activity, recording its new evidence resets the anchor
+before inserting fresh activity, even if paged cleanup has not reached its old rows yet.
+When intervals are loaded, activity earlier than `first received - 1 h` is clipped
 away. Any interval shorter than the activity gap is widened symmetrically to that width (a stamp
 means "present around then"), so a copy stamping once per 301 s still overlaps.
 
@@ -117,7 +120,8 @@ into the oldest matching device (`from_device`, `into_device`).
 `score = sum(weights of equal signals)` (`SIGNAL_WEIGHTS`: opt55 0.30, opt60 0.30, mDNS 0.20,
 hostname 0.20); every structural candidate scores >= 0.80. `VIGIE_STITCH_THRESHOLD` (0.8) decides
 which candidates become suggestions. States in `identity_candidates` (unique per `(device_a,
-device_b)`): `open`, `suggested`, `ambiguous`, `vetoed`, `dismissed` (human; sticky). The
+device_b)`): `open`, `suggested`, `ambiguous`, `vetoed`, `dismissed` (human; sticky),
+and `cleared` (consumed human clearance; fresh evidence can replace it). The
 `evidence` column holds the full signature values and is the only place they are stored.
 
 **Ambiguity.** If two matching devices were active together for longer than the grace window they
@@ -142,8 +146,10 @@ provisional `open` row (written once, never over a `suggested` row), no event, n
 **Vetoes are permanent with one human recovery.** A `vetoed` row is never rewritten by the
 pipeline and is looked up through the COMPLETE merge chains of both endpoints (cycle-safe, from the
 smaller side's index), so merging the vetoed target into another device does not launder it. The
-recovery is `state='dismissed'` (to be exposed by the API as "clear this veto"); the overlap is
-still evaluated afterwards and a real one still blocks the attach. When a pair becomes `vetoed` or
+recovery is `state='cleared'` (the API's "clear this veto" action); overlap is
+evaluated afresh afterwards and sustained overlap establishes a new sticky veto, which remains
+after the evidence leaves retention. Clearing alone never attaches; absent overlap, attachment
+still requires the normal compute/apply checks. Plain dismissal remains sticky. When a pair becomes `vetoed` or
 `ambiguous` its open suggestion is withdrawn (`expires_at` set to just before now).
 
 ## 5. Suggestions
@@ -176,18 +182,31 @@ suggestion-only. For a mature randomized self MAC whose signature matches:
 4. Both devices `identity_state='ok'` and the target in an EXPLICIT `auto_inherit=1` group;
    otherwise a `rule_hit_needs_confirm` suggestion.
 
-The snapshot records `PRAGMA data_version` of the pipeline's `overrides.db` connection inside its
-read transaction. Under the inventory lock the APPLY phase re-reads it FRESH immediately before
-every attach write (never cached across attaches; once it differs, no further attach is made that
-pass): if anything was committed
-to `overrides.db` since (a merge, a new, revoked or malformed rule, a regroup), every attach of the
-pass is dropped and recomputed against a fresh snapshot next pass, so a merge can never launder a
-veto and a second rule can never appear unseen. The check is deliberately coarse: `vigie-api`
-writes `overrides.db` only on human actions (overrides, rules, links, token create/revoke and their
-`audit_log` rows; reads, including token verification, write nothing), so a commit in between
-costs one pass, never liveness (`test_an_unrelated_overrides_write_delays_the_attach_by_one_pass_only`).
-`data_version` is per connection: the snapshot and the check use the pipeline's one long-lived
-read-only connection. It also re-checks that the rule is unexpired at the
+The snapshot records `identity_version.version` inside its read transaction. Under the
+inventory lock APPLY re-reads this single row immediately before every attach write. Once it
+differs, remaining attaches wait for recomputation next pass. Schema triggers advance the
+stamp in the same transaction as attach-relevant rules, links, candidate/clear-veto decisions,
+suggestion decisions, device groups, and group `auto_inherit` changes. Thus a merge cannot
+launder a veto and a new rule cannot appear unseen. Token lifecycle, audit/receipt/history-only
+writes and device label fields (`name`, `owner`, `type`, version/update metadata alone) do not
+change attach authorization and do not delay attaches. Inventory `identity_state` is rechecked
+separately; the API exposes no identity-state override. Relevant writes delay remaining attaches
+by one pass; irrelevant writes do not. Continuous relevant changes can keep delaying attaches.
+APPLY also compares the schema version so a concurrent schema change fails closed.
+Pipeline migration 5 adds a separate inventory `veto_generation` stamp. Candidate triggers
+advance it for veto insertion, update or removal in the same transaction. COMPUTE captures it
+inside its inventory snapshot; APPLY compares it once after acquiring the writer lock,
+before applying decisions. A veto introduced on any merged alias therefore invalidates stale
+attachments and suggestions without an alias scan under the lock. Later generation increments
+from the same plan do not invalidate unrelated decisions: no external inventory writer can
+interleave while APPLY holds that lock. The direct candidate preconditions remain in force.
+All vetoes in the plan also form a bounded set of canonical identity pairs before application.
+An attachment or suggestion joining one of those pairs is blocked in either direction,
+regardless of decision order. Persisted veto lookup checks both directions across the two
+components, so reversing the proposed merge cannot bypass a sticky veto on a later pass.
+Only old schemas without the version table use the coarse `PRAGMA data_version` fallback:
+any commit delays attaches, using the same long-lived read-only connection for both reads.
+APPLY also re-checks that the rule is unexpired at the
 clock read under the lock, that the MAC is still a self MAC of the same device, both states `ok`,
 and that the pair's candidate row is as it was when computed. Otherwise nothing attaches that pass.
 A rule row whose target cannot even be read (a malformed `device_id`) makes EVERY rule hit of that
@@ -236,7 +255,7 @@ veto. Every degrade except "immature" also writes one `stitch_deferred` event pe
 
 **Residual window (cross-database race).** `overrides.db` and `inventory.db` are separate files
 and the inventory write lock does not serialise API commits; the pipeline cannot lock
-`overrides.db` (mounted read-only). Between the last `data_version` read and the `observations`
+`overrides.db` (mounted read-only). Between the last `identity_version` read and the `observations`
 UPDATE that follows it directly lies a window of microseconds in which a rule could be revoked or
 the target regrouped. Such an attach lands only in an `auto_inherit=1` group, is never widened by
 the window (every other check already passed), and is surfaced by the next pass: the re-check
@@ -251,6 +270,7 @@ attachment stays (section 6) and the owner sees the event.
 can still look open to a reader that trusts `expires_at` alone. Requirement for the API round: the
 accept path MUST refuse a `merge_identity` suggestion whose `from_device` (or `into_device`) is
 retired with no observations, whatever `expires_at` says, and the suggestion feed SHOULD hide them.
+The API implementation and human-action contract are documented in [api.md](api.md).
 
 ## 8. Post-attach re-check
 Every pass re-checks up to `MACS_PER_PASS` rule-attached MACs (its own robin, run before the self
@@ -297,7 +317,7 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | 65 compatible junk MACs around an attached copy | a flooded pool is incomplete evidence: flag / confirm, never silence | `test_a_flooded_compatible_pool_cannot_suppress_the_suspect_flag`, `test_a_flooded_compatible_pool_turns_the_rule_hit_into_a_confirm_suggestion` |
 | dismiss or decide a pair between COMPUTE and APPLY | candidate-state preconditions drop the decision | `test_a_dismissal_between_compute_and_apply_cancels_the_attach`, `test_a_dismissal_between_compute_and_apply_cancels_the_suggestion` |
 | 1000 accumulated candidate rows on an attaching orphan | cleanup under the row cap, finished by `Settle` later | `test_the_cleanup_of_an_orphans_candidate_rows_is_budgeted_and_finishes_later` |
-| grow overrides.db to lengthen the lock | one PRAGMA data_version per attach under the lock | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
+| grow overrides.db to lengthen the lock | one identity_version point read per attach under the lock (legacy: data_version) | `test_the_lock_time_revalidation_does_not_depend_on_the_size_of_overrides` |
 | Unicode names (É, ß, ς, full-width, NFD) to dodge the name buckets | one fold (NFKC + casefold) in Python and in the stored indexed `*_fold` columns; no NOCASE on names | `test_non_ascii_names_match_exactly_like_ascii_ones`, `test_a_fresh_non_ascii_roll_of_the_victim_vetoes_a_copy_under_a_rule` |
 | one enormous subject to eat the compute budget | the budget ticks per lookup inside a subject; known names capped; a cut subject is deferred/flagged and the cursor moves past it | `test_one_huge_recheck_subject_cannot_exceed_its_budget_share`, `test_a_subject_cut_by_the_budget_does_not_pin_the_robin` |
 | a persistent spray to mask the overlap flag behind the truncation flag | overlap always evaluated on the peers at hand; both flags fire | `test_an_overlap_seen_in_a_truncated_hood_is_still_flagged` |
@@ -316,9 +336,9 @@ by the compute budget is judged on everything gathered up to the cut and flagged
 | restart during a fold backfill with a different fold/Unicode version | persist the cursor's target version; restart the full traversal on mismatch or a legacy cursor without a target | `test_interrupted_fold_recompute_restarts_when_target_version_changes` |
 | a malformed rule on another device whose signature could match | any malformed rule makes every rule hit suggestion-only | `test_any_malformed_rule_makes_every_rule_hit_a_suggestion` |
 | 30k old attachments to switch the re-check off | own robin, persisted cursor, silent MACs cost one probe | `test_the_recheck_robin_cycles_through_every_attached_mac`, `test_a_recheck_subject_without_activity_in_retention_is_skipped` |
-| rule revoked / regrouped while the pass runs | data_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
-| merge a vetoed device into the target between COMPUTE and APPLY | data_version drops the attach; the next pass vetoes through the fresh components | `test_a_merge_between_compute_and_apply_cannot_launder_a_veto`, `test_any_overrides_change_between_compute_and_apply_drops_the_attach` |
-| commit to overrides.db between two attaches of one pass | data_version re-read before every write; the pass ends for attaches | `test_data_version_is_re_read_immediately_before_every_attach` |
+| rule revoked / regrouped while the pass runs | identity_version and clock under the lock | `test_the_attach_rereads_the_rule_and_group_under_the_lock`, `test_expiry_is_rechecked_with_the_clock_read_after_the_lock_is_held` |
+| merge a vetoed device into the target between COMPUTE and APPLY | identity_version drops the attach; the next pass vetoes through the fresh components | `test_a_merge_between_compute_and_apply_cannot_launder_a_veto`, `test_any_overrides_change_between_compute_and_apply_drops_the_attach` |
+| relevant commit to overrides.db between two attaches of one pass | identity_version re-read before every write; the pass ends for attaches | `test_identity_version_is_re_read_immediately_before_every_attach` |
 | revoke / regroup in the microsecond window before the write | next-pass re-check flags the attachment | `test_an_attachment_whose_rule_or_group_no_longer_authorises_it_is_flagged_next_pass` |
 | 1000 accumulated suggestions on an attaching orphan | expiry under the row cap, finished by `Settle` | `test_orphan_suggestion_expiry_is_bounded_per_pass_and_finishes_later` |
 | change identity_state or write a veto row between COMPUTE and APPLY | inventory-side preconditions | `test_an_identity_state_change_between_compute_and_apply_drops_the_attach`, `test_a_veto_row_written_between_compute_and_apply_drops_the_attach` |
@@ -345,10 +365,14 @@ by the compute budget is judged on everything gathered up to the cut and flagged
   over days (200 rows a pass). Pruning of candidate rows is not done.
 - **Compromised collector** (holds the ingest credential) is outside this threat model: it can
   withhold or invent stamps inside the accepted window.
-- **Attach availability under API traffic.** Any app-scope token may `PATCH /devices` and each
-  such write (and a `wal_checkpoint(TRUNCATE)` on `overrides.db`) bumps `data_version`, dropping
-  that pass's attaches (one pass of delay each, never a wrong attach). The API's rate limit bounds
-  it; requirement for the API round: keep write endpoints rate-limited per token.
+- **Cross-database API acceptance race.** The API checks inventory through a read-only mount
+  before committing to overrides. No cross-process lock can cover both databases; pipeline
+  changes can make those checks stale before acceptance commits. The pipeline revalidates
+  on its next pass and flags conflicts. The overrides version does not close this window.
+- **Attach availability under API traffic.** Relevant identity writes delay remaining attaches
+  by one pass; irrelevant writes do not. Continuous relevant changes can keep invalidating
+  plans, even with per-token rate limiting. Legacy schemas without the identity stamp retain
+  the coarse `data_version` fallback, where unrelated commits can also delay attaches.
 - **Names and the fold.** Hostnames and mDNS names are compared through one Unicode fold
   (`stitch_types.fold`: NFKC, casefold, NFKC again so that fold(fold(x)) == fold(x); stored as
   `observations.hostname_fold`/`mdns_fold`). The pipeline writes those columns; the stored values
@@ -370,10 +394,11 @@ by the compute budget is judged on everything gathered up to the cut and flagged
   ground-truth tests inject a constant opt60 to exercise the behaviour (decision for the owner).
 
 ## 12. Not done (explicitly)
-Behavioural demotion; `identity_state='conflict'|'pending_confirm'` side effects; the API: accept,
-reject, merge, undo, rule creation/revocation, `mac_detached`, clearing a veto (`dismissed`);
+Behavioural demotion; `identity_state='conflict'|'pending_confirm'` side effects; `mac_detached`;
 classification rules; a rate limit on attachments per hour beyond `MAX_ATTACHES_PER_PASS`; pruning
-of candidate rows.
+of candidate rows. The API now records accept/reject, merges and undo, rules and revocation,
+and veto-clear decisions; see [api.md](api.md). Veto clearing is consumed once by the pipeline
+before fresh COMPUTE/APPLY, using an inventory-side receipt. It does not grant an attachment.
 
 ## 13. Tests
 `server/tests/pipeline/test_stitch_attach_rules.py` (T1/T2, rule parsing, gating, the lock-time

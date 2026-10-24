@@ -85,8 +85,9 @@ def upsert_candidate(
     inv: sqlite3.Connection, a: str, b: str, score: float, evidence: dict, state: str, now: float
 ) -> tuple[str, bool]:
     """One row per (from, into). Returns (id, row_written). 'dismissed' and 'vetoed' are sticky
-    (no later evidence or capped window rewrites them) and an identical row is not rewritten, so
-    the write is the unit the per-pass cap charges."""
+    (no later evidence or capped window rewrites them). A human-cleared veto is 'cleared', which
+    fresh evidence can replace, including with another veto. An identical row is not rewritten,
+    so the write is the unit the per-pass cap charges."""
     text = json.dumps(evidence, sort_keys=True)
     row = _candidate_row(inv, a, b)
     if row is None:
@@ -138,23 +139,34 @@ def _chunks(ids: Collection[str]) -> list[list[str]]:
     return [items[i : i + CHUNK] for i in range(0, len(items), CHUNK)]
 
 
+def veto_generation(inv: sqlite3.Connection) -> int:
+    """Inventory-local stamp; read inside the compute snapshot and apply writer lock."""
+    row = inv.execute("SELECT value FROM pipeline_meta WHERE key='veto_generation'").fetchone()
+    if row is None:
+        raise RuntimeError("inventory veto generation is missing")
+    return int(row[0])
+
+
 def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Collection[str]) -> bool:
     """Is any (a, b) pair of the two alias sets recorded as vetoed? A permanent veto keyed by a
     device id must survive that device being merged into another. The vetoes are looked up by the
     ids of the SMALLER side (chunked, through that side's index) and checked by set membership
     against the larger one, so a huge merge component never becomes an IN list."""
     if len(a_ids) <= len(b_ids):
-        column, other, small, large = "device_a", "device_b", a_ids, set(b_ids)
+        small, large = a_ids, set(b_ids)
     else:
-        column, other, small, large = "device_b", "device_a", b_ids, set(a_ids)
+        small, large = b_ids, set(a_ids)
     for chunk in _chunks(small):
-        rows = inv.execute(
-            f"SELECT {other} FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
-            f" AND {column} IN ({','.join('?' * len(chunk))})",
-            chunk,
-        )
-        if any(r[0] in large for r in rows):
-            return True
+        # Concurrent presence is symmetric even when the candidate was originally
+        # recorded in the opposite direction. Both columns have covering indexes.
+        for column, other in (("device_a", "device_b"), ("device_b", "device_a")):
+            rows = inv.execute(
+                f"SELECT {other} FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
+                f" AND {column} IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            if any(r[0] in large for r in rows):
+                return True
     return False
 
 

@@ -126,7 +126,9 @@ class Overrides:
 
     def link(self, from_device: str, into_device: str) -> None:
         self.conn.execute(
-            "INSERT INTO identity_links VALUES (?,?,?,?,?)",
+            "INSERT INTO identity_links"
+            " (from_device, into_device, merge_id, created_at, created_by)"
+            " VALUES (?,?,?,?,?)",
             (from_device, into_device, "m1", "2026-10-01T00:00:00Z", "owner"),
         )
 

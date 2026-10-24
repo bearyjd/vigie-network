@@ -133,6 +133,7 @@ CREATE TABLE identity_links (         -- confirmed merges only; created only by 
   from_device TEXT PRIMARY KEY,
   into_device TEXT NOT NULL,          -- always canonical (links are flattened on merge)
   merge_id TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+  revoked_at TEXT,                    -- undo retains the row; only NULL links are active
   CHECK (from_device <> into_device)
 );
 CREATE TABLE identity_rules (         -- standing, human-approved: "this signature is device D"
@@ -150,6 +151,11 @@ CREATE TABLE suggestion_decisions (   -- at-most-once: PRIMARY KEY is the race g
   suggestion_id TEXT PRIMARY KEY,
   state TEXT NOT NULL CHECK (state IN ('accepted','rejected')),
   decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, applied TEXT
+);
+CREATE TABLE candidate_decisions (    -- API intent; pipeline consumes once before fresh compute
+  candidate_id TEXT PRIMARY KEY, device_a TEXT NOT NULL, device_b TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action='clear_veto'), decided_by TEXT NOT NULL,
+  decided_at TEXT NOT NULL, id TEXT NOT NULL UNIQUE
 );
 CREATE TABLE audit_log (id TEXT PRIMARY KEY, ts TEXT NOT NULL, principal TEXT NOT NULL,
                         action TEXT NOT NULL, target TEXT, detail TEXT);
@@ -237,17 +243,24 @@ CREATE TABLE batches (batch_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, rec
 | GET | `/devices` | filters `type`, `group`, `identity_state`, `updated_since`; cursor pagination; returns effective values + provenance + `merged_into` for aliases |
 | GET | `/devices/{id}` | adds observations, recent events, structured explanation; `macs[]` with `first_seen`, `last_seen`, `current`, `link_source`, `link_rule_id` |
 | GET | `/macs/{mac}` | resolves a MAC to its canonical `device_id`, `link_source`, `identity_state` (what the control app calls when programming the router); unknown MAC ⇒ 404 ⇒ unassigned |
-| GET/POST/DELETE | `/identity/rules` | list, approve (from an accepted suggestion), revoke standing rules |
+| GET/POST | `/identity/rules` | list and approve standing rules with control-app `rules:write` |
+| DELETE | `/identity/rules/{id}` | revoke a standing rule with control-app `rules:write` |
 | PATCH | `/devices/{id}` | `If-Match: <override.version>` **required**; sets name/owner/type/group; `null` clears a field |
 | GET | `/events` | `since` cursor, `kind`, `severity`; union of inventory events and human-action events from `audit_log`; optional SSE. Kinds include `mac_attached` (a rolled MAC joined a device: carries old/new MAC so the app can update router rules) and `mac_detached`. **The cursor pages on per-source insertion order (`seq`/`rowid`), not `ts`**, because late batches carry older timestamps and would otherwise be skipped; `ts` is display only. Token lifecycle audit rows are not exposed to the app token |
 | GET | `/suggestions` | effective state = decision if present, else `expired` if past `expires_at`, else `pending` (computed on read, no write race) |
 | POST | `/suggestions/{id}/accept` | see §7; body carries `If-Match` versions for every involved device |
 | POST | `/suggestions/{id}/reject` | |
 | POST | `/identity/merges/{id}/undo` | split; restores `prior_overrides` |
+| POST | `/identity/candidates/{id}/clear-veto` | audited overrides-side intent; pipeline clears once and revalidates |
 | GET | `/healthz` | unauthenticated, returns `ok` only |
 | GET | `/metrics` | token-protected or loopback-only |
 
 Envelope: `{ "ok", "data", "error": {code,message}|null, "page": {next_cursor}|null }`. Behavior notes from review: aliases (merged-away devices) are hidden from the default list and always report the canonical device's override and the **worst** `identity_state` across members; every attacker-influenced string (hostnames, event summaries, names, prose) is sanitised on read and documented as untrusted plain text; LLM/ML prose (`reason_text`) is returned only for `label` suggestions and withheld while any action suggestion is pending; authentication runs before body validation (uniform 401); the failure limiter counts failed authentications only and never blocks a valid token. TLS on the app API (compose ships a Caddy or self-signed cert). `api` and `ingest` bind the LAN interface only; no CORS. Principals: `collector` (ingest only) and `app` (API only), with disjoint scopes. All writes are recorded in `audit_log`.
+
+The implemented human-decision contract, token privileges, version guards, and write costs are
+documented in [../api.md](../api.md). Rule approval requires explicit control-app `rules:write`;
+the control app obtains human approval (D6 remains pending). Each actual overrides commit can
+delay an in-flight rule attachment by one pass; ordinary reads never write counters or stamps.
 
 ## 7. Suggestion and enforcement flow
 

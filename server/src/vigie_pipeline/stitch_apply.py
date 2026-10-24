@@ -1,7 +1,7 @@
 """APPLY phase of identity stitching (docs/stitching-design.md section 4): one short
 BEGIN IMMEDIATE that re-validates every decision of the plan with indexed point lookups (the
 pair's candidate state, the MAC's link, both identity states) and, immediately before each attach
-write, that overrides.db is unwritten since the snapshot (PRAGMA data_version on the pipeline's
+write, that identity inputs are unchanged since the snapshot (identity_version on the pipeline's
 own connection); drops what went stale; writes a count-bounded number of rows: at most
 MAX_ROWS_PER_PASS candidate/suggestion/widen/cleanup rows and MAX_ATTACHES_PER_PASS attaches.
 """
@@ -23,7 +23,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
-from vigie_pipeline.snapshot import Snapshot
+from vigie_pipeline.snapshot import OverridesUnreadable, Snapshot, read_identity_version
 from vigie_pipeline.stitch_db import (
     Attachment,
     SuggestionOutcome,
@@ -41,6 +41,7 @@ from vigie_pipeline.stitch_db import (
     state_get,
     state_set,
     upsert_candidate,
+    veto_generation,
     withdraw_open_suggestions,
     withdraw_orphan_suggestions,
 )
@@ -57,6 +58,7 @@ from vigie_pipeline.stitch_types import (
     Suggest,
     Veto,
     Widen,
+    fold,
     short_hash,
 )
 
@@ -67,13 +69,18 @@ class Applier:
     def __init__(
         self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
         cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
-        merge_decisions: Mapping[str, SuggestionOutcome],
+        merge_decisions: Mapping[str, SuggestionOutcome], veto_stamp: int,
+        planned_vetoes: frozenset[frozenset[str]],
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.clock, self.stats = now, clock, stats
         self.merge_decisions = merge_decisions
+        self.planned_vetoes = planned_vetoes
+        # Compare once after acquiring BEGIN IMMEDIATE. No external inventory
+        # writer can interleave now; later increments belong to this same plan.
+        self.veto_dirty = veto_generation(inv) != veto_stamp
         self.at = clock()  # the clock under the lock; read again before each attach write
-        self.dirty = False  # overrides.db written since the snapshot: no more attaches this pass
+        self.dirty = False  # identity inputs changed since snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
         self.writes = 0
         self.attaches = 0
@@ -170,6 +177,8 @@ class Applier:
             log(logger, logging.INFO, "identity_candidate_ambiguous", mac=short_hash(d.mac))
 
     def _suggest(self, d: Suggest) -> None:
+        if not self._vetoes_unchanged() or not self._plan_allows(d.from_device, d.into):
+            return
         if not self._still_self(d.mac, d.from_device):
             return
         if not self._unchanged(d.from_device, d.into, d.expected):
@@ -198,7 +207,11 @@ class Applier:
         summary = {
             "candidate_id": cid,
             "signals": list(d.signals),
-            "hashes": {k: short_hash(str(v)) for k, v in evidence.items() if k in HASHED and v},
+            "hashes": {
+                k: short_hash(fold(str(v)) if k in ("hostname", "mdns_name") else str(v))
+                for k, v in evidence.items()
+                if k in HASHED and v
+            },
         }
         create_merge_suggestion(
             self.inv, self.snap, d.from_device, d.into, score=d.score, reason_code=d.reason_code,
@@ -264,24 +277,29 @@ class Applier:
         )  # fmt: skip
 
     def _overrides_unchanged(self) -> bool:
-        """overrides.db has not been written since the snapshot was read: PRAGMA data_version on
-        the pipeline's own long-lived connection, read FRESH immediately before every attach write
-        (never cached: a commit between two attaches of one pass ends the pass for attaches). Any
-        write (a merge, a new, revoked or malformed rule, a regroup) drops the attach; it is
-        recomputed against a fresh snapshot next pass. Without an overrides connection (tests)
-        the compute snapshot stands in. The remaining window between this read and the write is
-        the cross-database race documented in docs/stitching.md; the next pass's re-check surfaces
-        an attach made in it."""
+        """Point-read identity_version immediately before every attach. Identity changes end
+        attaches for this pass; token, audit and label writes do not. Only legacy schemas missing
+        the version table use coarse PRAGMA data_version. Any unreadable stamp fails closed.
+        The cross-database check-to-write window is documented in docs/stitching.md."""
         if self.overrides is None:
             return True
         if not self.dirty:
             try:
-                row = self.overrides.execute("PRAGMA data_version").fetchone()  # type: ignore[union-attr]
-                current: int | None = int(row[0])
-            except (sqlite3.Error, TypeError, ValueError) as exc:  # unreadable: fail closed
+                if self.snap.schema_version is not None:
+                    schema = self.overrides.execute("PRAGMA schema_version").fetchone()[0]
+                    if schema != self.snap.schema_version:
+                        self.dirty = True
+                current = read_identity_version(self.overrides)
+                if self.snap.identity_version is None and current is None:
+                    row = self.overrides.execute("PRAGMA data_version").fetchone()
+                    current = int(row[0])
+                    expected = self.snap.data_version
+                else:
+                    expected = self.snap.identity_version
+                self.dirty = self.dirty or current is None or current != expected
+            except (sqlite3.Error, TypeError, ValueError, OverridesUnreadable) as exc:
                 log(logger, logging.ERROR, "attach_revalidation_failed", error=str(exc))
-                current = None
-            self.dirty = current is None or current != self.snap.data_version
+                self.dirty = True
         if self.dirty:
             self.stats.stale += 1
         return not self.dirty
@@ -292,11 +310,31 @@ class Applier:
         ).fetchone()
         return bool(row) and row[0] == "ok"
 
+    def _vetoes_unchanged(self) -> bool:
+        # External changes to any merged alias invalidate the precomputed plan.
+        # Vetoes authored by this plan must not cancel unrelated safe decisions.
+        if self.veto_dirty:
+            self.stats.stale += 1
+            return False
+        return True
+
+    def _plan_allows(self, a: str, b: str) -> bool:
+        # An asymmetric activity judgement can produce a reverse-direction veto
+        # in this very plan. It wins regardless of decision order or alias spelling.
+        if self.planned_vetoes and frozenset((self.snap.canonical(a), self.snap.canonical(b))) in (
+            self.planned_vetoes
+        ):
+            self.stats.stale += 1
+            return False
+        return True
+
     def _attach(self, d: Attach) -> None:
+        if not self._vetoes_unchanged() or not self._plan_allows(d.from_device, d.target):
+            return
         if self.attaches >= MAX_ATTACHES_PER_PASS:
             self.stats.capped += 1
             return
-        self.at = self.clock()  # expiry does not change data_version: judge it per attach
+        self.at = self.clock()  # expiry does not change identity_version: judge it per attach
         if not (
             self._authorised(d)
             and self._still_self(d.mac, d.from_device)
@@ -344,6 +382,37 @@ class Applier:
         log(logger, logging.INFO, "mac_attached", old=before, new=short_hash(d.mac))
 
 
+def apply_candidate_decisions(inv: sqlite3.Connection, snap: Snapshot) -> None:
+    """Consume human clears before COMPUTE, never attaching or changing observations.
+
+    A clear resets the veto to a nonsticky state so fresh overlap can veto it again; it does
+    not dismiss the candidate. A receipt makes each decision id one-shot, including stale
+    decisions whose candidate no longer matches. A later clear requires a new API decision id.
+    Select outside the writer lock, then recheck receipts and exact candidate id/pair/state
+    under the lock.
+    At most MAX_ROWS_PER_PASS rows are written in this separate bounded transaction.
+    """
+    pending = []
+    for decision in snap.candidate_decisions:
+        key = f"candidate-clear:{decision.id}"
+        if state_get(inv, key) is None:
+            pending.append((key, decision))
+            if len(pending) >= MAX_ROWS_PER_PASS // 2:
+                break
+    if not pending:
+        return
+    with immediate(inv):
+        for key, decision in pending:
+            if state_get(inv, key) is not None:
+                continue
+            inv.execute(
+                "UPDATE identity_candidates SET state='cleared'"
+                " WHERE id=? AND device_a=? AND device_b=? AND state='vetoed'",
+                (decision.candidate_id, decision.device_a, decision.device_b),
+            )
+            state_set(inv, key, "consumed")
+
+
 def apply_plan(
     inv: sqlite3.Connection, snap: Snapshot, cfg: PipelineConfig, now: float,
     clock: Callable[[], float], overrides: sqlite3.Connection | None, plan: Plan,
@@ -354,8 +423,26 @@ def apply_plan(
         if any(isinstance(d, Suggest) for d in plan.decisions)
         else {}
     )
+    # At most one pair per count-bounded decision. Canonical graph resolution is
+    # memoized on the immutable snapshot and primed BEFORE taking the writer lock.
+    planned_vetoes = frozenset(
+        frozenset((snap.canonical(d.from_device), snap.canonical(d.into)))
+        for d in plan.decisions
+        if isinstance(d, Veto)
+    )
     with immediate(inv):
-        applier = Applier(inv, snap, overrides, cfg, now, clock, stats, merge_decisions)
+        applier = Applier(
+            inv,
+            snap,
+            overrides,
+            cfg,
+            now,
+            clock,
+            stats,
+            merge_decisions,
+            plan.veto_generation,
+            planned_vetoes,
+        )
         for decision in plan.decisions:
             applier.apply(decision)
         for key, value in plan.cursors.items():

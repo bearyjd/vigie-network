@@ -17,6 +17,63 @@ from urllib.parse import quote
 BUSY_TIMEOUT_MS = 5000
 LOG = logging.getLogger("vigie_api")
 
+
+def _identity_triggers() -> tuple[str, ...]:
+    """Keep invalidation in the writing transaction, including UPSERT and direct SQL paths.
+
+    Identity input changes invalidate. Override labels/ETags and group display fields
+    do not authorize attaches: only group membership and auto_inherit invalidate those tables.
+    """
+    statements = []
+    columns = {
+        "identity_rules": (
+            "id",
+            "device_id",
+            "signature",
+            "created_by",
+            "expires_at",
+            "revoked_at",
+        ),
+        "identity_links": ("from_device", "into_device", "revoked_at"),
+        "suggestion_decisions": ("suggestion_id", "state"),
+        "candidate_decisions": (
+            "id",
+            "candidate_id",
+            "device_a",
+            "device_b",
+            "action",
+            "decided_by",
+            "decided_at",
+        ),
+        "device_overrides": ("device_id", "group_id"),
+        "groups": ("id", "auto_inherit"),
+    }
+    for table, watched in columns.items():
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            condition = ""
+            if table == "device_overrides":
+                if event == "INSERT":
+                    condition = " WHEN NEW.group_id IS NOT NULL"
+                elif event == "DELETE":
+                    condition = " WHEN OLD.group_id IS NOT NULL"
+                else:
+                    condition = (
+                        " WHEN OLD.group_id IS NOT NEW.group_id OR"
+                        " (OLD.device_id IS NOT NEW.device_id AND"
+                        " (OLD.group_id IS NOT NULL OR NEW.group_id IS NOT NULL))"
+                    )
+            elif event == "UPDATE":
+                condition = " WHEN " + " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}" for column in watched
+                )
+            statements.append(
+                f"CREATE TRIGGER identity_version_{table}_{event.lower()} AFTER {event}"  # noqa: S608
+                f" ON {table}{condition} BEGIN"
+                " UPDATE identity_version SET version=version+1 WHERE singleton=1; END"
+            )
+    return tuple(statements)
+
+
 # Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
 OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
     (
@@ -98,6 +155,30 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "DROP TABLE audit_log",
         "ALTER TABLE audit_log_new RENAME TO audit_log",
         "CREATE INDEX idx_audit_ts ON audit_log(ts, id)",
+    ),
+    (
+        "ALTER TABLE identity_links ADD COLUMN revoked_at TEXT",
+        """CREATE TABLE candidate_decisions (
+          candidate_id TEXT PRIMARY KEY, device_a TEXT NOT NULL, device_b TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (action='clear_veto'), decided_by TEXT NOT NULL,
+          decided_at TEXT NOT NULL, id TEXT NOT NULL UNIQUE
+        )""",
+        """CREATE TABLE api_write_receipts (
+          id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL
+        )""",
+    ),
+    (
+        """CREATE TABLE identity_version (
+          singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+          version INTEGER NOT NULL CHECK (typeof(version)='integer' AND version>=0)
+        )""",
+        "INSERT INTO identity_version (singleton,version) VALUES (1,0)",
+        """CREATE TRIGGER identity_version_no_delete BEFORE DELETE ON identity_version
+          BEGIN SELECT RAISE(ABORT, 'identity version singleton cannot be deleted'); END""",
+        "CREATE INDEX idx_identity_rules_created ON identity_rules(created_at,id)",
+        "CREATE INDEX idx_links_active_into ON identity_links(into_device,from_device)"
+        " WHERE revoked_at IS NULL",
+        *_identity_triggers(),
     ),
 )
 

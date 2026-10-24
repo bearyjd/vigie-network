@@ -56,7 +56,10 @@ def normalize_mac(raw: str) -> str:
 
 
 def link_map(ov: sqlite3.Connection) -> dict[str, str]:
-    return {r["from_device"]: r["into_device"] for r in rows(ov, "SELECT * FROM identity_links")}
+    return {
+        r["from_device"]: r["into_device"]
+        for r in rows(ov, "SELECT * FROM identity_links WHERE revoked_at IS NULL")
+    }
 
 
 def resolve(links: dict[str, str], device_id: str) -> str:
@@ -328,7 +331,9 @@ def device_detail(
     links = link_map(ov)
     canonical = resolve(links, device_id)
     row = _device_row(inv, canonical)
-    item = effective_device(row, override_map(ov), links)
+    overrides = override_map(ov)
+    item = effective_device(row, overrides, links)
+    identity_override = overrides.get(device_id)
     members = [canonical, *(f for f in links if f != canonical and resolve(links, f) == canonical)]
     marks = ",".join("?" * len(members))
     states = rows(
@@ -354,6 +359,7 @@ def device_detail(
         **item,
         "merged_into": canonical if canonical != device_id else None,
         "requested_id": device_id,
+        "identity_override_version": identity_override["version"] if identity_override else 0,
         "macs": [
             {
                 "mac": o["mac"],
@@ -361,7 +367,7 @@ def device_detail(
                 "first_seen": o["first_seen"],
                 "last_seen": o["last_seen"],
                 "current": o["last_seen"] == newest,
-                "link_source": o["link_source"],
+                "link_source": "human" if o["device_id"] != canonical else o["link_source"],
                 "link_rule_id": display_text(o["link_rule_id"]),
             }
             for o in obs
@@ -391,6 +397,6 @@ def resolve_mac(inv: sqlite3.Connection, ov: sqlite3.Connection, raw_mac: str) -
         "mac": mac,
         "device_id": canonical,
         "observed_device_id": found[0]["device_id"],
-        "link_source": found[0]["link_source"],
+        "link_source": "human" if found[0]["device_id"] != canonical else found[0]["link_source"],
         "identity_state": worst_state(states),
     }

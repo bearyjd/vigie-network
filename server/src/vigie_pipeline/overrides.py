@@ -39,6 +39,12 @@ def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
     return conn
 
 
+def link_revocations_supported(conn: sqlite3.Connection) -> bool:
+    """Only live links canonicalize; pre-revocation API schemas contain live links only."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(identity_links)")}
+    return "revoked_at" in columns
+
+
 def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
     """Follow identity_links (from_device -> into_device) to the canonical device.
     Links are flattened on merge, but a bounded walk also tolerates chains and cycles."""
@@ -46,11 +52,14 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
         return device_id
     seen = {device_id}
     current = device_id
+    query = (
+        "SELECT into_device FROM identity_links WHERE from_device=? AND revoked_at IS NULL"
+        if link_revocations_supported(conn)
+        else "SELECT into_device FROM identity_links WHERE from_device=?"
+    )
     for _ in range(MAX_LINK_DEPTH):
         try:
-            row = conn.execute(
-                "SELECT into_device FROM identity_links WHERE from_device=?", (current,)
-            ).fetchone()
+            row = conn.execute(query, (current,)).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc):  # api has not created the schema yet
                 return device_id

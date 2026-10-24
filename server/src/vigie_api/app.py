@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from vigie_api import effective, feeds, tokens, writes
+from vigie_api import effective, feeds, identity_writes, tokens, writes
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
@@ -29,14 +29,20 @@ from vigie_api.models import (
     IdentityState,
     MacResponse,
     PatchResponse,
+    RuleCreate,
+    RulesResponse,
+    SuggestionDecision,
     SuggestionsResponse,
     SuggestionState,
+    VersionedWrite,
+    WriteResultResponse,
 )
 from vigie_api.ratelimit import FailureLimiter
 from vigie_api.schema import open_inventory_ro, open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_ingest.keeper import Keeper
 from vigie_ingest.ratelimit import RateLimiter
+from vigie_pipeline.config import PipelineConfig
 
 DeviceId = Annotated[str, Path(min_length=1, max_length=64)]
 Limit = Annotated[int, Query(ge=1, le=500)]
@@ -44,6 +50,8 @@ VERSION = "0.1.0"
 LOG = logging.getLogger("vigie_api")
 ERROR_TEXT = {
     400: "Malformed cursor, If-Match or updated_since",
+    403: "Token lacks the required write privilege",
+    410: "Suggestion expired",
     401: "Unauthorized (uniform for every authentication failure)",
     404: "Not found",
     409: "device_merged: the device was merged into another; patch the canonical one",
@@ -267,9 +275,13 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         tags=["devices"],
         summary="Set or clear overrides",
         response_model=PatchResponse,
-        responses={200: ETAG_HEADER, **_errors(400, 401, 404, 409, 412, 413, 422, 428, 429, 503)},
+        responses={
+            200: ETAG_HEADER,
+            **_errors(400, 401, 403, 404, 409, 412, 413, 422, 428, 429, 503),
+        },
     )
     def patch_device(
+        request: Request,
         device_id: DeviceId,
         body: DevicePatch,
         principal: Principal,
@@ -278,6 +290,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         response: Response,
         if_match: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
+        principal.require_write()
         result = writes.patch_override(
             inv,
             ov,
@@ -286,6 +299,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             changes={f: getattr(body, f) for f in body.model_fields_set},
             principal=principal.name,
             now_iso=iso_utc(clock()),
+            request_id=request.headers.get("x-request-id", "")[:128] or None,
         )
         response.headers["ETag"] = writes.etag(result["version"])
         return envelope(result)
@@ -348,5 +362,230 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             inv, ov, now_iso=iso_utc(clock()), state=state, cursor=cursor, limit=limit
         )
         return envelope(items, page={"next_cursor": nxt})
+
+    RequestId = Annotated[
+        str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    ]
+    write_errors = _errors(401, 403, 404, 409, 410, 413, 422, 429, 503)
+    pipeline_config = PipelineConfig.from_env()
+    write_description = (
+        "Authenticated human action, audited with X-Request-ID. Supply the current device "
+        "identity_override_version values from device detail in expected_versions "
+        "(or expected_version for one device). Stale "
+        "versions return 409. Body and per-token rate limits apply. Attach-relevant identity "
+        "changes delay in-flight rule attachments; unrelated label/token/audit writes and "
+        "no-op retries do not. "
+    )
+    rule_description = (
+        write_description
+        + "Requires rules:write, granted only to control-app tokens. The control app is "
+        "responsible for obtaining human approval; person-id semantics are unresolved (D6 "
+        "pending). Created_by is app:<token_id>. Rules may target any group, but automatic "
+        "attachment requires an explicit auto_inherit=1 group and all pipeline safety checks. "
+        "Signatures use the shared pipeline parser and Unicode fold. Rules expire by "
+        "expires_at (180 days by default); revocation retains the row and does not detach MACs."
+    )
+
+    @app.post(
+        "/suggestions/{suggestion_id}/accept",
+        tags=["suggestions"],
+        description=write_description
+        + (
+            "Accept label, move_group, quarantine, or merge_identity. Both caller "
+            "versions and suggestion basis must match. Expired suggestions return 410; "
+            "retired/orphaned devices and stale candidates return 409. Merge decisions, "
+            "links, history, and audit commit atomically. remember=true requires "
+            "control-app rules:write and human approval of the evidence signature. "
+            "An already accepted suggestion returns its original result."
+        ),
+        response_model=WriteResultResponse,
+        responses=write_errors,
+    )
+    def accept_suggestion(
+        suggestion_id: DeviceId,
+        body: SuggestionDecision,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            identity_writes.decide(
+                inv,
+                ov,
+                sid=suggestion_id,
+                accept=True,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+                config=pipeline_config,
+                merge_limits=settings,
+            )
+        )
+
+    @app.post(
+        "/suggestions/{suggestion_id}/reject",
+        tags=["suggestions"],
+        description=write_description + "Record a rejection; repeating it is a no-op.",
+        response_model=WriteResultResponse,
+        responses=write_errors,
+    )
+    def reject_suggestion(
+        suggestion_id: DeviceId,
+        body: SuggestionDecision,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            identity_writes.decide(
+                inv,
+                ov,
+                sid=suggestion_id,
+                accept=False,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+                config=pipeline_config,
+            )
+        )
+
+    @app.post(
+        "/identity/merges/{merge_id}/undo",
+        tags=["identity"],
+        description=write_description
+        + (
+            "Revoke the link without deleting it and restore prior overrides. Refuse "
+            "intervening human changes. Repeating an already completed undo is a no-op."
+        ),
+        response_model=WriteResultResponse,
+        responses=write_errors,
+    )
+    def undo_merge(
+        merge_id: DeviceId,
+        body: VersionedWrite,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            identity_writes.undo(
+                inv,
+                ov,
+                merge_id=merge_id,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+            )
+        )
+
+    @app.get(
+        "/identity/rules",
+        tags=["identity"],
+        response_model=RulesResponse,
+        description=(
+            "Keyset-paginated rule history ordered by (created_at, id), including revoked "
+            "and expired rules with computed active state. Pass page.next_cursor as cursor. "
+            "Authentication and rate limiting never write token-use stamps."
+        ),
+        responses=_errors(400, 401, 422, 429),
+    )
+    def get_rules(
+        _: Principal,
+        ov: Ov,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    ):
+        items, nxt = identity_writes.list_rules(ov, iso_utc(clock()), limit=limit, cursor=cursor)
+        return envelope(items, page={"next_cursor": nxt})
+
+    @app.post(
+        "/identity/rules",
+        tags=["identity"],
+        response_model=WriteResultResponse,
+        description=rule_description,
+        responses=write_errors,
+    )
+    def add_rule(
+        body: RuleCreate, principal: Principal, inv: Inv, ov: Ov, x_request_id: RequestId = None
+    ):
+        return envelope(
+            identity_writes.create_rule(
+                inv,
+                ov,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+            )
+        )
+
+    @app.delete(
+        "/identity/rules/{rule_id}",
+        tags=["identity"],
+        description=rule_description,
+        response_model=WriteResultResponse,
+        responses=write_errors,
+    )
+    def delete_rule(
+        rule_id: DeviceId,
+        body: VersionedWrite,
+        principal: Principal,
+        ov: Ov,
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            identity_writes.revoke_rule(
+                None,
+                ov,
+                rule_id=rule_id,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+            )
+        )
+
+    @app.post(
+        "/identity/candidates/{candidate_id}/clear-veto",
+        tags=["identity"],
+        description=write_description
+        + (
+            "Record an overrides-side clear_veto decision for the exact candidate pair. "
+            "For historical merged endpoints, expected_versions covers both exact endpoints "
+            "and their current canonical devices, deduplicated. Read each device detail's "
+            "identity_override_version. Retired historical aliases are allowed only when "
+            "their canonical devices are live. All involved versions advance together. "
+            "The API keeps inventory.db read-only. The pipeline consumes this once on "
+            "its next pass, dismisses the veto, and recomputes/revalidates evidence. "
+            "Clearing alone never attaches; current overlap still blocks attachment."
+        ),
+        response_model=WriteResultResponse,
+        responses=write_errors,
+    )
+    def clear_candidate(
+        candidate_id: DeviceId,
+        body: VersionedWrite,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            identity_writes.clear_veto(
+                inv,
+                ov,
+                candidate_id=candidate_id,
+                body=body,
+                principal=principal,
+                now=iso_utc(clock()),
+                request_id=x_request_id,
+            )
+        )
 
     return app

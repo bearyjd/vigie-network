@@ -179,6 +179,13 @@ collector needs `admin provision --force` (it resets the sequence state).
 token once (stdout) and stores only its SHA-256. `tokens revoke control-app` revokes it. Rotate by creating
 a second token, switching the control app, then revoking the first.
 
+For a control app that obtains human approval of standing identity rules, issue its token with
+`tokens create --id control-app --rules-write`. This grants `rules:write` in addition to ordinary
+app access. Existing app tokens keep ordinary write access but cannot create or revoke rules.
+Service/integration and read-only tokens cannot approve rules. Vigie records the app token id;
+the control app is responsible for obtaining the human's approval (D6 remains pending).
+See [the API contract](api.md) for identity decisions and version guards.
+
 ## Health and logs
 
 `podman-compose ps` shows the healthchecks (`deploy/healthcheck.py`):

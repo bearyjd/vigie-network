@@ -11,6 +11,8 @@ import uuid
 from dataclasses import dataclass
 
 SCOPE_APP = "app"
+SCOPE_RULES = "app rules:write"
+VALID_SCOPES = {SCOPE_APP, SCOPE_RULES, "service", "integration", "read-only"}
 LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 TOKEN_RE = re.compile(r"^vgt_([A-Za-z0-9_-]{1,32})\.([A-Za-z0-9_-]{6,128})$")
 _DUMMY_HASH = hashlib.sha256(b"vigie-dummy-token").hexdigest()
@@ -23,22 +25,38 @@ class Principal:
 
     @property
     def name(self) -> str:
-        return f"app:{self.token_id}"
+        return f"{self.scope.split()[0]}:{self.token_id}"
+
+    def require_write(self, *, rules: bool = False) -> None:
+        from vigie_api.errors import ApiError
+
+        allowed = self.scope == SCOPE_RULES if rules else self.scope in {SCOPE_APP, SCOPE_RULES}
+        if not allowed:
+            raise ApiError(403, "forbidden", "token lacks the required write privilege")
 
 
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_token(conn: sqlite3.Connection, label: str | None = None) -> tuple[str, str]:
+def create_token(
+    conn: sqlite3.Connection,
+    label: str | None = None,
+    *,
+    rules_write: bool = False,
+    scope: str = SCOPE_APP,
+) -> tuple[str, str]:
     """Insert a new app token and return (id, token). The token is shown once, never stored."""
+    if scope not in VALID_SCOPES or (rules_write and scope != SCOPE_APP):
+        raise ValueError("invalid token scope or rules privilege")
+    scope = SCOPE_RULES if rules_write else scope
     token_id = label if label is not None else secrets.token_hex(4)
     if not LABEL_RE.fullmatch(token_id):
         raise ValueError("token id must match [A-Za-z0-9_-]{1,32}")
     token = f"vgt_{token_id}.{secrets.token_urlsafe(32)}"
     conn.execute(
         "INSERT INTO api_tokens (id, token_hash, scope, revoked) VALUES (?,?,?,0)",
-        (token_id, _hash(token), SCOPE_APP),
+        (token_id, _hash(token), scope),
     )
     return token_id, token
 
@@ -58,7 +76,7 @@ def verify_token(conn: sqlite3.Connection, presented: str) -> Principal | None:
         ).fetchone()
     stored = row["token_hash"] if row else _DUMMY_HASH
     equal = hmac.compare_digest(stored.encode(), _hash(presented).encode())
-    if row is None or not equal or row["revoked"] != 0 or row["scope"] != SCOPE_APP:
+    if row is None or not equal or row["revoked"] != 0 or row["scope"] not in VALID_SCOPES:
         return None
     return Principal(token_id=row["id"], scope=row["scope"])
 

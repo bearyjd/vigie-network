@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# Root conntrack service for OpenWrt/GL.iNet. Install as /etc/init.d/vigie-conntrack (0755).
+# The collector (START=95) prepares /tmp/vigie as root:vigie 0751 first. Do not mkdir/chown
+# it here: the helper validates its existing ownership/mode and creates its own 0600 socket.
+# Tested with account/procd fixtures only; firmware respawn, privileges and reboot are unverified.
+
+# rc.common reads these service variables.
+# shellcheck disable=SC2034
+START=96
+# shellcheck disable=SC2034
+STOP=9
+# shellcheck disable=SC2034
+USE_PROCD=1
+
+start_service() {
+	# Fixed binaries and paths: configuration/environment cannot add root helper arguments.
+	PATH=/usr/sbin:/usr/bin:/sbin:/bin
+	export PATH
+	if ! VIGIE_CT_UID=$(id -u vigie) || ! VIGIE_CT_GID=$(id -g vigie); then
+		logger -t vigie 'conntrack: dedicated vigie account missing'
+		return 1
+	fi
+	case "$VIGIE_CT_UID" in '' | *[!0-9]*) return 1 ;; esac
+	case "$VIGIE_CT_GID" in '' | *[!0-9]*) return 1 ;; esac
+	if ! [ "$VIGIE_CT_UID" -ge 1000 ] || ! [ "$VIGIE_CT_UID" -le 4294967294 ] || [ "$VIGIE_CT_UID" -eq 65534 ] ||
+	   ! [ "$VIGIE_CT_GID" -ge 1000 ] || ! [ "$VIGIE_CT_GID" -le 4294967294 ] || [ "$VIGIE_CT_GID" -eq 65534 ]; then
+		logger -t vigie 'conntrack: unsafe vigie uid/gid'
+		return 1
+	fi
+	if [ -L "/tmp/vigie" ] || [ ! -d "/tmp/vigie" ]; then
+		logger -t vigie 'conntrack: start vigie-collector to prepare the shared directory first'
+		return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command /usr/bin/vigie-conntrack \
+		--socket "/tmp/vigie/conntrack.sock" --uid "$VIGIE_CT_UID" --gid "$VIGIE_CT_GID" --interval 60
+	# Root is required for /proc/net/nf_conntrack; never drop this service to vigie.
+	procd_set_param respawn 3600 5 5
+	procd_set_param stderr 1
+	procd_close_instance
+}

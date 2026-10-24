@@ -44,7 +44,10 @@ def test_delete_trigger_aborts(tmp_path: Path) -> None:
 def test_identity_link_self_reference_rejected(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "o.db")
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO identity_links VALUES ('a','a','m','t','u')")
+        conn.execute(
+            "INSERT INTO identity_links (from_device,into_device,merge_id,created_at,created_by)"
+            " VALUES ('a','a','m','t','u')"
+        )
 
 
 def test_override_group_fk_enforced(tmp_path: Path) -> None:

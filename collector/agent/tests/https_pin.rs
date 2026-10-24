@@ -342,69 +342,21 @@ fn handshake_with_a_malformed_certificate_fails_cleanly() {
     );
 }
 
-/// Runs `openssl s_server -tls1_2 <extra>` for `id` and returns the result and duration of a post
-/// to it, or None when openssl is unavailable.
-fn post_to_openssl_tls12(
-    id: &Ident,
-    extra: &[&str],
-) -> Option<(Result<u16, TransportError>, Duration)> {
-    let dir = std::env::temp_dir().join(format!(
-        "vigie-ems-{}-{}",
-        std::process::id(),
-        extra.join("")
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("c.der"), &id.cert).unwrap();
-    std::fs::write(dir.join("k.der"), id.key.serialize_der()).unwrap();
-    let d = dir.display().to_string();
-    let converted = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "openssl x509 -inform der -in {d}/c.der -out {d}/c.pem && openssl pkey -inform der -in {d}/k.der -out {d}/k.pem"
-        ))
-        .output()
-        .is_ok_and(|o| o.status.success());
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let child = converted.then(|| {
-        std::process::Command::new("openssl")
-            .args(["s_server", "-accept", &port.to_string(), "-tls1_2"])
-            .args([
-                "-cert",
-                &format!("{d}/c.pem"),
-                "-key",
-                &format!("{d}/k.pem"),
-            ])
-            .args(["-www", "-quiet"])
-            .args(extra)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    });
-    let out = match child {
-        Some(Ok(mut child)) => {
-            std::thread::sleep(Duration::from_millis(500));
-            let out = child.try_wait().unwrap().is_none().then(|| {
-                let url = format!("https://127.0.0.1:{port}/v1/batch");
-                let pt = PinnedTransport::new(&url, &[id.pin_hex()]).unwrap();
-                let mut t = HttpsTransport::new(pt)
-                    .unwrap()
-                    .with_timeout(Duration::from_secs(2));
-                let start = std::time::Instant::now();
-                let r = t.post(&headers(), b"{}").map(|r| r.status);
-                (r, start.elapsed())
-            });
-            let _ = child.kill();
-            let _ = child.wait();
-            out
-        }
-        _ => None,
-    };
-    let _ = std::fs::remove_dir_all(&dir);
-    out
+/// TLS 1.2 ServerHello (RFC 5246 section 7.4.1.3), with only the optional
+/// extended_master_secret acknowledgment (RFC 7627 section 5.2) varying.
+/// The suite is TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, offered by our ring client.
+fn tls12_server_hello(ems: bool) -> Vec<u8> {
+    let extensions: &[u8] = if ems { &[0x00, 0x17, 0x00, 0x00] } else { &[] };
+    let body_len = 40 + extensions.len();
+    let handshake_len = 4 + body_len;
+    let mut wire = vec![0x16, 0x03, 0x03]; // Handshake record, TLS 1.2
+    wire.extend_from_slice(&(handshake_len as u16).to_be_bytes());
+    wire.extend_from_slice(&[0x02, 0x00, 0x00, body_len as u8, 0x03, 0x03]);
+    wire.extend_from_slice(&[0x42; 32]); // deterministic ServerHello random, test only
+    wire.extend_from_slice(&[0x00, 0xc0, 0x2b, 0x00]); // empty session ID, suite, null compression
+    wire.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    wire.extend_from_slice(extensions);
+    wire
 }
 
 #[test]
@@ -416,22 +368,42 @@ fn tls12_without_extended_master_secret_is_refused() {
     );
 
     let id = Ident::new();
-    // Control: with EMS the handshake completes, then openssl's `-www` mode sits waiting for a
-    // GET it never gets, so the post runs into its 2 s deadline. A refused handshake is an
-    // immediate error instead.
-    let Some((control, took)) = post_to_openssl_tls12(&id, &[]) else {
-        eprintln!("openssl unavailable: skipped");
-        return;
-    };
-    assert!(
-        control.is_err() && took >= Duration::from_secs(1),
-        "control: {control:?} {took:?}"
+    // A complete real TLS 1.2 handshake and HTTP exchange remains the positive control.
+    assert_eq!(
+        try_post(&id, &id, &[id.pin_hex()], &[&rustls::version::TLS12]).unwrap(),
+        200
     );
 
-    let (no_ems, took) = post_to_openssl_tls12(&id, &["-no_ems"]).unwrap();
-    assert!(no_ems.is_err());
-    assert!(
-        took < Duration::from_secs(1),
-        "handshake without EMS was not refused promptly: {no_ems:?} after {took:?}"
-    );
+    // OpenSSL 3.0 has no `s_server -no_ems`. Feed the ServerHello directly into the
+    // production client config so missing tools, timing, or socket errors cannot pass.
+    for ems in [true, false] {
+        let config = vigie_agent::tls_pin::client_config(&[id.pin()]).unwrap();
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        client.write_tls(&mut Vec::new()).unwrap(); // send ClientHello before the reply
+        client
+            .read_tls(&mut tls12_server_hello(ems).as_slice())
+            .unwrap();
+        let result = client.process_new_packets();
+        if ems {
+            // Validate the fixture: this exact flight with EMS is accepted and
+            // advances negotiation to TLS 1.2, waiting for the certificate flight.
+            assert!(result.is_ok(), "EMS ServerHello control: {result:?}");
+            assert_eq!(
+                client.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_2)
+            );
+            assert!(client.is_handshaking());
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::ExtendedMasterSecretExtensionRequired
+                )
+            );
+        }
+    }
 }

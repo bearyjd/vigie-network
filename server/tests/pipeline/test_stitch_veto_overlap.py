@@ -610,7 +610,7 @@ def test_a_mature_overlap_is_a_permanent_veto_that_only_a_human_dismissal_clears
     assert [c["state"] for c in candidates(data)] == ["vetoed"] and source_of(data, b) == "self"
     run_at(data, T0 + 4100)
     assert [c["state"] for c in candidates(data)] == ["vetoed"]
-    data.inv.execute("UPDATE identity_candidates SET state='dismissed'")  # the API's "clear"
+    data.inv.execute("UPDATE identity_candidates SET state='dismissed'")  # a direct dismissal
     run_at(data, T0 + 4200)
     assert [c["state"] for c in candidates(data)] == ["dismissed"]
     assert source_of(data, b) == "self"  # the overlap is real: dismissal does not invent a clear
