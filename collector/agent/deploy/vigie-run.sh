@@ -5,7 +5,7 @@
 # themselves, so this counts those exits in a state dir the init script prepares and logs once
 # the retry limit is reached. procd has no "gave up" hook; the count is the next best thing.
 COLLECTOR=/usr/bin/vigie-collector
-STATE=/var/run/vigie-collector
+STATE=/var/run/vigie-collector-root/state
 LIMIT=5
 if [ "${VIGIE_TEST:-}" = 1 ]; then
 	COLLECTOR="${VIGIE_COLLECTOR_BIN:-$COLLECTOR}"

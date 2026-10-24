@@ -167,7 +167,11 @@ def assess(samples, *, mode="simulated"):
             for key in (*_IDS, "collector_start", "helper_start"):
                 if key in before and key in after and before[key] != after[key]:
                     failures.add("boot_or_process_restart")
-            if before.get("logical_cpus") != after.get("logical_cpus"):
+            if (
+                _number(before.get("logical_cpus"))
+                and _number(after.get("logical_cpus"))
+                and before["logical_cpus"] != after["logical_cpus"]
+            ):
                 failures.add("cpu_topology_changed")
             for key in ("collector_cpu_ticks", "total_cpu_ticks"):
                 if (

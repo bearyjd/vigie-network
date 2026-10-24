@@ -180,6 +180,19 @@ class AdditionalBoundaries(unittest.TestCase):
         values[1]["logical_cpus"] = 4
         self.assertEqual(soak.assess(values)["status"], "fail")
 
+    def test_missing_meter_sample_is_pending_not_a_fictitious_restart(self):
+        values = [sample(0), sample(60)]
+        for key in [
+            "router_boot_id",
+            "collector_start",
+            "helper_start",
+            "logical_cpus",
+        ]:
+            values[-1].pop(key)
+        result = soak.assess(values)
+        self.assertEqual(result["status"], "pending")
+        self.assertIn("missing_metrics", result["reasons"])
+
     def test_nonfinite_record_failure_survives_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "journal.jsonl"
