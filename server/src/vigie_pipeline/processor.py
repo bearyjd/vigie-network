@@ -15,6 +15,7 @@ from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
+from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -135,6 +136,7 @@ def _process_batches(
         for rowid, batch_id, received in _pending(inv, collector):
             try:
                 acts, skipped = read_batch(config.data_dir, collector, batch_id)
+                measured = read_measurements(inv, config.data_dir, collector, batch_id)
             except ShardReadError as exc:
                 # never advance past an unreadable batch: it and its successors stay pending
                 failures.append(exc)
@@ -144,6 +146,7 @@ def _process_batches(
                 record_activity(
                     inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
                 )
+                apply_measurements(inv, measured)
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)

@@ -161,6 +161,21 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " WHEN OLD.state='vetoed' BEGIN UPDATE pipeline_meta"
         " SET value=CAST(value AS INTEGER)+1 WHERE key='veto_generation'; END",
     ),
+    (
+        """CREATE TABLE measurement_batches (
+          collector_id TEXT NOT NULL, batch_id TEXT NOT NULL, window_start INTEGER,
+          window_end INTEGER, received_at TEXT NOT NULL, hour INTEGER, quality TEXT NOT NULL,
+          PRIMARY KEY(collector_id,batch_id))""",
+        "CREATE INDEX idx_measurement_windows ON measurement_batches(collector_id,hour,window_end)",
+        """CREATE TABLE measurements_hourly (
+          collector_id TEXT NOT NULL, mac TEXT NOT NULL, hour INTEGER NOT NULL,
+          bytes_up INTEGER NOT NULL, bytes_down INTEGER NOT NULL, flows INTEGER NOT NULL,
+          dns_queries INTEGER NOT NULL, PRIMARY KEY(collector_id,mac,hour))""",
+        """CREATE TABLE coverage_hourly (
+          collector_id TEXT NOT NULL, hour INTEGER NOT NULL, observed_seconds INTEGER NOT NULL,
+          qualified_seconds INTEGER NOT NULL, reasons TEXT NOT NULL,
+          PRIMARY KEY(collector_id,hour))""",
+    ),
 )
 
 PIPELINE_TABLES = (

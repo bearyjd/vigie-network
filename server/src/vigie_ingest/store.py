@@ -292,10 +292,11 @@ def _commit_inventory(
     if rejection:
         return rejection
     conn.execute(
-        "INSERT INTO batches (collector_id, batch_id, received_at, truncated, dropped_batches)"
-        " VALUES (?,?,?,?,?)",
+        "INSERT INTO batches (collector_id,batch_id,received_at,truncated,dropped_batches,"
+        "window_start,window_end,observation_kind,health) VALUES (?,?,?,?,?,?,?,?,?)",
         (batch.collector_id, batch.batch_id, iso_utc(now), json.dumps(batch.truncated),
-         batch.dropped_batches),
+         batch.dropped_batches, batch.window_start, batch.window_end, batch.observation_kind,
+         batch.health.model_dump_json() if batch.health is not None else None),
     )  # fmt: skip
     conn.execute(
         "UPDATE collectors SET last_seq=?, boot_id=?, last_sent_ts=MAX(last_sent_ts, ?) WHERE id=?",

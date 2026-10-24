@@ -73,6 +73,13 @@ INVENTORY_MIGRATIONS: Sequence[str] = (
     ALTER TABLE batches_new RENAME TO batches;
     CREATE INDEX idx_batches_received ON batches(received_at);
     """,
+    # v4: retain observation windows beyond raw shards; NULL means legacy unknown.
+    """
+    ALTER TABLE batches ADD COLUMN window_start INTEGER;
+    ALTER TABLE batches ADD COLUMN window_end INTEGER;
+    ALTER TABLE batches ADD COLUMN observation_kind TEXT;
+    ALTER TABLE batches ADD COLUMN health TEXT;
+    """,
 )
 
 SHARD_MIGRATIONS: Sequence[str] = (
