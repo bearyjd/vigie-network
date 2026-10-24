@@ -329,10 +329,11 @@ fn all_scripts_parse() {
 }
 
 #[test]
-fn init_script_runs_the_agent_as_the_dedicated_vigie_user() {
+fn init_script_requires_root_privdrop_before_the_unprivileged_wrapper() {
     let t = fs::read_to_string(script("vigie-collector.init")).unwrap();
-    assert!(t.contains("procd_set_param user vigie"));
-    assert!(!t.contains("param user nobody"));
+    assert!(t.contains("procd_set_param command /usr/bin/vigie-privdrop \"$UID_N\" \"$GID_N\" /usr/libexec/vigie/vigie-run.sh"));
+    assert!(!t.contains("procd_set_param user "));
+    assert!(!t.contains("procd_set_param group "));
 }
 
 #[test]

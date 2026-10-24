@@ -223,7 +223,7 @@ class LogfsTests(unittest.TestCase):
         self.assertIn(b"symlink", result.stderr)
         self.assertEqual(victim.read_text(), "retain")
 
-    def test_collector_init_gates_all_work_and_sets_explicit_group_and_core_limits(
+    def test_collector_init_gates_all_work_and_uses_root_dropper_before_unprivileged_wrapper(
         self,
     ):
         trace = self.w.root / "trace"
@@ -236,7 +236,7 @@ class LogfsTests(unittest.TestCase):
             )
         init = self.w.root / "collector.init"
         init.write_text(source)
-        program = '. "$1"; id() { return 0; }; logger() { :; }; procd_open_instance() { echo OPEN >> "$TRACE"; }; procd_set_param() { printf \'[%s]\' "$@" >> "$TRACE"; printf \'\\n\' >> "$TRACE"; }; procd_close_instance() { :; }; start_service'
+        program = '. "$1"; id() { case "$*" in "-u vigie") echo "${FIXTURE_UID:-20061}";; "-g vigie") echo "${FIXTURE_GID:-20062}";; *) return 1;; esac; }; logger() { :; }; procd_open_instance() { echo OPEN >> "$TRACE"; }; procd_set_param() { printf \'[%s]\' "$@" >> "$TRACE"; printf \'\\n\' >> "$TRACE"; }; procd_close_instance() { :; }; start_service'
         result = subprocess.run(
             ["sh", "-c", program, "fixture", str(init)],
             env=dict(self.w.env, TRACE=str(trace)),
@@ -249,9 +249,36 @@ class LogfsTests(unittest.TestCase):
             text.splitlines()[:4],
             ["vigie-logfs.sh", "vigie-state-dir.sh", "vigie-dnsmasq-dropin.sh", "OPEN"],
         )
-        self.assertIn("[user][vigie]", text)
-        self.assertIn("[group][vigie]", text)
+        self.assertIn(
+            "[command][/usr/bin/vigie-privdrop][20061][20062][/usr/libexec/vigie/vigie-run.sh][--config][/etc/vigie/collector.conf]",
+            text,
+        )
+        self.assertNotIn("[user]", text)
+        self.assertNotIn("[group]", text)
         self.assertIn("[limits][core=0 0]", text)
+        for uid, gid in [
+            ("0", "20062"),
+            ("65534", "20062"),
+            ("020061", "20062"),
+            ("20061", "0"),
+            ("20061", "65534"),
+            ("20061", "4294967295"),
+        ]:
+            trace.unlink()
+            result = subprocess.run(
+                ["sh", "-c", program, "fixture", str(init)],
+                env=dict(
+                    self.w.env, TRACE=str(trace), FIXTURE_UID=uid, FIXTURE_GID=gid
+                ),
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                trace.read_text(),
+                "vigie-logfs.sh\n",
+                "unsafe account rejected before state/DNS/procd",
+            )
         trace.unlink()
         self.w.write_script(
             self.w.root / "vigie-logfs.sh",
