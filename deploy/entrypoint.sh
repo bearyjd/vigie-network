@@ -12,6 +12,9 @@
 #   - overrides.db exists AT ALL (file, symlink, even a dangling one) in either of those.
 # Nothing is ever deleted or repaired here; a human removes the stale entry.
 set -eu
+# SQLite and other runtime data must be private even when the host's umask is 022.
+# This governs new files only; it does not repair permissions on existing volumes.
+umask 077
 
 DATA_DIR="${VIGIE_DATA_DIR:-/var/lib/vigie}"
 INVENTORY_DIR=$(dirname -- "${VIGIE_INVENTORY_PATH:-$DATA_DIR/inventory.db}")

@@ -1,14 +1,19 @@
 # Operations guide
 
 Short guide for running the server stack in `deploy/`. Setup is in the top-level
-[`README.md`](../README.md). Nothing here has been run against a started stack yet (the image has
-not been built); commands marked *unverified* are written from the code and podman documentation.
+[`README.md`](../README.md). A real rootless Podman loopback pilot has exercised synthetic ingest/API traffic, actual
+mount boundaries, private creation modes and individual service restarts; see the
+[2026-10-24 validation report](deployment-validation-2026-10-24.md). Production host placement,
+real-router operation, host reboot/restore and a 48-hour soak remain unverified. Other commands
+marked *unverified* still require their own operational validation.
 
 ## Permission model: three processes, three volumes
 
-Ownership follows the PRP section 5 table. Nothing in this file has been run against a started
-stack (no image build, no real podman); the read-only-mount behavior below was tested with
-bubblewrap bind mounts (`server/tests/test_ro_mount_wal.py`), not with containers.
+Ownership follows the PRP section 5 table. The candidate image's real mounts and write boundaries
+were checked in an isolated synthetic pilot, alongside the existing bubblewrap tests. The entrypoint
+uses `umask 077` so newly created private files, including fresh SQLite database/WAL/SHM files,
+are 0600. This does not repair pre-existing file modes; inspect and handle existing volumes explicitly
+before an upgrade. Directory restrictions remain part of the privacy model.
 
 | Process | `inventory.db` | raw shards | `overrides.db` | Secrets |
 |---|---|---|---|---|
