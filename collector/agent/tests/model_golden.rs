@@ -31,7 +31,7 @@ fn empty_batch_golden() {
             r#""window_start":1760000000,"window_end":1760000060,"truncated":{},"#,
             r#""leases":[],"neigh":[],"dns":[],"conntrack":[],"sightings":[],"#,
             r#""health":{"dns_log_quiet":false,"rss_kb":null,"spool_batches":null,"uptime_s":null},"#,
-            r#""sent_ts":1760000061,"dropped_batches":0}"#
+            r#""sent_ts":1760000061,"observation_kind":"observation","dropped_batches":0}"#
         )
     );
 }
@@ -99,7 +99,7 @@ fn full_batch_golden() {
     assert!(body.contains(r#""dns":[{"ts":1760000010,"mac":"aa:bb:cc:dd:ee:01","qname":"example.com","qtype":"A","answer_ip":"93.184.216.34"}]"#));
     assert!(body.contains(r#""conntrack":[{"mac":"aa:bb:cc:dd:ee:01","dst_ip":null,"dst_port":null,"proto":"other","bytes_up":5,"bytes_down":6,"flows":2}]"#));
     assert!(body.contains(r#""sightings":[{"mac":"aa:bb:cc:dd:ee:01","kind":"mdns","name":"host.local","service":null,"ua":null}]"#));
-    assert!(body.ends_with(r#""health":{"dns_log_quiet":true,"rss_kb":900,"spool_batches":1,"uptime_s":60},"sent_ts":1760000061,"dropped_batches":2}"#));
+    assert!(body.ends_with(r#""health":{"dns_log_quiet":true,"rss_kb":900,"spool_batches":1,"uptime_s":60},"sent_ts":1760000061,"observation_kind":"observation","dropped_batches":2}"#));
 }
 
 #[test]
@@ -131,4 +131,20 @@ fn constructors_enforce_schema_limits() {
     .unwrap();
     assert_eq!(d.qname.len(), 253);
     assert_eq!(d.answer_ip, None);
+}
+
+#[test]
+fn observation_and_probe_kinds_are_explicit_and_size_accounted() {
+    let batch = encode(
+        &meta(),
+        &Sections::default(),
+        &BTreeMap::new(),
+        &Health::default(),
+    );
+    let observation: serde_json::Value = serde_json::from_slice(&batch.body(1, 0)).unwrap();
+    assert_eq!(observation["observation_kind"], "observation");
+    let probe = batch.as_probe();
+    let value: serde_json::Value = serde_json::from_slice(&probe.body(1, 0)).unwrap();
+    assert_eq!(value["observation_kind"], "probe");
+    assert!(probe.body(u64::MAX, u64::MAX).len() <= probe.len());
 }

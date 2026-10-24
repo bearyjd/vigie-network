@@ -78,6 +78,7 @@ class PipelineConfig:
     # Direct locations (VIGIE_INVENTORY_PATH / VIGIE_OVERRIDES_PATH); None = under data_dir.
     inventory_db: Path | None = None
     overrides_db: Path | None = None
+    monitoring_large_upload_bytes: int = 1024 * 1024 * 1024
     # Identity stitching
     suggest_threshold: float = SUGGEST_THRESHOLD_DEFAULT
     overlap_grace_s: int = OVERLAP_GRACE_DEFAULT_S
@@ -86,6 +87,8 @@ class PipelineConfig:
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
 
     def __post_init__(self) -> None:
+        if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
+            raise ValueError("monitoring_large_upload_bytes outside supported bounds")
         if self.transient_window_s < 1:
             raise ValueError("transient_window_s must be positive")
         if self.transient_min_dwell_s < 0 or self.promotion_cap_per_hour < 0:
@@ -110,6 +113,9 @@ class PipelineConfig:
         source = os.environ if env is None else env
         return cls(
             data_dir=Path(source.get("VIGIE_DATA_DIR", "/var/lib/vigie")),
+            monitoring_large_upload_bytes=int(
+                source.get("VIGIE_MONITORING_LARGE_UPLOAD_BYTES", 1024**3)
+            ),
             transient_window_s=int(
                 source.get("VIGIE_TRANSIENT_WINDOW_S", TRANSIENT_WINDOW_DEFAULT_S)
             ),

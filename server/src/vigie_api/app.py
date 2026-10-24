@@ -13,11 +13,13 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from vigie_api import effective, feeds, identity_writes, tokens, writes
+from vigie_api import effective, feeds, identity_writes, monitoring, tokens, writes
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
 from vigie_api.models import (
+    ActivityResponse,
+    CoverageResponse,
     DevicePatch,
     DeviceResponse,
     DevicesResponse,
@@ -27,6 +29,8 @@ from vigie_api.models import (
     EventsResponse,
     HealthResponse,
     IdentityState,
+    IncidentResponse,
+    IncidentsResponse,
     MacResponse,
     PatchResponse,
     RuleCreate,
@@ -209,6 +213,103 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     )  # fmt: skip
     def healthz() -> dict[str, Any]:
         return envelope("ok")
+
+    @app.get(
+        "/coverage",
+        tags=["monitoring"],
+        response_model=CoverageResponse,
+        responses=_errors(400, 401, 404, 422, 429, 503),
+    )
+    def get_coverage(
+        _: Principal,
+        inv: Inv,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        from_hour: Annotated[int | None, Query(ge=0)] = None,
+        to_hour: Annotated[int | None, Query(ge=0)] = None,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> dict[str, Any]:
+        monitoring.required(inv)
+        start, stop, nxt = monitoring.page(
+            "coverage", collector_id, None, from_hour, to_hour, limit, cursor, clock()
+        )
+        return envelope(
+            {
+                "collector": monitoring.collector_summary(inv, collector_id),
+                "hours": monitoring.coverage(inv, collector_id, start, stop, clock()),
+            },
+            page={"next_cursor": nxt},
+        )
+
+    @app.get(
+        "/devices/{device_id}/activity",
+        tags=["monitoring"],
+        response_model=ActivityResponse,
+        responses=_errors(400, 401, 404, 409, 422, 429, 503),
+    )
+    def get_activity(
+        _: Principal,
+        inv: Inv,
+        ov: Ov,
+        device_id: DeviceId,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        from_hour: Annotated[int | None, Query(ge=0)] = None,
+        to_hour: Annotated[int | None, Query(ge=0)] = None,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> dict[str, Any]:
+        monitoring.required(inv)
+        monitoring.collector_summary(inv, collector_id)
+        start, stop, nxt = monitoring.page(
+            "activity", collector_id, device_id, from_hour, to_hour, limit, cursor, clock()
+        )
+        hours = monitoring.coverage(inv, collector_id, start, stop, clock())
+        return envelope(
+            monitoring.activity(inv, ov, device_id, collector_id, start, stop, hours),
+            page={"next_cursor": nxt},
+        )
+
+    @app.get(
+        "/incidents",
+        tags=["monitoring"],
+        response_model=IncidentsResponse,
+        responses=_errors(400, 401, 404, 409, 422, 429, 503),
+    )
+    def get_incidents(
+        _: Principal,
+        inv: Inv,
+        ov: Ov,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        device_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        cursor: Annotated[str | None, Query(max_length=1024)] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> dict[str, Any]:
+        monitoring.required(inv)
+        monitoring.collector_summary(inv, collector_id)
+        items, nxt = monitoring.incident_list(inv, ov, collector_id, device_id, cursor, limit)
+        return envelope(items, page={"next_cursor": nxt})
+
+    @app.get(
+        "/incidents/{incident_id}",
+        tags=["monitoring"],
+        response_model=IncidentResponse,
+        responses=_errors(401, 404, 422, 429, 503),
+    )
+    def get_incident(
+        _: Principal,
+        inv: Inv,
+        ov: Ov,
+        incident_id: DeviceId,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+    ) -> dict[str, Any]:
+        monitoring.required(inv)
+        row = inv.execute(
+            "SELECT * FROM monitoring_incidents WHERE id=? AND collector_id=?",
+            (incident_id, collector_id),
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "incident_not_found", "incident not found")
+        return envelope(monitoring.incident_row(inv, ov, row))
 
     @app.get(
         "/devices",

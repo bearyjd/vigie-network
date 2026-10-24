@@ -93,6 +93,7 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
     spec = json.loads(render())
     assert spec["openapi"].startswith("3.1")
     assert set(spec["paths"]) == {
+        "/coverage", "/devices/{device_id}/activity", "/incidents", "/incidents/{incident_id}",
         "/healthz", "/devices", "/devices/{device_id}", "/macs/{mac}", "/events", "/suggestions",
         "/suggestions/{suggestion_id}/accept", "/suggestions/{suggestion_id}/reject",
         "/identity/merges/{merge_id}/undo", "/identity/rules", "/identity/rules/{rule_id}",
@@ -105,6 +106,10 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
 
 
 EXPECTED_ERRORS = {
+    ("get", "/coverage"): {"400", "401", "404", "422", "429", "503"},
+    ("get", "/devices/{device_id}/activity"): {"400", "401", "404", "409", "422", "429", "503"},
+    ("get", "/incidents"): {"400", "401", "404", "409", "422", "429", "503"},
+    ("get", "/incidents/{incident_id}"): {"401", "404", "422", "429", "503"},
     ("get", "/devices"): {"400", "401", "422", "429", "503"},
     ("get", "/devices/{device_id}"): {"401", "404", "422", "429", "503"},
     ("patch", "/devices/{device_id}"): {
