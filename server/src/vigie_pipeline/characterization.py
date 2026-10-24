@@ -64,7 +64,7 @@ def _number(value: object) -> bool:
 def _text(value: object) -> bool:
     if value is None:
         return True
-    if not isinstance(value, str):
+    if not isinstance(value, str) or len(value) > MAX_TEXT_BYTES:
         return False
     try:
         return len(value.encode("utf-8")) <= MAX_TEXT_BYTES and all(
@@ -124,7 +124,7 @@ def classify(
             observation.kind not in ("mdns", "ssdp", "dhcp")
             or not _number(timestamp)
             or timestamp > now
-            or not math.isfinite(timestamp + ttl_seconds)
+            or not _number(timestamp + ttl_seconds)
         ):
             return Classification(reason="invalid_input")
         if observation.kind != "mdns" or not observation.service:

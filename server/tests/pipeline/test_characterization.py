@@ -187,3 +187,27 @@ def test_malformed_kind_and_non_observation_fail_closed():
 def test_custom_ttl_and_exact_expiry_boundary():
     assert classify(tv(9), NOW, ttl_seconds=10).valid_until == NOW + 1
     assert classify(tv(10), NOW, ttl_seconds=10).inferred_type == "unknown"
+
+
+def test_finite_integer_timestamps_with_unrepresentable_expiry_fail_closed():
+    huge = 10**308
+    signals = [Observation(MAC, huge, "mdns", "_googlecast._tcp")]
+    assert classify(signals, huge, ttl_seconds=huge).reason == "invalid_input"
+
+
+def test_rejecting_oversized_claim_uses_bounded_extra_memory():
+    import tracemalloc
+
+    # Allocate the attacker-controlled input before measuring classifier overhead.
+    oversized = "é" * 1_000_000
+    signals = [obs(oversized)]
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before, _ = tracemalloc.get_traced_memory()
+        result = classify(signals, NOW)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result.reason == "invalid_input"
+    assert peak - before < 64 * 1024, "rejecting one claim must not allocate its full encoding"
