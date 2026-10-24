@@ -198,9 +198,22 @@ def check_compose_config() -> None:
         envfile = Path(tmp) / "env"
         envfile.write_text((ROOT / "deploy" / ".env.example").read_text())
         base = [tool, "--env-file", str(envfile), "-f", str(ROOT / "deploy" / "compose.yaml")]
-        ok = subprocess.run([*base, "config"], capture_output=True, text=True, check=False)
-        if ok.returncode != 0:
-            err(f"podman-compose config failed: {ok.stderr[-300:]}")
+        setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
+        clean_env = {k: v for k, v in os.environ.items() if k != setting}
+        for expected, config_env in (("1073741824", clean_env),
+                                     ("2097152", {**clean_env, setting: "2097152"})):
+            ok = subprocess.run([*base, "config"], capture_output=True, text=True,
+                                env=config_env, check=False)
+            if ok.returncode != 0:
+                err(f"podman-compose config failed: {ok.stderr[-300:]}")
+                continue
+            rendered = yaml.safe_load(ok.stdout)
+            for role in ("ingest", "pipeline", "api"):
+                actual = rendered["services"][role]["environment"].get(setting)
+                if role == "pipeline" and str(actual) != expected:
+                    err(f"rendered pipeline monitoring threshold differs from {expected}")
+                elif role != "pipeline" and actual is not None:
+                    err(f"rendered {role} unexpectedly receives monitoring threshold")
         env = {k: v for k, v in os.environ.items() if k != "VIGIE_LAN_ADDR"}
         bare = Path(tmp) / "empty"
         bare.write_text("")
@@ -211,6 +224,18 @@ def check_compose_config() -> None:
         if res.returncode == 0:
             err("compose accepted an unset VIGIE_LAN_ADDR (would publish on every interface)")
     print("podman-compose config: ok")
+
+
+def check_monitoring_config(doc: dict, example: str) -> None:
+    setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
+    expected = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
+    if not re.search(r"(?m)^VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824(?:\s|$)", example):
+        err("monitoring upload default must be documented as 1073741824 bytes")
+    if doc["services"]["pipeline"]["environment"].get(setting) != expected:
+        err("pipeline must forward the configurable monitoring upload threshold with its default")
+    for service in ("ingest", "api"):
+        if setting in doc["services"][service]["environment"]:
+            err(f"monitoring upload threshold belongs only to pipeline, not {service}")
 
 
 def check_env_names() -> None:
@@ -232,6 +257,8 @@ def check_env_names() -> None:
         if var not in {"VIGIE_DATA_DIR", "VIGIE_SECRETS_DIR", "VIGIE_TLS_CERT", "VIGIE_TLS_KEY",
                        "VIGIE_INSECURE_DEV", "VIGIE_TEST"}:
             err(f"server/src reads {var} but .env.example does not document it")
+    check_monitoring_config(yaml.safe_load((ROOT / "deploy/compose.yaml").read_text()),
+                            (ROOT / "deploy/.env.example").read_text())
     print("env names: ok")
 
 
@@ -343,6 +370,18 @@ def self_test() -> None:
     _fails("docs table out of step with compose", check_mounts, good, deploy_md.replace("| rw |", "| ro |"))
     _fails("api sharing ingest's TLS secrets", check_services, shared_cert)
     _fails("an unpinned base image under --release", check_images, "ARG PYTHON_IMAGE=python:3.12\nARG UV_IMAGE=uv:1", True)
+    setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
+    contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
+    contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
+    example = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824\n"
+    check_monitoring_config(contract, example)
+    _fails("missing monitoring default documentation", check_monitoring_config, contract, "")
+    _fails("incorrect monitoring default documentation", check_monitoring_config, contract, example.replace("1073741824", "1"))
+    contract["services"]["api"]["environment"][setting] = "1"
+    _fails("monitoring setting forwarded to wrong role", check_monitoring_config, contract, example)
+    del contract["services"]["api"]["environment"][setting]
+    del contract["services"]["pipeline"]["environment"][setting]
+    _fails("monitoring threshold not forwarded", check_monitoring_config, contract, example)
     # and the checks accept the real inputs
     check_mounts(good, deploy_md)
     check_firewall(readme)

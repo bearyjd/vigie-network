@@ -239,7 +239,7 @@ impl Agent {
         let Some(meta) = self.meta(now) else { return };
         let sections = self.window.take_identity();
         let b = build(&meta, sections, &self.health(false), BATCH_CAP);
-        self.engine.enqueue(b.encoded);
+        self.engine.enqueue(b.encoded.as_probe());
     }
 
     /// Before the first server `Date` the only thing sent is an empty probe: its reply, accepted
@@ -250,7 +250,7 @@ impl Agent {
         }
         let Some(meta) = self.meta(now) else { return };
         let b = build(&meta, Sections::default(), &self.health(false), BATCH_CAP);
-        self.engine.enqueue(b.encoded);
+        self.engine.enqueue(b.encoded.as_probe());
     }
 
     fn flush_window(&mut self, now: u64, mono_s: u64) {
@@ -493,6 +493,9 @@ mod tests {
         let now = BUILD_TS + 100;
         a.flush_window(now, 61);
         assert_eq!(a.engine.spool.len(), 1, "one probe");
+        let value: serde_json::Value =
+            serde_json::from_slice(&a.engine.spool.front().unwrap().body(now, 0)).unwrap();
+        assert_eq!(value["observation_kind"], "probe");
         assert_eq!(
             a.window.dns_count(),
             1,

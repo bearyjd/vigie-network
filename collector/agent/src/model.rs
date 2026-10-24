@@ -21,8 +21,8 @@ pub const MAX_SIGHTINGS: usize = 1000;
 pub const MAX_EPOCH: u64 = 1 << 40;
 /// Schema: counters are <= i64::MAX.
 pub const MAX_COUNT: u64 = i64::MAX as u64;
-/// Upper bound of the bytes appended after the stored head (`sent_ts` + `dropped_batches`).
-pub const TAIL_RESERVE: usize = 64;
+/// Upper bound of the bytes appended after the stored head (`sent_ts`, `observation_kind`, `dropped_batches`).
+pub const TAIL_RESERVE: usize = 104;
 
 /// Replace control characters with `?` and cap to `max` chars (schema limits are in chars).
 pub fn clean_text(s: &str, max: usize) -> String {
@@ -359,6 +359,7 @@ pub struct EncodedBatch {
     /// End of the batch's window (epoch seconds), kept for stale-batch accounting.
     pub window_end: u64,
     head: String,
+    probe: bool,
 }
 
 fn write_array<T>(out: &mut String, name: &str, items: &[T], w: impl Fn(&T, &mut String)) {
@@ -421,15 +422,24 @@ pub fn encode(
         batch_id: meta.batch_id.clone(),
         window_end: meta.window_end,
         head: out,
+        probe: false,
     }
 }
 
 impl EncodedBatch {
+    /// A partial identity/clock probe is never an observation coverage window.
+    pub fn as_probe(mut self) -> Self {
+        self.probe = true;
+        self
+    }
+
     /// Final request body for one send attempt.
     pub fn body(&self, sent_ts: u64, dropped_batches: u64) -> Vec<u8> {
         let mut out = String::with_capacity(self.head.len() + TAIL_RESERVE);
         out.push_str(&self.head);
         out.push_str(&sent_ts.min(MAX_EPOCH).to_string());
+        json::key(&mut out, false, "observation_kind");
+        json::push_str(&mut out, if self.probe { "probe" } else { "observation" });
         json::key(&mut out, false, "dropped_batches");
         out.push_str(&dropped_batches.min(MAX_COUNT).to_string());
         out.push('}');

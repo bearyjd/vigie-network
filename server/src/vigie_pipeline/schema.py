@@ -161,6 +161,101 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         " WHEN OLD.state='vetoed' BEGIN UPDATE pipeline_meta"
         " SET value=CAST(value AS INTEGER)+1 WHERE key='veto_generation'; END",
     ),
+    (
+        """CREATE TABLE measurement_batches (
+          collector_id TEXT NOT NULL, batch_id TEXT NOT NULL, window_start INTEGER,
+          window_end INTEGER, received_at TEXT NOT NULL, hour INTEGER, quality TEXT NOT NULL,
+          PRIMARY KEY(collector_id,batch_id))""",
+        "CREATE INDEX idx_measurement_windows ON measurement_batches(collector_id,hour,window_end)",
+        """CREATE TABLE measurements_hourly (
+          collector_id TEXT NOT NULL, mac TEXT NOT NULL, hour INTEGER NOT NULL,
+          bytes_up INTEGER NOT NULL, bytes_down INTEGER NOT NULL, flows INTEGER NOT NULL,
+          dns_queries INTEGER NOT NULL, PRIMARY KEY(collector_id,mac,hour))""",
+        """CREATE TABLE coverage_hourly (
+          collector_id TEXT NOT NULL, hour INTEGER NOT NULL, observed_seconds INTEGER NOT NULL,
+          qualified_seconds INTEGER NOT NULL, reasons TEXT NOT NULL,
+          PRIMARY KEY(collector_id,hour))""",
+    ),
+    (
+        "CREATE TABLE monitoring_assignment_versions (mac TEXT PRIMARY KEY, version IN"
+        "TEGER NOT NULL)",
+        """CREATE TRIGGER monitoring_assignment_change AFTER UPDATE OF
+        device_id,link_source,link_rule_id
+          ON observations WHEN OLD.device_id IS NOT NEW.device_id OR OLD.link_source IS NOT
+          NEW.link_source
+          OR OLD.link_rule_id IS NOT NEW.link_rule_id BEGIN
+          INSERT INTO monitoring_assignment_versions VALUES (NEW.mac,1)
+          ON CONFLICT(mac) DO UPDATE SET version=version+1; END""",
+    ),
+    (
+        "CREATE TABLE monitoring_dirty (collector_id TEXT NOT NULL,mac TEXT NOT NULL,q"
+        "ueued_at INTEGER NOT NULL, PRIMARY KEY(collector_id,mac))",
+        "CREATE INDEX idx_monitoring_dirty_age ON monitoring_dirty(queued_at,collector_id,mac)",
+        "CREATE TABLE monitoring_unavailable (collector_id TEXT NOT NULL,device_id TEXT NOT NULL,"
+        "reason TEXT NOT NULL,retry_at INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id))",
+        "CREATE TABLE monitoring_quality_work (collector_id TEXT NOT NULL,hour INTEGER NOT NULL,"
+        "after_mac TEXT NOT NULL,PRIMARY KEY(collector_id,hour))",
+        "CREATE INDEX idx_monitoring_quality_work ON monitoring_quality_work(hour,collector_id)",
+        "CREATE TABLE monitoring_revision (singleton INTEGER PRIMARY KEY CHECK(singlet"
+        "on=1),value INTEGER NOT NULL)",
+        "INSERT INTO monitoring_revision VALUES(1,0)",
+        *tuple(
+            "CREATE TRIGGER monitoring_revision_"  # noqa: S608
+            + table
+            + "_"
+            + action.lower()
+            + " AFTER "
+            + action
+            + " ON "
+            + table
+            + " BEGIN UPDATE monitoring_revision SET value=value+1 WHERE singleton=1; END"
+            for table in ("measurements_hourly", "coverage_hourly")
+            for action in ("INSERT", "UPDATE", "DELETE")
+        ),
+        """CREATE TABLE monitoring_profiles (
+          collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT NOT NULL,
+          config_version TEXT NOT NULL,training_since INTEGER NOT NULL,state TEXT NOT NULL,
+          baseline_id TEXT,updated_hour INTEGER NOT NULL,sample_hours INTEGER NOT NULL,
+          distinct_days INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id))""",
+        """CREATE TABLE monitoring_baselines (
+          id TEXT PRIMARY KEY,collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT
+          NOT NULL,
+          algorithm TEXT NOT NULL,config_version TEXT NOT NULL,config_json TEXT NOT NULL,
+          median_twice INTEGER NOT NULL,sample_hours INTEGER NOT NULL,distinct_days INTEGER NOT
+          NULL,
+          trained_until INTEGER NOT NULL,created_hour INTEGER NOT NULL,
+          training_hours TEXT NOT NULL)""",
+        """CREATE TABLE monitoring_incidents (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,collector_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,lineage TEXT NOT NULL,detector TEXT NOT NULL,state TEXT NOT NULL,
+          episode_start INTEGER NOT NULL,last_hour INTEGER NOT NULL,detected_at TEXT NOT NULL,
+          baseline_id TEXT,observed_bytes INTEGER NOT NULL,threshold_bytes INTEGER NOT NULL,
+          evidence TEXT NOT NULL)""",
+        "CREATE UNIQUE INDEX idx_monitoring_incident_open ON monitoring_incidents(coll"
+        "ector_id,device_id,lineage,detector) WHERE state='open'",
+        "CREATE INDEX idx_monitoring_incident_scope ON monitoring_incidents(collector_"
+        "id,device_id,seq)",
+        "CREATE TABLE monitoring_suspicious (collector_id TEXT NOT NULL,device_id TEXT"
+        " NOT NULL,lineage TEXT NOT NULL,hour INTEGER NOT NULL,PRIMARY KEY(collector_i"
+        "d,device_id,lineage,hour))",
+        "CREATE INDEX idx_measurements_hour ON measurements_hourly(hour,collector_id,mac)",
+        "CREATE INDEX idx_coverage_hour ON coverage_hourly(hour)",
+        "CREATE INDEX idx_measurement_retention ON measurement_batches(window_end)",
+        "CREATE INDEX idx_measurement_received ON measurement_batches(received_at)",
+        "CREATE INDEX idx_monitoring_incident_retention ON monitoring_incidents(last_hour)",
+        "CREATE INDEX idx_monitoring_incident_collector_seq ON monitoring_incidents(co"
+        "llector_id,seq)",
+        "CREATE INDEX idx_monitoring_suspicious_retention ON monitoring_suspicious(hour)",
+    ),
+    (
+        "CREATE TABLE characterization_evidence (mac TEXT NOT NULL,kind TEXT NOT NULL,"
+        "service TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(mac,kind,service))",
+        "CREATE INDEX idx_characterization_expiry ON characterization_evidence(observed_at)",
+        "CREATE TABLE characterization_overflow (mac TEXT PRIMARY KEY,until INTEGER NOT NULL)",
+        "CREATE TABLE characterization_results (device_id TEXT PRIMARY KEY,result TEXT NOT NULL)",
+        "CREATE TABLE characterization_dirty (device_id TEXT PRIMARY KEY)",
+        "ALTER TABLE devices ADD COLUMN inferred_valid_until REAL",
+    ),
 )
 
 PIPELINE_TABLES = (

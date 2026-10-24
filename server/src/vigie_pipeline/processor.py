@@ -13,8 +13,16 @@ from datetime import datetime
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
+from vigie_pipeline.baselines import BaselineConfig
+from vigie_pipeline.characterization_store import (
+    read_services,
+    refresh_characterization,
+    save_services,
+)
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.logs import log
+from vigie_pipeline.measurements import apply_measurements, read_measurements
+from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -57,6 +65,15 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
         )
         promoted, retired = sweep_transients(inv, clock, config)
         purge_activity(inv, clock, config.activity_retention_s)
+        if usable:
+            analyze_monitoring(
+                inv,
+                overrides,
+                BaselineConfig(large_upload_bytes=config.monitoring_large_upload_bytes),
+                clock,
+            )
+            refresh_characterization(inv, overrides, clock)
+        prune_monitoring(inv, clock)
     finally:
         inv.close()
         if overrides is not None:
@@ -135,6 +152,8 @@ def _process_batches(
         for rowid, batch_id, received in _pending(inv, collector):
             try:
                 acts, skipped = read_batch(config.data_dir, collector, batch_id)
+                measured = read_measurements(inv, config.data_dir, collector, batch_id)
+                services = read_services(config.data_dir, measured)
             except ShardReadError as exc:
                 # never advance past an unreadable batch: it and its successors stay pending
                 failures.append(exc)
@@ -144,6 +163,8 @@ def _process_batches(
                 record_activity(
                     inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
                 )
+                apply_measurements(inv, measured)
+                save_services(inv, services, _epoch(received))
                 _advance_cursor(inv, collector, rowid, batch_id)
             totals["batches"] += 1
             totals["macs"] += len(acts)

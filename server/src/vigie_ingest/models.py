@@ -146,6 +146,7 @@ class Batch(_Strict):
     window_start: EpochSeconds
     window_end: EpochSeconds
     sent_ts: EpochSeconds
+    observation_kind: Literal["observation", "probe"] | None = None
     truncated: Annotated[TruncatedMap, Field(description=_TRUNCATED_DOC)] = {}
     dropped_batches: Count = 0
     leases: Annotated[list[Lease], Field(max_length=1000)] = []
