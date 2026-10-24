@@ -80,7 +80,10 @@ elif [ "$size" -gt "$MAX" ]; then
 		(umask 077 && set -C && : >"$LOG") || refuse "cannot create $LOG after rotation"
 		chown "$DNSMASQ_UID:${VIGIE_OWNER#*:}" "$LOG" && chmod 0640 "$LOG" || refuse "cannot set owner/mode on $LOG"
 		old0=$(fsize "$OLD")
-		signal_dnsmasq || warn "SIGUSR2 to dnsmasq failed; $OLD stays open until restart"
+		signal_dnsmasq || {
+			rc=$?
+			warn "SIGUSR2 to dnsmasq failed; $OLD stays open until restart"
+		}
 		check_reopened "$old0"
 	fi
 fi

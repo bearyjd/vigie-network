@@ -88,7 +88,7 @@ test "\$(id -gn vigie)" = "vigie" || exit 1
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie
 install -m 0755 -o root -g root /tmp/vigie-collector /usr/bin/vigie-collector
 install -m 0755 -o root -g root /tmp/vigie-conntrack /usr/bin/vigie-conntrack
-install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /usr/libexec/vigie/
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /tmp/vigie-deploy/vigie-state-dir.sh /usr/libexec/vigie/
 install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-collector.init /etc/init.d/vigie-collector
 install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-conntrack.init /etc/init.d/vigie-conntrack
 # First install only: copy collector.conf.example to /etc/vigie/collector.conf (0644 root:root)
@@ -128,6 +128,6 @@ ps | grep -E 'dnsmasq|vigie-collector|vigie-conntrack'  # collector: vigie; conn
 # rm -f /tmp/dnsmasq.d/vigie.conf
 # /etc/init.d/dnsmasq reload
 # rm -f /etc/init.d/vigie-conntrack /etc/init.d/vigie-collector /usr/bin/vigie-conntrack /usr/bin/vigie-collector
-# rm -f /usr/libexec/vigie/vigie-lib.sh /usr/libexec/vigie/vigie-dnsmasq-dropin.sh /usr/libexec/vigie/vigie-log-watchdog.sh /usr/libexec/vigie/vigie-run.sh
+# rm -f /usr/libexec/vigie/vigie-lib.sh /usr/libexec/vigie/vigie-dnsmasq-dropin.sh /usr/libexec/vigie/vigie-log-watchdog.sh /usr/libexec/vigie/vigie-run.sh /usr/libexec/vigie/vigie-state-dir.sh
 # /etc/vigie (including its key/config) and tmpfs logs are retained for inspection/re-provisioning.
 COMMANDS

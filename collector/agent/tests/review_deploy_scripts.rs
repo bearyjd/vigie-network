@@ -510,3 +510,125 @@ fn killed_reload_process_leaves_no_success_confirmation() {
     assert!(dropin(&["ensure"], &dd, &ld, &[]).status.success());
     assert!(dropin(&["check"], &dd, &ld, &[]).status.success());
 }
+
+fn prepare_state(root: &Path, extra: &[(&str, String)]) -> Output {
+    let (uid, gid) = me();
+    let bin = root.parent().unwrap().join("state-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let real_id = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v id"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let fake_id = format!("#!/bin/sh\nif [ \"${{2:-}}\" = vigie ]; then case $1 in -u) echo {uid};; -g) echo {gid};; *) exit 1;; esac; else exec {} \"$@\"; fi\n",real_id.trim());
+    fs::write(bin.join("id"), fake_id).unwrap();
+    fs::set_permissions(bin.join("id"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut envs = vec![
+        ("VIGIE_STATE_ROOT", root.display().to_string()),
+        (
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        ),
+    ];
+    envs.extend(extra.iter().cloned());
+    sh("vigie-state-dir.sh", &[], &envs)
+}
+
+#[test]
+fn state_root_is_trusted_and_resets_only_known_failure_leaf() {
+    let d = tmpdir();
+    let root = d.join("vigie-collector-root");
+    let legacy = d.join("vigie-collector");
+    good_dir(&legacy, 0o700);
+    fs::write(legacy.join("fails"), "legacy evidence").unwrap();
+    let out = prepare_state(&root, &[]);
+    assert!(out.status.success(), "{}", err(&out));
+    assert_eq!(mode(&root), 0o711);
+    assert_eq!(mode(&root.join("state")), 0o700);
+    fs::write(root.join("state/fails"), "old count").unwrap();
+    fs::write(root.join("state/unknown"), "retain").unwrap();
+    assert!(prepare_state(&root, &[]).status.success());
+    assert!(!root.join("state/fails").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("state/unknown")).unwrap(),
+        "retain"
+    );
+    assert_eq!(
+        fs::read_to_string(legacy.join("fails")).unwrap(),
+        "legacy evidence"
+    );
+}
+
+#[test]
+fn state_parent_symlink_or_unsafe_mode_cannot_trigger_root_cleanup() {
+    let d = tmpdir();
+    let root = d.join("root");
+    let target = d.join("target");
+    good_dir(&target, 0o711);
+    fs::write(target.join("keep"), "precious").unwrap();
+    symlink(&target, &root).unwrap();
+    assert!(!prepare_state(&root, &[]).status.success());
+    assert_eq!(fs::read_to_string(target.join("keep")).unwrap(), "precious");
+    fs::remove_file(&root).unwrap();
+    good_dir(&root, 0o777);
+    assert!(!prepare_state(&root, &[]).status.success());
+    assert_eq!(mode(&root), 0o777, "never repair untrusted geometry");
+}
+
+#[test]
+fn state_child_symlink_and_directory_failure_leaf_are_refused_without_recursion() {
+    let d = tmpdir();
+    let root = d.join("root");
+    good_dir(&root, 0o711);
+    let victim = d.join("victim");
+    good_dir(&victim, 0o700);
+    fs::write(victim.join("keep"), "precious").unwrap();
+    symlink(&victim, root.join("state")).unwrap();
+    assert!(!prepare_state(&root, &[]).status.success());
+    assert_eq!(fs::read_to_string(victim.join("keep")).unwrap(), "precious");
+    fs::remove_file(root.join("state")).unwrap();
+    good_dir(&root.join("state/fails"), 0o700);
+    fs::write(root.join("state/fails/keep"), "retain").unwrap();
+    fs::set_permissions(root.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!prepare_state(&root, &[]).status.success());
+    assert_eq!(
+        fs::read_to_string(root.join("state/fails/keep")).unwrap(),
+        "retain"
+    );
+}
+
+#[test]
+fn state_failure_symlink_unlinks_only_itself_and_untrusted_owner_is_refused() {
+    let d = tmpdir();
+    let root = d.join("root");
+    assert!(prepare_state(&root, &[]).status.success());
+    let victim = d.join("victim");
+    fs::write(&victim, "precious").unwrap();
+    symlink(&victim, root.join("state/fails")).unwrap();
+    assert!(prepare_state(&root, &[]).status.success());
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+    assert!(
+        !prepare_state(&root, &[("VIGIE_TRUSTED_UID", (me().0 + 1).to_string())])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn watchdog_signal_failure_is_returned_to_operator() {
+    let d = tmpdir();
+    let ld = d.join("vigie");
+    good_dir(&ld, 0o751);
+    let log = ld.join("dnsmasq.log");
+    fs::write(&log, vec![b'x'; 15]).unwrap();
+    let out = watchdog(&log, "10", &[("VIGIE_SIGNAL_CMD", "exit 37".into())]);
+    assert_eq!(out.status.code(), Some(37), "{}", err(&out));
+    assert_eq!(
+        fs::read(ld.join("dnsmasq.log.1")).unwrap().len(),
+        15,
+        "rotated evidence retained"
+    );
+}

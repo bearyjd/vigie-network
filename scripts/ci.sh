@@ -50,6 +50,9 @@ stage_rust() { (cd collector && cargo test --locked --workspace); }
 stage_deploy() {
     bash deploy/tests/test_scripts.sh &&
     python3 -I deploy/tests/test_check_image_mounts.py &&
+    python3 -I deploy/tests/test_persistent.py &&
+    python3 -I deploy/tests/test_soak.py &&
+    python3 -I deploy/tests/test_soak_adapters.py &&
     UV_PROJECT_ENVIRONMENT="$TRAFFIC_ENV" uv run --frozen --project tools/trafficgen \
         --with PyYAML==6.0.3 python -I deploy/tests/check_refs.py --release &&
     bash tests/p0/test_mac_roll_report.sh
