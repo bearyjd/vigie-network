@@ -1,6 +1,674 @@
 {
   "components": {
     "schemas": {
+      "ActivityData": {
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/BaselineView"
+          },
+          "collector_id": {
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "hours": {
+            "items": {
+              "$ref": "#/components/schemas/ActivityHour"
+            },
+            "title": "Hours",
+            "type": "array"
+          },
+          "lineage": {
+            "title": "Lineage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "collector_id",
+          "lineage",
+          "hours",
+          "baseline"
+        ],
+        "title": "ActivityData",
+        "type": "object"
+      },
+      "ActivityHour": {
+        "properties": {
+          "bytes_down": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes Down"
+          },
+          "bytes_up": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes Up"
+          },
+          "dns_queries": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dns Queries"
+          },
+          "flows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flows"
+          },
+          "hour": {
+            "title": "Hour",
+            "type": "integer"
+          },
+          "observed_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Seconds"
+          },
+          "qualified_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualified Seconds"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "missing",
+              "partial",
+              "eligible",
+              "open"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hour",
+          "state",
+          "observed_seconds",
+          "qualified_seconds",
+          "reasons",
+          "bytes_up",
+          "bytes_down",
+          "flows",
+          "dns_queries"
+        ],
+        "title": "ActivityHour",
+        "type": "object"
+      },
+      "ActivityResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ActivityData"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Page"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "page",
+          "data"
+        ],
+        "title": "ActivityResponse",
+        "type": "object"
+      },
+      "BaselineView": {
+        "properties": {
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "baseline_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Id"
+          },
+          "config_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Version"
+          },
+          "distinct_days": {
+            "title": "Distinct Days",
+            "type": "integer"
+          },
+          "median_upload_bytes": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Upload Bytes"
+          },
+          "sample_hours": {
+            "title": "Sample Hours",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "learning",
+              "mature",
+              "rebuilding",
+              "lineage_unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "trained_until": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trained Until"
+          },
+          "training_since": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Training Since"
+          }
+        },
+        "required": [
+          "state",
+          "baseline_id",
+          "algorithm",
+          "config_version",
+          "sample_hours",
+          "distinct_days",
+          "training_since",
+          "trained_until",
+          "median_upload_bytes"
+        ],
+        "title": "BaselineView",
+        "type": "object"
+      },
+      "CharacterizationEvidence": {
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "observed_at": {
+            "title": "Observed At",
+            "type": "number"
+          },
+          "service": {
+            "description": "UNTRUSTED plain text (device- or human-supplied). Render as text only; never interpret it as markup, a URL, a command or an instruction.",
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "service",
+          "observed_at"
+        ],
+        "title": "CharacterizationEvidence",
+        "type": "object"
+      },
+      "CharacterizationView": {
+        "properties": {
+          "confidence": {
+            "title": "Confidence",
+            "type": "null"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/CharacterizationEvidence"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "inferred_type": {
+            "title": "Inferred Type",
+            "type": "string"
+          },
+          "model_version": {
+            "title": "Model Version",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
+          "rule_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Rule Ids",
+            "type": "array"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "strength": {
+            "title": "Strength",
+            "type": "string"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          }
+        },
+        "required": [
+          "inferred_type",
+          "role",
+          "strength",
+          "source",
+          "rule_ids",
+          "evidence",
+          "model_version",
+          "valid_until",
+          "reason"
+        ],
+        "title": "CharacterizationView",
+        "type": "object"
+      },
+      "CollectorCoverage": {
+        "properties": {
+          "agent_rss_kb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Rss Kb"
+          },
+          "agent_uptime_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Uptime S"
+          },
+          "backlog_batches": {
+            "title": "Backlog Batches",
+            "type": "integer"
+          },
+          "backlog_capped": {
+            "title": "Backlog Capped",
+            "type": "boolean"
+          },
+          "boot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Boot Id"
+          },
+          "collector_id": {
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "ct_unmapped_bytes_in_retained_detail": {
+            "title": "Ct Unmapped Bytes In Retained Detail",
+            "type": "integer"
+          },
+          "ct_unmapped_flows_in_retained_detail": {
+            "title": "Ct Unmapped Flows In Retained Detail",
+            "type": "integer"
+          },
+          "dns_log_quiet": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dns Log Quiet"
+          },
+          "dropped_batches_in_retained_detail": {
+            "title": "Dropped Batches In Retained Detail",
+            "type": "integer"
+          },
+          "last_received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Received At"
+          },
+          "last_seq": {
+            "title": "Last Seq",
+            "type": "integer"
+          },
+          "latest_dns_observation_received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Dns Observation Received At"
+          },
+          "latest_dns_observation_window_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Dns Observation Window End"
+          },
+          "latest_observation_received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Observation Received At"
+          },
+          "latest_window_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Window End"
+          },
+          "retained_detail_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Detail Since"
+          },
+          "source_flags_latest": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Flags Latest"
+          },
+          "summary_capped": {
+            "title": "Summary Capped",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "collector_id",
+          "last_received_at",
+          "latest_observation_received_at",
+          "latest_window_end",
+          "latest_dns_observation_window_end",
+          "latest_dns_observation_received_at",
+          "boot_id",
+          "last_seq",
+          "backlog_batches",
+          "backlog_capped",
+          "retained_detail_since",
+          "summary_capped",
+          "dropped_batches_in_retained_detail",
+          "ct_unmapped_bytes_in_retained_detail",
+          "ct_unmapped_flows_in_retained_detail",
+          "source_flags_latest",
+          "agent_rss_kb",
+          "agent_uptime_s",
+          "dns_log_quiet"
+        ],
+        "title": "CollectorCoverage",
+        "type": "object"
+      },
+      "CoverageData": {
+        "properties": {
+          "collector": {
+            "$ref": "#/components/schemas/CollectorCoverage"
+          },
+          "hours": {
+            "items": {
+              "$ref": "#/components/schemas/CoverageHour"
+            },
+            "title": "Hours",
+            "type": "array"
+          }
+        },
+        "required": [
+          "collector",
+          "hours"
+        ],
+        "title": "CoverageData",
+        "type": "object"
+      },
+      "CoverageHour": {
+        "properties": {
+          "hour": {
+            "title": "Hour",
+            "type": "integer"
+          },
+          "observed_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Seconds"
+          },
+          "qualified_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualified Seconds"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "missing",
+              "partial",
+              "eligible",
+              "open"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hour",
+          "state",
+          "observed_seconds",
+          "qualified_seconds",
+          "reasons"
+        ],
+        "title": "CoverageHour",
+        "type": "object"
+      },
+      "CoverageResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CoverageData"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Page"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "page",
+          "data"
+        ],
+        "title": "CoverageResponse",
+        "type": "object"
+      },
       "DeviceDetail": {
         "properties": {
           "explanation": {
@@ -564,6 +1232,16 @@
       },
       "Explanation": {
         "properties": {
+          "characterization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CharacterizationView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model_version": {
             "anyOf": [
               {
@@ -646,6 +1324,318 @@
           "data"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "IncidentEvidence": {
+        "properties": {
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "baseline_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Id"
+          },
+          "baseline_median_upload_bytes": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Median Upload Bytes"
+          },
+          "config_version": {
+            "title": "Config Version",
+            "type": "string"
+          },
+          "coverage_required_seconds": {
+            "title": "Coverage Required Seconds",
+            "type": "integer"
+          },
+          "distinct_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Distinct Days"
+          },
+          "hour": {
+            "title": "Hour",
+            "type": "integer"
+          },
+          "lineage": {
+            "title": "Lineage",
+            "type": "string"
+          },
+          "minimum_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Bytes"
+          },
+          "multiplier": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiplier"
+          },
+          "observed_bytes": {
+            "title": "Observed Bytes",
+            "type": "integer"
+          },
+          "previous_hour": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Hour"
+          },
+          "reason_code": {
+            "enum": [
+              "large_upload_threshold",
+              "two_qualified_upload_hours"
+            ],
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "sample_hours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Hours"
+          },
+          "threshold_bytes": {
+            "title": "Threshold Bytes",
+            "type": "integer"
+          },
+          "unusual_is_not_malicious": {
+            "const": true,
+            "title": "Unusual Is Not Malicious",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reason_code",
+          "hour",
+          "previous_hour",
+          "observed_bytes",
+          "threshold_bytes",
+          "baseline_id",
+          "algorithm",
+          "config_version",
+          "coverage_required_seconds",
+          "lineage",
+          "unusual_is_not_malicious"
+        ],
+        "title": "IncidentEvidence",
+        "type": "object"
+      },
+      "IncidentOut": {
+        "properties": {
+          "baseline_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Id"
+          },
+          "collector_id": {
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "current_lineage": {
+            "title": "Current Lineage",
+            "type": "boolean"
+          },
+          "detected_at": {
+            "title": "Detected At",
+            "type": "string"
+          },
+          "detector": {
+            "enum": [
+              "large_upload",
+              "upload_deviation"
+            ],
+            "title": "Detector",
+            "type": "string"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "episode_start": {
+            "title": "Episode Start",
+            "type": "integer"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/IncidentEvidence"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_hour": {
+            "title": "Last Hour",
+            "type": "integer"
+          },
+          "lineage": {
+            "title": "Lineage",
+            "type": "string"
+          },
+          "observed_bytes": {
+            "title": "Observed Bytes",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "resolved",
+              "superseded"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "threshold_bytes": {
+            "title": "Threshold Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "collector_id",
+          "device_id",
+          "lineage",
+          "current_lineage",
+          "detector",
+          "state",
+          "episode_start",
+          "last_hour",
+          "detected_at",
+          "observed_bytes",
+          "threshold_bytes",
+          "baseline_id",
+          "evidence"
+        ],
+        "title": "IncidentOut",
+        "type": "object"
+      },
+      "IncidentResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/IncidentOut"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Page"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "page",
+          "data"
+        ],
+        "title": "IncidentResponse",
+        "type": "object"
+      },
+      "IncidentsResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/IncidentOut"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Page"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "page",
+          "data"
+        ],
+        "title": "IncidentsResponse",
         "type": "object"
       },
       "MacOut": {
@@ -1325,6 +2315,184 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/coverage": {
+      "get": {
+        "operationId": "get_coverage_coverage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "collector_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Collector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from_hour",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From Hour"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to_hour",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To Hour"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoverageResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed cursor, If-Match or updated_since"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Get Coverage",
+        "tags": [
+          "monitoring"
+        ]
+      }
+    },
     "/devices": {
       "get": {
         "description": "Aliases (devices merged into another) are hidden unless `include_aliases=1`, and an alias shows its canonical device's override. Retired and transient devices are hidden unless `include_retired=1` / `include_transient=1` (or `status=` is given).",
@@ -1890,6 +3058,205 @@
         "summary": "Set or clear overrides",
         "tags": [
           "devices"
+        ]
+      }
+    },
+    "/devices/{device_id}/activity": {
+      "get": {
+        "operationId": "get_activity_devices__device_id__activity_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collector_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Collector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from_hour",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From Hour"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to_hour",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To Hour"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed cursor, If-Match or updated_since"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "device_merged: the device was merged into another; patch the canonical one"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Get Activity",
+        "tags": [
+          "monitoring"
         ]
       }
     },
@@ -2870,6 +4237,294 @@
         "summary": "Delete Rule",
         "tags": [
           "identity"
+        ]
+      }
+    },
+    "/incidents": {
+      "get": {
+        "operationId": "get_incidents_incidents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "collector_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Collector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "device_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncidentsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed cursor, If-Match or updated_since"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "device_merged: the device was merged into another; patch the canonical one"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Get Incidents",
+        "tags": [
+          "monitoring"
+        ]
+      }
+    },
+    "/incidents/{incident_id}": {
+      "get": {
+        "operationId": "get_incident_incidents__incident_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Incident Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collector_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Collector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IncidentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Get Incident",
+        "tags": [
+          "monitoring"
         ]
       }
     },

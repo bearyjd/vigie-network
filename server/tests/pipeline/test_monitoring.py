@@ -144,3 +144,31 @@ def test_measurement_and_cursor_crash_roll_back_together(tmp_path, monkeypatch):
         assert inv.execute("SELECT bytes_up FROM measurements_hourly").fetchone()[0] == 100
     finally:
         inv.close()
+
+
+def test_extreme_counters_stay_integer_and_disqualify_hour(tmp_path):
+    from vigie_pipeline.measurements import Measurements, apply_measurements
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    for seq in range(2):
+        apply_measurements(
+            inv,
+            Measurements(
+                "c1",
+                str(seq),
+                HOUR + seq * 60,
+                HOUR + (seq + 1) * 60,
+                "2026-10-24T00:00:00Z",
+                (),
+                {MAC: (2**63 - 1, 0, 1, 0)},
+            ),
+        )
+    value, kind = inv.execute(
+        "SELECT bytes_up,typeof(bytes_up) FROM measurements_hourly"
+    ).fetchone()
+    assert kind == "integer"
+    assert value == (2**63 - 1) // 64
+    row = inv.execute("SELECT reasons FROM coverage_hourly").fetchone()
+    assert "counter_overflow" in row[0]
+    inv.close()

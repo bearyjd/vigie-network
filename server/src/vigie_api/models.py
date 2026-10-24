@@ -123,7 +123,27 @@ class RecentEvent(BaseModel):
     summary: str = Untrusted
 
 
+class CharacterizationEvidence(BaseModel):
+    kind: str
+    service: str = Untrusted
+    observed_at: float
+
+
+class CharacterizationView(BaseModel):
+    inferred_type: str
+    role: str | None
+    strength: str
+    confidence: None = None
+    source: str
+    rule_ids: list[str]
+    evidence: list[CharacterizationEvidence]
+    model_version: str
+    valid_until: float | None
+    reason: str
+
+
 class Explanation(BaseModel):
+    characterization: CharacterizationView | None = None
     reason_code: str | None
     reason_text: str | None = Field(
         description=UNTRUSTED + " Informational only; null while a trust-changing suggestion "
@@ -258,3 +278,117 @@ class WriteResultResponse(_Envelope):
 
 class RulesResponse(_Envelope):
     data: list[dict[str, Any]]
+
+
+class CoverageHour(BaseModel):
+    hour: int
+    state: Literal["missing", "partial", "eligible", "open"]
+    observed_seconds: int | None
+    qualified_seconds: int | None
+    reasons: list[str]
+
+
+class CollectorCoverage(BaseModel):
+    collector_id: str
+    last_received_at: str | None
+    latest_observation_received_at: str | None
+    latest_window_end: int | None
+    latest_dns_observation_window_end: int | None
+    latest_dns_observation_received_at: str | None
+    boot_id: str | None
+    last_seq: int
+    backlog_batches: int
+    backlog_capped: bool
+    retained_detail_since: str | None
+    summary_capped: bool
+    dropped_batches_in_retained_detail: int
+    ct_unmapped_bytes_in_retained_detail: int
+    ct_unmapped_flows_in_retained_detail: int
+    source_flags_latest: int | None
+    agent_rss_kb: int | None
+    agent_uptime_s: int | None
+    dns_log_quiet: bool | None
+
+
+class CoverageData(BaseModel):
+    collector: CollectorCoverage
+    hours: list[CoverageHour]
+
+
+class CoverageResponse(_Envelope):
+    data: CoverageData
+
+
+class ActivityHour(CoverageHour):
+    bytes_up: int | None
+    bytes_down: int | None
+    flows: int | None
+    dns_queries: int | None
+
+
+class BaselineView(BaseModel):
+    state: Literal["learning", "mature", "rebuilding", "lineage_unavailable"]
+    baseline_id: str | None
+    algorithm: str
+    config_version: str | None
+    sample_hours: int
+    distinct_days: int
+    training_since: int | None
+    trained_until: int | None
+    median_upload_bytes: float | None
+
+
+class ActivityData(BaseModel):
+    device_id: str
+    collector_id: str
+    lineage: str
+    hours: list[ActivityHour]
+    baseline: BaselineView
+
+
+class ActivityResponse(_Envelope):
+    data: ActivityData
+
+
+class IncidentEvidence(BaseModel):
+    reason_code: Literal["large_upload_threshold", "two_qualified_upload_hours"]
+    hour: int
+    previous_hour: int | None
+    observed_bytes: int
+    threshold_bytes: int
+    baseline_id: str | None
+    algorithm: str
+    config_version: str
+    coverage_required_seconds: int
+    lineage: str
+    unusual_is_not_malicious: Literal[True]
+    baseline_median_upload_bytes: float | None = None
+    multiplier: int | None = None
+    minimum_bytes: int | None = None
+    sample_hours: int | None = None
+    distinct_days: int | None = None
+
+
+class IncidentOut(BaseModel):
+    id: str
+    collector_id: str
+    device_id: str
+    lineage: str
+    current_lineage: bool
+    detector: Literal["large_upload", "upload_deviation"]
+    state: Literal["open", "resolved", "superseded"]
+    episode_start: int
+    last_hour: int
+    detected_at: str
+    observed_bytes: int
+    threshold_bytes: int
+    baseline_id: str | None
+    evidence: IncidentEvidence
+
+
+class IncidentsResponse(_Envelope):
+    data: list[IncidentOut]
+
+
+class IncidentResponse(_Envelope):
+    data: IncidentOut

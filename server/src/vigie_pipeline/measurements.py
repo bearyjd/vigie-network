@@ -11,7 +11,7 @@ from urllib.parse import quote
 from vigie_ingest.db import shard_name, utc_day
 from vigie_pipeline.sources import ShardReadError, normalize_mac
 
-MAX_VALUE = 2**63 - 1
+MAX_VALUE = (2**63 - 1) // 64  # at most64 canonical MACs can be summed safely
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,17 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         for reason in ("probe", "cross_hour", "empty_window", "legacy_window", "overlapping_window")
     ):
         return
+    bounded = {}
+    for mac, values in m.counters.items():
+        prior = inv.execute(
+            "SELECT bytes_up,bytes_down,flows,dns_queries FROM measurements_hourly "
+            "WHERE collector_id=? AND mac=? AND hour=?",
+            (m.collector, mac, hour),
+        ).fetchone()
+        old_values = tuple(prior) if prior else (0, 0, 0, 0)
+        if any(old + value > MAX_VALUE for old, value in zip(old_values, values, strict=True)):
+            reasons.append("counter_overflow")
+        bounded[mac] = tuple(min(MAX_VALUE, value) for value in values)
     duration = m.end - m.start
     qualified = duration if not reasons else 0
     old = inv.execute(
@@ -150,11 +161,14 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         "qualified_seconds=qualified_seconds+excluded.qualified_seconds,reasons=excluded.reasons",
         (m.collector, hour, duration, qualified, json.dumps(combined)),
     )
-    for mac, values in m.counters.items():
+    for mac, values in bounded.items():
+        inv.execute(
+            "INSERT OR IGNORE INTO monitoring_dirty VALUES (?,?,?)", (m.collector, mac, m.end)
+        )
         inv.execute(
             "INSERT INTO measurements_hourly VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(collector_id,mac,hour) DO UPDATE SET "
             "bytes_up=MIN(?,bytes_up+excluded.bytes_up),bytes_down=MIN(?,bytes_down+excluded.bytes_down),"
-            "flows=MIN(?,flows+excluded.flows),dns_queries=dns_queries+excluded.dns_queries",
-            (m.collector, mac, hour, *values, MAX_VALUE, MAX_VALUE, MAX_VALUE),
+            "flows=MIN(?,flows+excluded.flows),dns_queries=MIN(?,dns_queries+excluded.dns_queries)",
+            (m.collector, mac, hour, *values, MAX_VALUE, MAX_VALUE, MAX_VALUE, MAX_VALUE),
         )

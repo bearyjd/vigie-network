@@ -1,0 +1,124 @@
+# Monitoring v1 contract
+
+This slice derives collector-scoped hourly activity, a frozen pooled-median upload reference,
+read-only incidents, and conservative service-based device hints. It does not establish malicious
+activity, identity trust, enforcement, calibrated classification accuracy, or production readiness.
+A baseline cannot mature before real qualifying history exists; synthetic fixtures prove arithmetic,
+not detection accuracy. A local monitoring UI and notifications remain subsequent product work.
+
+## Rollout and ownership
+
+Deploy the new server before new collectors: the new optional top-level `observation_kind` is
+accepted by this server, but older strict servers reject it. Ordinary collector windows emit
+`observation`; clock probes and partial identity pushes emit `probe`. Existing signed fixtures
+and legacy collectors remain accepted. Missing kind/bounds is unknown coverage, never proof
+of a complete observation window.
+
+Ingest owns durable event-window bounds, receipt time, kind, DNS-row count and health metadata
+(ingest migrations4–5). The pipeline owns measurements, profiles, reference models, incidents and
+service-only characterization evidence (pipeline migrations6–9). API owns only human overrides,
+including monotonic link generations (overrides migration6). No monitoring job writes human
+intent, grants trust, changes a group, approves an identity or invokes enforcement.
+
+## Measurements and coverage
+
+Each batch receipt is applied atomically with the pipeline cursor. `(collector_id,batch_id)`
+deduplicates derived contributions. Measurements are keyed by collector, canonical observed MAC,
+and closed UTC hour. Two batches with uploads100 and250 produce350; replay remains350.
+Sensors are never summed across collectors.
+
+An interval `[start,end)` contributes only when wholly inside one UTC hour. An interval ending
+exactly at the boundary belongs to the preceding hour. Crossing intervals, partial probes,
+o duration and overlaps are excluded rather than divided uniformly. Legacy unknown-kind windows
+may carry measurements, but never qualified training coverage. No data is represented as null,
+not zero. DNS rows count observed queries, not contacted domains; no qname is copied into aggregates.
+
+Qualification requires at least3420 observed qualified seconds (95%) and no quality reasons.
+Missing health, CT source gaps/unmapped/truncation, dropped batches and counter overflow disqualify
+the hour. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
+quietness is reported separately; it does not establish traffic completeness.
+
+Each stored per-MAC hourly counter saturates at `(2**63-1)//64`; saturation marks the entire hour
+`counter_overflow`. At most64 MACs may contribute to one identity, so SQLite sums remain integer
+and cannot overflow. Values remain capped displays, not training samples. Identity components
+beyond supported bounds fail unavailable instead of returning a favorable partial aggregate.
+
+## Frozen references and incidents
+
+Algorithm `pooled-median-v1` freezes the first chronological eligible cohort containing at least
+20 hours on14 distinct UTC dates. A stored `median_twice` preserves exact half-byte medians.
+Known suspicious and fixed-large-upload hours are excluded. This is an explainable pooled baseline,
+not an hour-of-week model or a malware verdict. It is deliberately not continually refit from
+new unusual traffic, which limits one form of baseline contamination; slow adversarial drift and
+unrecognized contamination still require real-data evaluation and feedback design.
+
+The learned detector requires TWO consecutive eligible post-reference hours each strictly above
+`max(50MiB,4*median)`. Equality does not fire. A missing or degraded intervening hour breaks the
+pair. The cold-start fixed detector fires at or above1GiB upload/hour. Configure the fixed threshold
+with `VIGIE_MONITORING_LARGE_UPLOAD_BYTES` (default1073741824; integer1..2**50). Algorithm and full
+policy are hashed into a version. A changed configuration rebuilds rather than silently reusing
+an incompatible reference.
+
+Only the latest closed hour is evaluated for new incidents. Historical backfill can supply allowed
+learning history but cannot emit a historical alert flood. An episode uses a deterministic ID;
+repeated processing updates it. A consecutive episode remains one incident. A later eligible quiet
+hour resolves it; missing coverage does not claim recovery. Evidence includes observed bytes,
+threshold, reference/config IDs, lineage, coverage floor and `unusual_is_not_malicious=true`.
+
+Lineage hashes the canonical MAC set, attachment assignment generations and human link generations.
+Merge, undo and attachment round-trips cannot resurrect a prior lineage by returning to the same
+MAC set. Changes restart learning from the next UTC-hour boundary; initial rule-attached devices
+also wait for future history. They can mature after probation, without requiring an unavailable
+confirmation UI. Name-only edits do not reset learning. Old immutable references remain attributable
+to their original lineage; stale open incidents are superseded. API labels stale profiles rebuilding.
+New entities may learn qualified history already recorded since feature activation; newly attached
+MACs cannot immediately redefine an old reference.
+
+## Bounded read API
+
+All routes require the existing bearer read token, preserve collector scope and return typed envelopes.
+
+- `GET /coverage?collector_id=...`: hourly coverage and collector receipt/window/backlog/resource
+  summaries, including `latest_dns_observation_window_end` and its receipt time only from a
+  positive DNS-row observation window. Probes never refresh these values.
+- `GET /devices/{id}/activity?collector_id=...`: per-identity activity, lineage and model state;
+  unknown devices return404. Human aliases resolve through existing identity links.
+- `GET /incidents?collector_id=...&device_id=...` and `GET /incidents/{id}?collector_id=...`:
+  bounded incident list/detail, with current-lineage attribution.
+
+Hour ranges use `from_hour`/`to_hour`, UTC boundaries, a maximum90 days and at most200 hours/page.
+Opaque cursors are bound to route, collector, device and exact range. Missing migrations yield503.
+Collector detail summaries inspect at most10000 recent batches and expose capped indicators.
+Agent RSS/uptime are reported observations; absent router/helper/RAM/tmpfs/CPU metrics stay unknown.
+These endpoints alone cannot certify a48-hour resource or DNS soak.
+
+## Characterization
+
+The pure rule contract is [characterization.md](characterization.md). The pipeline retains only
+MAC, protocol, service and timestamp, at most256 distinct services/MAC; overflow blocks a favorable
+partial classification for24 hours. Each rule's supporting pair must be on the SAME MAC. A TV pair
+split across two MACs cannot combine, even within one human identity. Conflicting qualified roles
+produce unknown. Evidence is unauthenticated, spoofable LAN metadata, never identity proof.
+
+`GET /devices/{id}` adds `explanation.characterization`: type/role, qualitative strength, rule IDs,
+canonical service evidence, model version and expiry; numeric confidence remains null. Human type
+choices take priority. Supporting evidence expires at the oldest required service's24-hour deadline;
+API withholds expired or stale-lineage hints, without waiting for the next pipeline refresh. A
+bounded20-device refresh processes new/expired hints and round-robin work. No raw hostname, vendor
+class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numeric probability.
+
+## Retention and verification limits
+
+Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
+pruned after7 days only once the original ingest batch is gone, preserving replay deduplication.
+Hourly measurements/coverage/suspicion and incidents retain90 days. Each pass deletes at most1000
+rows/table, so backlog catch-up can temporarily retain older records; immutable reference metadata
+retains its training-hour lineage while referenced by a current profile or retained incident.
+No long-term DNS names are stored. Service evidence has a24-hour eligibility TTL and bounded prune.
+
+Tests cover independent worked sums/replays, hour boundaries, atomic crash recovery, missing data,
+19/20 hours and13/14 dates, exact10MiB median/50vs51MiB learned thresholds, missing-pair breaks,
+lineage round-trips/name-only edits, cold-start fixed incidents and service expiry/same-MAC limits.
+Full CI and independent review remain release evidence recorded in the PR, not an accuracy claim.
+Real router DNS coverage, persistent deployment, resource bounds, reboot behavior and long-duration
+learning require their separate measured deployment gates. D1–D6 owner decisions remain unchanged.

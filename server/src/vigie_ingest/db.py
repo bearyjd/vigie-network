@@ -80,6 +80,9 @@ INVENTORY_MIGRATIONS: Sequence[str] = (
     ALTER TABLE batches ADD COLUMN observation_kind TEXT;
     ALTER TABLE batches ADD COLUMN health TEXT;
     """,
+    # v5: positive DNS coverage evidence without exposing names to the read-only API.
+    "ALTER TABLE batches ADD COLUMN dns_queries INTEGER;\n"
+    "CREATE INDEX idx_batches_collector_received ON batches(collector_id,received_at,batch_id);",
 )
 
 SHARD_MIGRATIONS: Sequence[str] = (

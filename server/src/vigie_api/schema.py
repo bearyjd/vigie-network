@@ -180,6 +180,31 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         " WHERE revoked_at IS NULL",
         *_identity_triggers(),
     ),
+    (
+        "CREATE TABLE monitoring_lineage_versions (device_id TEXT PRIMARY KEY, version"
+        " INTEGER NOT NULL)",
+        *tuple(
+            "CREATE TRIGGER monitoring_link_"  # noqa: S608
+            + action.lower()
+            + " AFTER "
+            + action
+            + " ON identity_links BEGIN "
+            + " ".join(
+                "INSERT INTO monitoring_lineage_versions VALUES (" + ref + "." + column + ",1) "  # noqa: S608
+                "ON CONFLICT(device_id) DO UPDATE SET version=version+1;"
+                for ref in (
+                    ("NEW",)
+                    if action == "INSERT"
+                    else ("OLD",)
+                    if action == "DELETE"
+                    else ("OLD", "NEW")
+                )
+                for column in ("from_device", "into_device")
+            )
+            + " END"
+            for action in ("INSERT", "UPDATE", "DELETE")
+        ),
+    ),
 )
 
 
