@@ -14,11 +14,16 @@
 #
 # cron (root):  */5 * * * * /usr/libexec/vigie/vigie-dnsmasq-dropin.sh ensure; /usr/libexec/vigie/vigie-log-watchdog.sh
 
+# shellcheck disable=SC2034
 START=95
+# shellcheck disable=SC2034
 STOP=10
+# shellcheck disable=SC2034
 USE_PROCD=1
 
 start_service() {
+	# Reboot/mount loss must not fall back to the shared /tmp filesystem.
+	/usr/libexec/vigie/vigie-logfs.sh check || return 1
 	# Fail closed: without the dedicated user procd would fall back to running as root.
 	id -u vigie >/dev/null 2>&1 || { logger -t vigie 'vigie user missing'; return 1; }
 	# Prepare a trusted parent and private counter child before any DNS mutation.
@@ -31,6 +36,8 @@ start_service() {
 	# procd drops to this dedicated user itself (no ujail needed). Never nobody: avahi shares
 	# that uid and could read the HMAC key. Unverified on this firmware.
 	procd_set_param user vigie
+	procd_set_param group vigie
+	procd_set_param limits core="0 0"
 	# Retry limit 5 (not infinite): exits 77/78 (root refused, bad config) never fix themselves.
 	# vigie-run.sh logs when the limit is reached. Unverified on this firmware: procd's exact
 	# off-by-one semantics.

@@ -16,6 +16,7 @@ start_service() {
 	# Fixed binaries and paths: configuration/environment cannot add root helper arguments.
 	PATH=/usr/sbin:/usr/bin:/sbin:/bin
 	export PATH
+	/usr/libexec/vigie/vigie-logfs.sh check || return 1
 	if ! VIGIE_CT_UID=$(id -u vigie) || ! VIGIE_CT_GID=$(id -g vigie); then
 		logger -t vigie 'conntrack: dedicated vigie account missing'
 		return 1
@@ -37,6 +38,7 @@ start_service() {
 		--socket "/tmp/vigie/conntrack.sock" --uid "$VIGIE_CT_UID" --gid "$VIGIE_CT_GID" --interval 60
 	# Root is required for /proc/net/nf_conntrack; never drop this service to vigie.
 	procd_set_param respawn 3600 5 5
+	procd_set_param limits core="0 0"
 	procd_set_param stderr 1
 	procd_close_instance
 }

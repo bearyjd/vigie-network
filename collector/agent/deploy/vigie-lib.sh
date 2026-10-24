@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Shared checks for the root-run Vigie scripts (sourced, not executed). POSIX sh / busybox ash.
 #
 # /tmp is world-writable, so everything the scripts touch there is verified first: no symlinks,
@@ -48,8 +49,24 @@ else
 	VIGIE_OWNER=root:vigie
 fi
 
+# Production paths are fixed; only the unprivileged fixture harness substitutes kernel ports.
+LOGFS_DIR=/tmp/vigie
+LOGFS_MOUNTINFO=/proc/self/mountinfo
+LOGFS_STATFS_BIN=stat
+LOGFS_MOUNT_BIN=mount
+LOGFS_LOCK_DIR=/var/run/vigie-logfs-lock
+if vtest; then
+	LOGFS_DIR="${VIGIE_LOGFS_DIR:-$LOGFS_DIR}"
+	LOGFS_MOUNTINFO="${VIGIE_LOGFS_MOUNTINFO:-$LOGFS_MOUNTINFO}"
+	LOGFS_STATFS_BIN="${VIGIE_LOGFS_STATFS_BIN:-$LOGFS_STATFS_BIN}"
+	LOGFS_MOUNT_BIN="${VIGIE_LOGFS_MOUNT_BIN:-$LOGFS_MOUNT_BIN}"
+	LOGFS_LOCK_DIR="${VIGIE_LOGFS_LOCK_DIR:-$LOGFS_LOCK_DIR}"
+fi
+
 # Everything below lives under the world-writable TMP_ROOT: without the sticky bit anyone could
 # rename the verified directories away and swap them.
+# BusyBox ash (the firmware target) and the fixture shell support this sticky-bit test.
+# shellcheck disable=SC3065
 [ -k "$TMP_ROOT" ] || refuse "$TMP_ROOT is not sticky (mode lacks +t): other users could rename what was verified"
 
 # dnsmasq pids from one source, one per line (stdout empty when the source has none).
@@ -81,6 +98,8 @@ dnsmasq_pid() {
 
 # resolve_dnsmasq_uid: sets DNSMASQ_UID and DNSMASQ_PID (empty when unresolved) and DNSMASQ_WHY. The real and
 # effective uid in /proc/<pid>/status must agree; anything else is treated as unresolved.
+# Result globals are the sourced API consumed by the watchdog.
+# shellcheck disable=SC2034
 resolve_dnsmasq_uid() {
 	DNSMASQ_UID=
 	DNSMASQ_PID=
@@ -135,4 +154,56 @@ require_file() {
 		[ "$_o" = "$_a" ] && return 0
 	done
 	refuse "$1 is owned by uid $_o (allowed: $2)"
+}
+
+
+# 0: exact/child mount present; 1: absent; any other exit means the kernel table was unreadable.
+logfs_mount_present() {
+	awk -v target="$LOGFS_DIR" '
+		$5 == target || index($5, target "/") == 1 { found=1 }
+		END { exit(found ? 0 : 1) }
+	' "$LOGFS_MOUNTINFO"
+}
+
+logfs_gid() {
+	if vtest; then
+		printf '%s\n' "${VIGIE_OWNER#*:}"
+	else
+		id -g vigie
+	fi
+}
+
+# Verify every prerequisite before a consumer can create/repair a file on shared /tmp.
+# Do not repair attributes or remount here: missing/foreign/stacked mounts fail closed.
+require_logfs() {
+	_logfs_gid=$(logfs_gid) || refuse "dedicated vigie group missing"
+	case "$_logfs_gid" in '' | *[!0-9]*) refuse "invalid vigie group" ;; esac
+	require_dir "$LOGFS_DIR"
+	[ "$(stat -c %u:%g:%a "$LOGFS_DIR")" = "$VIGIE_TRUSTED_UID:$_logfs_gid:751" ] ||
+		refuse "$LOGFS_DIR has unsafe log-filesystem ownership or mode"
+	awk -v target="$LOGFS_DIR" '
+		index($5, target "/") == 1 { bad=1 }
+		$5 == target {
+			count++
+			if ($4 != "/") bad=1
+			opts="," $6 ","
+			if (index(opts,",rw,")==0 || index(opts,",nosuid,")==0 ||
+			    index(opts,",nodev,")==0 || index(opts,",noexec,")==0) bad=1
+			for (i=7;i<=NF && $i!="-";i++) {}
+			if (i+3 != NF || $(i+1)!="tmpfs" || $(i+2)!="vigie-logfs") bad=1
+			n=split($(i+3),super,","); sizes=0
+			for (j=1;j<=n;j++) if (super[j] ~ /^size=/) {
+				sizes++
+				if (super[j]!="size=20480k" && super[j]!="size=20971520" && super[j]!="size=20m") bad=1
+			}
+			if (sizes!=1) bad=1
+		}
+		END { exit(count==1 && !bad ? 0 : 1) }
+	' "$LOGFS_MOUNTINFO" || refuse "$LOGFS_DIR is not the exact owned 20 MiB log mount"
+	_logfs_capacity=$("$LOGFS_STATFS_BIN" -f -c '%S %b' "$LOGFS_DIR") || refuse "cannot read log capacity"
+	case "$_logfs_capacity" in '' | *[!0-9\ ]*) refuse "invalid log capacity" ;; esac
+	set -- $_logfs_capacity
+	[ "$#" -eq 2 ] && [ "$1" -gt 0 ] && [ "$1" -le 20971520 ] &&
+		[ "$2" -gt 0 ] && [ "$2" -le 20971520 ] || refuse "invalid log capacity bounds"
+	[ "$(( $1 * $2 ))" -eq 20971520 ] || refuse "log filesystem capacity is not 20 MiB"
 }

@@ -241,6 +241,7 @@ fn run_dropin(
         .args(args)
         .env("VIGIE_DROPIN_DIR", dropin_dir)
         .env("VIGIE_LOG_DIR", log_dir)
+        .envs(common::fake_logfs_env(log_dir))
         .envs(trust_env())
         .env(
             "VIGIE_RELOAD_CMD",
@@ -316,12 +317,13 @@ fn dropin_script_creates_repairs_and_reloads_only_on_change() {
 #[test]
 fn watchdog_script_rotates_only_above_the_limit() {
     let d = tmpdir();
-    fs::set_permissions(&d, fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o751)).unwrap();
     let log = d.join("dnsmasq.log");
     let run = |limit: &str| {
         Command::new("sh")
             .arg(dist("vigie-log-watchdog.sh"))
             .env("VIGIE_LOG_FILE", &log)
+            .envs(common::fake_logfs_env(&d))
             .env("VIGIE_LOG_MAX_BYTES", limit)
             .env("VIGIE_SIGNAL_CMD", "true")
             .envs(trust_env())

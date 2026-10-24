@@ -41,6 +41,11 @@ fn sh(name: &str, args: &[&str], envs: &[(&str, String)]) -> Output {
         .env("VIGIE_OWNER", format!("{uid}:{gid}"))
         .env("VIGIE_LOG_ALLOWED_UIDS", uid.to_string());
     c.envs(common::fake_dnsmasq_env());
+    if let Some((_, value)) = envs.iter().find(|(key, _)| *key == "VIGIE_LOG_DIR") {
+        c.envs(common::fake_logfs_env(Path::new(value)));
+    } else if let Some((_, value)) = envs.iter().find(|(key, _)| *key == "VIGIE_LOG_FILE") {
+        c.envs(common::fake_logfs_env(Path::new(value).parent().unwrap()));
+    }
     for (k, v) in envs {
         c.env(k, v);
     }
@@ -90,7 +95,7 @@ fn ensure_creates_private_log_dir_and_group_readable_log() {
 fn ensure_refuses_a_preplanted_symlink_log() {
     let d = tmpdir();
     let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
-    good_dir(&ld, 0o750);
+    good_dir(&ld, 0o751);
     let victim = d.join("victim");
     fs::write(&victim, "precious").unwrap();
     fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
@@ -149,7 +154,7 @@ fn ensure_refuses_a_symlinked_conf_file() {
 fn ensure_refuses_directories_not_owned_by_the_trusted_uid() {
     let d = tmpdir();
     let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
-    good_dir(&ld, 0o750);
+    good_dir(&ld, 0o751);
     good_dir(&dd, 0o755);
     let (uid, _) = me();
     let other = (uid + 1).to_string();
@@ -267,7 +272,7 @@ fn watchdog(log: &Path, max: &str, extra: &[(&str, String)]) -> Output {
 fn watchdog_refuses_a_symlinked_log_and_leaves_the_target_alone() {
     let d = tmpdir();
     let ld = d.join("vigie");
-    good_dir(&ld, 0o750);
+    good_dir(&ld, 0o751);
     let victim = d.join("victim");
     fs::write(&victim, vec![b'x'; 100]).unwrap();
     symlink(&victim, ld.join("dnsmasq.log")).unwrap();
@@ -285,7 +290,7 @@ fn watchdog_refuses_a_symlinked_log_and_leaves_the_target_alone() {
 fn watchdog_refuses_untrusted_directory_and_foreign_owned_log() {
     let d = tmpdir();
     let ld = d.join("vigie");
-    good_dir(&ld, 0o750);
+    good_dir(&ld, 0o751);
     let log = ld.join("dnsmasq.log");
     fs::write(&log, vec![b'x'; 100]).unwrap();
     let (uid, _) = me();

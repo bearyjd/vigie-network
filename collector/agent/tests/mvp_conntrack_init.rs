@@ -41,9 +41,21 @@ fn run_init(uid: &str, gid: &str, account_ok: bool, directory: &str) -> (Output,
     // Only the shared-directory constant changes. Production has no environment path override.
     fs::write(
         dir.join("init"),
-        source.replace("/tmp/vigie", shared.to_str().unwrap()),
+        source
+            .replace("/tmp/vigie", shared.to_str().unwrap())
+            .replace("/usr/libexec/vigie/vigie-logfs.sh", "\"$LOGFS_CHECK\""),
     )
     .unwrap();
+    fs::write(
+        dir.join("logfs-check"),
+        if directory == "unmounted" {
+            "#!/bin/sh\nexit 70\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        },
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("logfs-check"), fs::Permissions::from_mode(0o700)).unwrap();
     let out = Command::new("sh")
         .args([
             "-c",
@@ -65,6 +77,7 @@ fn run_init(uid: &str, gid: &str, account_ok: bool, directory: &str) -> (Output,
     "#,
         ])
         .env("INIT", dir.join("init"))
+        .env("LOGFS_CHECK", dir.join("logfs-check"))
         .env("TRACE", dir.join("trace"))
         .env("ACCOUNT_UID", uid)
         .env("ACCOUNT_GID", gid)
@@ -126,7 +139,7 @@ fn missing_or_unsafe_account_never_opens_a_procd_instance() {
 
 #[test]
 fn collector_must_prepare_shared_directory_before_helper_starts() {
-    for state in ["missing", "symlink"] {
+    for state in ["missing", "symlink", "unmounted"] {
         let (out, trace) = run_init("6701", "6702", true, state);
         assert!(!out.status.success(), "{state} shared directory accepted");
         assert!(trace.is_empty());
