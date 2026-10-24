@@ -1,0 +1,16 @@
+[package]
+name = "vigie-privdrop"
+description = "Root-invoked Linux64 privilege transition for the unprivileged Vigie collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "vigie_privdrop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigie-privdrop"
+path = "src/main.rs"
+
+[dependencies]

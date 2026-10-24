@@ -189,10 +189,10 @@ yours), SSH as root works, and the files come from this checkout.
    are required; cross-compilation settings are in `collector/.cargo/config.toml`):
    ```sh
    rustup target add aarch64-unknown-linux-musl
-   (cd collector && cargo build --release --target aarch64-unknown-linux-musl -p vigie-collector -p vigie-conntrack)
+   (cd collector && cargo build --locked --release --target aarch64-unknown-linux-musl -p vigie-collector -p vigie-conntrack -p vigie-privdrop)
    ```
    Both binaries land in collector/target/aarch64-unknown-linux-musl/release/, unless
-   `CARGO_TARGET_DIR` overrides the location. Only `vigie-collector` and `vigie-conntrack` run
+   `CARGO_TARGET_DIR` overrides the location. `vigie-collector`, `vigie-conntrack` and the root-invoked [privilege transition helper](docs/privdrop.md) run
    on the router; `net-spike` is a test tool. Deploy scripts live in `collector/agent/deploy/`.
 2. **Create the `vigie` user.** Run the printer locally; it executes nothing:
    `sh collector/agent/deploy/vigie-print-install-commands.sh`. Review the output and run it on the
@@ -205,11 +205,12 @@ yours), SSH as root works, and the files come from this checkout.
    ssh root@192.168.8.1 mkdir -p /tmp/vigie-deploy
    scp -O collector/target/aarch64-unknown-linux-musl/release/vigie-collector \
           collector/target/aarch64-unknown-linux-musl/release/vigie-conntrack \
+          collector/target/aarch64-unknown-linux-musl/release/vigie-privdrop \
           root@192.168.8.1:/tmp/
    scp -O collector/agent/deploy/* root@192.168.8.1:/tmp/vigie-deploy/
    ```
    Then on the router install them root-owned, as listed in the printer's step 2:
-   `/usr/bin/vigie-collector`, `/usr/bin/vigie-conntrack`, the scripts in `/usr/libexec/vigie/`,
+   `/usr/bin/vigie-collector`, `/usr/bin/vigie-conntrack`, `/usr/bin/vigie-privdrop` (root:root 0755, never SUID/SGID), the scripts in `/usr/libexec/vigie/`,
    `/etc/init.d/vigie-collector` (755) and `/etc/vigie/collector.conf`.
 4. **Key and config.** `deploy/provision-collector.sh` printed the exact `scp -O` line for the key
    (to `/etc/vigie/key`, then `chown vigie:vigie` and `chmod 0600`) and the `collector.conf`
@@ -284,32 +285,23 @@ yours), SSH as root works, and the files come from this checkout.
    no inbound rule for Vigie. The rule that limits who can reach the ingest port is on the server
    host (see above).
 
-**Roll back everything** (as root on the router):
+**Rollback requires the exact installation journal and drift checks.** Follow the ordered
+[router filesystem rollback boundary](docs/router-logfs.md#reviewable-rollout-and-rollback-boundary):
+stop owned ensure jobs and collectors first, restore and verify DNS, then review a normal unmount.
+Preserve keys/configuration, logs, legacy directories and unrelated accounts/rules. Do not recursively
+remove the mounted log tree or blanket-delete shared account, cron or firewall entries.
 
-```sh
-/etc/init.d/vigie-collector stop; /etc/init.d/vigie-collector disable
-/etc/init.d/vigie-conntrack stop;  /etc/init.d/vigie-conntrack disable
-rm -f /etc/init.d/vigie-collector /etc/init.d/vigie-conntrack /usr/bin/vigie-collector /usr/bin/vigie-conntrack
-rm -rf /usr/libexec/vigie /etc/vigie /var/run/vigie-collector /tmp/vigie /tmp/vigie-deploy
-rm -f /tmp/dnsmasq.d/vigie.conf && /etc/init.d/dnsmasq restart
-sed -i '/vigie-dnsmasq-dropin.sh/d' /etc/crontabs/root && /etc/init.d/cron restart
-sed -i '/^vigie:/d' /etc/passwd /etc/group /etc/shadow
-# the firewall entries from step 7 (UCI form):
-uci delete firewall.vigie_dns_udp; uci delete firewall.vigie_dns_tcp; uci delete firewall.vigie_dot
-uci commit firewall && /etc/init.d/firewall reload
-# (raw iptables lines in /etc/firewall.user: delete them, then /etc/init.d/firewall restart)
-```
+Server rollback likewise stops only owned units and restores exact journaled files while retaining
+volumes, secrets and evidence; see the [persistent deployment plan](deploy/persistent/README.md).
 
-Server side: `docs/deploy.md`, section "Server-side rollback" (`podman-compose down -v`, `podman secret
-rm`, firewalld rule removal).
-
-A reboot reverts everything under `/tmp` (the drop-in, logs, helper socket) but not the flash
-files above. A firmware upgrade removes `/etc/vigie` including the key (not in the default
+A reboot discards tmpfs data (logs and helper socket). The reviewed early init must recreate the
+bounded log filesystem and drop-in before DNS starts; verify this on the actual firmware before
+unattended operation. Flash files remain. A firmware upgrade removes `/etc/vigie` including the key (not in the default
 sysupgrade keep list); re-provision with `provision-collector.sh --force`.
 
 ## Security notes: verify these on the router
 
-None of this has been observed on a real GL-XE3000 yet.
+The [bounded field pilot](docs/router-validation-2026-10-24.md) exercised temporary real-router collection. Permanent init, privilege-drop artifact, DNS ownership/recovery and reboot checks below still need their separate reviewed acceptance evidence.
 
 - **Log ownership**: `ls -ln /tmp/vigie /tmp/vigie/dnsmasq.log`. Expected: directory
   `drwxr-x--x` (0751), uid 0, group = the vigie gid; log `-rw-r-----`, group = the vigie gid. If

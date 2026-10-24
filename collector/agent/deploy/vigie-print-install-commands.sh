@@ -86,6 +86,8 @@ test "\$(id -gn vigie)" = "vigie" || exit 1
 
 # 2. install the files (binary, scripts, init, config) under root ownership
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie
+# Never set SUID/SGID or file capabilities on the privilege helper.
+install -m 0755 -o root -g root /tmp/vigie-privdrop /usr/bin/vigie-privdrop
 install -m 0755 -o root -g root /tmp/vigie-collector /usr/bin/vigie-collector
 install -m 0755 -o root -g root /tmp/vigie-conntrack /usr/bin/vigie-conntrack
 install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /tmp/vigie-deploy/vigie-state-dir.sh /tmp/vigie-deploy/vigie-logfs.sh /tmp/vigie-deploy/vigie-logfs-boot.sh /usr/libexec/vigie/

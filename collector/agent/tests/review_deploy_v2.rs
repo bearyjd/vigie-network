@@ -329,10 +329,11 @@ fn init_start_refuses_when_the_vigie_user_is_missing() {
     let o = Command::new(&sh)
         .arg("-c")
         .arg(format!(
-            ". '{}'; procd_open_instance() {{ echo OPENED; }}; start_service",
+            ". '{}'; id() {{ return 1; }}; logger() {{ printf '%s\\n' \"$*\" >> \"$SYSLOG\"; }}; procd_open_instance() {{ echo OPENED; }}; start_service",
             init.display()
         ))
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("SYSLOG", d.join("syslog"))
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));

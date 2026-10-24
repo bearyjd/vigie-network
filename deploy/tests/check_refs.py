@@ -36,7 +36,7 @@ OTHER_BRANCH = {
 }
 # Flags that belong to curl, podman, scp, cargo, openssl, iptables, git, sqlite... not to Vigie.
 THIRD_PARTY_FLAGS = {
-    "--cacert", "--format", "--release", "--target", "--permanent", "--add-rich-rule", "--dport",
+    "--cacert", "--format", "--release", "--locked", "--target", "--permanent", "--add-rich-rule", "--dport",
     "--to-destination", "--rm", "--no-deps", "--env-file", "--force-recreate", "--out-file",
     "--test", "--check", "--config", "--sport", "--once", "--file", "--secret",
     "--now", "--reload", "--restart", "--user", "--remove-rich-rule", "--list-rich-rules",
