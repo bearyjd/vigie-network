@@ -1,13 +1,14 @@
 # Vigie server image: ONE image, three services (ingest, pipeline, api) selected by command.
-# Build context is the repository root (see compose.yaml). Not yet built in CI; reviewed by hand only.
+# Build context is the repository root (see compose.yaml). Rootless build/runtime validated
+# on 2026-10-24; see docs/deployment-validation-2026-10-24.md. Image builds are not yet a CI gate.
 #
 #   podman build -f deploy/Containerfile -t localhost/vigie-server:dev .
 #
-# Runtime assumptions (compose.yaml sets them): read-only rootfs, /tmp as tmpfs, all
+# Runtime contract (compose.yaml sets it): read-only rootfs, /tmp as tmpfs, all
 # capabilities dropped, three data volumes: /raw (shards), /inv (inventory.db), /overrides.
 #
 # Base images are pinned by digest (the multi-arch index digest of the tag named next to it),
-# looked up on 2026-10-21 through the registries' HTTP APIs; NOT verified by pulling or building.
+# looked up on 2026-10-21 through the registries' HTTP APIs and built on 2026-10-24.
 # Refresh both together on purpose: deploy/tests/check_refs.py --release fails on an unpinned ARG.
 # tag: docker.io/library/python:3.12-slim-bookworm
 ARG PYTHON_IMAGE=docker.io/library/python@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
@@ -57,7 +58,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     VIGIE_SECRETS_DIR=/run/secrets
 USER vigie:vigie
 WORKDIR /var/lib/vigie
-VOLUME ["/raw", "/inv", "/overrides"]
-# The entrypoint only guards overrides.db (see entrypoint.sh) and then execs the command.
+# Compose owns the volume matrix. Image VOLUME declarations would add anonymous
+# writable mounts for paths a service deliberately does not mount.
+# The entrypoint sets a private creation mask, guards overrides.db, then execs the command.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "vigie_api", "--help"]

@@ -287,6 +287,13 @@ ep() { # ep DATA_DIR INVENTORY_PATH OVERRIDES_PATH CMD... ; guard on
 	VIGIE_GUARD_OVERRIDES=1 VIGIE_DATA_DIR="$d" VIGIE_INVENTORY_PATH="$i" VIGIE_OVERRIDES_PATH="$o" sh "$E" "$@"
 }
 mkdir -p "$T/raw" "$T/inv" "$T/ovr"
+(
+    umask 022
+    ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" \
+        sh -c ': > "$1"; mkdir "$2"' sh "$T/entrypoint-created.db" "$T/entrypoint-created-dir"
+)
+check "entrypoint creates private data files despite permissive parent umask" is_mode "$T/entrypoint-created.db" 600
+check "entrypoint creates private data directories despite permissive parent umask" is_mode "$T/entrypoint-created-dir" 700
 ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" true >/dev/null 2>&1
 check "entrypoint passes on clean volumes" test $? -eq 0
 check "entrypoint execs its command" test "$(ep "$T/raw" "$T/inv/inventory.db" "$T/ovr/overrides.db" echo hi)" = hi

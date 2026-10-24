@@ -23,9 +23,9 @@
 # keeper process is down its readers fail closed (pipeline: "no links, no rules" and a logged
 # error; api: 500 on inventory reads).
 #
-# NOT verified by a real build/run in this repo's review (no container runtime was available):
-# only static checks (yaml parse, `podman-compose config` against a stub podman, shellcheck, hand
-# review), plus the bubblewrap read-only-mount tests above.
+# Real rootless Podman loopback/synthetic validation is recorded in
+# docs/deployment-validation-2026-10-24.md (mounts, private file modes, service restarts).
+# Production placement, real router operation, host reboot and long soak remain unverified.
 #
 # All three containers run as the same numeric user (10001, set explicitly below) because files
 # are created 0600 and podman rootless maps volumes to one owner; separation is by mount + code,

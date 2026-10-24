@@ -28,7 +28,8 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$REPO/collector/target}
 # Resolve paths before entering project directories.
 SERVER_ENV=$(realpath -m "$SERVER_ENV")
 TRAFFIC_ENV=$(realpath -m "$TRAFFIC_ENV")
-export CARGO_TARGET_DIR=$(realpath -m "$CARGO_TARGET_DIR")
+CARGO_TARGET_DIR=$(realpath -m "$CARGO_TARGET_DIR")
+export CARGO_TARGET_DIR
 LOG_DIR=${VIGIE_CI_LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/vigie-ci.XXXXXX")}
 mkdir -p "$LOG_DIR"
 LOG_DIR=$(realpath "$LOG_DIR")
@@ -48,6 +49,7 @@ stage_trafficgen() {
 stage_rust() { (cd collector && cargo test --locked --workspace); }
 stage_deploy() {
     bash deploy/tests/test_scripts.sh &&
+    python3 -I deploy/tests/test_check_image_mounts.py &&
     UV_PROJECT_ENVIRONMENT="$TRAFFIC_ENV" uv run --frozen --project tools/trafficgen \
         --with PyYAML==6.0.3 python -I deploy/tests/check_refs.py --release &&
     bash tests/p0/test_mac_roll_report.sh
