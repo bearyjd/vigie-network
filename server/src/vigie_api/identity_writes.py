@@ -74,7 +74,7 @@ def _date(value: str) -> float:
         if parsed.tzinfo is None:
             raise ValueError
         return parsed.astimezone(UTC).timestamp()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ApiError(
             422, "invalid_timestamp", "timestamp must be an ISO-8601 instant with timezone"
         ) from None
@@ -695,13 +695,23 @@ def clear_veto(inv, ov, *, candidate_id, body, principal, now, request_id):
         if candidate is None:
             raise ApiError(404, "not_found", "candidate not found")
         ids = [candidate["device_a"], candidate["device_b"]]
-        _targets(inv, ov, ids)
-        _versions(ov, ids, body)
+        canonical = []
+        for device in ids:
+            if inv.execute("SELECT 1 FROM devices WHERE id=?", (device,)).fetchone() is None:
+                raise ApiError(409, "orphaned_device", "a historical device is missing")
+            canonical.append(_canonical(ov, device))
+        # Retired historical aliases still carry sticky vetoes; their current
+        # canonical identities must exist and be live. Protect both the exact
+        # historical pair and its current roots against intervening human edits.
+        _targets(inv, ov, dict.fromkeys(canonical), canonical=False)
+        involved = list(dict.fromkeys([*ids, *canonical]))
+        _versions(ov, involved, body)
         if candidate["state"] != "vetoed":
             raise ApiError(409, "candidate_not_vetoed", "candidate is not vetoed")
         old = ov.execute(
             "SELECT * FROM candidate_decisions WHERE candidate_id=?", (candidate_id,)
         ).fetchone()
+        before = {"decision": dict(old) if old else None, "overrides": _snapshot(ov, involved)}
         decision = str(uuid.uuid4())
         ov.execute(
             "INSERT INTO candidate_decisions"
@@ -712,14 +722,14 @@ def clear_veto(inv, ov, *, candidate_id, body, principal, now, request_id):
             " decided_at=excluded.decided_at,id=excluded.id",
             (candidate_id, *ids, principal.name, now, decision),
         )
-        versions = _bump(ov, ids, principal.name, now)
+        versions = _bump(ov, involved, principal.name, now)
         result = {
             "id": decision,
             "candidate_id": candidate_id,
             "action": "clear_veto",
             "versions": versions,
         }
-        return result, dict(old) if old else None, result
+        return result, before, {"decision": result, "overrides": _snapshot(ov, involved)}
 
     return atomic(
         ov,

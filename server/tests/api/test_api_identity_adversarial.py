@@ -186,3 +186,24 @@ def test_undo_uses_participant_versions_discovered_from_device_details(env):
 
     assert undone.status_code == 200, undone.text
     assert env.get("/devices/a").json()["data"]["merged_into"] is None
+
+
+@pytest.mark.parametrize("expires_at", ["0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59"])
+def test_rule_expiry_utc_overflow_is_a_validation_error_without_writes(env, expires_at):
+    env.device("a")
+    _, token = tokens.create_token(env.ov, "expiry-human", rules_write=True)
+    response = env.client.post(
+        "/identity/rules",
+        json={
+            "device_id": "a",
+            "expected_version": 0,
+            "signature": {"opt55": "1,3", "opt60": "vendor", "hostname": "host"},
+            "expires_at": expires_at,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "invalid_timestamp"
+    for table in ("identity_rules", "device_overrides", "audit_log", "api_write_receipts"):
+        assert env.ov.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0  # noqa: S608

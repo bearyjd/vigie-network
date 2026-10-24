@@ -372,8 +372,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         "Authenticated human action, audited with X-Request-ID. Supply the current device "
         "identity_override_version values from device detail in expected_versions "
         "(or expected_version for one device). Stale "
-        "versions return 409. Body and per-token rate limits apply. Every actual overrides.db "
-        "commit delays in-flight rule attaches by one pass; reads and no-op retries do not write. "
+        "versions return 409. Body and per-token rate limits apply. Attach-relevant identity "
+        "changes delay in-flight rule attachments; unrelated label/token/audit writes and "
+        "no-op retries do not. "
     )
     rule_description = (
         write_description
@@ -556,6 +557,10 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         description=write_description
         + (
             "Record an overrides-side clear_veto decision for the exact candidate pair. "
+            "For historical merged endpoints, expected_versions covers both exact endpoints "
+            "and their current canonical devices, deduplicated. Read each device detail's "
+            "identity_override_version. Retired historical aliases are allowed only when "
+            "their canonical devices are live. All involved versions advance together. "
             "The API keeps inventory.db read-only. The pipeline consumes this once on "
             "its next pass, dismisses the veto, and recomputes/revalidates evidence. "
             "Clearing alone never attaches; current overlap still blocks attachment."

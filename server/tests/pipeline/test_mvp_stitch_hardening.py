@@ -167,3 +167,45 @@ def test_planned_veto_does_not_cancel_unrelated_safe_decision(tmp_path, rule):
     assert (stats.attached if rule else stats.suggestions) == 1
     assert inv.link_of(returning) == (("D", "rule") if rule else ("A", "self"))
     inv.db.close()
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize("auto_inherit", [False, True])
+def test_computed_reverse_pair_veto_blocks_same_plan_attach_or_suggestion(
+    tmp_path, reverse_order, auto_inherit
+):
+    inv = Inv(tmp_path)
+    inv.mac(
+        "B", "victim", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 10000, NOW_ABS - 9399)]
+    )
+    a = inv.mac("A", "victim", None, "self", OLD, [(NOW_ABS - 9899, NOW_ABS - 7899)])
+    snap = replace(
+        RULE_SNAP,
+        rules=(replace(RULE_SNAP.rules[0], device_id="B"),),
+        overrides={"B": (1, "iot")},
+        group_auto_inherit={"iot": int(auto_inherit)},
+    )
+    inv.commit()
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    assert any(
+        isinstance(d, Veto) and (d.from_device, d.into) == ("B", "A") for d in plan.decisions
+    )
+    assert any(
+        isinstance(d, Attach if auto_inherit else Suggest) and d.mac == a for d in plan.decisions
+    )
+    if reverse_order:
+        plan = replace(plan, decisions=tuple(reversed(plan.decisions)))
+    stats = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert stats.vetoed == 1
+    assert stats.attached == stats.suggestions == 0
+    assert inv.link_of(a) == ("A", "self")
+    assert (
+        inv.db.execute(
+            "SELECT state FROM identity_candidates WHERE device_a='B' AND device_b='A'"
+        ).fetchone()[0]
+        == "vetoed"
+    )
+    again = inv.stitch(snap)
+    assert again.attached == again.suggestions == 0
+    assert inv.link_of(a) == ("A", "self")
+    inv.db.close()

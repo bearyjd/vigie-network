@@ -70,10 +70,12 @@ class Applier:
         self, inv: sqlite3.Connection, snap: Snapshot, overrides: sqlite3.Connection | None,
         cfg: PipelineConfig, now: float, clock: Callable[[], float], stats: StitchStats,
         merge_decisions: Mapping[str, SuggestionOutcome], veto_stamp: int,
+        planned_vetoes: frozenset[frozenset[str]],
     ) -> None:  # fmt: skip
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.clock, self.stats = now, clock, stats
         self.merge_decisions = merge_decisions
+        self.planned_vetoes = planned_vetoes
         # Compare once after acquiring BEGIN IMMEDIATE. No external inventory
         # writer can interleave now; later increments belong to this same plan.
         self.veto_dirty = veto_generation(inv) != veto_stamp
@@ -175,7 +177,7 @@ class Applier:
             log(logger, logging.INFO, "identity_candidate_ambiguous", mac=short_hash(d.mac))
 
     def _suggest(self, d: Suggest) -> None:
-        if not self._vetoes_unchanged():
+        if not self._vetoes_unchanged() or not self._plan_allows(d.from_device, d.into):
             return
         if not self._still_self(d.mac, d.from_device):
             return
@@ -316,8 +318,18 @@ class Applier:
             return False
         return True
 
+    def _plan_allows(self, a: str, b: str) -> bool:
+        # An asymmetric activity judgement can produce a reverse-direction veto
+        # in this very plan. It wins regardless of decision order or alias spelling.
+        if self.planned_vetoes and frozenset((self.snap.canonical(a), self.snap.canonical(b))) in (
+            self.planned_vetoes
+        ):
+            self.stats.stale += 1
+            return False
+        return True
+
     def _attach(self, d: Attach) -> None:
-        if not self._vetoes_unchanged():
+        if not self._vetoes_unchanged() or not self._plan_allows(d.from_device, d.target):
             return
         if self.attaches >= MAX_ATTACHES_PER_PASS:
             self.stats.capped += 1
@@ -411,9 +423,25 @@ def apply_plan(
         if any(isinstance(d, Suggest) for d in plan.decisions)
         else {}
     )
+    # At most one pair per count-bounded decision. Canonical graph resolution is
+    # memoized on the immutable snapshot and primed BEFORE taking the writer lock.
+    planned_vetoes = frozenset(
+        frozenset((snap.canonical(d.from_device), snap.canonical(d.into)))
+        for d in plan.decisions
+        if isinstance(d, Veto)
+    )
     with immediate(inv):
         applier = Applier(
-            inv, snap, overrides, cfg, now, clock, stats, merge_decisions, plan.veto_generation
+            inv,
+            snap,
+            overrides,
+            cfg,
+            now,
+            clock,
+            stats,
+            merge_decisions,
+            plan.veto_generation,
+            planned_vetoes,
         )
         for decision in plan.decisions:
             applier.apply(decision)

@@ -101,6 +101,16 @@ blocks attachment and establishes a fresh sticky veto. That veto survives eviden
 another audited clearance is required. A consumed clearance cannot clear any later veto again.
 An ordinary dismissed suggestion keeps its existing sticky semantics.
 
+Sticky vetoes can name historical merged aliases. To clear one, `expected_versions` must cover
+the union of its exact two endpoints and their current canonical devices (at most four distinct
+IDs). Fetch `GET /devices/{id}` for each endpoint, follow `merged_into` when present, and read
+each requested ID's `identity_override_version`. Canonical versions cannot replace an alias's
+own version. Missing or retired canonical devices, missing historical endpoints, cycles and
+overlong link chains fail closed. A retired historical alias is allowed when its canonical
+device remains live. The intent retains the original ordered candidate pair; all supplied
+device versions advance in the same audited transaction and return in `data.versions`.
+The pipeline still checks current rules, groups, identity state and overlap before attachment.
+
 ## Write costs and safety
 
 Each successful human mutation and its audit entry commit together. New writes use optimistic

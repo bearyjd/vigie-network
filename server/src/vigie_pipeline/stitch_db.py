@@ -153,17 +153,20 @@ def vetoed_between(inv: sqlite3.Connection, a_ids: Collection[str], b_ids: Colle
     ids of the SMALLER side (chunked, through that side's index) and checked by set membership
     against the larger one, so a huge merge component never becomes an IN list."""
     if len(a_ids) <= len(b_ids):
-        column, other, small, large = "device_a", "device_b", a_ids, set(b_ids)
+        small, large = a_ids, set(b_ids)
     else:
-        column, other, small, large = "device_b", "device_a", b_ids, set(a_ids)
+        small, large = b_ids, set(a_ids)
     for chunk in _chunks(small):
-        rows = inv.execute(
-            f"SELECT {other} FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
-            f" AND {column} IN ({','.join('?' * len(chunk))})",
-            chunk,
-        )
-        if any(r[0] in large for r in rows):
-            return True
+        # Concurrent presence is symmetric even when the candidate was originally
+        # recorded in the opposite direction. Both columns have covering indexes.
+        for column, other in (("device_a", "device_b"), ("device_b", "device_a")):
+            rows = inv.execute(
+                f"SELECT {other} FROM identity_candidates WHERE state='vetoed'"  # noqa: S608
+                f" AND {column} IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            if any(r[0] in large for r in rows):
+                return True
     return False
 
 

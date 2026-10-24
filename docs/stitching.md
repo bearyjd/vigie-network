@@ -200,6 +200,10 @@ before applying decisions. A veto introduced on any merged alias therefore inval
 attachments and suggestions without an alias scan under the lock. Later generation increments
 from the same plan do not invalidate unrelated decisions: no external inventory writer can
 interleave while APPLY holds that lock. The direct candidate preconditions remain in force.
+All vetoes in the plan also form a bounded set of canonical identity pairs before application.
+An attachment or suggestion joining one of those pairs is blocked in either direction,
+regardless of decision order. Persisted veto lookup checks both directions across the two
+components, so reversing the proposed merge cannot bypass a sticky veto on a later pass.
 Only old schemas without the version table use the coarse `PRAGMA data_version` fallback:
 any commit delays attaches, using the same long-lived read-only connection for both reads.
 APPLY also re-checks that the rule is unexpired at the
