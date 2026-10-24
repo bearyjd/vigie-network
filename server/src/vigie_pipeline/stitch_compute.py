@@ -350,11 +350,18 @@ class Compute:
 
     def _examine_self(self, mac: str, c: Obs) -> None:
         hood = self._hood()
-        hood.add_keys(c)
+        # A flood proven in this read-only snapshot cannot shrink during the pass.
+        # Keep the subject's own activity check, but do not reload its unsafe peers.
+        known_flood = any(key in self.flooded for key in group_keys(c))
+        if not known_flood:
+            hood.add_keys(c)
         hood.load(mac)
         if not hood.act.get(mac):
             return
         self.stats.examined += 1
+        if known_flood:
+            self.stats.flooded += 1
+            return
         if self._name_flooded(hood, c):
             return
         if not self._rule_path(hood, c):

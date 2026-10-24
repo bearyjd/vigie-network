@@ -62,6 +62,46 @@ def _same_name_macs(data: Data, n: int, base: int = 10) -> list[str]:
     return macs
 
 
+@pytest.mark.parametrize("clipped_subject", [False, True])
+def test_known_flood_reuses_its_snapshot_proof_instead_of_reloading_every_bucket(
+    inv, clipped_subject
+):
+    for n in range(301):
+        ivs = (
+            [(NOW_ABS - 7200, NOW_ABS - 7100)]
+            if clipped_subject and n == 1
+            else [(NOW_ABS - 600, NOW_ABS)]
+        )
+        m = inv.mac(f"D{n}", HOST, MDNS, "self", OLD, ivs)
+        if clipped_subject and n == 1:
+            # Retained activity can still be clipped away by the first-receipt horizon.
+            inv.db.execute("UPDATE mac_first_received SET received=? WHERE mac=?", (NOW_ABS, m))
+    inv.commit()
+    bucket_reads = []
+    inv.db.set_trace_callback(
+        lambda sql: bucket_reads.append(sql) if "WHERE o.dhcp_fingerprint=" in sql else None
+    )
+    try:
+        # Work counts must not depend on machine speed or the compute time budget.
+        plan = compute_plan(inv.db, EMPTY, inv.cfg, NOW_ABS, monotonic=lambda: 0.0)
+    finally:
+        inv.db.set_trace_callback(None)
+    assert (
+        plan.stats.examined
+        == plan.stats.flooded
+        == (compute_mod.MACS_PER_PASS - int(clipped_subject))
+    )
+    assert not any(isinstance(d, (apply_mod.Attach, apply_mod.Suggest)) for d in plan.decisions)
+    # One lookup for each of the two names suffices to prove this immutable group flooded.
+    assert 0 < len(bucket_reads) <= 2
+
+    # The proof belongs only to this transaction: a later, smaller live population is rechecked.
+    keep = [row[0] for row in inv.db.execute("SELECT mac FROM observations ORDER BY mac LIMIT 2")]
+    inv.db.execute("DELETE FROM mac_activity WHERE mac NOT IN (?,?)", keep)
+    later = compute_plan(inv.db, EMPTY, inv.cfg, NOW_ABS, monotonic=lambda: 0.0)
+    assert later.stats.flooded == 0
+
+
 def test_flood_of_one_signature_is_bounded_fast_and_reported_once_a_day(data, caplog):
     macs = [flood_mac(i) for i in range(301)]
     data.add_batch(
