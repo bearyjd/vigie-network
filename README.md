@@ -334,6 +334,8 @@ None of this has been observed on a real GL-XE3000 yet.
 
 ## Where to read more
 
+- Product roadmap: [`docs/roadmap.md`](docs/roadmap.md), with the
+  [feature research](docs/research/network-monitoring-features-2026-10-24.md).
 - Operations (backups, retention, upgrades, key and pin rotation, permission model):
   [`docs/deploy.md`](docs/deploy.md)
 - Architecture: [`docs/prp/001-vigie-architecture.md`](docs/prp/001-vigie-architecture.md) (rev 3)

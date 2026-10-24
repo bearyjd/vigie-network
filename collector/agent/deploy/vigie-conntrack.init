@@ -22,8 +22,8 @@ start_service() {
 	fi
 	case "$VIGIE_CT_UID" in '' | *[!0-9]*) return 1 ;; esac
 	case "$VIGIE_CT_GID" in '' | *[!0-9]*) return 1 ;; esac
-	if ! [ "$VIGIE_CT_UID" -ge 1000 ] || ! [ "$VIGIE_CT_UID" -le 4294967295 ] || [ "$VIGIE_CT_UID" -eq 65534 ] ||
-	   ! [ "$VIGIE_CT_GID" -ge 1000 ] || ! [ "$VIGIE_CT_GID" -le 4294967295 ] || [ "$VIGIE_CT_GID" -eq 65534 ]; then
+	if ! [ "$VIGIE_CT_UID" -ge 1000 ] || ! [ "$VIGIE_CT_UID" -le 4294967294 ] || [ "$VIGIE_CT_UID" -eq 65534 ] ||
+	   ! [ "$VIGIE_CT_GID" -ge 1000 ] || ! [ "$VIGIE_CT_GID" -le 4294967294 ] || [ "$VIGIE_CT_GID" -eq 65534 ]; then
 		logger -t vigie 'conntrack: unsafe vigie uid/gid'
 		return 1
 	fi

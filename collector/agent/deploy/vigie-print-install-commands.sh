@@ -47,11 +47,11 @@ case "$UID_N$GID_N" in
 	exit 64
 	;;
 esac
-if [ "$UID_N" = 0 ] || [ "$UID_N" = 65534 ] || [ "$GID_N" = 0 ] || [ "$GID_N" = 65534 ]; then
+if [ "$UID_N" -eq 0 ] || [ "$UID_N" -eq 65534 ] || [ "$GID_N" -eq 0 ] || [ "$GID_N" -eq 65534 ]; then
 	echo "refusing uid/gid 0 or 65534 (root / nobody)" >&2
 	exit 64
 fi
-if [ "$UID_N" -lt 6700 ] || [ "$UID_N" -gt 6799 ] || in_use "$PASSWD" "$UID_N"; then
+if ! [ "$UID_N" -ge 6700 ] || ! [ "$UID_N" -le 6799 ] || in_use "$PASSWD" "$UID_N"; then
 	echo "uid $UID_N is outside 6700..6799 or already used in $PASSWD" >&2
 	exit 64
 fi
@@ -59,8 +59,16 @@ if in_use "$GROUP" "$GID_N"; then
 	echo "gid $GID_N is already used in $GROUP" >&2
 	exit 64
 fi
-if ! [ "$GID_N" -ge 1000 ] || ! [ "$GID_N" -le 4294967295 ]; then
-	echo "gid must be a dedicated gid in 1000..4294967295" >&2
+if ! [ "$GID_N" -ge 1000 ] || ! [ "$GID_N" -le 4294967294 ]; then
+	echo "gid must be a dedicated gid in 1000..4294967294" >&2
+	exit 64
+fi
+
+# A pre-existing named group could differ from the selected numeric primary gid.
+# This printer provisions a fresh dedicated account; never silently reuse an old one.
+if awk -F: '$1 == "vigie" { f = 1 } END { exit !f }' "$PASSWD" ||
+   awk -F: '$1 == "vigie" { f = 1 } END { exit !f }' "$GROUP"; then
+	echo "vigie account/group already exists; inspect its ids instead of recreating it" >&2
 	exit 64
 fi
 
@@ -74,6 +82,7 @@ grep -q '^vigie:' /etc/shadow || echo 'vigie:x:0:0:99999:7:::' >> /etc/shadow
 # Verify the selected account before installing files or changing key ownership.
 test "\$(id -u vigie)" = "${UID_N}" || exit 1
 test "\$(id -g vigie)" = "${GID_N}" || exit 1
+test "\$(id -gn vigie)" = "vigie" || exit 1
 
 # 2. install the files (binary, scripts, init, config) under root ownership
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie

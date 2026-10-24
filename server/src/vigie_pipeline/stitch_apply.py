@@ -74,7 +74,9 @@ class Applier:
         self.inv, self.snap, self.overrides, self.cfg = inv, snap, overrides, cfg
         self.now, self.clock, self.stats = now, clock, stats
         self.merge_decisions = merge_decisions
-        self.veto_stamp = veto_stamp
+        # Compare once after acquiring BEGIN IMMEDIATE. No external inventory
+        # writer can interleave now; later increments belong to this same plan.
+        self.veto_dirty = veto_generation(inv) != veto_stamp
         self.at = clock()  # the clock under the lock; read again before each attach write
         self.dirty = False  # identity inputs changed since snapshot: no more attaches this pass
         self.cleanup_writes = 0  # orphan cleanup rows this pass (<= CLEANUP_ROWS_SHARE of the cap)
@@ -307,9 +309,9 @@ class Applier:
         return bool(row) and row[0] == "ok"
 
     def _vetoes_unchanged(self) -> bool:
-        # This point read is under BEGIN IMMEDIATE, so a merged alias cannot gain
-        # a veto between validation and attachment. No alias traversal under the lock.
-        if veto_generation(self.inv) != self.veto_stamp:
+        # External changes to any merged alias invalidate the precomputed plan.
+        # Vetoes authored by this plan must not cancel unrelated safe decisions.
+        if self.veto_dirty:
             self.stats.stale += 1
             return False
         return True

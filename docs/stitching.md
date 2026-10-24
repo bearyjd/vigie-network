@@ -84,7 +84,10 @@ Row timestamps are collector-supplied and untrusted. A stamp outside
 `[batch received_at - ACTIVITY_MAX_REPORT_LAG_S (1 h), received_at + ACTIVITY_SKEW_S (300 s)]` is
 ignored in every batch (epoch-near stamps from a router without an RTC, far-future stamps, back-fill
 over a peer's absence). `mac_first_received` records the SERVER receipt of the first batch carrying
-the MAC, set once; when intervals are loaded, activity earlier than `first received - 1 h` is clipped
+the MAC, set once while its receipt or activity remains within retention. When a MAC returns with
+an expired receipt anchor and no retained activity, recording its new evidence resets the anchor
+before inserting fresh activity, even if paged cleanup has not reached its old rows yet.
+When intervals are loaded, activity earlier than `first received - 1 h` is clipped
 away. Any interval shorter than the activity gap is widened symmetrically to that width (a stamp
 means "present around then"), so a copy stamping once per 301 s still overlaps.
 
@@ -190,6 +193,13 @@ change attach authorization and do not delay attaches. Inventory `identity_state
 separately; the API exposes no identity-state override. Relevant writes delay remaining attaches
 by one pass; irrelevant writes do not. Continuous relevant changes can keep delaying attaches.
 APPLY also compares the schema version so a concurrent schema change fails closed.
+Pipeline migration 5 adds a separate inventory `veto_generation` stamp. Candidate triggers
+advance it for veto insertion, update or removal in the same transaction. COMPUTE captures it
+inside its inventory snapshot; APPLY compares it once after acquiring the writer lock,
+before applying decisions. A veto introduced on any merged alias therefore invalidates stale
+attachments and suggestions without an alias scan under the lock. Later generation increments
+from the same plan do not invalidate unrelated decisions: no external inventory writer can
+interleave while APPLY holds that lock. The direct candidate preconditions remain in force.
 Only old schemas without the version table use the coarse `PRAGMA data_version` fallback:
 any commit delays attaches, using the same long-lived read-only connection for both reads.
 APPLY also re-checks that the rule is unexpired at the

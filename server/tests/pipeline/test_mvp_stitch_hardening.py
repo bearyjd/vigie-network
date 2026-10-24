@@ -15,7 +15,7 @@ from vigie_pipeline.sources import MacActivity
 from vigie_pipeline.stitch_apply import apply_plan
 from vigie_pipeline.stitch_compute import compute_plan
 from vigie_pipeline.stitch_db import veto_generation
-from vigie_pipeline.stitch_types import Attach, fold, short_hash
+from vigie_pipeline.stitch_types import Attach, Suggest, Veto, fold, short_hash
 
 
 @pytest.mark.parametrize("retained", [False, True])
@@ -122,4 +122,48 @@ def test_veto_stamp_tracks_all_mutations_but_not_unrelated_candidates(tmp_path):
     assert veto_generation(inv.db) == 2
     inv.db.execute("DELETE FROM identity_candidates WHERE id='c'")
     assert veto_generation(inv.db) == 3
+    inv.db.close()
+
+
+def test_recent_server_receipt_survives_until_usable_activity_arrives(tmp_path):
+    db = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    first, now = NOW_ABS - 1200, NOW_ABS
+    # A MAC can first reach the server in a batch whose row stamps are not usable.
+    record_activity(
+        db,
+        {"recent": MacActivity(first - 7200, first - 7200, stamps={first - 7200})},
+        300,
+        first,
+        86400,
+    )
+    assert db.execute("SELECT 1 FROM mac_activity WHERE mac='recent'").fetchone() is None
+    record_activity(
+        db, {"recent": MacActivity(now - 600, now, stamps={now - 600, now})}, 300, now, 86400
+    )
+    assert (
+        db.execute("SELECT received FROM mac_first_received WHERE mac='recent'").fetchone()[0]
+        == first
+    )
+    db.close()
+
+
+@pytest.mark.parametrize("rule", [False, True])
+def test_planned_veto_does_not_cancel_unrelated_safe_decision(tmp_path, rule):
+    inv = Inv(tmp_path)
+    inv.mac("D", "victim", None, "self", OLD, [(NOW_ABS - 90000, NOW_ABS - 80000)], rand=0)
+    inv.mac("X", "other", None, "self", OLD, [(NOW_ABS - 10000, NOW_ABS)], rand=0)
+    inv.mac("B", "other", None, "self", "2026-01-02T00:00:00Z", [(NOW_ABS - 6000, NOW_ABS)])
+    returning = inv.mac(
+        "A", "victim", None, "self", "2026-01-03T00:00:00Z", [(NOW_ABS - 60000, NOW_ABS - 4000)]
+    )
+    snap = RULE_SNAP if rule else EMPTY
+    inv.commit()
+    plan = compute_plan(inv.db, snap, inv.cfg, NOW_ABS)
+    actions = [d for d in plan.decisions if isinstance(d, (Veto, Attach, Suggest))]
+    assert isinstance(actions[0], Veto)
+    assert any(isinstance(d, Attach if rule else Suggest) and d.mac == returning for d in actions)
+    stats = apply_plan(inv.db, snap, inv.cfg, NOW_ABS, lambda: NOW_ABS, None, plan)
+    assert stats.vetoed == 1
+    assert (stats.attached if rule else stats.suggestions) == 1
+    assert inv.link_of(returning) == (("D", "rule") if rule else ("A", "self"))
     inv.db.close()

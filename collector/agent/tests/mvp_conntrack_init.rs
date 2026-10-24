@@ -9,9 +9,13 @@ static N: AtomicU32 = AtomicU32::new(0);
 
 fn fixture() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "vigie init {} {}",
+        "vigie init {} {} {}",
         std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
+        N.fetch_add(1, Ordering::SeqCst),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     fs::create_dir(&dir).unwrap();
     dir
@@ -105,6 +109,8 @@ fn missing_or_unsafe_account_never_opens_a_procd_instance() {
         ("065534", "6702", true),
         ("6701", "065534", true),
         ("", "6702", true),
+        ("4294967295", "6702", true),
+        ("6701", "4294967295", true),
         ("4294967296", "6702", true),
         ("6701", "4294967296", true),
         ("6701", "0", true),
@@ -201,6 +207,7 @@ fn printed_account_check_aborts_before_install_for_existing_mismatched_account()
                 case "$*" in
                     '-u vigie') printf '%s\n' "$FIXTURE_UID" ;;
                     '-g vigie') printf '%s\n' "$FIXTURE_GID" ;;
+                    '-gn vigie') printf '%s\n' vigie ;;
                     *) return 1 ;;
                 esac
             }
@@ -213,5 +220,38 @@ fn printed_account_check_aborts_before_install_for_existing_mismatched_account()
             .output()
             .unwrap();
         assert_eq!(out.status.success(), expected, "account {uid}:{gid}");
+    }
+}
+
+#[test]
+fn printer_refuses_preexisting_group_name_and_unsafe_gid_values() {
+    for (group, gid) in [
+        ("root:x:0:\nvigie:x:6702:\n", "6700"),
+        ("root:x:0:\n", "065534"),
+        ("root:x:0:\n", "4294967295"),
+    ] {
+        let dir = fixture();
+        fs::write(dir.join("passwd"), "root:x:0:0::/:/bin/sh\n").unwrap();
+        fs::write(dir.join("group"), group).unwrap();
+        let out = Command::new("sh")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/deploy/vigie-print-install-commands.sh"
+            ))
+            .env("VIGIE_TEST", "1")
+            .env("VIGIE_PASSWD", dir.join("passwd"))
+            .env("VIGIE_GROUP_FILE", dir.join("group"))
+            .env("VIGIE_UID", "6700")
+            .env("VIGIE_GID", gid)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "unsafe group {group:?}, gid {gid} accepted"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "unsafe setup printed install commands"
+        );
     }
 }

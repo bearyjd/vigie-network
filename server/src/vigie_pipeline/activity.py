@@ -85,10 +85,15 @@ def record_activity(
     their span is recorded in `evidence_gaps` (section 1 of docs/stitching.md)."""
     # Cleanup is paged: an expired anchor can outlive its activity rows. Check the
     # retained evidence before adding fresh rows, including rows awaiting pruning.
+    # Recent receipt anchors are themselves retained server evidence, even when
+    # the first batch's collector stamps were unusable.
     inv.executemany(
-        "DELETE FROM mac_first_received WHERE mac=? AND NOT EXISTS ("
+        "DELETE FROM mac_first_received WHERE mac=? AND received<? AND NOT EXISTS ("
         'SELECT 1 FROM mac_activity WHERE mac=? AND "end">=?)',
-        [(mac, mac, int(received_ts) - retention_s) for mac in acts],
+        [
+            (mac, int(received_ts) - retention_s, mac, int(received_ts) - retention_s)
+            for mac in acts
+        ],
     )
     inv.executemany(  # server-clock anchor, stable while retained activity survives
         "INSERT OR IGNORE INTO mac_first_received (mac, received) VALUES (?,?)",
