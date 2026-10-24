@@ -68,6 +68,30 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("vigie_test_ingest_key", api)
         self.assertIn("StartLimitBurst=5", api)
 
+    def test_recovery_dependencies_order_without_cancelling_own_restart(self):
+        files = render.render(config())
+        for role in ("api", "pipeline"):
+            text = files[f"vigie_test-{role}.container"]
+            self.assertIn("After=vigie_test-ingest.service", text)
+            self.assertIn("Wants=vigie_test-ingest.service", text)
+            self.assertNotIn("Requires=", text)
+            self.assertIn("Restart=on-failure", text)
+            self.assertIn("StartLimitBurst=5", text)
+
+    def test_monitoring_threshold_default_override_and_bounds(self):
+        key = "monitoring_large_upload_bytes"
+        default = render.render(config())["vigie_test-pipeline.container"]
+        self.assertIn(
+            "Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824", default
+        )
+        custom = render.render(config(**{key: 2**50}))["vigie_test-pipeline.container"]
+        self.assertIn(
+            f"Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES={2**50}", custom
+        )
+        for invalid in (0, -1, True, "1073741824", 2**50 + 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                render.render(config(**{key: invalid}))
+
     def test_invalid_or_injected_config_rejected(self):
         for updates in [
             {"namespace": "dev"},

@@ -30,8 +30,15 @@ _MOUNTS = {
 
 
 def render(config: dict) -> dict[str, str]:
-    if not isinstance(config, dict) or set(config) != _FIELDS:
-        raise ValueError("configuration must contain exactly the documented fields")
+    if (
+        not isinstance(config, dict)
+        or not _FIELDS <= set(config)
+        or set(config) - (_FIELDS | {"monitoring_large_upload_bytes"})
+    ):
+        raise ValueError("configuration must contain only the documented fields")
+    threshold = config.get("monitoring_large_upload_bytes", 1073741824)
+    if type(threshold) is not int or not 1 <= threshold <= 2**50:
+        raise ValueError("monitoring_large_upload_bytes must be an integer in 1..2**50")
     ns, image, key = (config[k] for k in ("namespace", "image", "collector_key_id"))
     if not isinstance(ns, str) or not re.fullmatch(r"vigie_[a-z0-9_]{1,32}", ns):
         raise ValueError("a dedicated vigie_ namespace is required")
@@ -82,7 +89,7 @@ def render(config: dict) -> dict[str, str]:
             )
         )
         if deps:
-            lines += ["After=" + " ".join(deps), "Requires=" + " ".join(deps)]
+            lines += ["After=" + " ".join(deps), "Wants=" + " ".join(deps)]
         lines += [
             "[Container]",
             f"Image={image}",
@@ -109,6 +116,7 @@ def render(config: dict) -> dict[str, str]:
                 "Environment=VIGIE_GUARD_OVERRIDES=1",
             ]
         if role == "pipeline":
+            lines += [f"Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES={threshold}"]
             lines += [
                 "Environment=VIGIE_PIPELINE_INTERVAL_S=30",
                 "Environment=VIGIE_HEALTH_FILE=/tmp/vigie-pipeline.ok",

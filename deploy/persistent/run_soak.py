@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -17,6 +18,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -49,12 +51,37 @@ def private_read(path, limit=_LIMIT):
         os.close(fd)
 
 
-def read_meter(path, expected_digest):
-    """Execute one reviewed fixed no-argument adapter, without the administrator agent."""
+def _open_trusted_meter(path):
+    """Walk trusted directory inodes without following any ancestor or leaf symlink."""
     path = Path(path)
-    if not path.is_absolute():
+    if not path.is_absolute() or ".." in path.parts:
         raise ValueError("meter must be an absolute fixed executable")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in path.parts[1:-1]:
+            next_directory = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = next_directory
+            info = os.fstat(directory)
+            # Sticky /tmp is safe for already-owned children; arbitrary writable ancestors
+            # are not. The opened descriptor pins each checked inode during traversal.
+            if info.st_uid not in (0, os.getuid()) or (
+                info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX
+            ):
+                raise ValueError("untrusted meter ancestor")
+        return os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _sealed_meter(path, expected_digest):
+    """Hash the exact copied bytes, then seal them against replacement AND in-place writes."""
+    fd = _open_trusted_meter(path)
+    snapshot = None
     try:
         info = os.fstat(fd)
         if (
@@ -65,32 +92,85 @@ def read_meter(path, expected_digest):
             or info.st_size > 16 * 1024 * 1024
         ):
             raise ValueError("unsafe meter executable")
-        digest = hashlib.sha256()
+        snapshot = os.memfd_create(
+            "vigie-reviewed-meter", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        )
+        digest, size = hashlib.sha256(), 0
         while chunk := os.read(fd, 65536):
+            size += len(chunk)
+            if size > 16 * 1024 * 1024:
+                raise ValueError("meter content limit")
             digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(snapshot, view)
+                if written == 0:
+                    raise OSError("snapshot write made no progress")
+                view = view[written:]
         if digest.hexdigest() != expected_digest:
             raise ValueError("meter differs from reviewed digest")
+        os.fchmod(snapshot, 0o500)
+        fcntl.fcntl(
+            snapshot,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_WRITE
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_SEAL,
+        )
+        os.lseek(snapshot, 0, os.SEEK_SET)
+        result, snapshot = snapshot, None
+        return result
     finally:
         os.close(fd)
-    child = subprocess.Popen(
-        [str(path)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"},
-    )
-    data = bytearray()
-    deadline = time.monotonic() + 10
+        if snapshot is not None:
+            os.close(snapshot)
+
+
+def _cleanup_meter(child):
+    # WNOWAIT proves this PID is still our child, live or waitable, without reaping it.
+    # Its retained PID pins the session/group identity until AFTER group termination.
+    # Never call Popen.poll()/wait() or use a reaped numeric PGID before this point.
+    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
     try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    finally:
+        child.wait()
+        child.stdout.close()
+
+
+def read_meter(path, expected_digest):
+    """Execute one sealed Linux snapshot, supervise its process group, never use an agent."""
+    if (
+        not sys.platform.startswith("linux")
+        or not hasattr(os, "memfd_create")
+        or not hasattr(os, "WNOWAIT")
+        or not hasattr(fcntl, "F_ADD_SEALS")
+        or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL
+        or threading.active_count() != 1
+    ):
+        raise ValueError("meter requires Linux sealing and exclusive child supervision")
+    snapshot = _sealed_meter(path, expected_digest)
+    child = None
+    try:
+        child = subprocess.Popen(
+            [f"/proc/self/fd/{snapshot}"],
+            pass_fds=(snapshot,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"},
+        )
+        data = bytearray()
+        deadline = time.monotonic() + 10
         with selectors.DefaultSelector() as selector:
             selector.register(child.stdout, selectors.EVENT_READ)
             while True:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ValueError("meter timeout")
-                events = selector.select(remaining)
-                if not events:
+                if remaining <= 0 or not selector.select(remaining):
                     raise ValueError("meter timeout")
                 chunk = os.read(child.stdout.fileno(), 4096)
                 if not chunk:
@@ -98,17 +178,27 @@ def read_meter(path, expected_digest):
                 data.extend(chunk)
                 if len(data) > _LIMIT:
                     raise ValueError("meter output exceeds bound")
-        if child.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+        while True:
+            status = os.waitid(
+                os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
+            )
+            if status is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError("meter timeout")
+            time.sleep(0.01)
+        if status.si_code != os.CLD_EXITED or status.si_status != 0:
             raise ValueError("meter failed")
         result = json.loads(data)
         if not isinstance(result, dict):
             raise ValueError("meter must return one object")  # noqa: TRY004 -- adapter contract
         return result
     finally:
-        if child.poll() is None:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
-        child.stdout.close()
+        try:
+            if child is not None:
+                _cleanup_meter(child)
+        finally:
+            os.close(snapshot)
 
 
 def dns_probe(router_address):
@@ -207,8 +297,12 @@ def coverage_metrics(collector, now):
     ):
         timestamp = _epoch(collector.get(source))
         result[target] = now - timestamp if timestamp is not None else None
-    if collector.get("backlog_batches_capped"):
+    # Exact typed API contract: a capped or absent summary is unknown, never favorable zero.
+    if collector.get("backlog_capped") is not False:
         result["backlog_batches"] = None
+    if collector.get("summary_capped") is not False:
+        for key in ("dropped_batches", "ct_unmapped_flows", "ct_unmapped_bytes"):
+            result[key] = None
     return result
 
 
@@ -277,7 +371,11 @@ def collect(config):
     except (OSError, ValueError, subprocess.SubprocessError):
         result["meter_error"] = True
     try:
-        result.update(read_coverage(config, result["wall"]))
+        api_metrics = read_coverage(config, result["wall"])
+        # Historical API health must never replace the independent live resource meter.
+        if "collector_rss_kib" in api_metrics:
+            api_metrics["api_collector_rss_kib"] = api_metrics.pop("collector_rss_kib")
+        result.update(api_metrics)
     except (OSError, ValueError, KeyError, TypeError):
         result["coverage_error"] = True
     result["dns_probe_ok"] = dns_probe(config["router_address"])
@@ -324,7 +422,7 @@ def main():
         raise ValueError("invalid router address")
     first = collect(config)
     failures, missing, quality = sample_issues(first)
-    if args.preflight or failures or missing or quality:
+    if args.preflight:
         report = assess([first], mode="real")
         print(json.dumps(report))
         return 1 if failures else 2
@@ -333,6 +431,11 @@ def main():
     metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
     with Journal(args.journal, mode="real", metadata=metadata) as journal:
         journal.append(first)
+        # Every resumed observation, including failure or absence, is durable before gates.
+        if failures or missing or quality:
+            report = assess(journal.samples, mode="real")
+            print(json.dumps(report))
+            return 1 if report["status"] == "fail" else 2
         try:
             while True:
                 report = assess(journal.samples, mode="real")
