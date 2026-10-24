@@ -11,9 +11,6 @@ jobs:
     timeout-minutes: 30
     env:
       UV_PYTHON: '3.12'
-      VIGIE_CI_LOG_DIR: ${{ runner.temp }}/vigie-ci-logs
-      VIGIE_E2E_BASE: ${{ runner.temp }}/vigie-e2e
-      VIGIE_E2E_TMP: ${{ runner.temp }}/vigie-e2e-tmp
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,6 +24,10 @@ jobs:
       - name: Install host Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Run the full local gate
+        env:
+          VIGIE_CI_LOG_DIR: ${{ runner.temp }}/vigie-ci-logs
+          VIGIE_E2E_BASE: ${{ runner.temp }}/vigie-e2e
+          VIGIE_E2E_TMP: ${{ runner.temp }}/vigie-e2e-tmp
         run: scripts/ci.sh
       - name: Upload gate and whole-chain logs
         if: always()
