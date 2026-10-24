@@ -21,11 +21,10 @@ USE_PROCD=1
 start_service() {
 	# Fail closed: without the dedicated user procd would fall back to running as root.
 	id -u vigie >/dev/null 2>&1 || { logger -t vigie 'vigie user missing'; return 1; }
+	# Prepare a trusted parent and private counter child before any DNS mutation.
+	/usr/libexec/vigie/vigie-state-dir.sh || return 1
 	# Recreate the tmpfs drop-in and reload dnsmasq (root).
 	/usr/libexec/vigie/vigie-dnsmasq-dropin.sh ensure || return 1
-
-	# Failure counter for vigie-run.sh, writable by the dedicated user, reset on every start.
-	rm -rf /var/run/vigie-collector && mkdir /var/run/vigie-collector && chown vigie /var/run/vigie-collector || return 1
 
 	procd_open_instance
 	procd_set_param command /usr/libexec/vigie/vigie-run.sh --config /etc/vigie/collector.conf
