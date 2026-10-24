@@ -1,0 +1,35 @@
+# Persistent deployment and real 48-hour monitoring
+
+These tools render plans and assess evidence. They do not install services, provision keys, modify router configuration, create containers/volumes/secrets, or complete a 48-hour run during unit tests. Current status: source/unit-test checkpoint; actual installation, recovery and long-duration acceptance remain pending independent review and execution.
+
+## Rootless Tower units
+
+`python3 deploy/persistent/render.py private-config.json private-new-output-directory` creates three `.container` files, three `.volume` files and an inert `plan.json`. The output directory must not exist. Configuration contains exactly `namespace` (dedicated `vigie_` prefix), `image` (reviewed local `sha256:` image ID), literal `ingest_address`, distinct unprivileged `ingest_port`/`api_port`, and `collector_key_id`. No household address, hardware identifier or credential belongs in the repository.
+
+The explicit ingest bind requires a verified stable DHCP reservation/name/certificate plan. API binds only 127.0.0.1. The existing three-volume permission matrix, user/group 10001, capability removal, read-only root, no-new-privileges and limits are retained. Each role receives only its secrets; provision the five exact names shown in the generated units before startup. Volumes and databases require reviewed initialization/enrollment before normal services start. The renderer does not silently migrate data from an earlier pilot namespace.
+
+Quadlet files are inert until copied to a user generator search path. Validate with `QUADLET_UNIT_DIRS=/absolute/private/output /usr/lib/systemd/user-generators/podman-user-generator --user --dryrun`; then independently inspect generated arguments and collisions. Rootless Quadlet requires cgroup v2 and user linger. `[Install] WantedBy=default.target` supplies boot activation; do not `enable` generated transient services. Source: [Podman Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html). No installer currently applies the plan. Before later installation, snapshot exact existing unit contents/modes, journal intended writes before mutation, and refuse conflicting resources or drift. Rollback stops only owned units, restores only matching snapshotted files, and retains data volumes/secrets/evidence.
+
+## Strict real-clock monitor
+
+`python3 deploy/persistent/run_soak.py private-config.json /private/new-or-resumable-directory/journal.jsonl --preflight` performs one observation and never reports 48-hour success. Remove `--preflight` only after reviewed deployment/recovery tests and healthy source/metric gates. It uses real wall, monotonic and boot-time clocks; there is no short-duration or fake-clock CLI option. A simulated engine result is labeled `simulated`, never real acceptance evidence.
+
+The private 0600 config has exactly `api_port`, `api_token_file` (owned0600 bearer token), `api_ca_file` (TLS trust certificate covering 127.0.0.1), `collector_id`, `meter_executable` (fixed absolute no-argument executable), `meter_sha256`, `router_address` (the reviewed literal IPv4 router). API is HTTPS loopback only; redirects are refused. The fixed UDP DNS probe asks only `example.com` A on port53, once per sample. Its successful response is separate from positive parsed-DNS window evidence within 120 seconds. DoH/DoT, caching and absent DHCP 55/60 remain visibility limits; DHCP fingerprint absence does not fail the resource monitor.
+
+The meter runs without `SSH_AUTH_SOCK`, stdin or caller environment, with a 10-second timeout and 16 KiB output bound; its digest and file ownership/modes are checked. It must use a separately reviewed least-privilege runtime credential with a forced fixed read-only command. This repository does not provision that credential, use the 12-hour administrator agent, or accept arbitrary remote command strings. No current metric adapter has been validated on the router. Missing meter data remains pending and cannot establish acceptance.
+
+The meter returns one JSON object with the following fields only (other fields are discarded):
+
+| Fields | Units/meaning |
+|---|---|
+| `router_boot_id` | Kernel boot identifier; must remain stable |
+| `collector_start`, `helper_start` | `/proc` process start counters; stable across the run |
+| `collector_cpu_ticks`, `total_cpu_ticks`, `logical_cpus` | Cumulative collector utime+stime; aggregate first eight `/proc/stat` CPU fields; logical CPU count |
+| `collector_rss_kib`, `helper_rss_kib`, `mem_available_kib` | KiB, independently measured |
+| `log_used_kib`, `log_capacity_kib` | Owned log-filesystem usage and proven capacity, KiB |
+
+A future forced-command wrapper must reject supplied commands/arguments, check a fixed root-owned expiry deadline, verify fixed process executables/UIDs before reading counters, and expose only this schema. Its dedicated key must prohibit PTY, forwarding, agent and X11. Do not assume OpenSSH `restrict`/expiry key options exist on Dropbear. Root must review actual firmware behavior before key installation. A private 20 MiB log tmpfs is only a proposed hard bound: verify dnsmasq jail/mount visibility before adding a mount; this tool does not mount anything.
+
+Acceptance requires 172800 actual seconds, 60-second cadence, maximum 180-second gap and ≥99% valid sample slots. Collector RSS is strictly below 9765 KiB; helper below 65536 KiB; available RAM at least 65536 KiB; log capacity/usage no more than 20480 KiB; collector average CPU ≤2% of one logical CPU using counter ratios. Unexpected restart, clock/suspend inconsistency, topology/counter reset, backlog, fresh dropped batches, source flags or hard resource violations fail. Missing metrics, DNS silence or stale parsed-DNS evidence block success; unmapped conntrack stays a visible attribution caveat. Historical drops are currently a strict zero gate, so start a new scoped healthy collector enrollment after resolving prior failures rather than hiding them.
+
+Journals are locked, private 0600, append-only and fsynced, including directory creation. Resume requires the identical configuration hash/contract; partial records are retained and rejected. Failure evidence survives resume. Host reboot or a gap over 180 seconds invalidates the strict run; begin a separately recorded new run after recovery. Interrupting the runner leaves a pending report and durable history. Unit fixtures exercise these transitions with fake clocks, without claiming real elapsed time.
