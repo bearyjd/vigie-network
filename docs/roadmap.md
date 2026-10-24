@@ -32,6 +32,8 @@ proposed acceptance targets to calibrate with owner-labeled data, not demonstrat
 | M3 — richer optional visibility | Approved multi-network adapters and external Zeek/Suricata metadata sensor on a capable host, with suitable TAP/SPAN placement | Fixture/replay contracts; malformed/flooded inputs bounded; missing sensor flagged; duplicate overlapping observations do not inflate totals. Demonstrate exactly which traffic is observable before enabling scan/beacon claims. | L |
 | M4 — measured learning | Robust per-device drift first; optional classifier/AI explanations only if rules leave a useful residual | Compare against deterministic baseline on owner-labeled chronological holdout; predeclare false-alert budget; no regression in explainability, privacy or resource bounds. Cancel models that add no measurable value. | M–L, conditional |
 
+The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. Prioritize visible source coverage and characterization backed by measured confidence before learned baseline alerts. This field evidence informs M1; it does not establish M1 as implemented.
+
 M1 includes network health, not only identity. Passive DNS error-rate/latency analysis is outside M1's existing
 batch contract; start with explicitly labeled probes, or approve a separate response-telemetry extension.
 Critical new-device or fixed-volume alerts may run during cold start; learned alerts must disclose insufficient history.

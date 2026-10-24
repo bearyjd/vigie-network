@@ -101,6 +101,9 @@ restarts, not host reboot, restoration, real traffic, load or long-duration stab
 
 ## Router access and remaining field gates
 
+This section records the earlier container-pilot closure state. Subsequent authorized router
+access and probe results are recorded separately in the [router field validation follow-up](router-validation-2026-10-24.md); the earlier closure is not retroactively rewritten.
+
 - Gateway `192.168.1.1` answered a DNS probe with response code 0; its configuration was unchanged.
 - SSH rejected the default RSA and Ed25519 identities and the explicitly tried existing
   couvre-feu-admin identity. Public-key authorization remains pending.
