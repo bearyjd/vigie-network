@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from vigie_ingest.db import shard_name, utc_day
+from vigie_ingest.models import FUTURE_WINDOW_SLACK
 from vigie_pipeline.sources import ShardReadError, normalize_mac
 
 MAX_VALUE = (2**63 - 1) // 64  # at most64 canonical MACs can be summed safely
@@ -58,45 +59,60 @@ def read_measurements(
             )
         ):
             reasons.append("flow_degraded")
-        path = root / shard_name(utc_day(end))
-        if not path.exists():
+        end_path = root / shard_name(utc_day(end))
+        if not end_path.exists():
             reasons.append("raw_missing")
-        else:
+        low = max(0, start - FUTURE_WINDOW_SLACK) // 86400 * 86400
+        high = (end + FUTURE_WINDOW_SLACK) // 86400 * 86400
+        paths = {root / shard_name(utc_day(day)) for day in range(low, high + 1, 86400)}
+        if len(paths) > 3:
+            raise ShardReadError("measurement shard bound exceeded")
+        flows, dns = [], []
+        for path in sorted(paths):
+            if not path.exists():
+                continue
             db = None
             try:
                 db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2)
-                flows = db.execute(
-                    "SELECT device_mac,bytes_up,bytes_down,flows FROM raw_flow "
-                    "WHERE collector_id=? AND batch_id=? LIMIT 5001",
-                    (collector, batch_id),
-                ).fetchall()
-                dns = db.execute(
-                    "SELECT device_mac FROM raw_dns WHERE collector_id=? AND batch_id=? LIMIT 5001",
-                    (collector, batch_id),
-                ).fetchall()
+                flows.extend(
+                    db.execute(
+                        "SELECT device_mac,bytes_up,bytes_down,flows FROM raw_flow "
+                        "WHERE collector_id=? AND batch_id=? LIMIT 5001",
+                        (collector, batch_id),
+                    ).fetchall()
+                )
+                dns.extend(
+                    db.execute(
+                        "SELECT device_mac FROM raw_dns WHERE collector_id=? AND "
+                        "batch_id=? LIMIT 5001",
+                        (collector, batch_id),
+                    ).fetchall()
+                )
                 if len(flows) > 5000 or len(dns) > 5000:
                     raise ShardReadError("measurement row bound exceeded")
-                for mac, up, down, count in flows:
-                    mac = normalize_mac(mac)
-                    if mac is None:
-                        reasons.append("invalid_mac")
-                        continue
-                    values = counters.setdefault(mac, [0, 0, 0, 0])
-                    for i, value in enumerate((up, down, count)):
-                        if not isinstance(value, int) or value < 0:
-                            raise ShardReadError("invalid measurement counter")
-                        if values[i] + value > MAX_VALUE:
-                            reasons.append("counter_overflow")
-                        values[i] = min(MAX_VALUE, values[i] + value)
-                for (mac,) in dns:
-                    mac = normalize_mac(mac)
-                    if mac is not None:
-                        counters.setdefault(mac, [0, 0, 0, 0])[3] += 1
             except sqlite3.Error as exc:
                 raise ShardReadError("measurement shard unavailable") from exc
             finally:
                 if db is not None:
                     db.close()
+        if row["dns_queries"] is not None and len(dns) != row["dns_queries"]:
+            reasons.append("raw_missing")
+        for mac, up, down, count in flows:
+            mac = normalize_mac(mac)
+            if mac is None:
+                reasons.append("invalid_mac")
+                continue
+            values = counters.setdefault(mac, [0, 0, 0, 0])
+            for i, value in enumerate((up, down, count)):
+                if not isinstance(value, int) or value < 0:
+                    raise ShardReadError("invalid measurement counter")
+                if values[i] + value > MAX_VALUE:
+                    reasons.append("counter_overflow")
+                values[i] = min(MAX_VALUE, values[i] + value)
+        for (mac,) in dns:
+            mac = normalize_mac(mac)
+            if mac is not None:
+                counters.setdefault(mac, [0, 0, 0, 0])[3] += 1
     return Measurements(
         collector,
         batch_id,
@@ -129,6 +145,21 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         ).fetchone()
         if overlap:
             reasons.append("overlapping_window")
+    if "overlapping_window" in reasons:
+        prior = inv.execute(
+            "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
+            (m.collector, hour),
+        ).fetchone()
+        if prior is not None:
+            degraded = sorted(set(json.loads(prior[0])) | {"overlapping_window"})
+            inv.execute(
+                "UPDATE coverage_hourly SET qualified_seconds=0,reasons=? "
+                "WHERE collector_id=? AND hour=?",
+                (json.dumps(degraded), m.collector, hour),
+            )
+            inv.execute(
+                "INSERT OR IGNORE INTO monitoring_quality_work VALUES (?,?,'')", (m.collector, hour)
+            )
     inv.execute(
         "INSERT INTO measurement_batches VALUES (?,?,?,?,?,?,?)",
         (m.collector, m.batch_id, m.start, m.end, m.received, hour, json.dumps(reasons)),
@@ -163,7 +194,9 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
     )
     for mac, values in bounded.items():
         inv.execute(
-            "INSERT OR IGNORE INTO monitoring_dirty VALUES (?,?,?)", (m.collector, mac, m.end)
+            "INSERT INTO monitoring_dirty VALUES (?,?,?) ON CONFLICT(collector_id,mac) "
+            "DO UPDATE SET queued_at=MIN(queued_at,excluded.queued_at)",
+            (m.collector, mac, m.end),
         )
         inv.execute(
             "INSERT INTO measurements_hourly VALUES (?,?,?,?,?,?,?) "

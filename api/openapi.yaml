@@ -231,6 +231,7 @@
               "learning",
               "mature",
               "rebuilding",
+              "rebuilding_quality",
               "lineage_unavailable"
             ],
             "title": "State",
@@ -503,6 +504,17 @@
             ],
             "title": "Latest Window End"
           },
+          "monitoring_unavailable": {
+            "items": {
+              "$ref": "#/components/schemas/MonitoringUnavailableScope"
+            },
+            "title": "Monitoring Unavailable",
+            "type": "array"
+          },
+          "monitoring_unavailable_capped": {
+            "title": "Monitoring Unavailable Capped",
+            "type": "boolean"
+          },
           "retained_detail_since": {
             "anyOf": [
               {
@@ -531,6 +543,8 @@
           }
         },
         "required": [
+          "monitoring_unavailable",
+          "monitoring_unavailable_capped",
           "collector_id",
           "last_received_at",
           "latest_observation_received_at",
@@ -1772,6 +1786,29 @@
           "data"
         ],
         "title": "MacResponse",
+        "type": "object"
+      },
+      "MonitoringUnavailableScope": {
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "retry_at": {
+            "title": "Retry At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "reason",
+          "retry_at"
+        ],
+        "title": "MonitoringUnavailableScope",
         "type": "object"
       },
       "Page": {

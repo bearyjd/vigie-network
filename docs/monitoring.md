@@ -31,11 +31,13 @@ An interval `[start,end)` contributes only when wholly inside one UTC hour. An i
 exactly at the boundary belongs to the preceding hour. Crossing intervals, partial probes,
 o duration and overlaps are excluded rather than divided uniformly. Legacy unknown-kind windows
 may carry measurements, but never qualified training coverage. No data is represented as null,
-not zero. DNS rows count observed queries, not contacted domains; no qname is copied into aggregates.
+not zero. DNS rows count observed queries, not contacted domains; no qname is copied into aggregates. Reads include all UTC shards touched by the accepted window
+and DNS clock slack; persisted expected DNS-row counts detect a retired query-day shard. Missing
+raw data degrades coverage and makes API counters null rather than asserting zero.
 
 Qualification requires at least3420 observed qualified seconds (95%) and no quality reasons.
 Missing health, CT source gaps/unmapped/truncation, dropped batches and counter overflow disqualify
-the hour. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
+the hour. A distinct overlapping batch also degrades the existing hour without adding its bytes or duration; an identical receipt replay does neither. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.
 
 Each stored per-MAC hourly counter saturates at `(2**63-1)//64`; saturation marks the entire hour
@@ -59,7 +61,7 @@ with `VIGIE_MONITORING_LARGE_UPLOAD_BYTES` (default1073741824; integer1..2**50).
 policy are hashed into a version. A changed configuration rebuilds rather than silently reusing
 an incompatible reference.
 
-Only the latest closed hour is evaluated for new incidents. Historical backfill can supply allowed
+Open-hour work retains its closing deadline, so a time-only pipeline pass can evaluate an hour even if no further batch arrives. Only the latest closed hour is evaluated for new incidents. Historical backfill can supply allowed
 learning history but cannot emit a historical alert flood. An episode uses a deterministic ID;
 repeated processing updates it. A consecutive episode remains one incident. A later eligible quiet
 hour resolves it; missing coverage does not claim recovery. Evidence includes observed bytes,
@@ -71,7 +73,7 @@ MAC set. Changes restart learning from the next UTC-hour boundary; initial rule-
 also wait for future history. They can mature after probation, without requiring an unavailable
 confirmation UI. Name-only edits do not reset learning. Old immutable references remain attributable
 to their original lineage; stale open incidents are superseded. API labels stale profiles rebuilding.
-New entities may learn qualified history already recorded since feature activation; newly attached
+If a retained training hour later loses quality, the active reference is withheld immediately by the API. The pipeline supersedes its open incidents and restarts future learning in `rebuilding_quality`; the historical immutable reference stays attributable. Collector-hour invalidations fan out through a durable cursor in batches of1000 MACs, and incomplete identities back off60 seconds so independent scopes progress. New entities may learn qualified history already recorded since feature activation; newly attached
 MACs cannot immediately redefine an old reference.
 
 ## Bounded read API
@@ -89,7 +91,7 @@ All routes require the existing bearer read token, preserve collector scope and 
 Hour ranges use `from_hour`/`to_hour`, UTC boundaries, a maximum90 days and at most200 hours/page.
 Opaque cursors are bound to route, collector, device and exact range. Missing migrations yield503.
 Collector detail summaries inspect at most10000 recent batches and expose capped indicators.
-Agent RSS/uptime are reported observations; absent router/helper/RAM/tmpfs/CPU metrics stay unknown.
+The device-list type filter examines at most `max(32,limit+1)` candidate rows per request and advances its opaque cursor by scanned position. A filtered page may be empty with a next cursor; following it does not skip later matches. Coverage also returns up to20 unavailable monitoring scopes with reason and retry time. Agent RSS/uptime are reported observations; absent router/helper/RAM/tmpfs/CPU metrics stay unknown.
 These endpoints alone cannot certify a48-hour resource or DNS soak.
 
 ## Characterization

@@ -22,6 +22,7 @@ def required(inv):
             "monitoring_profiles",
             "monitoring_baselines",
             "monitoring_incidents",
+            "monitoring_unavailable",
         }
         <= tables
     ):
@@ -104,8 +105,18 @@ def collector_summary(inv, collector):
         (collector,),
     ).fetchall()
     truncated = [json.loads(row["truncated"] or "{}") for row in rows]
+    unavailable = [
+        dict(row)
+        for row in inv.execute(
+            "SELECT device_id,reason,retry_at FROM monitoring_unavailable WHERE collector_id=? "
+            "ORDER BY device_id LIMIT 21",
+            (collector,),
+        )
+    ]
     return {
         "collector_id": collector,
+        "monitoring_unavailable": unavailable[:20],
+        "monitoring_unavailable_capped": len(unavailable) > 20,
         "last_received_at": rows[0]["received_at"] if rows else None,
         "latest_observation_received_at": observed["received_at"] if observed else None,
         "latest_window_end": observed["window_end"] if observed else None,
@@ -195,7 +206,7 @@ def activity(inv, ov, device, collector, start, stop, hours):
             {
                 **hour,
                 **{
-                    key: row[key] if row else None
+                    key: row[key] if row and "raw_missing" not in hour["reasons"] else None
                     for key in ("bytes_up", "bytes_down", "flows", "dns_queries")
                 },
             }
@@ -224,6 +235,14 @@ def baseline_view(inv, collector, device, key):
         ).fetchone()
         if model is None:
             state = "rebuilding"
+        elif inv.execute(
+            "SELECT 1 FROM coverage_hourly WHERE collector_id=? AND hour IN "
+            "(SELECT value FROM json_each(?)) AND (qualified_seconds<3420 OR reasons<>'[]') "
+            "LIMIT 1",
+            (collector, model["training_hours"]),
+        ).fetchone():
+            state = "rebuilding_quality"
+            model = None
     return {
         "state": state,
         "baseline_id": model["id"] if model else None,

@@ -288,7 +288,15 @@ class CoverageHour(BaseModel):
     reasons: list[str]
 
 
+class MonitoringUnavailableScope(BaseModel):
+    device_id: str
+    reason: str
+    retry_at: int
+
+
 class CollectorCoverage(BaseModel):
+    monitoring_unavailable: list[MonitoringUnavailableScope]
+    monitoring_unavailable_capped: bool
     collector_id: str
     last_received_at: str | None
     latest_observation_received_at: str | None
@@ -327,7 +335,7 @@ class ActivityHour(CoverageHour):
 
 
 class BaselineView(BaseModel):
-    state: Literal["learning", "mature", "rebuilding", "lineage_unavailable"]
+    state: Literal["learning", "mature", "rebuilding", "rebuilding_quality", "lineage_unavailable"]
     baseline_id: str | None
     algorithm: str
     config_version: str | None

@@ -111,6 +111,8 @@ def refresh_characterization(inv, ov, now):
         seen.add(device)
         candidates = []
         incomplete = False
+        conflicting = False
+        has_evidence = False
         for mac in identity.macs:
             overflow = inv.execute(
                 "SELECT 1 FROM characterization_overflow WHERE mac=? AND until>?", (mac, now)
@@ -120,6 +122,7 @@ def refresh_characterization(inv, ov, now):
                 "WHERE mac=? ORDER BY kind,service LIMIT 257",
                 (mac,),
             ).fetchall()
+            has_evidence |= bool(rows) or bool(overflow)
             result = (
                 Classification(reason="input_limit")
                 if overflow
@@ -127,11 +130,14 @@ def refresh_characterization(inv, ov, now):
                     (Observation(mac, stamp, kind, service) for kind, service, stamp in rows), now
                 )
             )
+            conflicting |= result.reason == "conflicting_roles"
             incomplete |= result.reason in {"input_limit", "invalid_input", "mixed_macs"}
             if result.inferred_type != "unknown":
                 candidates.append(result)
         kinds = {(r.inferred_type, r.role) for r in candidates}
-        if incomplete:
+        if conflicting:
+            result = Classification(reason="conflicting_roles")
+        elif incomplete:
             result = Classification(reason="input_limit")
         elif len(kinds) == 1:
             result = min(candidates, key=lambda r: r.valid_until)
@@ -147,14 +153,22 @@ def refresh_characterization(inv, ov, now):
             if fresh.key != identity.key:
                 continue
             inv.execute("DELETE FROM characterization_dirty WHERE device_id=?", (requested,))
+            cached = inv.execute(
+                "SELECT result FROM characterization_results WHERE device_id=?", (device,)
+            ).fetchone()
+            payload = json.dumps(
+                {"lineage": identity.key, "classification": asdict(result)}, sort_keys=True
+            )
+            if (cached is None and not has_evidence) or (
+                cached is not None and cached[0] == payload
+            ):
+                continue
             inv.execute(
                 "INSERT INTO characterization_results VALUES (?,?) "
                 "ON CONFLICT(device_id) DO UPDATE SET result=excluded.result",
                 (
                     device,
-                    json.dumps(
-                        {"lineage": identity.key, "classification": asdict(result)}, sort_keys=True
-                    ),
+                    payload,
                 ),
             )
             inv.execute(

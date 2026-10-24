@@ -172,3 +172,125 @@ def test_extreme_counters_stay_integer_and_disqualify_hour(tmp_path):
     row = inv.execute("SELECT reasons FROM coverage_hourly").fetchone()
     assert "counter_overflow" in row[0]
     inv.close()
+
+
+def test_distinct_overlap_degrades_hour_but_same_receipt_replay_does_not(tmp_path):
+    import json
+
+    from vigie_pipeline.measurements import Measurements, apply_measurements
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    first = Measurements(
+        "c1", "first", HOUR, HOUR + 3500, "2026-10-24T00:00:00Z", (), {MAC: (100, 0, 1, 0)}
+    )
+    apply_measurements(inv, first)
+    apply_measurements(inv, first)
+    assert tuple(
+        inv.execute(
+            "SELECT observed_seconds,qualified_seconds,reasons FROM coverage_hourly"
+        ).fetchone()
+    ) == (3500, 3500, "[]")
+    apply_measurements(
+        inv,
+        Measurements(
+            "c1",
+            "overlap",
+            HOUR + 3400,
+            HOUR + 3600,
+            "2026-10-24T00:01:00Z",
+            (),
+            {MAC: (250, 0, 1, 0)},
+        ),
+    )
+    row = inv.execute(
+        "SELECT observed_seconds,qualified_seconds,reasons FROM coverage_hourly"
+    ).fetchone()
+    assert tuple(row[:2]) == (3500, 0)
+    assert json.loads(row[2]) == ["overlapping_window"]
+    assert inv.execute("SELECT bytes_up FROM measurements_hourly").fetchone()[0] == 100
+    inv.close()
+
+
+def test_idle_time_only_pass_closes_qualified_upload_hour(tmp_path):
+    recorded(tmp_path, 1, HOUR, HOUR + 3540, 1024**3)
+    config = PipelineConfig(data_dir=tmp_path)
+    run_once(config, now=HOUR + 3541)
+    inv = open_inventory(tmp_path / "inventory.db")
+    assert inv.execute("SELECT COUNT(*) FROM monitoring_incidents").fetchone()[0] == 0
+    run_once(config, now=HOUR + 3601)
+    row = inv.execute("SELECT detector,observed_bytes FROM monitoring_incidents").fetchone()
+    assert row is not None and tuple(row) == ("large_upload", 1024**3)
+    inv.close()
+
+
+def test_midnight_dns_uses_query_day_and_end_day_without_double_count(tmp_path):
+    midnight = (HOUR // 86400 + 1) * 86400
+    inv = open_inventory(tmp_path / "inventory.db")
+    provision_collector(inv, "c1", "k1", False)
+    inv.close()
+    batch = Batch.model_validate(
+        dict(
+            collector_id="c1",
+            key_id="k1",
+            boot_id="boot1",
+            seq=1,
+            batch_id="01927f3e-8a1b-7c2d-9e4f-000000000001",
+            window_start=midnight - 3600,
+            window_end=midnight,
+            sent_ts=midnight,
+            observation_kind="observation",
+            health={},
+            dns=[dict(mac=MAC, qname="example.com", qtype="A", ts=midnight - 30)],
+        )
+    )
+    apply_batch(tmp_path / "inventory.db", tmp_path, batch, midnight + 1, 900)
+    run_once(PipelineConfig(data_dir=tmp_path), now=midnight + 2)
+    inv = open_inventory(tmp_path / "inventory.db")
+    row = inv.execute("SELECT dns_queries FROM measurements_hourly").fetchone()
+    assert row is not None and row[0] == 1
+    run_once(PipelineConfig(data_dir=tmp_path), now=midnight + 3)
+    assert inv.execute("SELECT SUM(dns_queries) FROM measurements_hourly").fetchone()[0] == 1
+    inv.close()
+
+
+def test_retired_query_day_is_unknown_quality_even_when_flow_day_survives(tmp_path):
+    from vigie_ingest.db import shard_name, utc_day
+
+    midnight = (HOUR // 86400 + 1) * 86400
+    inv = open_inventory(tmp_path / "inventory.db")
+    provision_collector(inv, "c1", "k1", False)
+    inv.close()
+    batch = Batch.model_validate(
+        dict(
+            collector_id="c1",
+            key_id="k1",
+            boot_id="boot1",
+            seq=1,
+            batch_id="01927f3e-8a1b-7c2d-9e4f-000000000001",
+            window_start=midnight - 3600,
+            window_end=midnight,
+            sent_ts=midnight,
+            observation_kind="observation",
+            health={},
+            dns=[dict(mac=MAC, qname="example.com", qtype="A", ts=midnight - 30)],
+            conntrack=[
+                dict(
+                    mac=MAC,
+                    dst_ip="93.184.216.34",
+                    dst_port=443,
+                    proto="tcp",
+                    bytes_up=100,
+                    bytes_down=2,
+                    flows=1,
+                )
+            ],
+        )
+    )
+    apply_batch(tmp_path / "inventory.db", tmp_path, batch, midnight + 1, 900)
+    (tmp_path / shard_name(utc_day(midnight - 30))).unlink()
+    run_once(PipelineConfig(data_dir=tmp_path), now=midnight + 2)
+    inv = open_inventory(tmp_path / "inventory.db")
+    row = inv.execute("SELECT qualified_seconds,reasons FROM coverage_hourly").fetchone()
+    assert row[0] == 0 and "raw_missing" in row[1]
+    inv.close()

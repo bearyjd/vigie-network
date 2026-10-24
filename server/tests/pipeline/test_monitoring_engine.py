@@ -138,11 +138,71 @@ def test_retention_is_bounded_and_keeps_live_dedupe_receipts(tmp_path):
                 "INSERT INTO measurement_batches VALUES ('c1',?,?,?, ?,?, '[]')",
                 (str(i), HOUR, HOUR + 60, iso_utc(HOUR), HOUR),
             )
+        inv.execute(
+            "INSERT INTO batches(collector_id,batch_id,received_at) VALUES ('c1','live',?)",
+            (iso_utc(HOUR),),
+        )
+        inv.execute(
+            "INSERT INTO measurement_batches VALUES ('c1','live',?,?,?,?,'[]')",
+            (HOUR, HOUR + 60, iso_utc(HOUR), HOUR),
+        )
         prune_monitoring(inv, now)
-        assert inv.execute("SELECT COUNT(*) FROM measurement_batches").fetchone()[0] == 3
+        assert inv.execute("SELECT COUNT(*) FROM measurement_batches").fetchone()[0] == 4
         assert [r[0] for r in inv.execute("SELECT bytes_up FROM measurements_hourly")] == [20]
         prune_monitoring(inv, now)
-        assert inv.execute("SELECT COUNT(*) FROM measurement_batches").fetchone()[0] == 0
+        assert [r[0] for r in inv.execute("SELECT batch_id FROM measurement_batches")] == ["live"]
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_late_training_quality_loss_rebuilds_reference_and_supersedes_incident(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        history(inv)
+        current = HOUR + 20 * 86400
+        hour(inv, current - 3600, 51 * MIB)
+        hour(inv, current, 51 * MIB)
+        analyze_monitoring(inv, ov, BaselineConfig(), current + 3610)
+        assert inv.execute("SELECT state FROM monitoring_profiles").fetchone()[0] == "mature"
+        inv.execute(
+            "UPDATE coverage_hourly SET qualified_seconds=0,reasons=? WHERE hour=?",
+            ('["overlapping_window"]', HOUR),
+        )
+        inv.execute("INSERT OR IGNORE INTO monitoring_dirty VALUES ('c1',?,?)", (MAC, current))
+        analyze_monitoring(inv, ov, BaselineConfig(), current + 3620)
+        row = inv.execute(
+            "SELECT state,baseline_id,training_since FROM monitoring_profiles"
+        ).fetchone()
+        assert tuple(row) == ("rebuilding_quality", None, current + 7200)
+        assert inv.execute("SELECT state FROM monitoring_incidents").fetchone()[0] == "superseded"
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_oversized_identity_cannot_starve_later_independent_upload_scope(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        for i in range(65):
+            mac = f"aa:bb:dd:00:00:{i:02x}"
+            inv.execute(
+                "INSERT INTO "
+                "observations(mac,device_id,is_randomized,link_source,"
+                "first_seen,last_seen) VALUES (?,'d2',0,'self','t','t')",
+                (mac,),
+            )
+            inv.execute("INSERT INTO monitoring_dirty VALUES ('c1',?,?)", (mac, HOUR))
+        current = HOUR + 3600
+        hour(inv, current, 1024 * MIB)
+        for _ in range(5):
+            analyze_monitoring(inv, ov, BaselineConfig(), current + 3610)
+        assert (
+            inv.execute(
+                "SELECT COUNT(*) FROM monitoring_incidents WHERE device_id='d1'"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         inv.close()
         ov.close()

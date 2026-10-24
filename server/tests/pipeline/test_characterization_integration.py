@@ -95,3 +95,34 @@ def test_service_overflow_cannot_classify_a_favorable_prefix(tmp_path):
     assert inv.execute("SELECT inferred_type FROM devices").fetchone()[0] == "unknown"
     inv.close()
     ov.close()
+
+
+def test_conflicting_mac_vetoes_another_macs_valid_tv_hint(tmp_path):
+    from vigie_api.schema import open_overrides
+    from vigie_pipeline.characterization_store import refresh_characterization, save_services
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    ov = open_overrides(tmp_path / "overrides.db")
+    inv.execute("INSERT INTO devices(id,first_seen,last_seen) VALUES ('d','t','t')")
+    for suffix in ["01", "02"]:
+        inv.execute(
+            "INSERT INTO "
+            "observations(mac,device_id,is_randomized,link_source,"
+            "first_seen,last_seen) VALUES (?,'d',0,'self','t','t')",
+            (f"aa:bb:cc:00:00:{suffix}",),
+        )
+    rows = [
+        (MAC, "mdns", service, NOW)
+        for service in ["_googlecast._tcp", "_androidtvremote2._tcp", "_printer._tcp", "_ipp._tcp"]
+    ]
+    rows += [
+        ("aa:bb:cc:00:00:02", "mdns", service, NOW)
+        for service in ["_googlecast._tcp", "_androidtvremote2._tcp"]
+    ]
+    save_services(inv, rows, NOW)
+    refresh_characterization(inv, ov, NOW)
+    row = inv.execute("SELECT inferred_type,inferred_reason_code FROM devices").fetchone()
+    assert tuple(row) == ("unknown", "conflicting_roles")
+    inv.close()
+    ov.close()

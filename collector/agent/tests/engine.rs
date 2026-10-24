@@ -190,10 +190,10 @@ fn success_pops_batch_resets_backoff_and_reports_drops() {
     assert!(e.spool.is_empty());
     assert_eq!(e.spool.dropped_unreported(), 0);
     let body = String::from_utf8(t.calls[0].1.clone()).unwrap();
-    assert!(
-        body.ends_with(&format!(r#""sent_ts":{NOW},"dropped_batches":3}}"#)),
-        "{body}"
-    );
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["sent_ts"], NOW);
+    assert_eq!(value["dropped_batches"], 3);
+    assert_eq!(value["observation_kind"], "observation");
 }
 
 #[test]

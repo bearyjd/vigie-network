@@ -191,6 +191,11 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE TABLE monitoring_dirty (collector_id TEXT NOT NULL,mac TEXT NOT NULL,q"
         "ueued_at INTEGER NOT NULL, PRIMARY KEY(collector_id,mac))",
         "CREATE INDEX idx_monitoring_dirty_age ON monitoring_dirty(queued_at,collector_id,mac)",
+        "CREATE TABLE monitoring_unavailable (collector_id TEXT NOT NULL,device_id TEXT NOT NULL,"
+        "reason TEXT NOT NULL,retry_at INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id))",
+        "CREATE TABLE monitoring_quality_work (collector_id TEXT NOT NULL,hour INTEGER NOT NULL,"
+        "after_mac TEXT NOT NULL,PRIMARY KEY(collector_id,hour))",
+        "CREATE INDEX idx_monitoring_quality_work ON monitoring_quality_work(hour,collector_id)",
         "CREATE TABLE monitoring_revision (singleton INTEGER PRIMARY KEY CHECK(singlet"
         "on=1),value INTEGER NOT NULL)",
         "INSERT INTO monitoring_revision VALUES(1,0)",

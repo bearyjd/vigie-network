@@ -184,3 +184,73 @@ def test_characterization_evidence_and_expiry_are_hints_and_type_filter_is_consi
     assert env.get("/devices/d1").json()["data"]["type"] == "unknown"
     assert env.get("/devices", type="tv").json()["data"] == []
     assert len(env.get("/devices", type="unknown").json()["data"]) == 1
+
+
+def test_type_hint_filter_scan_work_is_bounded_and_cursor_crosses_unknown_prefix(env: Env):
+    from vigie_api.effective import list_devices
+
+    def page(cursor=None):
+        return list_devices(
+            env.inv,
+            env.ov,
+            type_="tv",
+            group=None,
+            identity_state=None,
+            status=None,
+            updated_since=None,
+            include_transient=True,
+            include_retired=True,
+            include_aliases=False,
+            cursor=cursor,
+            limit=1,
+        )
+
+    for i in range(100):
+        env.device(f"a{i:04}", inferred_type="unknown", source="deterministic-services")
+    statements = []
+    env.inv.set_trace_callback(statements.append)
+    first, cursor = page()
+    small = len(statements)
+    env.inv.set_trace_callback(None)
+    for i in range(100, 1000):
+        env.device(f"a{i:04}", inferred_type="unknown", source="deterministic-services")
+    env.device("z-match", inferred_type="tv", source="other-model")
+    statements = []
+    env.inv.set_trace_callback(statements.append)
+    first, cursor = page()
+    env.inv.set_trace_callback(None)
+    assert len(statements) <= 150 and len(statements) <= small + 5
+    assert first == [] and cursor is not None
+    found = []
+    for _ in range(40):
+        items, cursor = page(cursor)
+        found += [item["id"] for item in items]
+        if cursor is None:
+            break
+    assert found == ["z-match"] and cursor is None
+
+
+def test_api_withholds_model_after_training_hour_quality_changes_and_reports_backoff(env: Env):
+    from vigie_pipeline.baselines import BaselineConfig
+    from vigie_pipeline.monitoring_engine import analyze_monitoring
+
+    seed(env)
+    env.inv.execute("INSERT INTO monitoring_dirty VALUES ('c1',?,?)", (MAC, HOUR))
+    analyze_monitoring(env.inv, env.ov, BaselineConfig(minimum_hours=1, minimum_days=1), NOW)
+    path = "/devices/d1/activity"
+    assert env.get(path, collector_id="c1").json()["data"]["baseline"]["state"] == "mature"
+    env.inv.execute(
+        "UPDATE coverage_hourly SET qualified_seconds=0,reasons=?", ('["raw_missing"]',)
+    )
+    env.inv.execute(
+        "INSERT INTO monitoring_unavailable VALUES ('c1','bad','lineage_unavailable',?)",
+        (int(NOW) + 60,),
+    )
+    response = env.get(path, collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600).json()["data"]
+    assert response["baseline"]["state"] == "rebuilding_quality"
+    assert response["baseline"]["baseline_id"] is None
+    assert response["hours"][0]["dns_queries"] is None
+    summary = env.get("/coverage", collector_id="c1").json()["data"]["collector"]
+    assert summary["monitoring_unavailable"] == [
+        {"device_id": "bad", "reason": "lineage_unavailable", "retry_at": int(NOW) + 60}
+    ]

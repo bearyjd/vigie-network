@@ -204,6 +204,7 @@ def iter_devices(
     include_retired: bool,
     include_aliases: bool,
     group_states: dict[str, str],
+    scan_limit: int | None = None,
 ) -> Iterator[sqlite3.Row]:
     """Filters run in SQL (override-derived ones through json_each id sets), so a flood of
     devices costs one indexed scan, not one Python-side effective view per device."""
@@ -260,6 +261,9 @@ def iter_devices(
             f" OR {in_set.format('ov_since')})"
         )
     sql = f"SELECT * FROM devices WHERE {' AND '.join(clauses)} ORDER BY id"  # noqa: S608
+    if scan_limit is not None:
+        sql += " LIMIT :scan_limit"
+        params["scan_limit"] = scan_limit
     yield from inv.execute(sql, params)
 
 
@@ -284,6 +288,9 @@ def list_devices(
     group_states = group_identity_states(inv, links)
     out: list[dict[str, Any]] = []
     more = False
+    scanned = 0
+    last_scanned = after
+    scan_budget = max(32, limit + 1)
     for row in iter_devices(
         inv,
         overrides,
@@ -298,15 +305,22 @@ def list_devices(
         include_retired=include_retired,
         include_aliases=include_aliases,
         group_states=group_states,
+        scan_limit=scan_budget + 1,
     ):
+        if scanned >= scan_budget:
+            more = True
+            break
+        scanned += 1
         item = effective_device(fresh_inference(inv, ov, row), overrides, links, group_states)
         if type_ is not None and item["type"] != type_:
+            last_scanned = row["id"]
             continue
         if len(out) == limit:
             more = True
             break
         out.append(item)
-    return out, (encode_cursor(out[-1]["id"]) if more else None)
+        last_scanned = row["id"]
+    return out, (encode_cursor(last_scanned) if more else None)
 
 
 def _device_row(inv: sqlite3.Connection, device_id: str) -> sqlite3.Row:

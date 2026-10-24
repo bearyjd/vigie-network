@@ -87,6 +87,18 @@ def analyze_entity(inv, ov, collector, device, policy, now):
         ).fetchone()
         if reference_row is not None:
             reference = dict(reference_row)
+    quality_reset = False
+    if reference is not None:
+        used = set(json.loads(reference["training_hours"]))
+        if any(
+            s.hour in used
+            and (not s.eligible or s.suspicious or s.bytes_up >= policy.large_upload_bytes)
+            for s in series
+        ):
+            quality_reset = True
+            changed = True
+            reference = None
+            training_since = (int(now) // 3600 + 1) * 3600
     training = [s for s in series if s.hour >= training_since]
     if reference is None and identity.versioned:
         reference = fit_reference(training, policy)
@@ -102,6 +114,10 @@ def analyze_entity(inv, ov, collector, device, policy, now):
         else len({sample.hour // 86400 for sample in qualified_training})
     )
     state = "mature" if reference else "learning" if identity.versioned else "lineage_unavailable"
+    if reference is None and (
+        quality_reset or (old is not None and old["state"] == "rebuilding_quality")
+    ):
+        state = "rebuilding_quality"
     baseline_id = old["baseline_id"] if old is not None and not changed else None
     if reference is not None and baseline_id is None:
         baseline_id = hashlib.sha256(
@@ -258,15 +274,29 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                         (active["id"],),
                     )
         for mac in identity.macs:
-            inv.execute(
-                "DELETE FROM monitoring_dirty WHERE collector_id=? AND mac=?", (collector, mac)
-            )
+            future = inv.execute(
+                "SELECT MIN(hour+3600) FROM measurements_hourly "
+                "WHERE collector_id=? AND mac=? AND hour>=?",
+                (collector, mac, int(now) // 3600 * 3600),
+            ).fetchone()[0]
+            if future is None:
+                inv.execute(
+                    "DELETE FROM monitoring_dirty WHERE collector_id=? AND mac=?", (collector, mac)
+                )
+            else:
+                inv.execute(
+                    "INSERT INTO monitoring_dirty VALUES (?,?,?) "
+                    "ON CONFLICT(collector_id,mac) DO UPDATE SET queued_at=excluded.queued_at",
+                    (collector, mac, future),
+                )
 
 
 def analyze_monitoring(inv, ov, policy: BaselineConfig, now):
+    drain_quality_work(inv, now)
     queue = inv.execute(
-        "SELECT collector_id,mac FROM monitoring_dirty ORDER BY queued_at,collector_id,mac LIMIT ?",
-        (MAX_ENTITIES,),
+        "SELECT collector_id,mac FROM monitoring_dirty WHERE queued_at<=? "
+        "ORDER BY queued_at,collector_id,mac LIMIT ?",
+        (int(now), MAX_ENTITIES),
     ).fetchall()
     seen = set()
     for collector, mac in queue:
@@ -284,8 +314,31 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig, now):
                 continue
             seen.add(scope)
             analyze_entity(inv, ov, collector, row[0], policy, now)
-        except (LineageUnavailable, sqlite3.OperationalError):
-            # Bounds/timeouts leave work pending, never a fabricated healthy model.
+            with immediate(inv):
+                inv.execute(
+                    "DELETE FROM monitoring_unavailable WHERE collector_id=? AND device_id=?",
+                    (collector, row[0]),
+                )
+        except (LineageUnavailable, sqlite3.OperationalError) as exc:
+            # Back off failed subjects so an incomplete component cannot monopolize the queue.
+            with immediate(inv):
+                inv.execute(
+                    "UPDATE monitoring_dirty SET queued_at=? WHERE collector_id=? AND mac=?",
+                    (int(now) + 60, collector, mac),
+                )
+                inv.execute(
+                    "INSERT INTO monitoring_unavailable VALUES (?,?,?,?) "
+                    "ON CONFLICT(collector_id,device_id) DO UPDATE SET "
+                    "reason=excluded.reason,retry_at=excluded.retry_at",
+                    (
+                        collector,
+                        row[0],
+                        "lineage_unavailable"
+                        if isinstance(exc, LineageUnavailable)
+                        else "read_budget_or_database_unavailable",
+                        int(now) + 60,
+                    ),
+                )
             continue
 
 
@@ -322,3 +375,37 @@ def prune_monitoring(inv, now):
             "LIMIT 1000)",
             (cutoff,),
         )
+
+
+def drain_quality_work(inv, now):
+    """Fan out a collector-hour invalidation incrementally, never dropping a partial tail."""
+    work = inv.execute(
+        "SELECT collector_id,hour,after_mac FROM monitoring_quality_work "
+        "ORDER BY hour,collector_id LIMIT 1"
+    ).fetchone()
+    if work is None:
+        return
+    collector, hour, after = work
+    rows = inv.execute(
+        "SELECT mac FROM measurements_hourly WHERE hour=? AND collector_id=? "
+        "AND mac>? ORDER BY mac LIMIT 1000",
+        (hour, collector, after),
+    ).fetchall()
+    with immediate(inv):
+        for (mac,) in rows:
+            inv.execute(
+                "INSERT INTO monitoring_dirty VALUES (?,?,?) "
+                "ON CONFLICT(collector_id,mac) DO UPDATE SET "
+                "queued_at=MIN(queued_at,excluded.queued_at)",
+                (collector, mac, int(now)),
+            )
+        if len(rows) < 1000:
+            inv.execute(
+                "DELETE FROM monitoring_quality_work WHERE collector_id=? AND hour=?",
+                (collector, hour),
+            )
+        else:
+            inv.execute(
+                "UPDATE monitoring_quality_work SET after_mac=? WHERE collector_id=? AND hour=?",
+                (rows[-1][0], collector, hour),
+            )

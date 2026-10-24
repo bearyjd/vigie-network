@@ -31,6 +31,8 @@ def has_table(db, name):
 
 
 def lineage(inv, ov, device):
+    if ov is not None and not has_table(ov, "monitoring_lineage_versions"):
+        raise LineageUnavailable("monitoring identity migration missing")
     seen = set()
     canonical = device
     while ov is not None:
