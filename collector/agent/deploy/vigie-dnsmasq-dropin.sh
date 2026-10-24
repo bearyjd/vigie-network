@@ -4,7 +4,8 @@
 # reloads may clear it. Reloads until the desired drop-in has a successful reload confirmation.
 #
 #   ensure   create/repair the drop-in and log file; reload if changed or unconfirmed
-#   check    exit 0 confirmed, 1 missing/unconfirmed, 2 differs or unsafe (no changes made)
+#   check    exit 0 confirmed, 1 missing/unconfirmed, 2 differs or unsafe config/marker;
+#            directory/file trust failures exit 70 (no changes made)
 #
 # Runs as root inside world-writable /tmp, so every path is verified first (vigie-lib.sh): no
 # symlinks, trusted owner, private directories. Any failed check exits 70 with a message.
