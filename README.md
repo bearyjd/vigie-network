@@ -41,18 +41,16 @@ reviewer (PRP section 17), not run in production.
 | Ingest service (`vigie_ingest`) | `server/` | Built, 4 review rounds, tests pass |
 | Pipeline core (`vigie_pipeline`) | `server/` | Built, with bounded identity stitching and overlap vetoes. Classification rules and behavioral demotion remain incomplete; no LLM or ML stage |
 | App API (`vigie_api`) | `server/` | Inventory reads and overrides, accept/reject/merge/undo, standing rules and audited veto clearance. See `docs/api.md`; SSE and metrics remain deferred |
-| Container image, compose, cert and provisioning scripts | `deploy/` | Real rootless Podman loopback pilot validated synthetic ingest/API, mounts, private file modes and individual service restarts; see [validation report](docs/deployment-validation-2026-10-24.md). Production placement, router operation and long soak remain unverified |
-| Router collector agent (`vigie-collector`) | `collector/agent/` | Built, reviewed, host-tested; HTTPS transport with SPKI pinning and HMAC exercised against the real ingest service on localhost |
-| Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Built, wired to the collector socket reader, host-tested; root daemon and router behavior remain unverified |
-| DHCP log, conntrack and `ubus` output formats | router | **Unverified on the router.** Parsers are written against assumed formats and fixtures (PRP section 17, spikes) |
+| Container image, compose, cert and provisioning scripts | `deploy/` | Real rootless Podman loopback pilot validated synthetic ingest/API, mounts, private file modes and individual service restarts; see [validation report](docs/deployment-validation-2026-10-24.md). The [bounded router pilot](docs/router-validation-2026-10-24.md) also delivered real observations; production placement and long soak remain unverified |
+| Router collector agent (`vigie-collector`) | `collector/agent/` | Built, reviewed and exercised on the real router in a [ten-minute isolated pilot](docs/router-validation-2026-10-24.md), with pinned HTTPS/HMAC ingest and authenticated inventory; persistent install and long soak remain unverified |
+| Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Real router helper/socket path exercised in the bounded pilot; observed parser sample skipped 0 lines. Persistent procd operation and long soak remain unverified |
+| DHCP log, conntrack and `ubus` output formats | router | Actual leases, neighbors and conntrack were exercised in the bounded pilot. DNS logs, DHCP option 55/60 capture, `ubus` formats and other firmware cases remain unverified |
 | Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Never run on the router; procd retry semantics and dnsmasq log ownership are assumptions |
 | LLM / ML classification stages | none | **Not built** |
 | Control app | separate project | Out of scope here |
 
 The real collector, ingest, pipeline and API can be exercised together on localhost with
-[`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). Router observations, deployment and resource soak
-still require owner validation. The container evidence is an isolated localhost pilot; no real-router
-or production deployment is claimed.
+[`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). The [real-router field report](docs/router-validation-2026-10-24.md) records a ten-minute isolated run with real observations and resource samples. Production deployment, persistent router services, DNS logging and a 48-hour resource soak remain unverified; the run does not establish classification accuracy.
 
 ## Server quick start
 

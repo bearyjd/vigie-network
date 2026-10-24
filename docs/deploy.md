@@ -4,7 +4,7 @@ Short guide for running the server stack in `deploy/`. Setup is in the top-level
 [`README.md`](../README.md). A real rootless Podman loopback pilot has exercised synthetic ingest/API traffic, actual
 mount boundaries, private creation modes and individual service restarts; see the
 [2026-10-24 validation report](deployment-validation-2026-10-24.md). Production host placement,
-real-router operation, host reboot/restore and a 48-hour soak remain unverified. Other commands
+persistent real-router operation, host reboot/restore and a 48-hour soak remain unverified. A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
 marked *unverified* still require their own operational validation.
 
 ## Permission model: three processes, three volumes
