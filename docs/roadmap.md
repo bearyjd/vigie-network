@@ -3,7 +3,28 @@
 Draft recommendation, 2026-10-24. This roadmap extends the identity MVP; it does not claim that the current
 build detects network anomalies. The user wants an app that discovers and characterizes devices AND the
 network, learns normal activity, and makes strange behavior understandable. Implementation beyond the
-approved current MVP requires its own reviewed scope. [Research and primary sources](research/network-monitoring-features-2026-10-24.md).
+approved current build requires its own reviewed scope. [Research and primary sources](research/network-monitoring-features-2026-10-24.md).
+
+## Execution stages
+
+The user authorized the five-area autonomous build on 2026-10-24. Its
+[implementation plan](plans/monitoring-build-2026-10-24.md) defines the TDD seams, initial settings,
+deployment boundaries and PR/review/CI/merge gates. This table stages the whole roadmap; queued
+features remain unimplemented until their own acceptance evidence exists.
+
+| Stage | Scope | State / prerequisite |
+|---|---|---|
+| M0 | Inventory, reversible identity decisions and rules, API, bounded real-router pilot | Foundation merged; ten-minute field evidence recorded separately from production readiness |
+| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | Authorized and in progress; do not infer completion from this plan or an open PR |
+| M1b | Local overview, device charts/history, coverage panel and incident inbox | Queued after M1a API/data contracts; necessary for the eventual monitoring MVP |
+| M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Queued after persisted incident state; external delivery needs a configured owner-controlled destination |
+| M2 | Time-of-day patterns, destination/port novelty, essential-device absence, network-wide shifts, incident correlation and calibrated characterization | Queued after sufficient qualified history and owner-labeled evaluation |
+| M3 | Multiple network/VLAN scopes and optional external Zeek/Suricata metadata adapters | Queued after approved sensor placement and measured traffic visibility |
+| M4 | Drift models and optional AI explanations/classifiers | Conditional on demonstrated benefit over deterministic rules and an explicit privacy/resource review |
+
+M1a uses local authenticated APIs as its initial review surface. It does not replace the queued UI,
+claim full-MVP completion, or make a48h observation satisfy fourteen-day baseline eligibility.
+The real soak must reach its endpoint; synthetic clock tests verify the runner, not elapsed field time.
 
 ## Intended daily experience
 
@@ -26,7 +47,7 @@ proposed acceptance targets to calibrate with owner-labeled data, not demonstrat
 
 | Milestone | Deliverable / dependency | Proposed exit evidence | Effort |
 |---|---|---|---|
-| M0 — identity foundation, current work | Inventory, reversible human identity decisions/rules, bounded stitching, API workflow, CI and honest deployment docs | Independent review; all local gates green; merge/remember/rotation/undo and veto tests. Real deployment acceptance remains explicitly separate. | M, already under way |
+| M0 — identity foundation | Inventory, reversible human identity decisions/rules, bounded stitching, API workflow, CI and honest deployment docs | Foundation merged after independent review and CI. Real deployment acceptance remains explicitly separate. | M, completed foundation |
 | M1 — monitoring MVP, next | Real collection validation; coverage panel; hourly device/network aggregates; cold-start baseline status; fixed large-upload and qualified upload-deviation alerts; bounded DNS/reachability probes; minimal local UI/inbox and notification lifecycle | Deterministic replay without duplicate counts/alerts; injected collection failure visible within two configured collection windows; injected sustained upload and probe outage visible within two detector windows. Seven-day normal-LAN pilot reports alert volume and owner judgments, target ≤1 unwanted external notification/network/day. | L |
 | M2 — richer behavior/context | Day/time patterns, destination/port novelty, network-wide shifts, measured type rules, incident correlation and feedback | ≥14 valid observation days before evaluating initial learned deviations; chronological held-out replay includes backups/updates, sleeping devices, restarts, IPv6 and gaps. Report precision/recall per detector, abstentions and coverage, never a single unsupported accuracy score. | L |
 | M3 — richer optional visibility | Approved multi-network adapters and external Zeek/Suricata metadata sensor on a capable host, with suitable TAP/SPAN placement | Fixture/replay contracts; malformed/flooded inputs bounded; missing sensor flagged; duplicate overlapping observations do not inflate totals. Demonstrate exactly which traffic is observable before enabling scan/beacon claims. | L |

@@ -7,6 +7,7 @@ import binascii
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from typing import Any
@@ -82,7 +83,12 @@ def override_map(ov: sqlite3.Connection) -> dict[str, sqlite3.Row]:
 def _type_and_provenance(device: sqlite3.Row, override: sqlite3.Row | None) -> tuple[str, dict]:
     if override is not None and override["type"]:
         return override["type"], {"source": "human", "confidence": 1.0}
-    if device["inferred_type"]:
+    valid = (
+        "inferred_valid_until" not in device.keys()
+        or device["inferred_valid_until"] is None
+        or device["inferred_valid_until"] > time.time()
+    )
+    if device["inferred_type"] and valid:
         return device["inferred_type"], {
             "source": device["inferred_source"],
             "confidence": device["inferred_confidence"],
@@ -198,6 +204,7 @@ def iter_devices(
     include_retired: bool,
     include_aliases: bool,
     group_states: dict[str, str],
+    scan_limit: int | None = None,
 ) -> Iterator[sqlite3.Row]:
     """Filters run in SQL (override-derived ones through json_each id sets), so a flood of
     devices costs one indexed scan, not one Python-side effective view per device."""
@@ -226,9 +233,16 @@ def iter_devices(
         params["type_has"] = _ids_where(overrides, links, lambda r: bool(r["type"]))
         params["type_eq"] = _ids_where(overrides, links, lambda r: r["type"] == type_)
         params["type"] = type_
+        freshness = ""
+        if "inferred_valid_until" in {r[1] for r in inv.execute("PRAGMA table_info(devices)")}:
+            freshness = "CASE WHEN inferred_valid_until<=:type_now THEN 'unknown' ELSE "
+            params["type_now"] = time.time()
+        inferred = "COALESCE(NULLIF(inferred_type, ''), 'unknown')"
+        if freshness:
+            inferred = freshness + inferred + " END"
         clauses.append(
             f"({in_set.format('type_eq')} OR (NOT {in_set.format('type_has')}"
-            " AND COALESCE(NULLIF(inferred_type, ''), 'unknown') = :type))"
+            f" AND ({inferred} = :type OR inferred_source='deterministic-services')))"
         )
     if group is not None:
         if group == "unassigned":
@@ -247,6 +261,9 @@ def iter_devices(
             f" OR {in_set.format('ov_since')})"
         )
     sql = f"SELECT * FROM devices WHERE {' AND '.join(clauses)} ORDER BY id"  # noqa: S608
+    if scan_limit is not None:
+        sql += " LIMIT :scan_limit"
+        params["scan_limit"] = scan_limit
     yield from inv.execute(sql, params)
 
 
@@ -271,6 +288,9 @@ def list_devices(
     group_states = group_identity_states(inv, links)
     out: list[dict[str, Any]] = []
     more = False
+    scanned = 0
+    last_scanned = after
+    scan_budget = max(32, limit + 1)
     for row in iter_devices(
         inv,
         overrides,
@@ -285,12 +305,22 @@ def list_devices(
         include_retired=include_retired,
         include_aliases=include_aliases,
         group_states=group_states,
+        scan_limit=scan_budget + 1,
     ):
+        if scanned >= scan_budget:
+            more = True
+            break
+        scanned += 1
+        item = effective_device(fresh_inference(inv, ov, row), overrides, links, group_states)
+        if type_ is not None and item["type"] != type_:
+            last_scanned = row["id"]
+            continue
         if len(out) == limit:
             more = True
             break
-        out.append(effective_device(row, overrides, links, group_states))
-    return out, (encode_cursor(out[-1]["id"]) if more else None)
+        out.append(item)
+        last_scanned = row["id"]
+    return out, (encode_cursor(last_scanned) if more else None)
 
 
 def _device_row(inv: sqlite3.Connection, device_id: str) -> sqlite3.Row:
@@ -332,7 +362,7 @@ def device_detail(
     canonical = resolve(links, device_id)
     row = _device_row(inv, canonical)
     overrides = override_map(ov)
-    item = effective_device(row, overrides, links)
+    item = effective_device(fresh_inference(inv, ov, row), overrides, links)
     identity_override = overrides.get(device_id)
     members = [canonical, *(f for f in links if f != canonical and resolve(links, f) == canonical)]
     marks = ",".join("?" * len(members))
@@ -380,6 +410,7 @@ def device_detail(
             if suppress
             else display_text(row["inferred_reason_text"], PROSE_MAX),
             "model_version": display_text(row["inferred_model_version"]),
+            "characterization": characterization_detail(inv, ov, canonical),
         },
     }
 
@@ -400,3 +431,46 @@ def resolve_mac(inv: sqlite3.Connection, ov: sqlite3.Connection, raw_mac: str) -
         "link_source": "human" if found[0]["device_id"] != canonical else found[0]["link_source"],
         "identity_state": worst_state(states),
     }
+
+
+def characterization_detail(inv, ov, device):
+    from dataclasses import asdict
+
+    from vigie_pipeline.characterization import Classification
+
+    if (
+        inv.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='characterization_results'"
+        ).fetchone()
+        is None
+    ):
+        return None
+    row = inv.execute(
+        "SELECT result FROM characterization_results WHERE device_id=?", (device,)
+    ).fetchone()
+    if row is None:
+        return None
+    from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
+
+    cached = json.loads(row[0])
+    try:
+        fresh = lineage(inv, ov, device)
+    except LineageUnavailable:
+        return asdict(Classification(reason="invalid_input"))
+    if cached["lineage"] != fresh.key:
+        return asdict(Classification(reason="insufficient_evidence"))
+    result = cached["classification"]
+    if result["valid_until"] is not None and result["valid_until"] <= time.time():
+        return asdict(Classification(reason="expired_evidence"))
+    return result
+
+
+def fresh_inference(inv, ov, row):
+    if row["inferred_source"] != "deterministic-services":
+        return row
+    result = characterization_detail(inv, ov, row["id"])
+    if result is not None and result["inferred_type"] != row["inferred_type"]:
+        copy = dict(row)
+        copy["inferred_type"] = result["inferred_type"]
+        return copy
+    return row

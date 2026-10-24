@@ -414,6 +414,22 @@
       "title": "Neigh",
       "type": "array"
     },
+    "observation_kind": {
+      "anyOf": [
+        {
+          "enum": [
+            "observation",
+            "probe"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Observation Kind"
+    },
     "sent_ts": {
       "maximum": 1099511627776,
       "minimum": 0,
