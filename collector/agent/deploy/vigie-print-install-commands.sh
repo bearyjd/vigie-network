@@ -88,7 +88,8 @@ test "\$(id -gn vigie)" = "vigie" || exit 1
 install -d -m 0755 -o root -g root /etc/vigie /usr/libexec/vigie
 install -m 0755 -o root -g root /tmp/vigie-collector /usr/bin/vigie-collector
 install -m 0755 -o root -g root /tmp/vigie-conntrack /usr/bin/vigie-conntrack
-install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /tmp/vigie-deploy/vigie-state-dir.sh /usr/libexec/vigie/
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-lib.sh /tmp/vigie-deploy/vigie-dnsmasq-dropin.sh /tmp/vigie-deploy/vigie-log-watchdog.sh /tmp/vigie-deploy/vigie-run.sh /tmp/vigie-deploy/vigie-state-dir.sh /tmp/vigie-deploy/vigie-logfs.sh /tmp/vigie-deploy/vigie-logfs-boot.sh /usr/libexec/vigie/
+install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-logfs.init /etc/init.d/vigie-logfs
 install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-collector.init /etc/init.d/vigie-collector
 install -m 0755 -o root -g root /tmp/vigie-deploy/vigie-conntrack.init /etc/init.d/vigie-conntrack
 # First install only: copy collector.conf.example to /etc/vigie/collector.conf (0644 root:root)
@@ -104,6 +105,10 @@ chmod 0600 /etc/vigie/key
 #    it refuses a directory that somebody else created first.
 
 # 5. start, then VERIFY the assumptions the scripts rely on
+# Fixed 20 MiB private log filesystem, boot START=17 before dnsmasq START=19.
+# Existing contents/foreign mounts are refused; inspect and preserve them before retrying.
+/etc/init.d/vigie-logfs enable
+/etc/init.d/vigie-logfs start
 /etc/init.d/vigie-collector enable
 /etc/init.d/vigie-collector start
 # The collector/drop-in creates root:vigie 0751 first; the helper accepts that existing
@@ -120,6 +125,9 @@ ps | grep -E 'dnsmasq|vigie-collector|vigie-conntrack'  # collector: vigie; conn
 # dnsmasq ownership and reboot recovery before leaving these services unattended.
 
 # Rollback: run separately, as root. Stop/disable before removing installed service files.
+# FIRST remove/disable only owned Vigie cron ensure/watchdog jobs, then stop collector/helper.
+# Restore the exact prior DNS configuration and restart/verify DNS before reviewing an unmount.
+# /etc/init.d/vigie-logfs disable
 # /etc/init.d/vigie-conntrack stop
 # /etc/init.d/vigie-conntrack disable
 # /etc/init.d/vigie-collector stop

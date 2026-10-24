@@ -2,6 +2,7 @@
 //! the VIGIE_TEST gate, and procd respawn limits. Shell scripts run unprivileged under the
 //! `VIGIE_TEST=1` hooks; `chown`, `stat`, `id`, `ubus`, `pidof` and `logger` are stubs on PATH.
 
+mod common;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
@@ -109,6 +110,7 @@ impl World {
             .env("VIGIE_TRUSTED_UID", uid.to_string())
             .env("VIGIE_OWNER", format!("{uid}:{gid}"))
             .env("VIGIE_LOG_FILE", &self.log)
+            .envs(common::fake_logfs_env(self.log.parent().unwrap()))
             .env("VIGIE_LOG_MAX_BYTES", "100")
             .env("VIGIE_SIGNAL_CMD", signal)
             .env("VIGIE_PROC_DIR", self.d.join("proc"))

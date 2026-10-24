@@ -28,6 +28,7 @@ if vtest; then
 fi
 OLD="$LOG.1"
 
+require_logfs
 [ -e "$LOG" ] || [ -L "$LOG" ] || exit 0
 require_dir "$(dirname "$LOG")"
 ALLOWED=$(log_allowed_uids)

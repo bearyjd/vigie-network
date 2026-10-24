@@ -61,6 +61,10 @@ applied_state() {
 }
 
 case "${1:-}" in
+check|ensure|prepare) require_logfs ;;
+esac
+
+case "${1:-}" in
 check)
 	state || exit $?
 	require_dir "$DROPIN_DIR"
@@ -69,7 +73,7 @@ check)
 	applied_state
 	exit $?
 	;;
-ensure)
+ensure|prepare)
 	ensure_dir "$LOG_DIR" 0751
 	ensure_dir "$DROPIN_DIR" 0755
 	if [ ! -e "$LOG" ] && [ ! -L "$LOG" ]; then
@@ -85,6 +89,9 @@ ensure)
 	if [ -e "$APPLIED" ] && [ "$(stat -c %a "$APPLIED")" != 600 ]; then
 		refuse "$APPLIED must have mode 600"
 	fi
+	if [ "$1" = prepare ] && state; then
+		exit 0
+	fi
 	if state && applied_state; then
 		exit 0
 	fi
@@ -98,6 +105,8 @@ ensure)
 			exit 1
 		fi
 	fi
+	# Pre-DNS boot preparation stages files only; never assert the daemon applied them.
+	[ "$1" != prepare ] || exit 0
 	sh -c "$RELOAD_CMD" || exit $?
 	# Only the successful reload path may publish confirmation; atomic rename prevents
 	# a killed writer from leaving a partial confirmation that check could accept.
@@ -109,7 +118,7 @@ ensure)
 	exit 1
 	;;
 *)
-	echo "usage: $0 ensure|check" >&2
+	echo "usage: $0 prepare|ensure|check" >&2
 	exit 64
 	;;
 esac

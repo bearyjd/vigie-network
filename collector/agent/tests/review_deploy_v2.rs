@@ -67,6 +67,7 @@ fn dropin(dd: &Path, ld: &Path, path: Option<&str>) -> Output {
     trusted(&mut c)
         .env("VIGIE_DROPIN_DIR", dd)
         .env("VIGIE_LOG_DIR", ld)
+        .envs(common::fake_logfs_env(ld))
         .env("VIGIE_RELOAD_CMD", "true");
     if let Some(p) = path {
         c.env("PATH", p);
@@ -103,7 +104,7 @@ fn a_directory_that_wins_the_mkdir_race_is_refused_not_adopted() {
     let o = dropin(&dd, &ld, Some(&path));
     assert_eq!(o.status.code(), Some(70), "{}", err(&o));
     assert_eq!(
-        mode(&ld),
+        mode(&dd),
         0o777,
         "an existing directory is never chmod'ed by path"
     );
@@ -121,12 +122,23 @@ fn a_raced_directory_with_a_good_mode_but_foreign_owner_is_refused_too() {
     let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
     let path = racing_path(&d, "0750");
     let (uid, _) = me();
+    stub(
+        &d.join("bin"),
+        "stat",
+        &format!(
+            "if [ \"$1:$2:$3\" = '-c:%u:{}' ]; then echo {}; else exec {} \"$@\"; fi",
+            dd.display(),
+            uid + 1,
+            real("stat")
+        ),
+    );
+
     let mut c = Command::new("sh");
     c.arg(script("vigie-dnsmasq-dropin.sh")).arg("ensure");
     let o = trusted(&mut c)
-        .env("VIGIE_TRUSTED_UID", (uid + 1).to_string())
         .env("VIGIE_DROPIN_DIR", &dd)
         .env("VIGIE_LOG_DIR", &ld)
+        .envs(common::fake_logfs_env(&ld))
         .env("VIGIE_RELOAD_CMD", "true")
         .env("PATH", &path)
         .output()
@@ -138,14 +150,18 @@ fn a_raced_directory_with_a_good_mode_but_foreign_owner_is_refused_too() {
 }
 
 #[test]
-fn a_preexisting_good_directory_is_accepted_and_left_alone() {
+fn a_preexisting_untraversable_logroot_is_refused_and_left_alone() {
     let d = tmpdir();
     let (dd, ld) = (d.join("dnsmasq.d"), d.join("vigie"));
     fs::create_dir_all(&ld).unwrap();
     fs::set_permissions(&ld, fs::Permissions::from_mode(0o700)).unwrap();
     let o = dropin(&dd, &ld, None);
-    assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(mode(&ld), 0o700, "mode of an existing directory unchanged");
+    assert_eq!(o.status.code(), Some(70), "{}", err(&o));
+    assert_eq!(
+        mode(&ld),
+        0o700,
+        "unsafe existing geometry is never repaired"
+    );
 }
 
 #[test]
@@ -170,6 +186,7 @@ fn overrides_are_ignored_without_vigie_test() {
         c.arg(script("vigie-dnsmasq-dropin.sh")).arg("check");
         c.env("VIGIE_DROPIN_DIR", &dd)
             .env("VIGIE_LOG_DIR", &ld)
+            .envs(common::fake_logfs_env(&ld))
             .env("VIGIE_TRUSTED_UID", uid.to_string())
             .env("VIGIE_OWNER", format!("{uid}:{gid}"));
         if test {
@@ -214,6 +231,7 @@ fn watchdog(log: &Path, max: &str, signal: &str) -> Output {
         .env("VIGIE_LOG_FILE", log)
         .env("VIGIE_LOG_MAX_BYTES", max)
         .env("VIGIE_SIGNAL_CMD", signal)
+        .envs(common::fake_logfs_env(log.parent().unwrap()))
         .envs(common::fake_dnsmasq_env())
         .output()
         .unwrap()
@@ -297,12 +315,22 @@ fn init_start_refuses_when_the_vigie_user_is_missing() {
         "logger",
         &format!("printf '%s\\n' \"$*\" >> '{}'", d.join("syslog").display()),
     );
+    // The user check must be exercised after a satisfied mount prerequisite, not an
+    // unrelated missing host /usr/libexec path. Only this fixture copy replaces that port.
+    let init = d.join("collector.init");
+    fs::write(
+        &init,
+        fs::read_to_string(script("vigie-collector.init"))
+            .unwrap()
+            .replace("/usr/libexec/vigie/vigie-logfs.sh check", "true"),
+    )
+    .unwrap();
     let sh = real("sh");
     let o = Command::new(&sh)
         .arg("-c")
         .arg(format!(
             ". '{}'; procd_open_instance() {{ echo OPENED; }}; start_service",
-            script("vigie-collector.init")
+            init.display()
         ))
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .output()

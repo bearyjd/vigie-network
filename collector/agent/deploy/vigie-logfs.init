@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+# One-shot filesystem/config staging before firmware dnsmasq START=19.
+# No DNS service is started/reloaded here. Stopping does not unmount live consumers.
+# Rollback must stop Vigie ensure jobs/collectors, restore DNS, then review unmount separately.
+# shellcheck disable=SC2034
+START=17
+# shellcheck disable=SC2034
+STOP=99
+start() {
+	/usr/libexec/vigie/vigie-logfs-boot.sh
+}
+stop() {
+	:
+}
