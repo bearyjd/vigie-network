@@ -9,6 +9,7 @@ import json
 import math
 import os
 import stat
+from datetime import datetime
 from pathlib import Path
 
 DURATION_SECONDS = 172800
@@ -33,6 +34,8 @@ _REQUIRED_NUMERIC = (
     "logical_cpus",
     "freshness_s",
     "backlog_batches",
+    "processing_backlog_age_s",
+    "processing_backlog_reference_wall",
     "dropped_batches",
     "source_flags",
     "ct_unmapped_flows",
@@ -40,6 +43,7 @@ _REQUIRED_NUMERIC = (
     "dns_parsed_age_s",
 )
 _IDS = ("host_boot_id", "router_boot_id")
+_BOOLS = ("dns_log_quiet", "dns_probe_ok", "backlog_capped")
 
 
 def _number(value):
@@ -51,6 +55,28 @@ def _number(value):
         return False
 
 
+def processing_backlog_age(count, capped, oldest, reference_wall):
+    """Unknown is never an invented zero; a future receipt retains its negative age."""
+    if (
+        type(count) is not int
+        or count < 0
+        or capped is not False
+        or not _number(reference_wall)
+    ):
+        return None
+    if count == 0:
+        return 0 if oldest is None else None
+    if not isinstance(oldest, str) or len(oldest) > 128 or not oldest.isascii():
+        return None
+    try:
+        received = datetime.fromisoformat(oldest)
+        if received.tzinfo is None:
+            return None
+        return reference_wall - received.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def sample_issues(sample):
     """Return hard failures, absent fields, and collection-quality gates separately."""
     if not isinstance(sample, dict):
@@ -59,9 +85,11 @@ def sample_issues(sample):
         return {"invalid_metrics"}, set(), set()
     missing = {
         key
-        for key in (*_REQUIRED_NUMERIC, *_IDS, "dns_log_quiet", "dns_probe_ok")
+        for key in (*_REQUIRED_NUMERIC, *_IDS, *_BOOLS)
         if key not in sample or sample[key] is None
     }
+    if "oldest_pending_received_at" not in sample:
+        missing.add("oldest_pending_received_at")
     failures = (
         {"invalid_metrics"}
         if any(
@@ -77,11 +105,34 @@ def sample_issues(sample):
             or not all(c.isalnum() or c == "-" for c in sample[key])
         ):
             failures.add("invalid_metrics")
-    for key in ("dns_log_quiet", "dns_probe_ok"):
+    for key in _BOOLS:
         if key not in missing and type(sample[key]) is not bool:
             failures.add("invalid_metrics")
+    oldest = sample.get("oldest_pending_received_at")
+    if oldest is not None and (
+        not isinstance(oldest, str) or len(oldest) > 128 or not oldest.isascii()
+    ):
+        failures.add("invalid_metrics")
     if failures:
         return failures, missing, set()
+    expected_age = processing_backlog_age(
+        sample.get("backlog_batches"),
+        sample.get("backlog_capped"),
+        oldest,
+        sample.get("processing_backlog_reference_wall"),
+    )
+    if expected_age is None or "oldest_pending_received_at" in missing:
+        missing.add("processing_backlog_age_s")
+    elif expected_age < 0 or (
+        "processing_backlog_age_s" not in missing
+        and abs(sample["processing_backlog_age_s"] - expected_age) > 0.000001
+    ):
+        failures.add("invalid_metrics")
+    if (
+        not {"wall", "processing_backlog_reference_wall"} & missing
+        and sample["processing_backlog_reference_wall"] < sample["wall"]
+    ):
+        failures.add("processing_backlog_clock_regression")
     limits = {
         "collector_rss_kib": lambda x: x < 9765,
         "helper_rss_kib": lambda x: x < 65536,
@@ -89,7 +140,7 @@ def sample_issues(sample):
         "log_used_kib": lambda x: x <= 20480,
         "log_capacity_kib": lambda x: 0 < x <= 20480,
         "freshness_s": lambda x: x <= 180,
-        "backlog_batches": lambda x: x == 0,
+        "processing_backlog_age_s": lambda x: x <= 180,
         "dropped_batches": lambda x: x == 0,
         "source_flags": lambda x: x == 0,
         "logical_cpus": lambda x: x >= 1 and int(x) == x,
@@ -264,7 +315,7 @@ class Journal:
             ):
                 raise ValueError("journal record limit")
             header = {
-                "schema": 1,
+                "schema": 2,
                 "mode": self.mode,
                 "duration_seconds": DURATION_SECONDS,
                 "metadata": self.metadata,
@@ -318,6 +369,27 @@ class Journal:
                     value = sample.get(key)
                     if isinstance(value, str) and len(value) <= 128 and value.isascii():
                         safe[key] = value
+                # Preserve bounded raw processing evidence even for an invalid/future sample.
+                for key in _BOOLS:
+                    if type(sample.get(key)) is bool:
+                        safe[key] = sample[key]
+                oldest = sample.get("oldest_pending_received_at")
+                if "oldest_pending_received_at" in sample and (
+                    oldest is None
+                    or (
+                        isinstance(oldest, str)
+                        and len(oldest) <= 128
+                        and oldest.isascii()
+                    )
+                ):
+                    safe["oldest_pending_received_at"] = oldest
+                age = sample.get("processing_backlog_age_s")
+                if type(age) in (float, int):
+                    try:
+                        if math.isfinite(age) and abs(age) <= 1e20:
+                            safe["processing_backlog_age_s"] = age
+                    except OverflowError:
+                        pass
             sample = dict(safe, invalid_record=True)
         self._write(sample)
         self.samples.append(sample)

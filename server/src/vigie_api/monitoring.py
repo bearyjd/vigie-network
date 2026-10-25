@@ -99,9 +99,9 @@ def collector_summary(inv, collector):
     health = json.loads(latest["health"] or "{}") if latest else {}
     flags = json.loads(latest["truncated"] or "{}") if latest else {}
     pending = inv.execute(
-        "SELECT 1 FROM batches b WHERE b.collector_id=? AND NOT EXISTS "
+        "SELECT b.received_at FROM batches b WHERE b.collector_id=? AND NOT EXISTS "
         "(SELECT 1 FROM measurement_batches m WHERE m.collector_id=b.collector_id "
-        "AND m.batch_id=b.batch_id) LIMIT 10001",
+        "AND m.batch_id=b.batch_id) ORDER BY b.received_at,b.batch_id LIMIT 10001",
         (collector,),
     ).fetchall()
     truncated = [json.loads(row["truncated"] or "{}") for row in rows]
@@ -126,6 +126,7 @@ def collector_summary(inv, collector):
         "last_seq": owner["last_seq"],
         "backlog_batches": min(len(pending), 10000),
         "backlog_capped": len(pending) > 10000,
+        "oldest_pending_received_at": pending[0]["received_at"] if pending else None,
         "retained_detail_since": rows[-1]["received_at"] if rows else None,
         "summary_capped": capped,
         "dropped_batches_in_retained_detail": sum(row["dropped_batches"] for row in rows),

@@ -515,6 +515,17 @@
             "title": "Monitoring Unavailable Capped",
             "type": "boolean"
           },
+          "oldest_pending_received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending Received At"
+          },
           "retained_detail_since": {
             "anyOf": [
               {
@@ -555,6 +566,7 @@
           "last_seq",
           "backlog_batches",
           "backlog_capped",
+          "oldest_pending_received_at",
           "retained_detail_since",
           "summary_capped",
           "dropped_batches_in_retained_detail",

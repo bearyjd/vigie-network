@@ -254,3 +254,64 @@ def test_api_withholds_model_after_training_hour_quality_changes_and_reports_bac
     assert summary["monitoring_unavailable"] == [
         {"device_id": "bad", "reason": "lineage_unavailable", "retry_at": int(NOW) + 60}
     ]
+
+
+def test_pending_oldest_is_collector_scoped_chronological_and_receipt_driven(env: Env):
+    seed(env)
+    env.inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c2','k2')")
+    for collector, batch, received, kind in [
+        ("c1", "completed", "2026-01-01T00:00:00Z", "observation"),
+        ("c2", "z-probe", "2026-01-01T00:00:01Z", "probe"),
+        ("c1", "z-probe", "2026-01-01T00:00:10Z", "probe"),
+        ("c1", "a-observation", "2026-01-01T00:00:20Z", "observation"),
+    ]:
+        env.inv.execute(
+            "INSERT INTO batches(collector_id,batch_id,received_at,observation_kind) "
+            "VALUES (?,?,?,?)",
+            (collector, batch, received, kind),
+        )
+
+    def receipt(collector, batch):
+        env.inv.execute(
+            "INSERT INTO measurement_batches(collector_id,batch_id,received_at,quality) "
+            "VALUES (?,?,?,'[]')",
+            (collector, batch, "2026-01-01T00:00:30Z"),
+        )
+
+    receipt("c1", "completed")
+    receipt("c2", "z-probe")
+
+    def summary():
+        return env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600).json()[
+            "data"
+        ]["collector"]
+
+    value = summary()
+    assert value["backlog_batches"] == 2
+    assert value["oldest_pending_received_at"] == "2026-01-01T00:00:10Z"
+    receipt("c1", "z-probe")
+    value = summary()
+    assert value["backlog_batches"] == 1
+    assert value["oldest_pending_received_at"] == "2026-01-01T00:00:20Z"
+    receipt("c1", "a-observation")
+    value = summary()
+    assert value["backlog_batches"] == 0
+    assert value["oldest_pending_received_at"] is None
+
+
+def test_pending_oldest_survives_detail_cap_and_reordered_batch_ids(env: Env):
+    seed(env)
+    env.inv.executemany(
+        "INSERT INTO batches(collector_id,batch_id,received_at) VALUES (?,?,?)",
+        [("c1", f"a{i:05}", "2026-01-01T00:01:00Z") for i in range(10001)],
+    )
+    env.inv.execute(
+        "INSERT INTO batches(collector_id,batch_id,received_at) "
+        "VALUES ('c1','z-oldest','2026-01-01T00:00:00Z')"
+    )
+    result = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
+    assert result.status_code == 200, result.text
+    value = result.json()["data"]["collector"]
+    assert value["backlog_batches"] == 10000
+    assert value["backlog_capped"] is True
+    assert value["oldest_pending_received_at"] == "2026-01-01T00:00:00Z"

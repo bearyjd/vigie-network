@@ -26,7 +26,14 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from soak import CADENCE_SECONDS, DURATION_SECONDS, Journal, assess, sample_issues
+from soak import (
+    CADENCE_SECONDS,
+    DURATION_SECONDS,
+    Journal,
+    assess,
+    processing_backlog_age,
+    sample_issues,
+)
 
 _LIMIT = 16384
 _QUESTION = b"\x07example\x03com\x00\x00\x01\x00\x01"
@@ -332,8 +339,19 @@ def coverage_metrics(collector, now):
         timestamp = _epoch(collector.get(source))
         result[target] = now - timestamp if timestamp is not None else None
     # Exact typed API contract: a capped or absent summary is unknown, never favorable zero.
-    if collector.get("backlog_capped") is not False:
-        result["backlog_batches"] = None
+    result["backlog_capped"] = collector.get("backlog_capped")
+    result["oldest_pending_received_at"] = collector.get("oldest_pending_received_at")
+    result["processing_backlog_reference_wall"] = now
+    result["processing_backlog_age_s"] = (
+        processing_backlog_age(
+            result["backlog_batches"],
+            result["backlog_capped"],
+            result["oldest_pending_received_at"],
+            now,
+        )
+        if "oldest_pending_received_at" in collector
+        else None
+    )
     if collector.get("summary_capped") is not False:
         for key in ("dropped_batches", "ct_unmapped_flows", "ct_unmapped_bytes"):
             result[key] = None
@@ -371,7 +389,7 @@ def read_coverage(config, now):
         if len(body) > 262144:
             raise ValueError("coverage response limit")
     collector = json.loads(body)["data"]["collector"]
-    return coverage_metrics(collector, now)
+    return coverage_metrics(collector, time.time())
 
 
 def clock_sample():
