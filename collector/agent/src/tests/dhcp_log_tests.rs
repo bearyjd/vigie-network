@@ -105,3 +105,26 @@ fn a_complete_block_is_published_once_by_an_unparsed_line_or_the_second_poll() {
     );
     fs::remove_file(path).ok();
 }
+
+#[test]
+fn a_failed_poll_never_publishes_the_held_block_ahead_of_the_pending_gap() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut a, path) = log_agent("errpoll");
+    append(
+        &path,
+        &(packet(1, MAC_A, "vendor-a") + &opts(1, "1:netmask, 3:router")),
+    );
+    a.poll_log(1);
+    // The continuation lands in the rotated-to file, which cannot be opened right now.
+    rotate(&path, "1", &opts(1, "6:dns-server"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    a.poll_log(2);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    a.poll_log(3);
+    a.poll_log(4);
+    let all = leases(&mut a);
+    assert!(all.iter().all(|x| x.opt55.is_empty()), "{all:?}");
+    assert!(all.iter().all(|x| x.opt60.is_none()), "{all:?}");
+    fs::remove_file(path.with_extension("1")).ok();
+    fs::remove_file(path).ok();
+}

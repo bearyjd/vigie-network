@@ -19,6 +19,14 @@
 //! or by `end_poll` on the second poll the block has been open at the end of. A gap
 //! (`lose_context`) discards an unfinished block unpublished, so a truncated list never leaves.
 //!
+//! Lines of another dnsmasq process (different pid) pass through every open context untouched;
+//! the contexts are keyed on the pid and are closed by a line of their own pid, a gap, or the
+//! second `end_poll`. A new verified ACK of another pid replaces (drops unpublished) a held block.
+//!
+//! Known limit of the timeout design: it assumes dnsmasq writes one `requested options:` list
+//! contiguously. An unparsed line between two option lines, or a writer that stalls for
+//! `BLOCK_HOLD_POLLS` polls mid-list, closes the block and publishes the truncated list.
+//!
 //! Lines this module deliberately does not recognise end the contexts (safe drop, fingerprint
 //! lost, never leaked): a `user class:` line between vendor class and request, and
 //! `available DHCP subnet:` (static/proxy ranges), which is not a packet-start marker.
@@ -200,6 +208,22 @@ impl DhcpAssembler {
 
     /// Feeds one event written by dnsmasq process `pid`; returns the leases it publishes.
     pub fn feed_pid(&mut self, pid: u64, ev: &LogEvent) -> Vec<Lease> {
+        // A line of another dnsmasq process touches none of the open contexts (their keys
+        // include the pid, so nothing can attach across): they are set aside and put back.
+        let held = (
+            self.ctx.take_if(|c| c.key.0 != pid),
+            self.pre.take_if(|p| p.key.0 != pid),
+            self.post.take_if(|p| p.key.0 != pid),
+        );
+        let out = self.feed_own(pid, ev);
+        self.ctx = self.ctx.take().or(held.0);
+        self.pre = self.pre.take().or(held.1);
+        self.post = self.post.take().or(held.2);
+        out
+    }
+
+    /// `feed_pid` for a line of the process the open contexts (if any) belong to.
+    fn feed_own(&mut self, pid: u64, ev: &LogEvent) -> Vec<Lease> {
         // Preamble and post-ACK contexts survive only the lines that directly continue them.
         let pre = self
             .pre

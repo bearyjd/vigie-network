@@ -133,8 +133,12 @@ impl Tail {
         match File::open(&self.path) {
             Ok(f) => {
                 let meta = f.metadata()?;
-                self.pos = if at_end { meta.len() } else { 0 };
-                self.fingerprint = read_before(&f, self.pos)?;
+                // Both are read before anything is assigned: a failure half-way must leave the
+                // cursor of the file still in `cur` untouched.
+                let pos = if at_end { meta.len() } else { 0 };
+                let fingerprint = read_before(&f, pos)?;
+                self.pos = pos;
+                self.fingerprint = fingerprint;
                 self.cur = Some((f, meta.ino()));
                 Ok(())
             }
@@ -225,4 +229,27 @@ fn read_before(mut f: &File, pos: u64) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.take(pos - from).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_open_leaves_the_cursor_of_the_current_file_alone() {
+        let dir = std::env::temp_dir().join(format!("vigie-tail-l2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.log");
+        std::fs::write(&old, "0123456789\n").unwrap();
+        std::fs::write(dir.join("entry"), "x").unwrap();
+        let mut tail = Tail::new(old.clone());
+        tail.poll_with_gaps().unwrap();
+        let before = (tail.pos, tail.fingerprint.clone());
+        // A directory opens, but its bytes cannot be read: the open fails half-way.
+        tail.path = dir.clone();
+        assert!(tail.open_new(true).is_err());
+        assert_eq!((tail.pos, tail.fingerprint.clone()), before);
+        assert!(tail.cur.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
