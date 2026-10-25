@@ -90,7 +90,8 @@ fn an_error_with_only_gap_markers_surfaces_and_the_gap_is_kept() {
     // Nothing but the rotation gap was drained: the failure is reported, as `poll` does.
     assert!(t.poll_with_gaps().is_err());
     assert!(t.poll().is_err());
-    assert_eq!(t.take_counts().get("tail_open_failed"), None);
+    // Every failed poll is counted, also the ones that return nothing but the error.
+    assert_eq!(t.take_counts().get("tail_open_failed"), Some(&2));
     fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(t.poll_with_gaps().unwrap(), vec![None, s("new1")]);
     fs::remove_dir_all(d).unwrap();

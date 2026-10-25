@@ -15,17 +15,28 @@
 //! Publication: the `DHCPACK` publishes the lease (address, hostname) with the fingerprint
 //! "not known" (empty options, no vendor class), which the window reads as "keep what you
 //! have". The fingerprint (options + vendor class) of the post-ACK block is published ONCE,
-//! when the block is finished: by the next line that is not the block's own options/tags line,
-//! or by `end_poll` on the second poll the block has been open at the end of. A gap
-//! (`lose_context`) discards an unfinished block unpublished, so a truncated list never leaves.
+//! when the block is finished, never before: by the next line of the block's own dnsmasq
+//! process that is not the block's options/tags line, by an unparsed line, or by `end_poll`
+//! on the second end-of-log poll the block has been open at the end of.
 //!
-//! Lines of another dnsmasq process (different pid) pass through every open context untouched;
-//! the contexts are keyed on the pid and are closed by a line of their own pid, a gap, or the
-//! second `end_poll`. A new verified ACK of another pid replaces (drops unpublished) a held block.
+//! Lifecycle of the held state:
+//! - Blocks are held per pid: at most one per dnsmasq process and `MAX_HELD_BLOCKS` in all.
+//!   A line of another pid touches none of them (their keys include the pid), so a verified
+//!   ACK of one process never costs another its block. Past the cap the oldest block is
+//!   dropped unpublished (`dhcp_block_evicted`), never published, as its list may be cut.
+//! - A verified ACK for a MAC drops every held block of that MAC (`dhcp_block_superseded`):
+//!   a block built on an older lease must never republish it over the newer one.
+//! - A gap (`lose_context`) clears everything: contexts, preamble, held blocks (unpublished)
+//!   AND the pending pre-ACK entries, so nothing collected before the gap joins an ACK after it.
+//! - The attach context and preamble also age out after `BLOCK_HOLD_POLLS` polls.
+//! - Only polls that read the log to its end age anything (`end_poll_at`): a poll that
+//!   stopped at its byte budget says nothing about the writer having paused.
+//! - A marked packet (preamble) restates the whole fingerprint: options, vendor and name of an
+//!   earlier attempt of the same serial are cleared, never mixed with the new ones.
 //!
 //! Known limit of the timeout design: it assumes dnsmasq writes one `requested options:` list
 //! contiguously. An unparsed line between two option lines, or a writer that stalls for
-//! `BLOCK_HOLD_POLLS` polls mid-list, closes the block and publishes the truncated list.
+//! `BLOCK_HOLD_POLLS` end-of-log polls mid-list, closes the block and publishes the truncated list.
 //!
 //! Lines this module deliberately does not recognise end the contexts (safe drop, fingerprint
 //! lost, never leaked): a `user class:` line between vendor class and request, and
@@ -37,6 +48,8 @@ use crate::dnsmasq::LogEvent;
 use crate::model::{Lease, MAX_OPT55};
 
 const MAX_PENDING_DHCP: usize = 256;
+/// Finished-but-unpublished post-ACK blocks kept at once (one per dnsmasq process).
+const MAX_HELD_BLOCKS: usize = 4;
 /// Polls an open post-ACK block is held at the end of before it is closed.
 const BLOCK_HOLD_POLLS: u8 = 2;
 
@@ -75,6 +88,8 @@ struct Context {
     /// An options line has already been attached in this context (later ones extend it; the
     /// first one replaces what an earlier packet of the same transaction left).
     opts_started: bool,
+    /// Polls this context has been open at the end of.
+    polls: u8,
 }
 
 /// Vendor class and client name lines that dnsmasq logs BEFORE the `DHCPREQUEST` of the same
@@ -85,6 +100,8 @@ struct Preamble {
     key: Key,
     class: Option<String>,
     name: Option<String>,
+    /// Polls this preamble has been open at the end of.
+    polls: u8,
 }
 
 /// The verified `DHCPACK` whose `requested options:` lines (logged AFTER the ACK) are being
@@ -136,7 +153,12 @@ pub struct DhcpAssembler {
     order: VecDeque<Key>,
     ctx: Option<Context>,
     pre: Option<Preamble>,
+    /// Held post-ACK blocks, oldest first: at most one per pid, at most `MAX_HELD_BLOCKS`.
+    posts: VecDeque<PostAck>,
+    /// The block of the line being fed (always `None` between two `feed_pid` calls).
     post: Option<PostAck>,
+    evicted: u64,
+    superseded: u64,
 }
 
 impl DhcpAssembler {
@@ -152,41 +174,86 @@ impl DhcpAssembler {
         self.partial.entry(key.clone()).or_default()
     }
 
-    /// A line that is not one of ours (unparsed) ends every attach context; a finished
+    /// A line that is not one of ours (unparsed) ends every attach context; every finished
     /// post-ACK block is published.
     pub fn break_context(&mut self) -> Vec<Lease> {
         self.ctx = None;
         self.pre = None;
-        self.post
-            .take()
-            .and_then(PostAck::finish)
-            .into_iter()
-            .collect()
+        self.posts.drain(..).filter_map(PostAck::finish).collect()
     }
 
-    /// Bytes were lost here: nothing may attach across it, and an unfinished block is dropped
-    /// unpublished (its list may be truncated).
+    /// Bytes were lost here: nothing may attach across it, every pending pre-ACK field is
+    /// forgotten and unfinished blocks are dropped unpublished (their lists may be truncated).
     pub fn lose_context(&mut self) {
         self.ctx = None;
         self.pre = None;
-        self.post = None;
+        self.posts.clear();
+        self.partial.clear();
+        self.order.clear();
     }
 
-    /// End of one poll of the log. A block still open after `BLOCK_HOLD_POLLS` polls is closed
-    /// and published, so it cannot wait forever on a quiet log.
+    /// End of one poll of the log that read it to its end. A block, context or preamble still
+    /// open after `BLOCK_HOLD_POLLS` such polls is closed (blocks are published), so nothing
+    /// can wait forever on a quiet log.
     pub fn end_poll(&mut self) -> Vec<Lease> {
-        let Some(pa) = self.post.as_mut() else {
-            return Vec::new();
-        };
-        pa.polls += 1;
-        if pa.polls < BLOCK_HOLD_POLLS {
+        self.end_poll_at(true)
+    }
+
+    /// `end_poll` for a poll that did (`eof`) or did not read the log to its end: a poll that
+    /// stopped at its byte budget says nothing about the writer having paused, so it ages nothing.
+    pub fn end_poll_at(&mut self, eof: bool) -> Vec<Lease> {
+        if !eof {
             return Vec::new();
         }
-        self.post
-            .take()
-            .and_then(PostAck::finish)
-            .into_iter()
-            .collect()
+        if let Some(c) = self.ctx.as_mut() {
+            c.polls += 1;
+        }
+        self.ctx.take_if(|c| c.polls >= BLOCK_HOLD_POLLS);
+        if let Some(p) = self.pre.as_mut() {
+            p.polls += 1;
+        }
+        self.pre.take_if(|p| p.polls >= BLOCK_HOLD_POLLS);
+        let mut out = Vec::new();
+        for mut pa in std::mem::take(&mut self.posts) {
+            pa.polls += 1;
+            if pa.polls < BLOCK_HOLD_POLLS {
+                self.posts.push_back(pa);
+            } else {
+                out.extend(pa.finish());
+            }
+        }
+        out
+    }
+
+    /// Drained counters of fingerprint blocks dropped unpublished, by `truncated` key.
+    pub fn take_counts(&mut self) -> std::collections::BTreeMap<String, u64> {
+        [
+            ("dhcp_block_evicted", std::mem::take(&mut self.evicted)),
+            (
+                "dhcp_block_superseded",
+                std::mem::take(&mut self.superseded),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| (k.to_string(), n))
+        .collect()
+    }
+
+    /// The held block of process `pid`, if any.
+    fn take_post(&mut self, pid: u64) -> Option<PostAck> {
+        let i = self.posts.iter().position(|p| p.key.0 == pid)?;
+        self.posts.remove(i)
+    }
+
+    /// Holds an open block; when `MAX_HELD_BLOCKS` are already held the oldest is dropped
+    /// unpublished (counted).
+    fn hold(&mut self, pa: PostAck) {
+        if self.posts.len() >= MAX_HELD_BLOCKS {
+            self.posts.pop_front();
+            self.evicted += 1;
+        }
+        self.posts.push_back(pa);
     }
 
     /// The entry a fingerprint line may be attached to, or `None` (and the context is dropped
@@ -213,23 +280,25 @@ impl DhcpAssembler {
         let held = (
             self.ctx.take_if(|c| c.key.0 != pid),
             self.pre.take_if(|p| p.key.0 != pid),
-            self.post.take_if(|p| p.key.0 != pid),
         );
-        let out = self.feed_own(pid, ev);
+        let own = self.take_post(pid);
+        let out = self.feed_own(pid, ev, own);
         self.ctx = self.ctx.take().or(held.0);
         self.pre = self.pre.take().or(held.1);
-        self.post = self.post.take().or(held.2);
+        if let Some(pa) = self.post.take() {
+            self.hold(pa);
+        }
         out
     }
 
     /// `feed_pid` for a line of the process the open contexts (if any) belong to.
-    fn feed_own(&mut self, pid: u64, ev: &LogEvent) -> Vec<Lease> {
+    fn feed_own(&mut self, pid: u64, ev: &LogEvent, own: Option<PostAck>) -> Vec<Lease> {
         // Preamble and post-ACK contexts survive only the lines that directly continue them.
         let pre = self
             .pre
             .take()
             .filter(|p| continues_preamble(ev, pid, &p.key));
-        let (post, ended) = match self.post.take() {
+        let (post, ended) = match own {
             Some(p) if continues_post_ack(ev, pid, &p.key) => (Some(p), None),
             other => (None, other),
         };
@@ -242,6 +311,7 @@ impl DhcpAssembler {
                     key: key(id),
                     class: None,
                     name: None,
+                    polls: 0,
                 });
             }
             LogEvent::DhcpRequest { id, mac, discover } => {
@@ -324,7 +394,8 @@ impl DhcpAssembler {
             p.mac = mac.clone();
         }
         if let (Some(pre), false) = (pre, p.tainted) {
-            // A marked packet states its own vendor/name: nothing is inherited from a retry.
+            // A marked packet states its own fingerprint: nothing is inherited from a retry.
+            p.clear_fingerprint();
             p.class = pre.class.clone();
             p.name = pre.name.clone();
         }
@@ -332,6 +403,7 @@ impl DhcpAssembler {
             key: key.clone(),
             mac,
             opts_started: false,
+            polls: 0,
         });
     }
 
@@ -352,6 +424,11 @@ impl DhcpAssembler {
             (&[], None)
         };
         let lease = Lease::new(mac, ip, host, known.0, known.1)?;
+        // This lease is the current state of the MAC: a block held for it was built on an
+        // older lease and must not republish that.
+        let before = self.posts.len();
+        self.posts.retain(|b| b.base.mac != lease.mac);
+        self.superseded += (before - self.posts.len()) as u64;
         if !p.tainted {
             let base = Lease::new(mac, ip, host, &[], None)?;
             self.post = Some(PostAck {
@@ -391,4 +468,18 @@ fn continues_post_ack(ev: &LogEvent, pid: u64, key: &Key) -> bool {
         ev,
         LogEvent::DhcpOptions { id, .. } | LogEvent::DhcpTags { id } if same(pid, id, key)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gap_forgets_every_pending_entry_and_its_order_slot() {
+        let mut a = DhcpAssembler::default();
+        a.entry(&(1, "7".into())).mac = Some("02:00:00:00:00:01".into());
+        assert_eq!((a.partial.len(), a.order.len()), (1, 1));
+        a.lose_context();
+        assert_eq!((a.partial.len(), a.order.len()), (0, 0));
+    }
 }

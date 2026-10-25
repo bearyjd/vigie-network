@@ -12,6 +12,10 @@
 //!   an overlong line, and EVERY switch to a different file (even with nothing partial pending:
 //!   two rotations between polls would hide a whole intermediate file, and an inode alone cannot
 //!   tell). The DHCP assembler drops its attach contexts at each `None`.
+//!   Every failed poll is counted in `tail_open_failed`, also one whose drained lines are
+//!   still returned.
+//! - `at_eof` tells whether the last poll read everything: false when it stopped at its byte
+//!   budget or on a failure (even a counted one), so the reader never takes it for a pause.
 //! - Bounded: lines over `MAX_LINE` bytes are dropped, at most `MAX_POLL_BYTES` read per poll.
 
 use std::collections::BTreeMap;
@@ -38,6 +42,8 @@ pub struct Tail {
     resets: u64,
     skipped: u64,
     open_failed: u64,
+    /// The last poll ended at the end of the file (not at its byte budget or on an error).
+    eof: bool,
 }
 
 impl Tail {
@@ -54,7 +60,14 @@ impl Tail {
             resets: 0,
             skipped: 0,
             open_failed: 0,
+            eof: true,
         }
+    }
+
+    /// Whether the last poll read everything there was: a poll that stopped at its byte
+    /// budget or failed says nothing about the writer having paused.
+    pub fn at_eof(&self) -> bool {
+        self.eof
     }
 
     /// New complete lines since the last poll. A missing file is not an error.
@@ -66,12 +79,17 @@ impl Tail {
     pub fn poll_with_gaps(&mut self) -> io::Result<Vec<Option<String>>> {
         let mut out = Vec::new();
         let mut budget = MAX_POLL_BYTES;
+        self.eof = false;
         if std::mem::take(&mut self.gap_pending) {
             push_gap(&mut out);
         }
         if self.cur.is_none() {
             let first = !self.polled_once;
-            self.open_new(first)?;
+            if let Err(e) = self.open_new(first) {
+                self.open_failed += 1;
+                self.gap_pending |= out.contains(&None);
+                return Err(e);
+            }
             self.polled_once = true;
             // A file that reappears after a failed switch or a missing path: nothing is known
             // about what happened in between.
@@ -87,16 +105,20 @@ impl Tail {
                 // retries (and reports the error itself when it has no line to return; gap
                 // markers alone are not data, so the error still surfaces and the gap is kept
                 // for the next poll).
+                // `eof` stays false for such a poll: the reader must not count it as one that
+                // found the writer paused.
                 Err(_) if out.iter().any(Option::is_some) => {
                     self.open_failed += 1;
-                    break;
+                    return Ok(out);
                 }
                 Err(e) => {
+                    self.open_failed += 1;
                     self.gap_pending |= out.contains(&None);
                     return Err(e);
                 }
             }
         }
+        self.eof = budget > 0;
         Ok(out)
     }
 
@@ -126,7 +148,18 @@ impl Tail {
         .collect()
     }
 
+    /// Switches to the file at the path. A failure leaves the old file's cursor alone, and so
+    /// the torn-line state: the rest of a half-read line is still not a line of its own.
     fn open_new(&mut self, at_end: bool) -> io::Result<()> {
+        let partial = self.skipping || !self.carry.is_empty();
+        let r = self.open_inner(at_end);
+        if r.is_err() {
+            self.skipping = partial;
+        }
+        r
+    }
+
+    fn open_inner(&mut self, at_end: bool) -> io::Result<()> {
         self.skipped += self.carry.len() as u64;
         self.carry.clear();
         self.skipping = false;
@@ -250,6 +283,98 @@ mod tests {
         assert!(tail.open_new(true).is_err());
         assert_eq!((tail.pos, tail.fingerprint.clone()), before);
         assert!(tail.cur.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn failing_tail(tag: &str, written: &[u8]) -> (Tail, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vigie-tail-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::write(&log, written).unwrap();
+        let mut tail = Tail::new(log);
+        tail.polled_once = true;
+        tail.poll_with_gaps().unwrap();
+        // The next open succeeds on a directory but cannot read it: a failure half-way.
+        tail.path = dir.clone();
+        (tail, dir)
+    }
+
+    #[test]
+    fn a_failed_open_keeps_the_torn_line_state() {
+        let (mut tail, dir) = failing_tail("torn", b"0123456789\nabc");
+        assert!(!tail.carry.is_empty());
+        assert!(tail.open_new(true).is_err());
+        assert!(
+            tail.skipping,
+            "the rest of the torn line must still be dropped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_open_keeps_the_skipping_state_of_an_overlong_line() {
+        let long = vec![b'z'; MAX_LINE + 10];
+        let (mut tail, dir) = failing_tail("long", &long);
+        assert!(tail.skipping);
+        assert!(tail.open_new(true).is_err());
+        assert!(tail.skipping);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_open_of_a_clean_stream_does_not_start_skipping() {
+        let (mut tail, dir) = failing_tail("clean", b"0123456789\n");
+        assert!(tail.open_new(true).is_err());
+        assert!(!tail.skipping);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_poll_at_its_budget_is_not_at_eof() {
+        let dir = std::env::temp_dir().join(format!("vigie-tail-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::write(&log, "").unwrap();
+        let mut tail = Tail::new(log.clone());
+        tail.poll_with_gaps().unwrap();
+        assert!(tail.at_eof());
+        let line = "x".repeat(99) + "\n";
+        std::fs::write(&log, line.repeat(MAX_POLL_BYTES as usize / 100 + 10)).unwrap();
+        tail.poll_with_gaps().unwrap();
+        assert!(!tail.at_eof(), "stopped at the budget");
+        tail.poll_with_gaps().unwrap();
+        assert!(tail.at_eof());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_polls_are_counted_and_never_at_eof() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("vigie-tail-cnt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        // First open fails (a socket cannot be opened, also for root): an error-only poll.
+        let sock = UnixListener::bind(&log).unwrap();
+        let mut tail = Tail::new(log.clone());
+        assert!(tail.poll_with_gaps().is_err());
+        assert_eq!(tail.take_counts().get("tail_open_failed"), Some(&1));
+        drop(sock);
+        std::fs::remove_file(&log).unwrap();
+        // Lines drained, then the rotation stat fails (a self-loop link): counted, not at eof.
+        std::fs::write(&log, "seed\n").unwrap();
+        let mut tail = Tail::new(log.clone());
+        tail.poll_with_gaps().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"more\n"))
+            .unwrap();
+        std::fs::rename(&log, dir.join("a.log.1")).unwrap();
+        std::os::unix::fs::symlink(&log, &log).unwrap();
+        let got = tail.poll_with_gaps().unwrap();
+        assert_eq!(got, vec![Some("more".to_string())]);
+        assert_eq!(tail.take_counts().get("tail_open_failed"), Some(&1));
+        assert!(!tail.at_eof());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

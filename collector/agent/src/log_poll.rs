@@ -36,7 +36,7 @@ impl Agent {
                 self.dhcp.lose_context();
             }
         }
-        let done = self.dhcp.end_poll();
+        let done = self.dhcp.end_poll_at(self.tail.at_eof());
         self.on_leases(done);
         for q in self.dns.take_ready(&self.ip_to_mac) {
             self.window.add_dns(q);
@@ -46,6 +46,7 @@ impl Agent {
             .take_counts()
             .into_iter()
             .chain(self.tail.take_counts())
+            .chain(self.dhcp.take_counts())
         {
             self.window.note_drops(&kind, n);
         }

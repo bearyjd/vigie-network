@@ -106,25 +106,132 @@ fn a_complete_block_is_published_once_by_an_unparsed_line_or_the_second_poll() {
     fs::remove_file(path).ok();
 }
 
+/// A path that names itself: every stat of it fails with ELOOP, also for root.
+fn break_path(path: &Path) {
+    std::os::unix::fs::symlink(path, path).unwrap();
+}
+fn mend_path(path: &Path, content: &str) {
+    fs::remove_file(path).unwrap();
+    fs::write(path, content).unwrap();
+}
+fn drop_count(a: &mut Agent, kind: &str) -> u64 {
+    a.window
+        .take_with_drops()
+        .1
+        .get(kind)
+        .copied()
+        .unwrap_or_default()
+}
+
 #[test]
 fn a_failed_poll_never_publishes_the_held_block_ahead_of_the_pending_gap() {
-    use std::os::unix::fs::PermissionsExt;
     let (mut a, path) = log_agent("errpoll");
     append(
         &path,
         &(packet(1, MAC_A, "vendor-a") + &opts(1, "1:netmask, 3:router")),
     );
     a.poll_log(1);
-    // The continuation lands in the rotated-to file, which cannot be opened right now.
-    rotate(&path, "1", &opts(1, "6:dns-server"));
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    // The continuation lands in the rotated-to file, which cannot be reached right now.
+    fs::rename(&path, path.with_extension("1")).unwrap();
+    break_path(&path);
     a.poll_log(2);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        drop_count(&mut a, "tail_open_failed"),
+        1,
+        "poll 2 must fail"
+    );
+    mend_path(&path, &opts(1, "6:dns-server"));
     a.poll_log(3);
     a.poll_log(4);
     let all = leases(&mut a);
     assert!(all.iter().all(|x| x.opt55.is_empty()), "{all:?}");
     assert!(all.iter().all(|x| x.opt60.is_none()), "{all:?}");
+    fs::remove_file(path.with_extension("1")).ok();
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_suppressed_tail_error_never_lets_a_truncated_block_publish() {
+    let (mut a, path) = log_agent("suppressed");
+    append(&path, &packet(1, MAC_A, "vendor-a"));
+    a.poll_log(1);
+    append(&path, &opts(1, "1:netmask, 3:router"));
+    fs::rename(&path, path.with_extension("1")).unwrap();
+    break_path(&path);
+    // The old file is drained, the rotation stat fails: the lines come back, the failure is
+    // only counted, and the list may continue in the file that cannot be reached yet.
+    a.poll_log(2);
+    mend_path(&path, &opts(1, "6:dns-server, 15:domain-name"));
+    a.poll_log(3);
+    a.poll_log(4);
+    let all = leases(&mut a);
+    assert!(all.iter().all(|x| x.opt55.is_empty()), "{all:?}");
+    fs::remove_file(path.with_extension("1")).ok();
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_poll_that_stopped_at_its_byte_budget_does_not_close_the_block() {
+    let (mut a, path) = log_agent("budget");
+    let query =
+        "Oct 20 14:00:00 dnsmasq[456]: 9 192.0.2.99/5353 query[A] example.test from 192.0.2.99\n";
+    let n = 2 * vigie_agent::tail::MAX_POLL_BYTES as usize / query.len() + 2000;
+    let mut stream = packet(1, MAC_A, "vendor-a") + &opts(1, "1:netmask, 3:router");
+    stream += &query.repeat(n);
+    stream += &opts(1, "6:dns-server, 15:domain-name");
+    append(&path, &stream);
+    for t in 1..=4 {
+        a.poll_log(t);
+    }
+    let lease = lease_of(&leases(&mut a), MAC_A);
+    assert_eq!(lease.opt55, vec![1, 3, 6, 15], "{lease:?}");
+    assert_eq!(lease.opt60.as_deref(), Some("vendor-a"));
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_query_of_another_pid_through_poll_log_keeps_the_whole_list() {
+    let (mut a, path) = log_agent("k27");
+    append(
+        &path,
+        &(packet(1, MAC_A, "vendor-a") + &opts(1, "1:netmask, 3:router")),
+    );
+    append(
+        &path,
+        "Oct 20 14:00:00 dnsmasq[456]: 9 192.0.2.99/5353 query[A] example.test from 192.0.2.99\n",
+    );
+    append(&path, &opts(1, "6:dns-server, 15:domain-name"));
+    a.poll_log(1);
+    a.poll_log(2);
+    let lease = lease_of(&leases(&mut a), MAC_A);
+    assert_eq!(lease.opt55, vec![1, 3, 6, 15], "{lease:?}");
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_failed_open_never_turns_the_tail_of_a_torn_line_into_a_lease() {
+    use std::os::unix::net::UnixListener;
+    let (mut a, path) = log_agent("tornopen");
+    append(
+        &path,
+        "Oct 20 14:00:00 dnsmasq-dhcp[123]: 5 vendor class: zz",
+    );
+    a.poll_log(1);
+    // The new file at the path cannot be opened (a socket: ENXIO, also for root).
+    fs::rename(&path, path.with_extension("1")).unwrap();
+    let sock = UnixListener::bind(&path).unwrap();
+    a.poll_log(2);
+    // The writer finishes the torn line in the renamed file.
+    append(
+        &path.with_extension("1"),
+        &l(&format!("9 DHCPACK(br-lan) 192.0.2.77 {MAC_B}")),
+    );
+    drop(sock);
+    mend_path(&path, "");
+    a.poll_log(3);
+    a.poll_log(4);
+    let all = leases(&mut a);
+    assert!(all.iter().all(|x| x.mac != MAC_B), "forged lease: {all:?}");
     fs::remove_file(path.with_extension("1")).ok();
     fs::remove_file(path).ok();
 }
