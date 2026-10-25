@@ -87,6 +87,8 @@ assert.equal(liveLabel(true,false,5,121),'Stale');assert.equal(liveLabel(true,tr
 assert.equal(liveLabel(true,false,5,120),'Current');assert.equal(liveLabel(true,false,5,null),'Stale');
 assert.equal(liveLabel(false,false,5,500),'Stale / unknown');
 // L3: a client clock stepped backwards yields negative ages; that is unknown freshness, never 'Current'.
+for (const bad of [NaN,Infinity,-Infinity]) { assert.equal(liveLabel(true,false,bad),'Stale'); assert.equal(liveLabel(true,true,5,bad),'Stale'); }
+assert.equal(liveLabel(true,false,undefined),'Stale');
 assert.equal(liveLabel(true,false,-1),'Stale');assert.equal(liveLabel(true,true,-1),'Stale');
 assert.equal(liveLabel(true,false,5,-1),'Stale');assert.equal(liveLabel(true,true,5,-0.5),'Stale');
 assert.equal(liveLabel(true,false,0,0),'Current');assert.equal(liveLabel(false,false,-1,-1),'Stale / unknown');

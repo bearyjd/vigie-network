@@ -2,13 +2,17 @@
 
 The cached uv Python lacks os.pidfd_open, so the scenarios run in `/usr/bin/python3 -I` via
 gui_preview_native_lane.py (throwaway sleeper/health children, ephemeral port, private lock).
-They are skipped where no native interpreter with pidfd support exists.
+They are skipped where no native interpreter with pidfd support exists, EXCEPT when the CI
+environment variable is set: there a missing capability or an untrustable interpreter is a FAILURE,
+so the real-interpreter coverage cannot silently vanish (the end-to-end child prefers uv's Python,
+whose stdlib has no distro symlinks).
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -31,7 +35,17 @@ def _native_has_pidfd() -> bool:
     return probe.returncode == 0
 
 
-pytestmark = pytest.mark.skipif(not _native_has_pidfd(), reason="needs native Python with pidfd")
+pytestmark = pytest.mark.skipif(
+    not _native_has_pidfd() and not os.environ.get("CI"), reason="needs native Python with pidfd"
+)
+
+
+def end_to_end_unavailable(reason: str) -> None:
+    """Skip locally; under CI a lane that cannot run is a failure, not a quiet skip."""
+    if os.environ.get("CI"):
+        pytest.fail(f"CI must exercise the real-interpreter end-to-end lane, but: {reason}")
+    pytest.skip(reason)
+
 
 SPEC = importlib.util.spec_from_file_location("gui_preview_native", PREVIEW)
 assert SPEC is not None and SPEC.loader is not None
@@ -83,7 +97,7 @@ def test_end_to_end_start_stop_uses_real_interpreter_check_isolation_and_clear_s
 ):
     out = lane(tmp_path, "start-end-to-end")
     if "skipped" in out:
-        pytest.skip(out["skipped"])
+        end_to_end_unavailable(out["skipped"])
     assert out["started"] == "running" and out["argv_flags"] == ["-I", "-B"]
     assert out["sigblk"] == "0000000000000000"
     assert out["journal"] == ["prepared", "spawned", "ready"]

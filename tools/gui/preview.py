@@ -43,12 +43,14 @@ _TERMINATION = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 LOCK_WAIT_SECONDS = 2.0  # start/stop wait this long for a concurrent command; status never waits.
 # The only .pth files a vetted venv may carry besides plain directory lines: name -> sha256 of the
 # exact bytes. _virtualenv.pth: virtualenv/uv `import _virtualenv`. a1_coverage.pth: coverage's
-# no-op unless COVERAGE_PROCESS_START is set. distutils-precedence.pth: setuptools' distutils shim.
+# no-op unless COVERAGE_PROCESS_START is set (inert only while the child env is exactly
+# PATH and LC_ALL; a test pins that). distutils-precedence.pth: setuptools' distutils shim.
 _BENIGN_PTH = {
     "_virtualenv.pth": "69ac3d8f27e679c81b94ab30b3b56e9cd138219b1ba94a1fa3606d5a76a1433d",
     "a1_coverage.pth": "ef2ed06d19867ec669c09a804060666a9cd5e383af0a9d11aa2de79b77d448e8",
     "distutils-precedence.pth": "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
 }
+MAX_PTH_TREE_ENTRIES = 100_000  # A .pth directory line with more entries is refused, not walked.
 SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
 
@@ -341,10 +343,35 @@ def event(journal: Path, value: dict) -> None:
         os.close(fd)
 
 
+def _recorded_holder(fd: int) -> str:
+    """Hint naming the exclusive holder's PID (a bare integer written by the holder) if alive."""
+    try:
+        pid = os.pread(fd, 32, 0).decode("ascii", "replace").strip()
+    except OSError:
+        return ""
+    return f" (PID {pid})" if pid.isdigit() and Path("/proc", pid).exists() else ""
+
+
 @contextlib.contextmanager
-def manager_lock(wait: float = 0.0):
-    """Exclusive shared lock; retries for up to `wait` seconds, then raises BlockingIOError."""
-    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+def manager_lock(wait: float = 0.0, *, shared: bool = False):
+    """Exclusive lock (start/stop) or, with `shared`, a read-only probe (status).
+
+    Retries for up to `wait` seconds, then raises BlockingIOError. The exclusive holder writes its
+    PID into the lock file (cleared on release) so a stuck holder can be named. A shared probe
+    never creates the file: an absent file means nobody holds it. Shared probes do not exclude
+    each other, so concurrent read-only status calls cannot report `starting` for one another.
+    """
+    flags = os.O_RDONLY if shared else os.O_RDWR | os.O_CREAT
+    try:
+        fd = os.open(LOCK, flags | os.O_NOFOLLOW, 0o600)
+    except FileNotFoundError:
+        if not shared:
+            raise
+        fd = -1
+    if fd < 0:
+        yield
+        return
+    held = False
     try:
         st = os.fstat(fd)
         current = LOCK.lstat()
@@ -363,16 +390,25 @@ def manager_lock(wait: float = 0.0):
         deadline = time.monotonic() + wait
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise BlockingIOError(
-                        errno.EAGAIN, "another preview command holds the lock; retry shortly"
+                        errno.EAGAIN,
+                        f"another preview command holds the lock{_recorded_holder(fd)}; "
+                        "retry shortly",
                     ) from None
                 time.sleep(0.05)
+        if not shared:
+            held = True
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
         yield
     finally:
+        if held:
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, 0)  # do not advertise a holder that is gone
         os.close(fd)
 
 
@@ -565,6 +601,13 @@ def status(root: Path, *, locked: bool = False) -> dict:
         "token_file": manifest["token_file"],
         "collector_id": COLLECTOR,
     }
+    busy = {**common, "state": "starting", "managed": False}
+    if not locked:  # A start/stop holding the lock is mid-flight: report it, never wait.
+        try:
+            with manager_lock(shared=True):  # Probe only: the slow scan below runs without it.
+                pass
+        except BlockingIOError:
+            return busy
     inodes = listeners()
     last = rows[-1] if rows else None
     if last is not None and (
@@ -584,13 +627,6 @@ def status(root: Path, *, locked: bool = False) -> dict:
                 "state": "unmanaged-listener" if inodes else "stopped",
                 "managed": False,
             }
-        busy = {**common, "state": "starting", "managed": False}
-        if not locked:  # A start/stop holding the lock is mid-flight: report it, never wait.
-            try:
-                with manager_lock():  # Probe only: the slow scan below runs without the lock.
-                    pass
-            except BlockingIOError:
-                return busy
         lookalikes = _lookalikes(rows)
         orphan = _orphan(rows, inodes, lookalikes)
         if orphan is not None:  # Crash between spawn and the `spawned` receipt.
@@ -684,17 +720,24 @@ def _trusted_chain(path: Path, message: str) -> None:
             raise ValueError(message)
 
 
-def _trusted_tree(root: Path, message: str, skip: frozenset[str] = frozenset()) -> None:
+def _trusted_tree(
+    root: Path, message: str, skip: frozenset[str] = frozenset(), limit: int | None = None
+) -> None:
     """Every entry below root: no symlink, owned by root/us, not group/world-writable.
 
     An unreadable subdirectory is refused, never skipped. Names in `skip` are not descended.
+    More than `limit` entries (when given) is refused, so a `/` line cannot stall the lock holder.
     """
+    count = 0
 
     def unreadable(exc: OSError) -> None:
         raise ValueError(message) from exc
 
     for current, names, files in os.walk(root, followlinks=False, onerror=unreadable):
         for name in (*names, *files):
+            count += 1
+            if limit is not None and count > limit:
+                raise ValueError(message)
             st = (Path(current) / name).lstat()
             if (
                 stat.S_ISLNK(st.st_mode)
@@ -778,30 +821,50 @@ def _vet_pth(site: Path, message: str) -> None:
     """Vet every *.pth of a site dir that will be on sys.path: `python -I` still runs them.
 
     A file is accepted only if it is one of the exact known-benign files (by name AND sha256), or
-    every line is a comment or a directory line: no line beginning `import` and none containing
-    `;` (site.py would exec those). A directory line that exists must be a symlink-free directory
-    whose chain and whole tree are root/us-owned and not group/world-writable (the editable
-    install's target); a missing one is ignored, as site.py ignores it.
+    every line is blank, a column-0 `#` comment or a bare directory line, read exactly as site.py
+    reads it (utf-8-sig, universal newlines, `#` only in column 0, no stripping). A line with
+    leading/trailing whitespace, beginning `import`, or containing `;` or NUL is refused (site.py
+    would exec or mis-read it). A directory line that exists must be a symlink-free directory
+    whose chain and whole tree are root/us-owned, not group/world-writable and bounded in size
+    (the editable install's target). A missing one is accepted only if its nearest existing
+    ancestor is root/us-owned and not group/world-writable (a sticky /tmp is not enough), else
+    another user could create it after this check and site.py would put it on sys.path.
     """
     seen: set[Path] = set()
     for pth in sorted(site.glob("*.pth")):
         raw = pth.read_bytes()
         if hashlib.sha256(raw).hexdigest() == _BENIGN_PTH.get(pth.name):
             continue
-        for line in raw.decode("utf-8", "surrogateescape").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
+        try:
+            text = raw.decode("utf-8-sig")  # exactly what site.py decodes (BOM dropped)
+        except UnicodeDecodeError:
+            raise ValueError(message) from None
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if line.startswith("#") or not line.strip():
                 continue
-            if line.startswith("import") or ";" in line or "\0" in line:
+            if line != line.strip() or line.startswith("import") or ";" in line or "\0" in line:
                 raise ValueError(message)
             target = Path(os.path.normpath(site / line))
-            if target in seen or not os.path.lexists(target):
+            if target in seen:
+                continue
+            seen.add(target)
+            if not os.path.lexists(target):
+                _trusted_anchor(target, message)
                 continue
             if not target.is_dir():  # a symlinked path fails _trusted_chain: links are mode 0777
                 raise ValueError(message)
             _trusted_chain(target, message)
-            _trusted_tree(target, message)
-            seen.add(target)
+            _trusted_tree(target, message, limit=MAX_PTH_TREE_ENTRIES)
+
+
+def _trusted_anchor(missing: Path, message: str) -> None:
+    """A not-yet-existing .pth target is safe only if nobody else can create it later."""
+    anchor = missing
+    while not os.path.lexists(anchor):
+        anchor = anchor.parent
+    if anchor.lstat().st_mode & 0o022:  # sticky is not enough; ownership is checked by the chain
+        raise ValueError(message)
+    _trusted_chain(anchor, message)
 
 
 def _venv_home(cfg: Path, message: str) -> tuple[Path, bool]:

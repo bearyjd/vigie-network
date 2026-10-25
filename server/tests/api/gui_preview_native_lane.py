@@ -198,14 +198,45 @@ def stdlib_symlinks(prefix: Path) -> list[str]:
     return found
 
 
+def uv_interpreters() -> list[Path]:
+    """Interpreters uv manages (no distro symlinks in their stdlib); empty without uv."""
+    found = []
+    for command in (["uv", "python", "find", "3.12"], ["uv", "python", "find"]):
+        try:
+            done = subprocess.run(  # noqa: S603, S607 -- fixed read-only uv query, no shell.
+                command, capture_output=True, text=True, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        path = Path(done.stdout.strip())
+        if done.returncode == 0 and path.is_absolute() and path.is_file() and path not in found:
+            found.append(path)
+    return found
+
+
+def child_interpreter() -> tuple[Path | None, str]:
+    """The first interpreter whose stdlib the trust check can accept, preferring uv's.
+
+    Returns (resolved binary, "") or (None, reason) when every candidate is distro-patched.
+    """
+    example = ""
+    for candidate in [*uv_interpreters(), Path("/usr/bin/python3")]:
+        resolved = candidate.resolve()
+        links = stdlib_symlinks(resolved.parent.parent)
+        if not links:
+            return resolved, ""
+        example = example or links[0]
+    return None, (
+        f"host stdlib contains symlinks (e.g. {example}); the interpreter "
+        "trust check would refuse it, so this lane needs a clean native Python or uv"
+    )
+
+
 def start_end_to_end(pv, root: Path, work: Path) -> dict:
     """start -> ready -> running -> stop -> stopped through the REAL _interpreter and pidfd."""
-    links = stdlib_symlinks(Path("/usr/bin/python3").resolve().parent.parent)
-    if links:  # The trust check refuses symlinked stdlib files by design (Debian: sitecustomize).
-        return {
-            "skipped": f"host stdlib contains symlinks (e.g. {links[0]}); the interpreter "
-            "trust check would refuse it, so this lane needs a clean native Python"
-        }
+    interpreter, reason = child_interpreter()
+    if interpreter is None:  # The trust check refuses symlinked stdlib files by design.
+        return {"skipped": reason}
     fresh(root, pv)
     pv.PORT = free_port()
     pv._package = lambda p: p
@@ -214,8 +245,10 @@ def start_end_to_end(pv, root: Path, work: Path) -> dict:
     pv.__file__ = str(health)
     venv = work / "venv"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to("/usr/bin/python3")
-    (venv / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = false\n")
+    (venv / "bin" / "python").symlink_to(interpreter)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {interpreter.parent}\ninclude-system-site-packages = false\n"
+    )
     (venv / "lib" / "python3" / "site-packages").mkdir(parents=True)
     pv.SYSTEM_UIDS = (0, os.stat("/tmp").st_uid)  # noqa: S108 -- sandboxed /tmp owner
     started = pv.start(root, work / "pkg", venv / "bin" / "python")

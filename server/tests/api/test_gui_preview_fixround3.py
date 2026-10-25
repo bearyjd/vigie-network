@@ -580,7 +580,13 @@ def test_real_serve_imports_the_vetted_package_dir_ahead_of_every_other_vigie_ap
         assert "MARK-VETTED" in body and "MARK-DECOY" not in body
     finally:
         child.terminate()
-        child.wait(10)
+        try:
+            child.wait(10)
+        except subprocess.TimeoutExpired:  # TERM ignored: never leak the throwaway child
+            child.kill()
+            child.wait(10)
+        if child.stdout is not None:
+            child.stdout.close()
         sock.close()
 
 

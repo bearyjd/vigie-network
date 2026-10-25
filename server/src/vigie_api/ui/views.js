@@ -20,7 +20,7 @@ export function processingState(c, now = Date.now()) {
 /* 'Current' needs a fresh observation NOW, not at render: both the snapshot and the observation itself age. */
 export function liveLabel(current, paused, snapshotAge, observedAge = 0) {
   if (!current) return 'Stale / unknown';
-  if (snapshotAge === null || snapshotAge < 0 || snapshotAge > 120 || observedAge === null || observedAge < 0 || observedAge > 120) return 'Stale'; // negative = client clock stepped back
+  if (![snapshotAge, observedAge].every(age => Number.isFinite(age) && age >= 0 && age <= 120)) return 'Stale'; // negative = client clock stepped back; NaN/Infinity/null/undefined are never fresh
   return paused ? 'Snapshot (paused)' : 'Current';
 }
 export function refreshLiveLabels(root, paused, snapshotAge, now = Date.now() / 1000) {
