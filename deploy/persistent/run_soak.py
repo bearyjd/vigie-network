@@ -201,17 +201,21 @@ def read_meter(path, expected_digest):
             os.close(snapshot)
 
 
-def _dns_name(packet, offset, starts):
+def _dns_name(packet, offset, starts, wire_end=None):
     """Decode bounded wire labels, preserving boundaries; pointers target prior names only."""
     labels, seen, end, expanded = [], set(), None, 1
+    wire_end = len(packet) if wire_end is None else wire_end
     for _ in range(128):
-        if not 12 <= offset < len(packet) or offset in seen:
+        # Inline RDATA bytes stay inside RDLENGTH. A pointer may resolve an
+        # already-validated earlier name outside that interval.
+        bound = len(packet) if end is not None else wire_end
+        if not 12 <= offset < bound or offset in seen:
             raise ValueError("invalid DNS name offset")
         seen.add(offset)
         starts.add(offset)
         size = packet[offset]
         if size & 0xC0 == 0xC0:
-            if offset + 1 >= len(packet):
+            if offset + 1 >= bound:
                 raise ValueError("short DNS pointer")
             target = ((size & 0x3F) << 8) | packet[offset + 1]
             if not 12 <= target < offset or target not in starts:
@@ -222,7 +226,7 @@ def _dns_name(packet, offset, starts):
         elif size == 0:
             return tuple(labels), end if end is not None else offset + 1
         elif size <= 63:
-            if offset + 1 + size > len(packet):
+            if offset + 1 + size > bound:
                 raise ValueError("short DNS label")
             expanded += size + 1
             if expanded > 255:
@@ -277,6 +281,12 @@ def dns_probe(router_address):
             offset += 10
             if offset + length > len(reply):
                 return False
+            if kind == 2 and dns_class == 1:
+                # Register NS names for subsequent glue compression, without
+                # resolving them or treating glue addresses as the probe answer.
+                _, ns_end = _dns_name(reply, offset, starts, offset + length)
+                if ns_end != offset + length:
+                    return False
             found |= (
                 index < answers
                 and owner == expected

@@ -137,6 +137,57 @@ class DnsProbeTests(unittest.TestCase):
             response = struct.pack("!5H", 0x8180, 1, 1, ns, ar) + packet[10:] + address
             self.assertFalse(self.probe(response))
 
+    def test_direct_answer_with_ns_rdata_compressed_glue_is_valid(self):
+        # RFC1035 4.1.4: glue owner may point at the name inside prior NS RDATA.
+        direct = self.reply(b"\xc0\x0c")[10:]
+        server = b"\x01a\x0ciana-servers\x03net\0"
+        ns = b"\xc0\x0c" + struct.pack("!HHIH", 2, 1, 60, len(server)) + server
+        server_offset = 12 + len(direct) + 12
+        self.assertEqual(server_offset, 57)  # independently worked wire offset
+        glue = (
+            bytes([0xC0, server_offset])
+            + struct.pack("!HHIH", 1, 1, 60, 4)
+            + b"\xc7\x2b\x87\x35"
+        )
+        response = struct.pack("!5H", 0x8180, 1, 1, 1, 1) + direct + ns + glue
+        self.assertTrue(self.probe(response))
+
+    def test_ns_rdata_has_exact_wire_bounds_and_opaque_data_is_not_a_name(self):
+        direct = self.reply(b"\xc0\x0c")[10:]
+        server = b"\x01a\x0ciana-servers\x03net\0"
+
+        def response(data, *, kind=2, length=None, glue_offset=57):
+            ns = (
+                b"\xc0\x0c"
+                + struct.pack(
+                    "!HHIH", kind, 1, 60, len(data) if length is None else length
+                )
+                + data
+            )
+            glue = (
+                bytes([0xC0, glue_offset])
+                + struct.pack("!HHIH", 1, 1, 60, 4)
+                + b"\xc7\x2b\x87\x35"
+            )
+            return struct.pack("!5H", 0x8180, 1, 1, 1, 1) + direct + ns + glue
+
+        # NS RDATA itself may compress a suffix against the prior question.
+        self.assertTrue(self.probe(response(b"\x01a\xc0\x14")))
+        for data in (
+            b"",
+            server[:-1],
+            server + b"x",
+            b"\xc0\x39",
+            b"\xc0\0",
+            b"\x40" + b"x" * 64 + b"\0",
+        ):
+            with self.subTest(data=data):
+                self.assertFalse(self.probe(response(data)))
+        for length in (1, len(server) + 1):
+            self.assertFalse(self.probe(response(server, length=length)))
+        self.assertFalse(self.probe(response(server, glue_offset=58)))
+        self.assertFalse(self.probe(response(server, kind=16)))  # opaque TXT bytes
+
 
 class AdapterTests(unittest.TestCase):
     def test_fixed_dns_query_and_matching_response_only(self):
