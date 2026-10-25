@@ -82,6 +82,8 @@ def test_end_to_end_start_stop_uses_real_interpreter_check_isolation_and_clear_s
     tmp_path,
 ):
     out = lane(tmp_path, "start-end-to-end")
+    if "skipped" in out:
+        pytest.skip(out["skipped"])
     assert out["started"] == "running" and out["argv_flags"] == ["-I", "-B"]
     assert out["sigblk"] == "0000000000000000"
     assert out["journal"] == ["prepared", "spawned", "ready"]

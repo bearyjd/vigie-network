@@ -2,7 +2,7 @@
 // Run from any directory: node /path/to/repository/tools/gui/frontend_contracts.mjs
 import assert from 'node:assert/strict';
 import {ApiClient,ApiError,StaleResult,retryTime} from '../../server/src/vigie_api/ui/client.js';
-import {processingState,coverageView,liveLabel} from '../../server/src/vigie_api/ui/views.js';
+import {processingState,coverageView,liveLabel,refreshLiveLabels} from '../../server/src/vigie_api/ui/views.js';
 globalThis.location={origin:'http://127.0.0.1:18745'};
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const now=Date.parse('2026-10-25T12:00:00Z');
@@ -86,6 +86,20 @@ assert.equal(liveLabel(false,false,5),'Stale / unknown');assert.equal(liveLabel(
 assert.equal(liveLabel(true,false,5,121),'Stale');assert.equal(liveLabel(true,true,5,121),'Stale');
 assert.equal(liveLabel(true,false,5,120),'Current');assert.equal(liveLabel(true,false,5,null),'Stale');
 assert.equal(liveLabel(false,false,5,500),'Stale / unknown');
+// L3: a client clock stepped backwards yields negative ages; that is unknown freshness, never 'Current'.
+assert.equal(liveLabel(true,false,-1),'Stale');assert.equal(liveLabel(true,true,-1),'Stale');
+assert.equal(liveLabel(true,false,5,-1),'Stale');assert.equal(liveLabel(true,true,5,-0.5),'Stale');
+assert.equal(liveLabel(true,false,0,0),'Current');assert.equal(liveLabel(false,false,-1,-1),'Stale / unknown');
+{
+  const label = (observed, snapshotAge = 5) => {
+    const el = {textContent: '', getAttribute: name => ({'data-live-current': 'true', 'data-live-observed': observed})[name]};
+    refreshLiveLabels({querySelectorAll: () => [el]}, false, snapshotAge, 1000);
+    return el.textContent;
+  };
+  assert.equal(label('990'), 'Current'); assert.equal(label('1000'), 'Current');
+  assert.equal(label('1001'), 'Stale'); assert.equal(label('5000'), 'Stale');
+  assert.equal(label('800'), 'Stale'); assert.equal(label(''), 'Stale'); assert.equal(label('990', -3), 'Stale');
+}
 
 // Deadline failures are surfaced and cleaned up without a real 15-second wait.
 const originalSetTimeout = globalThis.setTimeout; const originalClearTimeout = globalThis.clearTimeout;

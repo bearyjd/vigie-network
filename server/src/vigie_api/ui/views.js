@@ -20,7 +20,7 @@ export function processingState(c, now = Date.now()) {
 /* 'Current' needs a fresh observation NOW, not at render: both the snapshot and the observation itself age. */
 export function liveLabel(current, paused, snapshotAge, observedAge = 0) {
   if (!current) return 'Stale / unknown';
-  if (snapshotAge === null || snapshotAge > 120 || observedAge === null || observedAge > 120) return 'Stale';
+  if (snapshotAge === null || snapshotAge < 0 || snapshotAge > 120 || observedAge === null || observedAge < 0 || observedAge > 120) return 'Stale'; // negative = client clock stepped back
   return paused ? 'Snapshot (paused)' : 'Current';
 }
 export function refreshLiveLabels(root, paused, snapshotAge, now = Date.now() / 1000) {

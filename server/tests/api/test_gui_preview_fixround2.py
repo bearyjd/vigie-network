@@ -325,7 +325,10 @@ def test_venv_base_site_packages_is_only_walked_when_it_is_on_sys_path(sandbox_o
     base_site.chmod(0o700)
     (base_site / "x.py").write_text("")
     (base_site / "x.py").chmod(0o666)
-    assert _accepts(root / "bin" / "python")  # include-system-site-packages absent: not imported
+    (root / "pyvenv.cfg").write_text(
+        f"home = {binary.parent}\ninclude-system-site-packages = false\n"
+    )
+    assert _accepts(root / "bin" / "python")  # explicitly isolated: base packages not imported
     (root / "pyvenv.cfg").write_text(
         f"home = {binary.parent}\ninclude-system-site-packages = true\n"
     )

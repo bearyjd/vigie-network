@@ -181,8 +181,31 @@ def stop_with_real_pidfd(pv, root: Path, work: Path) -> dict:
     return out
 
 
+def stdlib_symlinks(prefix: Path) -> list[str]:
+    """Symlinks in the stdlib the venv check walks (base site-packages is not walked)."""
+    found = []
+    for lib in ("lib", "lib64"):
+        if not (prefix / lib).exists():
+            continue
+        for tree in (prefix / lib).resolve().glob("python3*"):
+            for current, names, files in os.walk(tree, followlinks=False):
+                found += [
+                    str(Path(current) / n)
+                    for n in (*names, *files)
+                    if (Path(current) / n).is_symlink()
+                ]
+                names[:] = [n for n in names if n not in ("site-packages", "dist-packages")]
+    return found
+
+
 def start_end_to_end(pv, root: Path, work: Path) -> dict:
     """start -> ready -> running -> stop -> stopped through the REAL _interpreter and pidfd."""
+    links = stdlib_symlinks(Path("/usr/bin/python3").resolve().parent.parent)
+    if links:  # The trust check refuses symlinked stdlib files by design (Debian: sitecustomize).
+        return {
+            "skipped": f"host stdlib contains symlinks (e.g. {links[0]}); the interpreter "
+            "trust check would refuse it, so this lane needs a clean native Python"
+        }
     fresh(root, pv)
     pv.PORT = free_port()
     pv._package = lambda p: p

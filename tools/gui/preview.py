@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -38,6 +40,15 @@ DEFAULT_PACKAGE = PREVIEW_PARENT / "vigie-gui-wheel-target-attempt3"
 DEFAULT_PYTHON = PREVIEW_PARENT / "vigie-pr9-native-server-env/bin/python"
 CURRENT = "manager-current.json"
 _TERMINATION = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+LOCK_WAIT_SECONDS = 2.0  # start/stop wait this long for a concurrent command; status never waits.
+# The only .pth files a vetted venv may carry besides plain directory lines: name -> sha256 of the
+# exact bytes. _virtualenv.pth: virtualenv/uv `import _virtualenv`. a1_coverage.pth: coverage's
+# no-op unless COVERAGE_PROCESS_START is set. distutils-precedence.pth: setuptools' distutils shim.
+_BENIGN_PTH = {
+    "_virtualenv.pth": "69ac3d8f27e679c81b94ab30b3b56e9cd138219b1ba94a1fa3606d5a76a1433d",
+    "a1_coverage.pth": "ef2ed06d19867ec669c09a804060666a9cd5e383af0a9d11aa2de79b77d448e8",
+    "distutils-precedence.pth": "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
+}
 SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
 
@@ -331,7 +342,8 @@ def event(journal: Path, value: dict) -> None:
 
 
 @contextlib.contextmanager
-def manager_lock():
+def manager_lock(wait: float = 0.0):
+    """Exclusive shared lock; retries for up to `wait` seconds, then raises BlockingIOError."""
     fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         st = os.fstat(fd)
@@ -343,8 +355,22 @@ def manager_lock():
             or st.st_nlink != 1
             or (st.st_dev, st.st_ino) != (current.st_dev, current.st_ino)
         ):
-            raise ValueError("unsafe shared preview lock")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raise ValueError(
+                f"unsafe shared preview lock {LOCK}: it must be a regular single-link file owned "
+                f"by you with mode 0600 (found mode {stat.S_IMODE(st.st_mode):04o}); fix it or "
+                "remove it while no preview command is running"
+            )
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise BlockingIOError(
+                        errno.EAGAIN, "another preview command holds the lock; retry shortly"
+                    ) from None
+                time.sleep(0.05)
         yield
     finally:
         os.close(fd)
@@ -516,13 +542,13 @@ def _lookalikes(rows: list) -> list[dict]:
     return found
 
 
-def _orphan(rows: list, inodes: set[str]) -> dict | None:
+def _orphan(rows: list, inodes: set[str], candidates: list[dict] | None = None) -> dict | None:
     """The one process that is exactly our prepared child: same UID, full argv and listener."""
     inode = rows[0]["listener_inode"]
     if inodes != {inode}:
         return None
     found = []
-    for identity in _lookalikes(rows):
+    for identity in _lookalikes(rows) if candidates is None else candidates:
         try:
             if owns_listener(identity["pid"], inode):
                 found.append(identity)
@@ -558,15 +584,17 @@ def status(root: Path, *, locked: bool = False) -> dict:
                 "state": "unmanaged-listener" if inodes else "stopped",
                 "managed": False,
             }
-        if not locked:  # A start holding the lock is between `prepared` and `spawned`.
+        busy = {**common, "state": "starting", "managed": False}
+        if not locked:  # A start/stop holding the lock is mid-flight: report it, never wait.
             try:
-                with manager_lock():
-                    return status(root, locked=True)
+                with manager_lock():  # Probe only: the slow scan below runs without the lock.
+                    pass
             except BlockingIOError:
-                return {**common, "state": "starting", "managed": False}
-        orphan = _orphan(rows, inodes)
+                return busy
+        lookalikes = _lookalikes(rows)
+        orphan = _orphan(rows, inodes, lookalikes)
         if orphan is not None:  # Crash between spawn and the `spawned` receipt.
-            return {
+            outcome = {
                 **common,
                 "state": "orphaned",
                 "managed": True,
@@ -576,13 +604,18 @@ def status(root: Path, *, locked: bool = False) -> dict:
                 "log": str(root / rows[0]["log"]),
                 "runtime_limit_seconds": PREVIEW_SECONDS,
             }
-        # A child that closed its listener may still be shutting down: never call that stopped.
-        pending = bool(inodes) or bool(_lookalikes(rows))
-        return {
-            **common,
-            "state": "uncertain" if pending else "stopped",
-            "managed": False,
-        }
+        elif inodes or lookalikes:  # A child that closed its listener may still be shutting down.
+            outcome = {
+                **common,
+                "state": "uncertain",
+                "managed": False,
+                "candidate_pids": [identity["pid"] for identity in lookalikes],
+            }
+        else:
+            outcome = {**common, "state": "stopped", "managed": False}
+        if not locked and current_attempt(root)[1] != rows:  # A start swapped the attempt mid-scan.
+            return busy
+        return outcome
     actual = process_identity(saved["pid"])
     if actual is None:
         return {
@@ -727,6 +760,13 @@ def _resolve_trusted(path: Path, message: str) -> Path:
         if hops > 40:
             raise ValueError(message)
         _trusted_chain(current, message)
+        link, hop_dir = candidate.lstat(), current.lstat()
+        if link.st_uid not in _owners() or (  # Sticky /tmp passes the chain: swaps need the owner.
+            hop_dir.st_mode & stat.S_IWOTH
+            and hop_dir.st_mode & stat.S_ISVTX
+            and link.st_uid != os.getuid()
+        ):
+            raise ValueError(message)
         target = os.readlink(candidate)
         if target.startswith("/"):
             current = Path("/")
@@ -734,8 +774,41 @@ def _resolve_trusted(path: Path, message: str) -> Path:
     return current
 
 
+def _vet_pth(site: Path, message: str) -> None:
+    """Vet every *.pth of a site dir that will be on sys.path: `python -I` still runs them.
+
+    A file is accepted only if it is one of the exact known-benign files (by name AND sha256), or
+    every line is a comment or a directory line: no line beginning `import` and none containing
+    `;` (site.py would exec those). A directory line that exists must be a symlink-free directory
+    whose chain and whole tree are root/us-owned and not group/world-writable (the editable
+    install's target); a missing one is ignored, as site.py ignores it.
+    """
+    seen: set[Path] = set()
+    for pth in sorted(site.glob("*.pth")):
+        raw = pth.read_bytes()
+        if hashlib.sha256(raw).hexdigest() == _BENIGN_PTH.get(pth.name):
+            continue
+        for line in raw.decode("utf-8", "surrogateescape").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("import") or ";" in line or "\0" in line:
+                raise ValueError(message)
+            target = Path(os.path.normpath(site / line))
+            if target in seen or not os.path.lexists(target):
+                continue
+            if not target.is_dir():  # a symlinked path fails _trusted_chain: links are mode 0777
+                raise ValueError(message)
+            _trusted_chain(target, message)
+            _trusted_tree(target, message)
+            seen.add(target)
+
+
 def _venv_home(cfg: Path, message: str) -> tuple[Path, bool]:
-    """(`home`, include-system-site-packages) from a vetted pyvenv.cfg; `home` is required."""
+    """(`home`, include-system-site-packages) from a vetted pyvenv.cfg; `home` is required.
+
+    Like site.py the value is case-insensitive and an absent key means true (system packages are
+    walked); anything other than true/false is refused rather than guessed."""
     values = {}
     for line in cfg.read_text().splitlines():
         key, separator, value = line.partition("=")
@@ -743,7 +816,10 @@ def _venv_home(cfg: Path, message: str) -> tuple[Path, bool]:
             values[key.strip().lower()] = value.strip()
     if "home" not in values or not Path(values["home"]).is_absolute():
         raise ValueError(message)
-    return Path(values["home"]), values.get("include-system-site-packages") == "true"
+    system = values.get("include-system-site-packages", "true").lower()
+    if system not in {"true", "false"}:
+        raise ValueError(message)
+    return Path(values["home"]), system == "true"
 
 
 def _stdlib(prefix: Path, message: str, *, site_packages: bool) -> None:
@@ -762,6 +838,9 @@ def _stdlib(prefix: Path, message: str, *, site_packages: bool) -> None:
     for tree in trees:
         _trusted_chain(tree, message)
         _trusted_tree(tree, message, skip)
+        for name in () if skip else ("site-packages", "dist-packages"):
+            if (tree / name).is_dir():
+                _vet_pth(tree / name, message)
 
 
 def _interpreter(value: Path) -> Path:
@@ -808,6 +887,7 @@ def _interpreter(value: Path) -> Path:
                     for site in (base / lib).resolve(strict=True).glob("python*/site-packages"):
                         _trusted_chain(site, unavailable)
                         _trusted_tree(site, unavailable)
+                        _vet_pth(site, unavailable)
             break
         _stdlib(resolved.parent.parent, unavailable, site_packages=site_packages)
     except OSError as exc:
@@ -926,7 +1006,7 @@ def _spawn_and_wait(journal, log, argv, listener, log_fd, root, inode) -> None:
 def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
     require_pidfd()  # Refuse unsupported controller runtimes before a child or receipt exists.
     validate_namespace(root)
-    with manager_lock():
+    with manager_lock(LOCK_WAIT_SECONDS):
         before = status(root, locked=True)
         if before["state"] == "running":
             return {**before, "already_running": True}
@@ -978,7 +1058,7 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
 def stop(root: Path) -> dict:
     require_pidfd()
     validate_namespace(root)
-    with manager_lock():
+    with manager_lock(LOCK_WAIT_SECONDS):
         before = status(root, locked=True)
         if before["state"] == "stopped":
             return before
