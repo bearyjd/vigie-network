@@ -462,3 +462,14 @@ fn the_wrapper_stays_quiet_for_other_exit_codes() {
     run_wrapper(&w, 1, 7);
     assert!(w.syslog().is_empty(), "{:?}", w.syslog());
 }
+
+#[test]
+fn the_wrapper_preserves_root_refusal_counter_and_logs_once() {
+    let w = World::new();
+    run_wrapper(&w, 77, 6);
+    assert_eq!(
+        fs::read_to_string(w.d.join("state/fails")).unwrap(),
+        "x\n".repeat(6)
+    );
+    assert_eq!(w.syslog().matches("giving up").count(), 1);
+}
