@@ -307,6 +307,7 @@ class CollectorCoverage(BaseModel):
     last_seq: int
     backlog_batches: int
     backlog_capped: bool
+    oldest_pending_received_at: str | None
     retained_detail_since: str | None
     summary_capped: bool
     dropped_batches_in_retained_detail: int

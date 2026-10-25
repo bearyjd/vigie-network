@@ -290,7 +290,10 @@ class FinalCoverageContract(unittest.TestCase):
             "backlog_capped": True,
             "summary_capped": False,
         }
-        self.assertIsNone(runner.coverage_metrics(collector, 1000)["backlog_batches"])
+        self.assertEqual(runner.coverage_metrics(collector, 1000)["backlog_batches"], 0)
+        self.assertIsNone(
+            runner.coverage_metrics(collector, 1000)["processing_backlog_age_s"]
+        )
         collector.update(backlog_capped=False, summary_capped=True)
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["ct_unmapped_flows"])
@@ -493,6 +496,133 @@ with tempfile.TemporaryDirectory() as tmp:
             timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+
+class ProcessingBacklogContract(unittest.TestCase):
+    def test_normal_pending_age_is_29_and_keeps_raw_count(self):
+        collector = {
+            "backlog_batches": 1,
+            "backlog_capped": False,
+            "oldest_pending_received_at": "1970-01-01T00:16:11+00:00",
+        }
+        result = runner.coverage_metrics(collector, 1000)
+        self.assertEqual(result["backlog_batches"], 1)
+        self.assertEqual(result["processing_backlog_age_s"], 29)
+        self.assertEqual(
+            result["oldest_pending_received_at"],
+            collector["oldest_pending_received_at"],
+        )
+        self.assertEqual(result["processing_backlog_reference_wall"], 1000)
+
+    def test_zero_requires_explicit_null_oldest_and_pending_requires_valid_time(self):
+        for collector in [
+            {"backlog_batches": 0, "backlog_capped": False},
+            {
+                "backlog_batches": 0,
+                "backlog_capped": False,
+                "oldest_pending_received_at": "1970-01-01T00:00:00Z",
+            },
+            {
+                "backlog_batches": 1,
+                "backlog_capped": False,
+                "oldest_pending_received_at": None,
+            },
+            {
+                "backlog_batches": 1,
+                "backlog_capped": False,
+                "oldest_pending_received_at": "bad",
+            },
+            {
+                "backlog_batches": 1,
+                "backlog_capped": False,
+                "oldest_pending_received_at": 971,
+            },
+            {
+                "backlog_batches": 1,
+                "backlog_capped": True,
+                "oldest_pending_received_at": "1970-01-01T00:16:11Z",
+            },
+        ]:
+            with self.subTest(collector=collector):
+                self.assertIsNone(
+                    runner.coverage_metrics(collector, 1000)["processing_backlog_age_s"]
+                )
+        result = runner.coverage_metrics(
+            {
+                "backlog_batches": 0,
+                "backlog_capped": False,
+                "oldest_pending_received_at": None,
+            },
+            1000,
+        )
+        self.assertEqual(result["processing_backlog_age_s"], 0)
+
+    def test_capped_count_and_oldest_remain_visible_while_age_is_unknown(self):
+        collector = {
+            "backlog_batches": 10000,
+            "backlog_capped": True,
+            "oldest_pending_received_at": "1970-01-01T00:16:11Z",
+        }
+        result = runner.coverage_metrics(collector, 1000)
+        self.assertEqual(result["backlog_batches"], 10000)
+        self.assertIs(result["backlog_capped"], True)
+        self.assertEqual(
+            result["oldest_pending_received_at"],
+            collector["oldest_pending_received_at"],
+        )
+        self.assertIsNone(result["processing_backlog_age_s"])
+
+    def test_timestamp_reference_is_captured_after_response_not_before_http(self):
+        import json
+
+        closed = False
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def read(self, _):
+                return json.dumps(
+                    {
+                        "data": {
+                            "collector": {
+                                "backlog_batches": 1,
+                                "backlog_capped": False,
+                                "oldest_pending_received_at": "1970-01-01T00:16:50Z",
+                            }
+                        }
+                    }
+                ).encode()
+
+            def __exit__(self, *_):
+                nonlocal closed
+                closed = True
+
+        class Opener:
+            def open(self, *_, **__):
+                return Response()
+
+        def current():
+            self.assertTrue(closed)
+            return 1039
+
+        with (
+            patch.object(runner, "private_read", return_value=b"token"),
+            patch.object(runner.ssl, "create_default_context"),
+            patch.object(runner.urllib.request, "build_opener", return_value=Opener()),
+            patch.object(runner.time, "time", side_effect=current),
+        ):
+            result = runner.read_coverage(
+                {
+                    "api_token_file": "private",
+                    "api_ca_file": "ca",
+                    "api_port": 18444,
+                    "collector_id": "c1",
+                },
+                1000,
+            )
+        self.assertEqual(result["processing_backlog_age_s"], 29)
+        self.assertEqual(result["processing_backlog_reference_wall"], 1039)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 SPEC = importlib.util.spec_from_file_location(
@@ -33,6 +34,10 @@ def sample(second, **overrides):
         "logical_cpus": 2,
         "freshness_s": 30,
         "backlog_batches": 0,
+        "backlog_capped": False,
+        "oldest_pending_received_at": None,
+        "processing_backlog_age_s": 0,
+        "processing_backlog_reference_wall": 1_800_000_000 + second,
         "dropped_batches": 0,
         "source_flags": 0,
         "dns_log_quiet": False,
@@ -89,7 +94,13 @@ class SoakTests(unittest.TestCase):
             {"mem_available_kib": 65535},
             {"log_used_kib": 20481},
             {"log_capacity_kib": 20481},
-            {"backlog_batches": 1},
+            {
+                "backlog_batches": 1,
+                "processing_backlog_age_s": 181,
+                "oldest_pending_received_at": datetime.fromtimestamp(
+                    1_800_000_060 - 181, UTC
+                ).isoformat(),
+            },
             {"dropped_batches": 1},
             {"source_flags": 1},
             {"freshness_s": 181},
@@ -200,6 +211,104 @@ class AdditionalBoundaries(unittest.TestCase):
                 journal.append(sample(0))
                 journal.append(sample(60, collector_rss_kib=float("nan")))
             with soak.Journal(path, mode="simulated") as journal:
+                self.assertEqual(soak.assess(journal.samples)["status"], "fail")
+
+
+class ProcessingAgeTests(unittest.TestCase):
+    def queued(self, value, age):
+        return dict(
+            value,
+            backlog_batches=1,
+            backlog_capped=False,
+            oldest_pending_received_at=datetime.fromtimestamp(
+                value["wall"] - age, UTC
+            ).isoformat(),
+            processing_backlog_age_s=age,
+            processing_backlog_reference_wall=value["wall"],
+        )
+
+    def test_normal_29_second_handoff_and_exact_180_seconds_are_allowed(self):
+        for age in (29, 180):
+            values = full()
+            values[-1] = self.queued(values[-1], age)
+            self.assertEqual(soak.assess(values)["status"], "pass")
+
+    def test_stalled_processing_fails_despite_fresh_new_ingest(self):
+        values = full()
+        values[-1] = self.queued(values[-1], 181)
+        values[-1]["freshness_s"] = 1
+        result = soak.assess(values)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("processing_backlog_age_s_limit", result["reasons"])
+
+    def test_unknown_capped_and_inconsistent_pending_state_cannot_pass(self):
+        for changes in [
+            {"oldest_pending_received_at": None, "processing_backlog_age_s": None},
+            {"oldest_pending_received_at": "bad", "processing_backlog_age_s": None},
+            {"backlog_capped": True, "processing_backlog_age_s": None},
+            {"oldest_pending_received_at": None, "processing_backlog_age_s": 0},
+        ]:
+            values = full()
+            values[-1] = self.queued(values[-1], 29)
+            values[-1].update(changes)
+            self.assertNotEqual(soak.assess(values)["status"], "pass")
+
+    def test_future_pending_time_and_reference_clock_regression_fail(self):
+        values = full()
+        values[-1] = self.queued(values[-1], -1)
+        self.assertEqual(soak.assess(values)["status"], "fail")
+        values = full()
+        values[-1] = self.queued(values[-1], 29)
+        values[-1].update(
+            processing_backlog_reference_wall=values[-1]["wall"] - 1,
+            processing_backlog_age_s=28,
+        )
+        self.assertEqual(soak.assess(values)["status"], "fail")
+
+    def test_future_timestamp_cannot_hide_as_missing_computed_age(self):
+        values = full()
+        values[-1] = self.queued(values[-1], -1)
+        values[-1]["processing_backlog_age_s"] = None
+        self.assertEqual(soak.assess(values)["status"], "fail")
+
+    def test_prior_journal_contract_is_retained_and_refused(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            before = (
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "mode": "simulated",
+                        "duration_seconds": 172800,
+                        "metadata": {},
+                    }
+                )
+                + "\n"
+            ).encode()
+            path.write_bytes(before)
+            path.chmod(0o600)
+            with self.assertRaises(ValueError), soak.Journal(path, mode="simulated"):
+                pass
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_raw_processing_evidence_survives_failed_journal_and_resume(self):
+        value = self.queued(sample(0), -1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            with soak.Journal(path, mode="simulated") as journal:
+                journal.append(value)
+            with soak.Journal(path, mode="simulated") as journal:
+                recorded = journal.samples[0]
+                for key in [
+                    "backlog_batches",
+                    "backlog_capped",
+                    "oldest_pending_received_at",
+                    "processing_backlog_reference_wall",
+                    "processing_backlog_age_s",
+                ]:
+                    self.assertEqual(recorded[key], value[key])
                 self.assertEqual(soak.assess(journal.samples)["status"], "fail")
 
 
