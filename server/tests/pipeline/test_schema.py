@@ -39,7 +39,7 @@ def test_reapply_is_noop(tmp_path):
     open_pipeline_inventory(path, migrate=True).close()
     conn = open_pipeline_inventory(path, migrate=True)
     rows = conn.execute("SELECT version FROM pipeline_schema ORDER BY version").fetchall()
-    assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
 def test_new_device_event_unique_per_device(tmp_path):

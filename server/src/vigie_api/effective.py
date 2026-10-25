@@ -14,6 +14,7 @@ from typing import Any
 
 from vigie_api.errors import ApiError
 from vigie_api.textsafe import PROSE_MAX, display_text
+from vigie_ingest.db import iso_utc
 
 DEVICE_TYPES = ("phone", "tv", "iot", "camera", "laptop", "console", "unknown")
 MAX_LINK_DEPTH = 32
@@ -267,6 +268,30 @@ def iter_devices(
     yield from inv.execute(sql, params)
 
 
+def add_last_ips(inv: sqlite3.Connection, items: list[dict], links: dict[str, str]) -> None:
+    """One indexed page-scoped query; canonical groups are resolved afresh on every read."""
+    wanted = {resolve(links, item["id"]) for item in items}
+    members = {member: resolve(links, member) for member in {*wanted, *links}
+               if resolve(links, member) in wanted}
+    found = rows(
+        inv,
+        "SELECT o.device_id,o.mac,p.ip,p.observed_at,p.source FROM observations o "
+        "JOIN mac_last_ip p ON p.mac=o.mac "
+        "WHERE o.device_id IN (SELECT value FROM json_each(?))",
+        (json.dumps(sorted(members)),),
+    ) if members else []
+    latest = {}
+    for row in found:
+        key = members[row["device_id"]]
+        candidate = (row["observed_at"], int(row["source"] == "lease"), row["ip"], row["mac"])
+        if key not in latest or candidate > latest[key]:
+            latest[key] = candidate
+    for item in items:
+        value = latest.get(resolve(links, item["id"]))
+        item["last_observed_ip"] = value[2] if value else None
+        item["last_observed_ip_at"] = iso_utc(value[0]) if value else None
+
+
 def list_devices(
     inv: sqlite3.Connection,
     ov: sqlite3.Connection,
@@ -320,6 +345,7 @@ def list_devices(
             break
         out.append(item)
         last_scanned = row["id"]
+    add_last_ips(inv, out, links)
     return out, (encode_cursor(last_scanned) if more else None)
 
 
@@ -363,6 +389,7 @@ def device_detail(
     row = _device_row(inv, canonical)
     overrides = override_map(ov)
     item = effective_device(fresh_inference(inv, ov, row), overrides, links)
+    add_last_ips(inv, [item], links)
     identity_override = overrides.get(device_id)
     members = [canonical, *(f for f in links if f != canonical and resolve(links, f) == canonical)]
     marks = ",".join("?" * len(members))

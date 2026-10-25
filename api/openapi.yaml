@@ -733,6 +733,30 @@
             "title": "Identity State",
             "type": "string"
           },
+          "last_observed_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Last source address observed for this identity's MACs; not a current address or identity key. Nullable until new lease/neighbour evidence.",
+            "title": "Last Observed Ip"
+          },
+          "last_observed_ip_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sensor batch-window-end observation time in UTC; not lease expiry or server receipt time.",
+            "title": "Last Observed Ip At"
+          },
           "last_seen": {
             "title": "Last Seen",
             "type": "string"
@@ -868,6 +892,30 @@
             ],
             "title": "Identity State",
             "type": "string"
+          },
+          "last_observed_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Last source address observed for this identity's MACs; not a current address or identity key. Nullable until new lease/neighbour evidence.",
+            "title": "Last Observed Ip"
+          },
+          "last_observed_ip_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sensor batch-window-end observation time in UTC; not lease expiry or server receipt time.",
+            "title": "Last Observed Ip At"
           },
           "last_seen": {
             "title": "Last Seen",

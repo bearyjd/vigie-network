@@ -148,3 +148,29 @@ transaction, including direct group and `auto_inherit` edits.
   acceptance does not provide a cross-database atomic snapshot through commit.
 - **Attach availability.** Relevant writes delay attaches by one pass; irrelevant writes do
   not. Sustained relevant changes can keep invalidating plans despite per-token rate limits.
+
+
+## Last observed address
+
+Device list and detail responses include nullable `last_observed_ip` and
+`last_observed_ip_at`. They report the latest valid source-address association
+from DHCP lease or neighbour evidence for the identity's MACs, including its
+currently merged members. The time is the collector batch window end attached
+to that snapshot, not lease expiry, packet arrival time, or server receipt time.
+This historical observation does not guarantee the device's current address.
+An address never creates an identity link or changes a human label.
+
+IPv4 and IPv6 are supported. Invalid, scoped, unspecified, multicast, loopback,
+and limited-broadcast addresses are excluded. Observations outside the existing
+one-hour report-lag / activity clock-skew limits are excluded. The newest sensor
+stamp wins; equal stamps prefer lease evidence, then the lexically greatest
+canonical address (and MAC for an otherwise equal identity-level tie). This is a
+deterministic presentation choice, not proof of address ownership.
+
+Pipeline schema 10 retains one latest association per observed MAC. It does not
+replay processed batches or backfill old raw data. Fields remain null until new
+qualifying lease/neighbour evidence arrives; an API reading an older pipeline
+schema also returns null. Merge and undo recompute the view from current member
+MACs. Device filtering and pagination are unchanged, with one indexed address
+query scoped to each returned page. Existing clients can ignore the additive
+fields; terminal viewers should use `.get` for compatibility with older APIs.
