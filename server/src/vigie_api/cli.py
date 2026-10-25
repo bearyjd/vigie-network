@@ -110,13 +110,18 @@ def _tokens_main(argv: list[str]) -> int:
 
 
 def _create_token(
-    conn: sqlite3.Connection, label: str | None, *,
-    rules_write: bool = False, read_only: bool = False,
+    conn: sqlite3.Connection,
+    label: str | None,
+    *,
+    rules_write: bool = False,
+    read_only: bool = False,
 ) -> int:
     conn.execute("BEGIN IMMEDIATE")
     try:
         token_id, token = tokens.create_token(
-            conn, label, rules_write=rules_write,
+            conn,
+            label,
+            rules_write=rules_write,
             scope="read-only" if read_only else tokens.SCOPE_APP,
         )
         tokens.audit(conn, CLI_PRINCIPAL, "token.create", token_id, iso_utc(time.time()))

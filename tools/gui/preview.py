@@ -529,7 +529,11 @@ def status(root: Path) -> dict:
     saved = next((row["identity"] for row in reversed(rows) if "identity" in row), None)
     if saved is None:
         if not rows:
-            return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
+            return {
+                **common,
+                "state": "unmanaged-listener" if inodes else "stopped",
+                "managed": False,
+            }
         orphan = _orphan(rows, inodes)
         if orphan is not None:  # Crash between spawn and the `spawned` receipt.
             return {
@@ -587,14 +591,12 @@ def _owners() -> tuple[int, ...]:
 def _trusted_chain(path: Path, message: str) -> None:
     for parent in (path, *path.parents):
         st = parent.lstat()
-        if st.st_uid not in _owners() or (
-            st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX
-        ):
+        if st.st_uid not in _owners() or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
             raise ValueError(message)
 
 
 def _trusted_tree(root: Path, message: str) -> None:
-    """Every directory and file below root: no symlink, owned by root/us, not group/world-writable."""
+    """Every entry below root: no symlink, owned by root/us, not group/world-writable."""
     for current, names, files in os.walk(root, followlinks=False):
         for name in (*names, *files):
             st = (Path(current) / name).lstat()
@@ -663,8 +665,10 @@ def _interpreter(value: Path) -> Path:
             if not os.path.lexists(base / "pyvenv.cfg"):
                 continue
             cfg = (base / "pyvenv.cfg").lstat()
-            if not stat.S_ISREG(cfg.st_mode) or cfg.st_uid not in _owners() or (
-                cfg.st_mode & 0o022
+            if (
+                not stat.S_ISREG(cfg.st_mode)
+                or cfg.st_uid not in _owners()
+                or (cfg.st_mode & 0o022)
             ):
                 raise ValueError(unavailable)
             _trusted_chain(base, unavailable)

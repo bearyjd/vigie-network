@@ -5,6 +5,7 @@ The optional source overlay tests assets before the separately owned preview
 wheel is rebuilt. Reports identify that mode; it is not installed-wheel proof.
 Uses the existing Playwright/browser and private font cache, installs nothing.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,21 +24,29 @@ class HardeningQA(BrowserQA):
     def prepare(self, page):
         if self.source_assets is None:
             return
-        assets = {"/ui/": "index.html", **{
-            "/ui/" + name: name for name in
-            ("index.html", "styles.css", "app.js", "client.js", "views.js")
-        }}
+        assets = {
+            "/ui/": "index.html",
+            **{
+                "/ui/" + name: name
+                for name in ("index.html", "styles.css", "app.js", "client.js", "views.js")
+            },
+        }
 
         def asset(route):
             name = assets.get(urlsplit(route.request.url).path)
             if name is None:
                 route.continue_()
                 return
-            kind = "text/html" if name.endswith(".html") else (
-                "text/css" if name.endswith(".css") else "text/javascript")
+            kind = (
+                "text/html"
+                if name.endswith(".html")
+                else ("text/css" if name.endswith(".css") else "text/javascript")
+            )
             response = route.fetch()
-            route.fulfill(response=response, content_type=kind,
-                          body=(self.source_assets / name).read_bytes())
+            route.fulfill(
+                response=response, content_type=kind, body=(self.source_assets / name).read_bytes()
+            )
+
         page.route("**/ui/**", asset)
 
     def focus_lifecycle(self, page, context, audit):
@@ -86,8 +95,11 @@ class HardeningQA(BrowserQA):
         page.clock.install(time=now)
         self.connect(page)
         self.view(page, "inventory")
-        region = page.get_by_role("region", name="Scrollable table: Inventory identity, Type, "
-                                  "Status, Last observed IP, Last seen · UTC")
+        region = page.get_by_role(
+            "region",
+            name="Scrollable table: Inventory identity, Type, "
+            "Status, Last observed IP, Last seen · UTC",
+        )
         region.focus()
         expect(page.locator("#refresh-status")).to_contain_text("paused while interacting")
         before = audit.count("/devices")
@@ -130,8 +142,10 @@ class HardeningQA(BrowserQA):
             region.evaluate("element => {window.__focusedRegion=element}")
             page.evaluate("() => window.__release()")
             expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
-            check(page.evaluate("() => window.__focusedRegion.isConnected"),
-                  "pending automatic response replaced focused observations")
+            check(
+                page.evaluate("() => window.__focusedRegion.isConnected"),
+                "pending automatic response replaced focused observations",
+            )
             expect(region).to_be_focused()
             expect(page.locator("#refresh-status")).to_contain_text("snapshot " + snapshot)
         finally:
@@ -152,7 +166,9 @@ class HardeningQA(BrowserQA):
         self.connect(page)
         badge = page.locator("#content [data-live-current]").first
         expect(badge).to_have_text("Current")
-        page.locator("#content .hour-strip").evaluate("element => {element.tabIndex=0; element.focus()}")
+        page.locator("#content .hour-strip").evaluate(
+            "element => {element.tabIndex=0; element.focus()}"
+        )
         expect(badge).to_have_text("Snapshot (paused)")
         page.clock.fast_forward(125000)
         expect(badge).to_have_text("Stale")  # recomputed by the timer, no render or refresh
@@ -201,10 +217,18 @@ class HardeningQA(BrowserQA):
 
     def incomplete_coverage(self, page, context, audit):
         self.prepare(page)
-        page.route("**/coverage?*", lambda route: route.fulfill(status=200, json={
-            "ok": True, "page": {"next_cursor": None}, "error": None,
-            "data": {"collector": {"collector_id": "synthetic-preview"}, "hours": []},
-        }))
+        page.route(
+            "**/coverage?*",
+            lambda route: route.fulfill(
+                status=200,
+                json={
+                    "ok": True,
+                    "page": {"next_cursor": None},
+                    "error": None,
+                    "data": {"collector": {"collector_id": "synthetic-preview"}, "hours": []},
+                },
+            ),
+        )
         page.goto(self.url)
         page.locator("#token").fill(self.token)
         page.get_by_role("button", name="Connect", exact=True).click()
@@ -215,8 +239,10 @@ class HardeningQA(BrowserQA):
           const {coverageView}=await import('/ui/views.js');
           return coverageView({collector:{},hours:[]}).textContent;
         }""")
-        check("Coverage unavailable" in direct and "All displayed hours qualified" not in direct,
-              "empty direct coverage view still made a quality claim")
+        check(
+            "Coverage unavailable" in direct and "All displayed hours qualified" not in direct,
+            "empty direct coverage view still made a quality claim",
+        )
 
 
 def main():
@@ -228,34 +254,57 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     manifest = private_json(args.manifest)
-    check(manifest.get("synthetic") is True and manifest.get("collector_id") == "synthetic-preview"
-          and manifest.get("url") == "http://127.0.0.1:18745/ui/?preview=synthetic"
-          and Path(manifest["token_file"]).parent == args.manifest.parent,
-          "unexpected synthetic manifest")
+    check(
+        manifest.get("synthetic") is True
+        and manifest.get("collector_id") == "synthetic-preview"
+        and manifest.get("url") == "http://127.0.0.1:18745/ui/?preview=synthetic"
+        and Path(manifest["token_file"]).parent == args.manifest.parent,
+        "unexpected synthetic manifest",
+    )
     args.output.mkdir(mode=0o700)
     cache = args.output / "font-cache"
     cache.mkdir(mode=0o700)
     config = args.output / "fontconfig.conf"
-    config.write_text("<?xml version='1.0'?><fontconfig><dir>/usr/share/fonts</dir><cachedir>"
-                      + escape(str(cache)) + "</cachedir></fontconfig>")
+    config.write_text(
+        "<?xml version='1.0'?><fontconfig><dir>/usr/share/fonts</dir><cachedir>"
+        + escape(str(cache))
+        + "</cachedir></fontconfig>"
+    )
     qa = HardeningQA(manifest, args.output, args.browser_executable)
     qa.source_assets = args.source_assets
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, executable_path=str(args.browser_executable),
-            env={**os.environ, "FONTCONFIG_FILE": str(config), "FONTCONFIG_PATH": "/etc/fonts"})
+        browser = playwright.chromium.launch(
+            headless=True,
+            executable_path=str(args.browser_executable),
+            env={**os.environ, "FONTCONFIG_FILE": str(config), "FONTCONFIG_PATH": "/etc/fonts"},
+        )
         try:
-            for name in ("focus_lifecycle", "header_focus_during_request",
-                         "interaction_polling", "observation_badge_follows_pause_and_age",
-                         "hidden_scope_change", "incomplete_coverage"):
-                qa.case(browser, name, getattr(qa, name),
-                        network_errors=name == "hidden_scope_change")
+            for name in (
+                "focus_lifecycle",
+                "header_focus_during_request",
+                "interaction_polling",
+                "observation_badge_follows_pause_and_age",
+                "hidden_scope_change",
+                "incomplete_coverage",
+            ):
+                qa.case(
+                    browser, name, getattr(qa, name), network_errors=name == "hidden_scope_change"
+                )
         finally:
             browser.close()
     report = {"source_overlay": args.source_assets is not None, "cases": qa.results}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     passed = sum(case["status"] == "pass" for case in qa.results)
-    print(json.dumps({"passed": passed, "failed": len(qa.results)-passed,
-                      "source_overlay": report["source_overlay"], "artifacts": str(args.output)}))
+    print(
+        json.dumps(
+            {
+                "passed": passed,
+                "failed": len(qa.results) - passed,
+                "source_overlay": report["source_overlay"],
+                "artifacts": str(args.output),
+            }
+        )
+    )
     return 0 if passed == len(qa.results) else 1
 
 
