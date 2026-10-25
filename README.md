@@ -39,18 +39,20 @@ reviewer (PRP section 17), not run in production.
 | Component | Where | State |
 |---|---|---|
 | Ingest service (`vigie_ingest`) | `server/` | Built, 4 review rounds, tests pass |
-| Pipeline core (`vigie_pipeline`) | `server/` | Built, with bounded identity stitching and overlap vetoes. Classification rules and behavioral demotion remain incomplete; no LLM or ML stage |
-| App API (`vigie_api`) | `server/` | Inventory reads and overrides, accept/reject/merge/undo, standing rules and audited veto clearance. See `docs/api.md`; SSE and metrics remain deferred |
-| Container image, compose, cert and provisioning scripts | `deploy/` | Real rootless Podman loopback pilot validated synthetic ingest/API, mounts, private file modes and individual service restarts; see [validation report](docs/deployment-validation-2026-10-24.md). The [bounded router pilot](docs/router-validation-2026-10-24.md) also delivered real observations; production placement and long soak remain unverified |
-| Router collector agent (`vigie-collector`) | `collector/agent/` | Built, reviewed and exercised on the real router in a [ten-minute isolated pilot](docs/router-validation-2026-10-24.md), with pinned HTTPS/HMAC ingest and authenticated inventory; persistent install and long soak remain unverified |
-| Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Real router helper/socket path exercised in the bounded pilot; observed parser sample skipped 0 lines. Persistent procd operation and long soak remain unverified |
-| DHCP log, conntrack and `ubus` output formats | router | Actual leases, neighbors and conntrack were exercised in the bounded pilot. DNS logs, DHCP option 55/60 capture, `ubus` formats and other firmware cases remain unverified |
-| Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Never run on the router; procd retry semantics and dnsmasq log ownership are assumptions |
+| Pipeline core (`vigie_pipeline`) | `server/` | Bounded identity stitching, conservative service characterization, hourly coverage, pooled upload baselines and explainable incidents are merged; field accuracy remains unmeasured; no LLM/ML stage |
+| App API (`vigie_api`) | `server/` | Inventory/identity writes plus authenticated coverage, activity and incident reads. See `docs/api.md` and `docs/monitoring.md`; monitoring UI and notification lifecycle remain queued |
+| Container image, compose, cert and provisioning scripts | `deploy/` | Three owned rootless server roles are healthy with verified mounts, TLS and API scopes; see [current field status](docs/monitoring-field-status-2026-10-25.md). Cold boot/restore and long soak remain pending |
+| Router collector agent (`vigie-collector`) | `collector/agent/` | Running with actual privilege checks and signed parsed-DNS delivery; LAN correction yields source flags 0, with earlier degraded history retained. Controlled drain and portable stop/restart passed; processing-age acceptance source is merged; its candidate image awaits deployment. See [field status](docs/monitoring-field-status-2026-10-25.md); long soak has not started |
+| Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Live helper/socket path exercised; it remains a separate root service. Lifecycle, boot and long-soak acceptance remain separate gates |
+| DHCP log, conntrack and `ubus` output formats | router | Leases, neighbors, conntrack, selected procd metadata and parsed DNS have been observed. DHCP option 55/60 capture and remaining firmware cases await field verification |
+| Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Real logging, renewed privilege checks, portable UID scan and controlled stop/restart passed; 20 MiB logfs capacity proof passed before writers. Boot links and scoped cron installation passed; drop-in repair, rotation and cold boot remain pending |
 | LLM / ML classification stages | none | **Not built** |
 | Control app | separate project | Out of scope here |
 
 The real collector, ingest, pipeline and API can be exercised together on localhost with
-[`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). The [real-router field report](docs/router-validation-2026-10-24.md) records a ten-minute isolated run with real observations and resource samples. Production deployment, persistent router services, DNS logging and a 48-hour resource soak remain unverified; the run does not establish classification accuracy.
+[`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). The [2026-10-25 field status](docs/monitoring-field-status-2026-10-25.md)
+separates merged source, live server/router evidence and remaining quality/recovery gates. The real
+48-hour run has not started; no mature field baseline, cold-boot acceptance or classification accuracy is claimed.
 
 ## Server quick start
 
@@ -175,8 +177,9 @@ a hosted result exists only after the workflow actually runs.
 ## Router install (GL-XE3000, OpenWrt 21.02, aarch64)
 
 **Owner gate: these are reference installation steps, pending the couvre-feu integration
-decisions D1–D6.** In particular, D2 must settle permission to change dnsmasq before starting
-the collector service or running any logging/drop-in script (including `logging-on.sh`).
+decisions D1–D6.** The scoped field rollout has explicit owner authorization; it does not settle
+general couvre-feu integration. Other installations need their own authorization to change
+dnsmasq before starting the collector service or running a logging/drop-in script.
 The current service changes dnsmasq configuration; a lease-only coexistence mode is still planned.
 Everything here is run by you, as root, by hand;
 nothing is executed for you. Every command below that reads like a fact about the router is an
@@ -184,6 +187,8 @@ assumption until you have seen its output.
 
 Assumptions: router LAN address `192.168.8.1` (GL.iNet default; PRP examples use other values, use
 yours), SSH as root works, and the files come from this checkout.
+Explicitly set the collector's three [LAN scope keys](docs/deploy.md#collector-lan-scope) from
+the measured network; parser defaults are not a deployment configuration.
 
 1. **Build** on your workstation from this repository root (Rust, clang and the musl target
    are required; cross-compilation settings are in `collector/.cargo/config.toml`):

@@ -3,9 +3,29 @@
 Short guide for running the server stack in `deploy/`. Setup is in the top-level
 [`README.md`](../README.md). A real rootless Podman loopback pilot has exercised synthetic ingest/API traffic, actual
 mount boundaries, private creation modes and individual service restarts; see the
-[2026-10-24 validation report](deployment-validation-2026-10-24.md). Production host placement,
-persistent real-router operation, host reboot/restore and a 48-hour soak remain unverified. A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
+[2026-10-24 validation report](deployment-validation-2026-10-24.md). The
+[2026-10-25 field status](monitoring-field-status-2026-10-25.md) records three healthy deployed
+server roles, real router logging/signed parsed-DNS delivery and actual collector privileges.
+The LAN correction now yields fresh source flags 0 while retaining earlier degraded history.
+Controlled drain and portable stop/restart passed; the processing-age candidate-image deployment,
+remaining repair/rotation, host reboot/restore and the
+not-yet-started 48-hour soak remain pending. A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
 marked *unverified* still require their own operational validation.
+
+## Collector LAN scope
+
+Set all three collector configuration keys from the actual reviewed network:
+
+| Key | Required deployment value |
+|---|---|
+| `lan_addr` | The router's IPv4 address on the observed LAN, used for multicast membership and on-link filtering |
+| `lan_prefix` | That LAN's actual IPv4 prefix length |
+| `lan_iface` | The actual LAN bridge/interface name used for IPv6 multicast membership |
+
+The parser accepts omitted keys using builtin defaults; `--check` verifies syntax and credentials,
+not that those defaults match the live network. A wrong selection can leave multicast unavailable
+while DNS and HTTPS still work. Verify fresh source flags and actual multicast reception after a
+reviewed correction/restart, retaining previously flagged history as degraded evidence.
 
 ## Permission model: three processes, three volumes
 

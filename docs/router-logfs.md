@@ -1,6 +1,10 @@
 # Router log filesystem and pre-DNS startup
 
-Source contract, not a completed rollout. Native mount, dnsmasq startup/reopen behavior, reboot and long-duration acceptance still need separate reviewed field evidence. This change does not install anything or modify DHCP/firewall policy.
+The [2026-10-25 field report](monitoring-field-status-2026-10-25.md) records actual installation,
+native mount verification and a successful 20 MiB capacity/ENOSPC proof before DNS writers.
+Real DNS logging and parsed delivery now work; active-full/reopen recovery, reboot and
+long-duration acceptance remain separate pending gates.
+The source helper itself does not modify DHCP/firewall policy.
 
 The only production target is `/tmp/vigie`, backed by a dedicated tmpfs named `vigie-logfs` with exactly 20971520 bytes (20 MiB), `nosuid,nodev,noexec`, root ownership, the actual dedicated `vigie` group and mode 0751. Existing root-owned empty backing directories with that exact geometry are accepted; contents (including hidden entries), symlinks, foreign/stacked/child mounts and ownership/mode mismatches are refused. Preparation does not cover files, adopt foreign state or remount an existing filesystem.
 
@@ -10,9 +14,19 @@ The only production target is `/tmp/vigie`, backed by a dedicated tmpfs named `v
 
 The new one-shot `/etc/init.d/vigie-logfs` has START 17, before this firmware's confirmed dnsmasq START 19. Its boot helper mounts/verifies the filesystem and calls drop-in `prepare` mode. That stages the exact configuration and 0640 log only: it does not reload/restart/start DNS or publish a successful-apply marker. Normal `ensure` retains the independently reviewed retryable reload confirmation contract. Merely invoking reload is not evidence that dnsmasq reread its main configuration. Installation needs an explicit reviewed controlled restart and parsing/ownership/DNS-continuity verification; reboot validation remains separate.
 
-The independent watchdog still rotates at 8 MiB and retains one rotated file. Polling alone cannot bound a burst; the 20 MiB filesystem bounds this owned log allocation even when collection/rotation stops. Full-filesystem behavior, logging loss and impact on DNS must be observed before unattended acceptance. This filesystem cap does not bound every router process or the collector's separate RAM spool.
+The independent watchdog still rotates at 8 MiB and retains one rotated file. Polling alone cannot bound a burst; the 20 MiB filesystem bounds this owned log allocation even when collection/rotation stops. Capacity exhaustion before DNS writers has been observed; logging loss, reopen/recovery and impact on active DNS still need field evidence before unattended acceptance. If dnsmasq falls back to the system logger, those allocations occur outside the owned mount and are not bounded by its cap. This filesystem cap also does not bound every router process or the collector's separate RAM spool.
 
-Collector init explicitly supplies dedicated user/group and zero soft/hard core limits; helper init also supplies zero core limits. This is not a complete privilege-drop claim: the actual firmware probe accepted procd `no_new_privs` but showed kernel NNP 0. A separately reviewed permanent privilege-drop helper and real procd child UID/group/capability/NNP/core evidence are required before deployment. Do not substitute the earlier disposable-launcher proof or add an ineffective bare procd boolean and call it complete.
+Collector init resolves the dedicated account and starts the audited `vigie-privdrop` transition
+as root; it also supplies zero soft/hard core limits. Helper init supplies zero core limits.
+The public helper has passed a harmless real procd/kernel proof, as recorded in the
+[field report](monitoring-field-status-2026-10-25.md) and [privilege contract](privdrop.md).
+The actual running collector wrapper/child has also passed its kernel privilege checks;
+the controlled wrapper/child stop, portable UID scan and new stop/restart also passed. Remaining
+drop-in repair, natural-threshold rotation and boot behavior are separate gates. Six owned
+boot links and the scoped root cron job have been installed; installation does not prove a
+first cron execution or cold boot. The earlier
+firmware probe accepted a bare procd `no_new_privs` setting but left kernel NNP 0; that boolean
+remains insufficient.
 
 ## Reviewable rollout and rollback boundary
 

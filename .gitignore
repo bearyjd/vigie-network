@@ -7,6 +7,8 @@ __pycache__/
 *.db-wal
 *.db-shm
 .env
+.env.*
+!.env.example
 target/
 dist/
 
