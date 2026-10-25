@@ -27,9 +27,10 @@ forward_stop() {
 # Called by the signal traps below.
 # shellcheck disable=SC2329
 request_stop() {
-	# The first request owns shutdown, including the pre-assignment pending state.
-	trap '' TERM INT
 	[ "$stop_rc" -ne 0 ] || stop_rc=$1
+	# Keep TERM caught until the child exists: ignoring it before fork would make
+	# a newly created collector inherit TERM ignored and lose the pending stop.
+	if [ -n "$child" ]; then trap '' TERM INT; fi
 	# Flag-only traps lose a stop delivered after the branch check but before wait.
 	forward_stop
 }
@@ -43,6 +44,7 @@ if [ "$stop_rc" -eq 0 ]; then
 	rc=$?
 else
 	# Stop arrived between the pre-launch check and the first wait.
+	trap '' TERM INT
 	forward_stop
 	rc=128
 fi

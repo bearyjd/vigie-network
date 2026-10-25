@@ -35,7 +35,8 @@ def identity(pid):
 
 for mode, stop in [('ready', signal.SIGTERM), ('ready', signal.SIGINT),
                    ('early', signal.SIGTERM), ('early', signal.SIGINT),
-                   ('forced_wait', signal.SIGTERM), ('forced_assignment', signal.SIGTERM)] + [
+                   ('forced_wait', signal.SIGTERM), ('forced_assignment', signal.SIGTERM),
+                   ('forced_creation', signal.SIGTERM)] + [
                        ('natural', signal.SIGTERM)] * 16:
     with tempfile.TemporaryDirectory(prefix='vigie-wrapper-stop-') as folder:
         root = pathlib.Path(folder)
@@ -46,7 +47,7 @@ for mode, stop in [('ready', signal.SIGTERM), ('ready', signal.SIGINT),
         collector = root / 'collector'
         collector.write_text('''#!/usr/bin/python3
 import os, pathlib, signal, time
-if os.environ['MODE'] == 'early':
+if os.environ['MODE'] in ('early', 'forced_creation'):
     pathlib.Path(os.environ['READY']).write_text(str(os.getpid()))
     time.sleep(10) # stop before the collector has installed any handlers
 def stop(sig, frame):
@@ -75,6 +76,9 @@ while True: signal.pause()
                 # Force the exact real-kernel signal after the branch check and BEFORE wait.
                 assert '\twait "$child"\n' in source
                 source = source.replace('\twait "$child"\n', '\tkill -TERM "$$"\n\twait "$child"\n', 1)
+            if mode == 'forced_creation':
+                assert '"$COLLECTOR" "$@" &' in source
+                source = source.replace('"$COLLECTOR" "$@" &', 'kill -TERM "$$"\n"$COLLECTOR" "$@" &', 1)
             wrapper_path = str(root / 'scheduled-wrapper')
             pathlib.Path(wrapper_path).write_text(source)
         wrapper = subprocess.Popen(shell_argv + [wrapper_path], env=env,
