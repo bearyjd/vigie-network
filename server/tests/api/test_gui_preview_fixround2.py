@@ -291,8 +291,12 @@ def test_venv_keeps_its_launch_path_and_plain_binary_resolves(sandbox_owners, tm
 def test_stdlib_below_the_binary_prefix_is_walked(sandbox_owners, tmp_path, lib, damage):
     root, binary, _ = _venv(tmp_path)
     prefix = binary.parent.parent
-    if lib == "lib64":
-        (prefix / "lib").rename(prefix / "lib64")
+    if lib == "lib64":  # a clean lib stays: only lib64 is dirty, so only walking it can object
+        (prefix / "lib64" / "python3.12").mkdir(parents=True)
+        (prefix / "lib64" / "python3.12" / "os.py").write_text("")
+        (prefix / "lib64" / "python3.12" / "os.py").chmod(0o644)
+        for path in (prefix / "lib64", prefix / "lib64" / "python3.12"):
+            path.chmod(0o700)
     stdlib = prefix / lib / "python3.12"
     if damage == "writable":
         (stdlib / "os.py").chmod(0o666)
@@ -371,6 +375,14 @@ def test_symlinked_directory_hop_inside_a_target_is_checked(sandbox_owners, tmp_
     (root / "bin" / "python").symlink_to(swap / "dirlink" / binary.name)
     with pytest.raises(ValueError, match=UNTRUSTED):
         _accepts(root / "bin" / "python")
+
+
+def test_non_venv_launch_through_a_symlinked_directory_is_refused(sandbox_owners, tmp_path):
+    root, binary, _ = _venv(tmp_path)
+    alias = tmp_path / "alias"
+    alias.symlink_to(binary.parent, target_is_directory=True)
+    with pytest.raises(ValueError, match=UNTRUSTED):
+        _accepts(alias / binary.name)
 
 
 def test_symlink_loop_is_refused(sandbox_owners, tmp_path):

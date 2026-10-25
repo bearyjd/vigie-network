@@ -724,7 +724,7 @@ def _resolve_trusted(path: Path, message: str) -> Path:
             current = candidate
             continue
         hops += 1
-        if hops > 40 or candidate.lstat().st_uid not in _owners():
+        if hops > 40:
             raise ValueError(message)
         _trusted_chain(current, message)
         target = os.readlink(candidate)
@@ -786,7 +786,6 @@ def _interpreter(value: Path) -> Path:
         ):
             raise ValueError(unavailable)
         _trusted_chain(resolved, unavailable)
-        _trusted_chain(python.parent, unavailable)
         site_packages = True
         launch = resolved
         for base in (python.parent, python.parent.parent):

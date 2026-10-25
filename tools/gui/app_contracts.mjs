@@ -42,12 +42,12 @@ let intervalTick = null; globalThis.setInterval = callback => { intervalTick = c
 globalThis.setTimeout = () => 1; globalThis.clearTimeout = () => {};
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
-let mode = 'ok'; let retryAfter = '60'; let lag = 0;  // seconds between the observation and the fetch
+let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
   const from = Number(url.searchParams.get('from_hour')); const to = Number(url.searchParams.get('to_hour'));
   const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
   const now = clock / 1000; const stamp = new Date(clock - lag * 1000).toISOString();
-  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - lag, latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - lag, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
+  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
 globalThis.fetch = async url => {
@@ -98,6 +98,11 @@ clock += 2000; intervalTick();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'observation 121 s old while the snapshot is only 21 s old');
 document.hidden = true; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'pausing never revives an aged observation');
 document.hidden = false;
+// J12: the OLDEST evidence rules; a fresh receipt does not rescue a 100 s old window.
+lag = 10; windowLag = 100; refresh.fire('click'); await flush();
+assert.deepEqual(labels(), ['Current', 'Current']);
+clock += 21000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'window 121 s old although received 31 s ago');
+windowLag = null; lag = 0; refresh.fire('click'); await flush();
 // An observation already stale at render never says Current, and the first chrome() keeps it that way.
 lag = 200; refresh.fire('click'); await flush();
 assert.deepEqual(labels(), ['Stale / unknown', 'Stale / unknown'], 'stale at render is unknown, not Current');
