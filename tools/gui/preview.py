@@ -37,6 +37,7 @@ LOCK = PREVIEW_PARENT / "vigie-gui-preview-18745.lock"
 DEFAULT_PACKAGE = PREVIEW_PARENT / "vigie-gui-wheel-target-attempt3"
 DEFAULT_PYTHON = PREVIEW_PARENT / "vigie-pr9-native-server-env/bin/python"
 CURRENT = "manager-current.json"
+SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
 
 def directory(value: str) -> Path:
@@ -444,7 +445,7 @@ def current_attempt(root: Path):
         raise ValueError("invalid fixed child command in receipt")
     transitions = {
         "prepared": {"spawned", "failed-before-spawn", "startup-failed"},
-        "spawned": {"ready", "startup-failed"},
+        "spawned": {"ready", "startup-failed", "stop-requested"},
         "ready": {"stop-requested"},
         "startup-failed": {"stop-requested", "stopped"},
         "stop-requested": {"stop-requested", "stopped"},
@@ -487,6 +488,29 @@ def current_attempt(root: Path):
     return journal, rows
 
 
+def _orphan(rows: list, inodes: set[str]) -> dict | None:
+    """The one process that is exactly our prepared child: same UID, full argv and listener."""
+    inode = rows[0]["listener_inode"]
+    if inodes != {inode}:
+        return None
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            identity = process_identity(int(entry.name))
+            if (
+                identity is not None
+                and identity["uid"] == os.getuid()
+                and identity["argv"] == rows[0]["argv"]
+                and owns_listener(identity["pid"], inode)
+            ):
+                found.append(identity)
+        except OSError:
+            continue
+    return found[0] if len(found) == 1 else None
+
+
 def status(root: Path) -> dict:
     manifest = validate_namespace(root)
     journal, rows = current_attempt(root)
@@ -496,18 +520,30 @@ def status(root: Path) -> dict:
         "collector_id": COLLECTOR,
     }
     inodes = listeners()
+    last = rows[-1] if rows else None
+    if last is not None and (
+        last["state"] in {"stopped", "failed-before-spawn"}
+        or (last["state"] == "startup-failed" and last.get("child_exited") is True)
+    ):  # Terminal: the recorded child is gone, so its PID may belong to anyone now.
+        return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
     saved = next((row["identity"] for row in reversed(rows) if "identity" in row), None)
     if saved is None:
-        complete = rows and (
-            rows[-1]["state"] == "failed-before-spawn"
-            or (rows[-1]["state"] == "startup-failed" and rows[-1].get("child_exited") is True)
-        )
-        state = (
-            "uncertain"
-            if rows and not complete
-            else ("unmanaged-listener" if inodes else "stopped")
-        )
-        return {**common, "state": state, "managed": False}
+        if not rows:
+            return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
+        orphan = _orphan(rows, inodes)
+        if orphan is not None:  # Crash between spawn and the `spawned` receipt.
+            return {
+                **common,
+                "state": "orphaned",
+                "managed": True,
+                "pid": orphan["pid"],
+                "start_ticks": orphan["start_ticks"],
+                "journal": str(journal),
+                "log": str(root / rows[0]["log"]),
+                "runtime_limit_seconds": PREVIEW_SECONDS,
+            }
+        # Our listener dies with a crashed manager; with none open no child can exist.
+        return {**common, "state": "uncertain" if inodes else "stopped", "managed": False}
     actual = process_identity(saved["pid"])
     if actual is None:
         return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
@@ -544,21 +580,44 @@ def require_pidfd() -> None:
         raise ValueError("use native /usr/bin/python3 with Linux pidfd support for start/stop")
 
 
+def _owners() -> tuple[int, ...]:
+    return (*SYSTEM_UIDS, os.getuid())
+
+
+def _trusted_chain(path: Path, message: str) -> None:
+    for parent in (path, *path.parents):
+        st = parent.lstat()
+        if st.st_uid not in _owners() or (
+            st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX
+        ):
+            raise ValueError(message)
+
+
+def _trusted_tree(root: Path, message: str) -> None:
+    """Every directory and file below root: no symlink, owned by root/us, not group/world-writable."""
+    for current, names, files in os.walk(root, followlinks=False):
+        for name in (*names, *files):
+            st = (Path(current) / name).lstat()
+            if (
+                stat.S_ISLNK(st.st_mode)
+                or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode))
+                or st.st_uid not in _owners()
+                or st.st_mode & 0o022
+            ):
+                raise ValueError(message)
+
+
 def _package(value: Path) -> Path:
+    """Trust the package directory, its ancestors and EVERY entry below it (no symlinks)."""
     root = value.absolute()
     if (
         root.resolve() != root
         or not root.is_dir()
-        or root.stat().st_uid not in (0, os.getuid())
+        or root.stat().st_uid not in _owners()
         or root.stat().st_mode & 0o022
     ):
         raise ValueError("installed package directory must be trusted and without symlinks")
-    for parent in (root, *root.parents):
-        st = parent.lstat()
-        if st.st_uid not in (0, os.getuid()) or (
-            st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX
-        ):
-            raise ValueError("writable or foreign package ancestor")
+    _trusted_chain(root, "writable or foreign package ancestor")
     required = [
         "vigie_api/app.py",
         "vigie_api/ui_static.py",
@@ -575,10 +634,49 @@ def _package(value: Path) -> Path:
             path.resolve() != path
             or not stat.S_ISREG(st.st_mode)
             or st.st_mode & 0o022
-            or st.st_uid not in (0, os.getuid())
+            or st.st_uid not in _owners()
         ):
             raise ValueError("unsafe or incomplete installed package")
+    _trusted_tree(root, "unsafe or incomplete installed package")
     return root
+
+
+def _interpreter(value: Path) -> Path:
+    """Trust the resolved binary, the directory holding the launch path and any venv it names.
+
+    The venv root (the folder holding pyvenv.cfg) and every lib*/python*/site-packages tree
+    below it are checked as _package is: ancestors, owner, no group/world write, no symlinks.
+    """
+    unavailable = "native Python interpreter unavailable or untrusted; pass --python"
+    python = value.absolute()
+    try:
+        resolved = python.resolve(strict=True)
+        if (
+            python.parent.resolve() != python.parent
+            or not resolved.is_file()
+            or not os.access(resolved, os.X_OK)
+        ):
+            raise ValueError(unavailable)
+        _trusted_chain(resolved, unavailable)
+        _trusted_chain(python.parent, unavailable)
+        for base in (python.parent, python.parent.parent):
+            if not os.path.lexists(base / "pyvenv.cfg"):
+                continue
+            cfg = (base / "pyvenv.cfg").lstat()
+            if not stat.S_ISREG(cfg.st_mode) or cfg.st_uid not in _owners() or (
+                cfg.st_mode & 0o022
+            ):
+                raise ValueError(unavailable)
+            _trusted_chain(base, unavailable)
+            for lib in ("lib", "lib64"):
+                if os.path.lexists(base / lib):
+                    for site in (base / lib).resolve(strict=True).glob("python*/site-packages"):
+                        _trusted_chain(site, unavailable)
+                        _trusted_tree(site, unavailable)
+            break
+    except OSError as exc:
+        raise ValueError(unavailable) from exc
+    return python
 
 
 def _health() -> bool:
@@ -588,7 +686,8 @@ def _health() -> bool:
 
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     with client.open(f"http://127.0.0.1:{PORT}/healthz", timeout=0.5) as response:
-        return response.status == 200 and json.loads(response.read(16385)).get("data") == "ok"
+        body = json.loads(response.read(16385))
+        return response.status == 200 and isinstance(body, dict) and body.get("data") == "ok"
 
 
 def _ready(child, identity: dict, inode: str) -> None:
@@ -626,6 +725,53 @@ def cleanup_startup(child, pidfd: int | None) -> bool:
         return False
 
 
+def _spawn_and_wait(journal, log, argv, listener, log_fd, root, package_dir, inode) -> None:
+    child = None
+    pidfd = None
+    try:
+        child = subprocess.Popen(  # noqa: S603 -- fixed script/argv; checked interpreter.
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            cwd=root,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=(listener.fileno(),),
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONPATH": str(package_dir),
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+        identity = process_identity(child.pid)
+        if identity is None or identity["uid"] != os.getuid() or identity["argv"] != argv:
+            raise RuntimeError("could not establish exact child identity")
+        event(journal, {"state": "spawned", "identity": identity})
+        pidfd = guarded_pidfd(identity)
+        _ready(child, identity, inode)
+        event(journal, {"state": "ready", "identity": identity})
+    except BaseException as exc:  # Includes KeyboardInterrupt/SystemExit: never strand the child.
+        exited = child is None or cleanup_startup(child, pidfd)
+        event(
+            journal,
+            {
+                "state": "failed-before-spawn" if child is None else "startup-failed",
+                "error_type": type(exc).__name__,
+                "child_exited": exited,
+                "child_pid": None if child is None else child.pid,
+            },
+        )
+        if isinstance(exc, OSError | ValueError | RuntimeError):
+            raise RuntimeError(f"preview startup failed; retained private log {log}") from exc
+        raise
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
 def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
     require_pidfd()  # Refuse unsupported controller runtimes before a child or receipt exists.
     validate_namespace(root)
@@ -639,14 +785,7 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
         package_dir = _package(
             package_dir or Path(prior[0]["package_dir"] if prior else DEFAULT_PACKAGE)
         )
-        python = (python or Path(prior[0]["argv"][0] if prior else DEFAULT_PYTHON)).absolute()
-        if (
-            not python.is_file()
-            or not os.access(python, os.X_OK)
-            or python.stat().st_uid not in (0, os.getuid())
-            or python.stat().st_mode & 0o022
-        ):
-            raise ValueError("native Python interpreter unavailable; pass --python")
+        python = _interpreter(python or Path(prior[0]["argv"][0] if prior else DEFAULT_PYTHON))
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", PORT))
@@ -673,61 +812,23 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
                 "runtime_limit_seconds": PREVIEW_SECONDS,
                 "wall": time.time(),
             }
-            write_new(journal, (json.dumps(prepared) + "\n").encode())
-            temporary = root / (CURRENT + "." + uuid.uuid4().hex)
             if (root / CURRENT).is_symlink():
                 raise ValueError("symlinked manager pointer")
-            write_new(temporary, json.dumps({"journal": journal.name}).encode())
-            os.replace(temporary, root / CURRENT)
-            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
+            # The log exists before any receipt: a failure here leaves nothing to recover.
             log_fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            child = None
-            pidfd = None
             try:
-                child = subprocess.Popen(  # noqa: S603 -- fixed script/argv; checked interpreter.
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_fd,
-                    stderr=subprocess.STDOUT,
-                    cwd=root,
-                    start_new_session=True,
-                    close_fds=True,
-                    pass_fds=(listener.fileno(),),
-                    env={
-                        "PATH": "/usr/bin:/bin",
-                        "LC_ALL": "C.UTF-8",
-                        "PYTHONPATH": str(package_dir),
-                        "PYTHONNOUSERSITE": "1",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                    },
-                )
-                identity = process_identity(child.pid)
-                if identity is None or identity["uid"] != os.getuid() or identity["argv"] != argv:
-                    raise RuntimeError("could not establish exact child identity")
-                event(journal, {"state": "spawned", "identity": identity})
-                pidfd = guarded_pidfd(identity)
-                _ready(child, identity, inode)
-                event(journal, {"state": "ready", "identity": identity})
-            except (OSError, ValueError, RuntimeError) as exc:
-                exited = child is None or cleanup_startup(child, pidfd)
-                event(
-                    journal,
-                    {
-                        "state": "failed-before-spawn" if child is None else "startup-failed",
-                        "error_type": type(exc).__name__,
-                        "child_exited": exited,
-                        "child_pid": None if child is None else child.pid,
-                    },
-                )
-                raise RuntimeError(f"preview startup failed; retained private log {log}") from exc
+                write_new(journal, (json.dumps(prepared) + "\n").encode())
+                temporary = root / (CURRENT + "." + uuid.uuid4().hex)
+                write_new(temporary, json.dumps({"journal": journal.name}).encode())
+                os.replace(temporary, root / CURRENT)
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                _spawn_and_wait(journal, log, argv, listener, log_fd, root, package_dir, inode)
             finally:
                 os.close(log_fd)
-                if pidfd is not None:
-                    os.close(pidfd)
         return status(root)
 
 
@@ -741,9 +842,16 @@ def stop(root: Path) -> dict:
         if not before["managed"]:
             raise ValueError("refusing to stop an unmanaged or changed process")
         journal, rows = current_attempt(root)
-        identity = next(row["identity"] for row in reversed(rows) if "identity" in row)
+        identity = next((row["identity"] for row in reversed(rows) if "identity" in row), None)
+        adopted = identity is None
+        if adopted:  # Orphaned child: re-verify it, then record it like any spawned child.
+            identity = _orphan(rows, listeners())
+            if identity is None:
+                raise ValueError("refusing to stop an unmanaged or changed process")
         fd = guarded_pidfd(identity)
         try:
+            if adopted:
+                event(journal, {"state": "spawned", "identity": identity})
             event(journal, {"state": "stop-requested", "identity": identity})
             signal.pidfd_send_signal(fd, signal.SIGTERM)
             if not select.select([fd], [], [], 6)[0]:
@@ -752,6 +860,10 @@ def stop(root: Path) -> dict:
         finally:
             os.close(fd)
         return status(root)
+
+
+def _exit_on_signal(number: int, frame) -> None:
+    raise SystemExit(128 + number)
 
 
 def main() -> int:
@@ -767,6 +879,8 @@ def main() -> int:
     parser.add_argument("--listen-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, _exit_on_signal)  # Unwind start's cleanup instead of dying mid-spawn.
     try:
         root = directory(args.directory)
         if args.action == "seed":

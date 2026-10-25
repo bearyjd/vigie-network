@@ -25,6 +25,8 @@ BOOT = "01234567-89ab-cdef-0123-456789abcdef"
 def pidfd_support_for_offline_fixtures(monkeypatch):
     # The cached uv Python3.12 build omits optional pidfd APIs; the controller
     # runs under native /usr/bin/python3. Unit fixtures always replace signals.
+    # Interpreter trust is covered by test_gui_preview_fixround1; these fixtures use sys.executable.
+    monkeypatch.setattr(preview, "_interpreter", lambda path: path.absolute())
     if not hasattr(preview.os, "pidfd_open"):
         monkeypatch.setattr(preview.os, "pidfd_open", Mock(), raising=False)
     if not hasattr(preview.signal, "pidfd_send_signal"):
