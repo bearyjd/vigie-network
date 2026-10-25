@@ -142,6 +142,20 @@ def test_missing_target_under_an_owned_private_ancestor_is_still_ignored(sandbox
     assert _accepts(root / "bin" / "python")
 
 
+def test_missing_target_below_an_unsafe_ancestor_chain_is_refused(sandbox_owners, tmp_path):
+    root, _, site = _venv(tmp_path)
+    open_dir = tmp_path / "open"  # a non-sticky 0777 parent could rename our private anchor away
+    mine = open_dir / "mine"
+    mine.mkdir(parents=True)
+    open_dir.chmod(0o777)
+    mine.chmod(0o700)
+    _pth(site, "e.pth", f"{mine / 'gone'}\n")
+    try:
+        _refuses(root)
+    finally:
+        open_dir.chmod(0o700)
+
+
 def test_a_pth_directory_line_of_slash_is_refused_by_the_bounded_walk(sandbox_owners, tmp_path):
     root, _, site = _venv(tmp_path)
     _pth(site, "e.pth", "/\n")  # would otherwise walk the whole filesystem under the lock
@@ -157,7 +171,10 @@ def test_the_bounded_walk_refuses_past_the_limit_and_accepts_within_it(
         (target / f"module{number}.py").write_text("")
     _pth(site, "e.pth", f"{target}\n")
     assert _accepts(root / "bin" / "python")
-    monkeypatch.setattr(preview, "MAX_PTH_TREE_ENTRIES", 5)
+    entries = sum(len(names) + len(files) for _, names, files in os.walk(target))
+    monkeypatch.setattr(preview, "MAX_PTH_TREE_ENTRIES", entries)
+    assert _accepts(root / "bin" / "python")  # exactly at the limit
+    monkeypatch.setattr(preview, "MAX_PTH_TREE_ENTRIES", entries - 1)
     _refuses(root)
 
 
@@ -175,6 +192,19 @@ def test_a_busy_lock_names_the_holder_pid_and_clears_it_when_released(namespace,
     assert preview.LOCK.read_bytes() == b""  # a stale holder must not be advertised
     with preview.manager_lock():
         pass
+
+
+def test_a_stale_holder_pid_of_a_dead_process_is_not_advertised(namespace, monkeypatch):
+    monkeypatch.setattr(preview, "LOCK_WAIT_SECONDS", 0.1)
+    preview.LOCK.write_text("4194305\n")  # above pid_max: no such process
+    preview.LOCK.chmod(0o600)
+    thread = _shared_hold(1.0)
+    try:
+        with pytest.raises(BlockingIOError) as raised:
+            preview.stop(namespace)
+    finally:
+        thread.join(5)
+    assert "another preview command holds the lock; retry shortly" in str(raised.value)
 
 
 def test_the_documented_wait_is_two_seconds(namespace):
