@@ -201,8 +201,41 @@ def read_meter(path, expected_digest):
             os.close(snapshot)
 
 
+def _dns_name(packet, offset, starts):
+    """Decode bounded wire labels, preserving boundaries; pointers target prior names only."""
+    labels, seen, end, expanded = [], set(), None, 1
+    for _ in range(128):
+        if not 12 <= offset < len(packet) or offset in seen:
+            raise ValueError("invalid DNS name offset")
+        seen.add(offset)
+        starts.add(offset)
+        size = packet[offset]
+        if size & 0xC0 == 0xC0:
+            if offset + 1 >= len(packet):
+                raise ValueError("short DNS pointer")
+            target = ((size & 0x3F) << 8) | packet[offset + 1]
+            if not 12 <= target < offset or target not in starts:
+                raise ValueError("invalid DNS pointer target")
+            if end is None:
+                end = offset + 2
+            offset = target
+        elif size == 0:
+            return tuple(labels), end if end is not None else offset + 1
+        elif size <= 63:
+            if offset + 1 + size > len(packet):
+                raise ValueError("short DNS label")
+            expanded += size + 1
+            if expanded > 255:
+                raise ValueError("DNS name exceeds wire limit")
+            labels.append(packet[offset + 1 : offset + 1 + size].lower())
+            offset += 1 + size
+        else:
+            raise ValueError("invalid DNS label")
+    raise ValueError("DNS name traversal bound")
+
+
 def dns_probe(router_address):
-    """Exactly one UDP A query for example.com to the reviewed router address/port53."""
+    """One fixed query; success requires a direct IN/A answer owned by example.com."""
     address = ipaddress.IPv4Address(router_address)
     if address.is_unspecified or address.is_loopback or address.is_multicast:
         raise ValueError("invalid router probe address")
@@ -213,44 +246,29 @@ def dns_probe(router_address):
             connection.settimeout(3)
             connection.connect((str(address), 53))
             connection.send(packet)
-            reply = connection.recv(4096)
-        if (
-            len(reply) < 12 + len(_QUESTION)
-            or reply[:2] != query_id
-            or reply[12 : 12 + len(_QUESTION)] != _QUESTION
-        ):
+            reply = connection.recv(4097)
+        if not 12 <= len(reply) <= 4096 or reply[:2] != query_id:
             return False
-        flags, questions, answers = struct.unpack("!HHH", reply[2:8])
+        flags, questions, answers, authority, additional = struct.unpack(
+            "!5H", reply[2:12]
+        )
         if not (
             flags & 0x8000
-            and not flags & 0x020F
+            and not flags & 0x7A0F
             and questions == 1
             and 0 < answers <= 64
+            and answers + authority + additional <= 128
         ):
             return False
-        offset = 12 + len(_QUESTION)
+        starts = set()
+        expected = (b"example", b"com")
+        question, offset = _dns_name(reply, 12, starts)
+        if question != expected or reply[offset : offset + 4] != b"\0\1\0\1":
+            return False
+        offset += 4
         found = False
-        for _ in range(answers):
-            # A pointer terminates an owner name and must target inside this packet.
-            for _label in range(128):
-                if offset >= len(reply):
-                    return False
-                size = reply[offset]
-                offset += 1
-                if size == 0:
-                    break
-                if size & 0xC0 == 0xC0:
-                    if offset >= len(reply) or not 12 <= (
-                        (size & 0x3F) << 8 | reply[offset]
-                    ) < len(reply):
-                        return False
-                    offset += 1
-                    break
-                if size > 63 or offset + size > len(reply):
-                    return False
-                offset += size
-            else:
-                return False
+        for index in range(answers + authority + additional):
+            owner, offset = _dns_name(reply, offset, starts)
             if offset + 10 > len(reply):
                 return False
             kind, dns_class, _ttl, length = struct.unpack(
@@ -259,10 +277,16 @@ def dns_probe(router_address):
             offset += 10
             if offset + length > len(reply):
                 return False
-            found |= kind == 1 and dns_class == 1 and length == 4
+            found |= (
+                index < answers
+                and owner == expected
+                and kind == 1
+                and dns_class == 1
+                and length == 4
+            )
             offset += length
-        return found
-    except OSError:
+        return found and offset == len(reply)
+    except (OSError, ValueError):
         return False
 
 
