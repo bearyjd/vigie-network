@@ -11,11 +11,30 @@ if [ "${VIGIE_TEST:-}" = 1 ]; then
 	COLLECTOR="${VIGIE_COLLECTOR_BIN:-$COLLECTOR}"
 	STATE="${VIGIE_RUN_STATE_DIR:-$STATE}"
 fi
-# procd signals this PID only. Install flag-only traps before creating the child,
-# including the window before $! is assigned. Never signal an empty PID/group.
+# procd signals this PID only. Install traps before creating the child, including
+# the window before $! is assigned. Never signal an empty PID/group.
 stop_rc=0
-trap '[ "$stop_rc" -ne 0 ] || stop_rc=143' TERM
-trap '[ "$stop_rc" -ne 0 ] || stop_rc=130' INT
+child=
+forwarded=0
+forward_stop() {
+	[ -n "$child" ] && [ "$forwarded" -eq 0 ] || return 0
+	# Set BEFORE kill: a repeated trap must never signal twice or after the reap.
+	forwarded=1
+	# Async POSIX children may inherit INT ignored: normalize both stops to TERM.
+	# This is the dedicated UID's sole managed child, not atomic PID pinning.
+	kill -TERM "$child" 2>/dev/null || :
+}
+# Called by the signal traps below.
+# shellcheck disable=SC2329
+request_stop() {
+	# The first request owns shutdown, including the pre-assignment pending state.
+	trap '' TERM INT
+	[ "$stop_rc" -ne 0 ] || stop_rc=$1
+	# Flag-only traps lose a stop delivered after the branch check but before wait.
+	forward_stop
+}
+trap 'request_stop 143' TERM
+trap 'request_stop 130' INT
 [ "$stop_rc" -eq 0 ] || exit "$stop_rc"
 "$COLLECTOR" "$@" &
 child=$!
@@ -24,15 +43,14 @@ if [ "$stop_rc" -eq 0 ]; then
 	rc=$?
 else
 	# Stop arrived between the pre-launch check and the first wait.
+	forward_stop
 	rc=128
 fi
 if [ "$stop_rc" -ne 0 ]; then
 	# Further requests must not interrupt the final reap or cause repeated kills.
 	trap '' TERM INT
 	if [ "$rc" -ge 128 ]; then
-		# Async POSIX children may inherit INT ignored: normalize both stops to TERM.
-		# This is the dedicated UID's sole managed child, not atomic PID pinning.
-		kill -TERM "$child" 2>/dev/null || :
+		# The handler (or pending-stop branch) already forwarded exactly once.
 		wait "$child"
 	fi
 	exit "$stop_rc"
