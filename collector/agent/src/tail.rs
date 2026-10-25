@@ -8,6 +8,8 @@
 //!   bytes before its cursor and compares them on every poll. A shorter file or different bytes
 //!   restart at offset 0 and drop the partial line, so a cursor that now sits inside a line
 //!   somebody else wrote is never trusted. Resets and lost bytes are counted (`take_counts`).
+//! - `poll_with_gaps` also reports where bytes were lost (reset, rotation dropping a partial
+//!   line, overlong line) as `None`, so the DHCP assembler can drop its attach contexts there.
 //! - Bounded: lines over `MAX_LINE` bytes are dropped, at most `MAX_POLL_BYTES` read per poll.
 
 use std::collections::BTreeMap;
@@ -52,6 +54,11 @@ impl Tail {
 
     /// New complete lines since the last poll. A missing file is not an error.
     pub fn poll(&mut self) -> io::Result<Vec<String>> {
+        Ok(self.poll_with_gaps()?.into_iter().flatten().collect())
+    }
+
+    /// Like `poll`, with a `None` at every place where bytes were lost between two lines.
+    pub fn poll_with_gaps(&mut self) -> io::Result<Vec<Option<String>>> {
         let mut out = Vec::new();
         let mut budget = MAX_POLL_BYTES;
         if self.cur.is_none() {
@@ -75,10 +82,13 @@ impl Tail {
     }
 
     /// One drain-then-maybe-rotate step; `Ok(true)` when the loop should go on.
-    fn step(&mut self, budget: &mut u64, out: &mut Vec<String>) -> io::Result<bool> {
+    fn step(&mut self, budget: &mut u64, out: &mut Vec<Option<String>>) -> io::Result<bool> {
         *budget = budget.saturating_sub(self.drain_current(*budget, out)?);
         if !self.rotated()? || *budget == 0 {
             return Ok(false);
+        }
+        if !self.carry.is_empty() {
+            out.push(None);
         }
         self.open_new(false)?;
         Ok(self.cur.is_some())
@@ -132,13 +142,14 @@ impl Tail {
         Ok(now.ino() != *ino && self.pos >= f.metadata()?.len())
     }
 
-    fn drain_current(&mut self, budget: u64, out: &mut Vec<String>) -> io::Result<u64> {
+    fn drain_current(&mut self, budget: u64, out: &mut Vec<Option<String>>) -> io::Result<u64> {
         let Some((f, _)) = &mut self.cur else {
             return Ok(0);
         };
         let len = f.metadata()?.len();
         if len < self.pos || read_before(f, self.pos)? != self.fingerprint {
             self.resets += 1;
+            out.push(None);
             self.skipped += self.carry.len() as u64;
             self.pos = 0;
             self.fingerprint.clear();
@@ -159,11 +170,11 @@ impl Tail {
         Ok(n as u64)
     }
 
-    fn split_lines(&mut self, buf: &[u8], out: &mut Vec<String>) {
+    fn split_lines(&mut self, buf: &[u8], out: &mut Vec<Option<String>>) {
         for &b in buf {
             if b == b'\n' {
                 if !self.skipping {
-                    out.push(String::from_utf8_lossy(&self.carry).into_owned());
+                    out.push(Some(String::from_utf8_lossy(&self.carry).into_owned()));
                 }
                 self.carry.clear();
                 self.skipping = false;
@@ -172,6 +183,7 @@ impl Tail {
                     self.skipped += self.carry.len() as u64 + 1;
                     self.carry.clear();
                     self.skipping = true;
+                    out.push(None);
                 } else {
                     self.carry.push(b);
                 }

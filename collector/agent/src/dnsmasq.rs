@@ -57,6 +57,12 @@ pub enum LogEvent {
     DhcpTags {
         id: String,
     },
+    /// `<xid> available DHCP range: ...`: dnsmasq's first line of a packet. It opens the
+    /// preamble that the packet's `vendor class:` / `client provides name:` lines (which precede
+    /// the `DHCPREQUEST`) are collected in.
+    DhcpPacketStart {
+        id: String,
+    },
     DhcpOptions {
         id: String,
         opt55: Vec<u8>,
@@ -168,6 +174,11 @@ fn parse_dhcp(id: &str, rest: &str) -> Option<LogEvent> {
         let sane = v.len() <= MAX_TAGS_LEN && !v.chars().any(char::is_control);
         return sane.then_some(LogEvent::DhcpTags { id });
     }
+    if let Some(v) = rest.strip_prefix("available DHCP range:") {
+        let v = v.trim();
+        let sane = v.len() <= MAX_TAGS_LEN && !v.chars().any(char::is_control);
+        return sane.then_some(LogEvent::DhcpPacketStart { id });
+    }
     if let Some(v) = rest.strip_prefix("requested options:") {
         let opt55 = v
             .split(',')
@@ -249,17 +260,46 @@ struct Context {
     opts_started: bool,
 }
 
-/// Joins the per-transaction DHCP lines into one lease on `DHCPACK`.
+/// Vendor class and client name lines that dnsmasq logs BEFORE the `DHCPREQUEST` of the same
+/// packet, collected after a packet-start marker. At most one is open; it moves into the
+/// `DHCPREQUEST` of the same serial that directly follows, and is dropped on anything else.
+#[derive(Debug)]
+struct Preamble {
+    id: String,
+    class: Option<String>,
+    name: Option<String>,
+}
+
+/// The verified `DHCPACK` whose `requested options:` lines (logged AFTER the ACK) are being read.
+/// Each line extends `lease` for the ACKed MAC only; any other line ends it.
+#[derive(Debug)]
+struct PostAck {
+    id: String,
+    lease: Lease,
+    /// An options line has already been attached (later ones extend, the first replaces).
+    started: bool,
+}
+
+/// Joins the per-transaction DHCP lines into leases.
 ///
 /// The serial (xid) is chosen by the client, so it proves nothing. The log is therefore read as
-/// a sequential stream: a fingerprint line is attached only to the packet line directly before
-/// it (same serial, nothing in between). Every other line, including every DHCP verb we do not
-/// build leases from, ends that context; INFORM/RELEASE/DECLINE/NAK also poison the serial.
+/// a sequential stream, and a fingerprint line is attached only where it directly continues the
+/// packet it belongs to (same serial, nothing in between):
+/// - `vendor class:` / `client provides name:` right after a packet-start marker, up to the
+///   `DHCPREQUEST` of the same serial (`Preamble`);
+/// - `requested options:` right after a verified `DHCPACK` (`PostAck`), which emits cumulative
+///   leases for that MAC;
+/// - (older assumed order) any of the three right after the `DHCPREQUEST` (`Context`).
+///
+/// Every other line, including every DHCP verb we do not build leases from, ends all contexts;
+/// INFORM/RELEASE/DECLINE/NAK also poison the serial.
 #[derive(Debug, Default)]
 pub struct DhcpAssembler {
     partial: HashMap<String, DhcpPartial>,
     order: VecDeque<String>,
     ctx: Option<Context>,
+    pre: Option<Preamble>,
+    post: Option<PostAck>,
 }
 
 impl DhcpAssembler {
@@ -275,9 +315,11 @@ impl DhcpAssembler {
         self.partial.entry(id.to_string()).or_default()
     }
 
-    /// A log line that is not one of ours (unparsed, or DNS) ends the attach context.
+    /// A log line that is not one of ours (unparsed, or DNS) ends every attach context.
     pub fn break_context(&mut self) {
         self.ctx = None;
+        self.pre = None;
+        self.post = None;
     }
 
     /// The entry a fingerprint line may be attached to, or `None` (and the context is dropped
@@ -293,29 +335,26 @@ impl DhcpAssembler {
     }
 
     pub fn feed(&mut self, ev: &LogEvent) -> Option<Lease> {
+        // Preamble and post-ACK contexts survive only the lines that directly continue them.
+        let pre = self.pre.take().filter(|p| continues_preamble(ev, &p.id));
+        let post = self.post.take().filter(|p| continues_post_ack(ev, &p.id));
         match ev {
-            LogEvent::DhcpRequest { id, mac, discover } => {
-                let mac = crate::mac::normalize(mac);
-                let p = self.entry(id);
-                // The serial is attacker-chosen: a second MAC on it poisons the entry for good.
-                let foreign =
-                    matches!((&p.mac, &mac), (Some(old), new) if Some(old) != new.as_ref());
-                if foreign || mac.is_none() {
-                    p.taint();
-                } else if *discover {
-                    p.clear_fingerprint();
-                }
-                if p.mac.is_none() {
-                    p.mac = mac.clone();
-                }
-                self.ctx = Some(Context {
+            LogEvent::DhcpPacketStart { id } => {
+                self.ctx = None;
+                self.pre = Some(Preamble {
                     id: id.clone(),
-                    mac,
-                    opts_started: false,
+                    class: None,
+                    name: None,
                 });
+            }
+            LogEvent::DhcpRequest { id, mac, discover } => {
+                self.on_request(id, mac, *discover, pre.as_ref());
             }
             // dnsmasq may split a long list over several lines (assumed); accumulate.
             LogEvent::DhcpOptions { id, opt55 } => {
+                if let Some(pa) = post {
+                    return self.extend_post_ack(pa, opt55);
+                }
                 if let Some((p, started)) = self.attach_target(id) {
                     if !*started {
                         p.opt55.clear();
@@ -325,21 +364,39 @@ impl DhcpAssembler {
                     p.opt55.truncate(MAX_OPT55);
                 }
             }
-            LogEvent::DhcpVendor { id, class } => {
-                if let Some((p, _)) = self.attach_target(id) {
-                    p.class = Some(class.clone());
+            LogEvent::DhcpVendor { id, class } => match pre {
+                Some(pre) => {
+                    self.pre = Some(Preamble {
+                        class: Some(class.clone()),
+                        ..pre
+                    })
                 }
-            }
-            LogEvent::DhcpName { id, name } => {
-                if let Some((p, _)) = self.attach_target(id) {
-                    p.name = Some(name.clone());
+                None => {
+                    if let Some((p, _)) = self.attach_target(id) {
+                        p.class = Some(class.clone());
+                    }
                 }
-            }
-            // Neutral: the context survives only if it is this xid's; it is never created here.
+            },
+            LogEvent::DhcpName { id, name } => match pre {
+                Some(pre) => {
+                    self.pre = Some(Preamble {
+                        name: Some(name.clone()),
+                        ..pre
+                    })
+                }
+                None => {
+                    if let Some((p, _)) = self.attach_target(id) {
+                        p.name = Some(name.clone());
+                    }
+                }
+            },
+            // Neutral: every context survives only if it is this xid's; none is created here.
             LogEvent::DhcpTags { id } => {
                 if self.ctx.as_ref().is_some_and(|c| &c.id != id) {
                     self.ctx = None;
                 }
+                self.pre = pre;
+                self.post = post;
             }
             LogEvent::DhcpBoundary { id, poison } => {
                 self.ctx = None;
@@ -349,18 +406,92 @@ impl DhcpAssembler {
             }
             LogEvent::DhcpAck { id, mac, ip, name } => {
                 self.ctx = None;
-                let mut p = self.partial.remove(id).unwrap_or_default();
-                self.order.retain(|o| o != id);
-                if p.mac.is_none() || p.mac != crate::mac::normalize(mac) {
-                    p.taint();
-                }
-                let host = name.as_deref().or(p.name.as_deref());
-                return Lease::new(mac, ip, host, &p.opt55, p.class.as_deref());
+                return self.on_ack(id, mac, ip, name.as_deref());
             }
             LogEvent::Query { .. } | LogEvent::Answer { .. } => self.ctx = None,
         }
         None
     }
+
+    fn on_request(&mut self, id: &str, mac: &str, discover: bool, pre: Option<&Preamble>) {
+        let mac = crate::mac::normalize(mac);
+        let p = self.entry(id);
+        // The serial is attacker-chosen: a second MAC on it poisons the entry for good.
+        let foreign = matches!((&p.mac, &mac), (Some(old), new) if Some(old) != new.as_ref());
+        if foreign || mac.is_none() {
+            p.taint();
+        } else if discover {
+            p.clear_fingerprint();
+        }
+        if p.mac.is_none() {
+            p.mac = mac.clone();
+        }
+        if let (Some(pre), false) = (pre, p.tainted) {
+            // A marked packet states its own vendor/name: nothing is inherited from a retry.
+            p.class = pre.class.clone();
+            p.name = pre.name.clone();
+        }
+        self.ctx = Some(Context {
+            id: id.to_string(),
+            mac,
+            opts_started: false,
+        });
+    }
+
+    fn on_ack(&mut self, id: &str, mac: &str, ip: &str, name: Option<&str>) -> Option<Lease> {
+        let mut p = self.partial.remove(id).unwrap_or_default();
+        self.order.retain(|o| o != id);
+        if p.mac.is_none() || p.mac != crate::mac::normalize(mac) {
+            p.taint();
+        }
+        let host = name.or(p.name.as_deref());
+        let lease = Lease::new(mac, ip, host, &p.opt55, p.class.as_deref())?;
+        if !p.tainted {
+            self.post = Some(PostAck {
+                id: id.to_string(),
+                lease: lease.clone(),
+                started: false,
+            });
+        }
+        Some(lease)
+    }
+
+    /// Adds one `requested options:` line to the verified ACK and re-emits the lease.
+    fn extend_post_ack(&mut self, pa: PostAck, opt55: &[u8]) -> Option<Lease> {
+        let kept: &[u8] = if pa.started { &pa.lease.opt55 } else { &[] };
+        let merged = kept.iter().chain(opt55).copied().take(MAX_OPT55).collect();
+        let lease = Lease {
+            opt55: merged,
+            ..pa.lease
+        };
+        self.post = Some(PostAck {
+            id: pa.id,
+            lease: lease.clone(),
+            started: true,
+        });
+        Some(lease)
+    }
+}
+
+/// Lines that directly continue an open preamble: the packet's own vendor/name/tags lines and
+/// the `DHCPREQUEST` that consumes it.
+fn continues_preamble(ev: &LogEvent, id: &str) -> bool {
+    matches!(
+        ev,
+        LogEvent::DhcpVendor { id: i, .. }
+            | LogEvent::DhcpName { id: i, .. }
+            | LogEvent::DhcpTags { id: i }
+            | LogEvent::DhcpRequest { id: i, .. }
+        if i == id
+    )
+}
+
+/// Lines that directly continue a verified ACK: its own options (and neutral tags) lines.
+fn continues_post_ack(ev: &LogEvent, id: &str) -> bool {
+    matches!(
+        ev,
+        LogEvent::DhcpOptions { id: i, .. } | LogEvent::DhcpTags { id: i } if i == id
+    )
 }
 
 impl DhcpPartial {

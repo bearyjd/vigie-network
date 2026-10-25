@@ -1,0 +1,10 @@
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 available DHCP range: 192.0.2.10 -- 192.0.2.50
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 vendor class: fixture-vendor
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 client provides name: fixture-client
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 DHCPREQUEST(br-lan) 192.0.2.10 02:00:00:00:00:01
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 tags: br-lan
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 DHCPACK(br-lan) 192.0.2.10 02:00:00:00:00:01 fixture-client
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 requested options: 1:netmask, 3:router
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 requested options: 6:dns-server, 15:domain-name
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 next server: 192.0.2.1
+Oct 20 14:00:00 dnsmasq-dhcp[123]: 1 sent size: 1 option: 53 message-type 5

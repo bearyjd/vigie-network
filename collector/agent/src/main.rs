@@ -149,9 +149,14 @@ impl Agent {
     }
 
     fn poll_log(&mut self, now: u64) {
-        match self.tail.poll() {
+        match self.tail.poll_with_gaps() {
             Ok(lines) => {
                 for line in &lines {
+                    // `None`: bytes were lost here, so nothing may attach across it.
+                    let Some(line) = line else {
+                        self.dhcp.break_context();
+                        continue;
+                    };
                     match parse_line(line) {
                         Some(ev) => {
                             self.dns.feed(&ev, now);
