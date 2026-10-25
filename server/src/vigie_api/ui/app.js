@@ -1,5 +1,5 @@
 import {ApiClient, ApiError, StaleResult} from './client.js';
-import {node, empty, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, utc} from './views.js';
+import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, utc} from './views.js';
 
 const byId = id => document.getElementById(id);
 const client = new ApiClient();
@@ -13,8 +13,13 @@ function interacting() { return state.updated !== null && byId('content').contai
 function resetPage() { state.cursors = [null]; state.page = 0; state.next = null; }
 function range() { const to = Math.floor(Date.now() / 3600000) * 3600 + 3600; return {from: to - state.hours * 3600, to}; }
 function notice(message = '', retry = false) {
-  const box = byId('notice'); box.replaceChildren(); box.hidden = !message;
-  if (message) { box.append(node('span', {}, message)); if (retry) box.append(node('button', {type: 'button', disabled: Date.now() < client.retryAt ? '' : null, onclick: () => load(false)}, 'Retry')); }
+  const box = byId('notice'); const hadFocus = box.contains(document.activeElement); box.replaceChildren(); box.hidden = !message;
+  let button = null;
+  if (message) { box.append(node('span', {}, message)); if (retry) { button = node('button', {type: 'button', disabled: Date.now() < client.retryAt ? '' : null, onclick: () => load(false)}, 'Retry'); box.append(button); } }
+  if (!hadFocus) return;
+  if (button && !button.disabled) button.focus({preventScroll: true});
+  else if (message) { box.setAttribute('tabindex', '-1'); box.focus({preventScroll: true}); }
+  else byId('view-title').focus({preventScroll: true});
 }
 function chrome() {
   byId('connect-panel').hidden = state.connected; byId('workspace').hidden = !state.connected; byId('disconnect').hidden = !state.connected;
@@ -24,6 +29,8 @@ function chrome() {
   byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
   byId('refresh').setAttribute('aria-disabled', String(state.loading || Date.now() < client.retryAt));
   byId('content').setAttribute('aria-busy', String(state.loading));
+  const retryButton = byId('notice').querySelector('button'); if (retryButton) retryButton.disabled = Date.now() < client.retryAt;
+  refreshLiveLabels(byId('content'), document.hidden || interacting(), state.updated === null ? null : Date.now() / 1000 - state.updated);
   byId('refresh-status').textContent = document.hidden ? 'Refresh paused while hidden' : state.loading ? 'Refreshing…' : interacting() ? `Refresh paused while interacting · snapshot ${utc(state.updated)}` : state.updated ? `Updated ${utc(state.updated)} · refresh every 30s` : 'Refreshes every 30 seconds while visible';
 }
 function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false, null, true), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
@@ -103,3 +110,4 @@ byId('content').addEventListener('focusout', () => queueMicrotask(chrome));
 document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (document.hidden) { client.invalidate(); state.generation++; state.loading = false; chrome(); } else if (state.connected) load(false, null, true); });
 window.addEventListener('pagehide', () => disconnected());
 chrome();
+setInterval(() => { if (state.connected) chrome(); }, 5000);

@@ -2,8 +2,9 @@
 // Run from any directory: node /path/to/repository/tools/gui/frontend_contracts.mjs
 import assert from 'node:assert/strict';
 import {ApiClient,ApiError,StaleResult,retryTime} from '../../server/src/vigie_api/ui/client.js';
-import {processingState} from '../../server/src/vigie_api/ui/views.js';
+import {processingState,coverageView,liveLabel} from '../../server/src/vigie_api/ui/views.js';
 globalThis.location={origin:'http://127.0.0.1:18745'};
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const now=Date.parse('2026-10-25T12:00:00Z');
 assert.equal(processingState({backlog_batches:0,backlog_capped:false,oldest_pending_received_at:null},now).label,'Drained');
 for(const c of [{backlog_batches:0,backlog_capped:true,oldest_pending_received_at:null},{backlog_batches:1,backlog_capped:false,oldest_pending_received_at:null},{backlog_batches:0,backlog_capped:false},{backlog_batches:1,backlog_capped:false,oldest_pending_received_at:'2026-10-25T12:00:01Z'}])assert.equal(processingState(c,now).label,'Unknown');
@@ -64,6 +65,23 @@ for (const kind of ['coverage', 'activity']) {
   finish(new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {hours: grid}})));
   assert.equal((await pending).data.hours.length, 24, 'response validation used a later range');
 }
+
+
+// A response whose body finishes after invalidate()/disconnect must never be delivered.
+{
+  const c=new ApiClient();c.setToken('synthetic-only');let release;
+  globalThis.fetch=async()=>new Response(new ReadableStream({start(controller){release=()=>{controller.enqueue(new TextEncoder().encode(JSON.stringify({ok:true,data:[],page:{next_cursor:null}})));controller.close();};}}));
+  const pending=c.devices();await tick();await tick();c.invalidate();release();
+  await assert.rejects(pending,e=>e instanceof StaleResult,'body completed after invalidate was delivered');
+}
+// The view layer re-validates the UTC grid itself: a numeric string passes `% 3600`, so the integer check is not dead.
+for(const hour of ['7200',7200.5,3601,-3600,null])assert.throws(()=>coverageView({collector:{},hours:[{hour,state:'missing',reasons:[]}]}),/Malformed monitoring response/,`hour ${String(hour)} accepted`);
+// 'Current' is only claimed for a fresh, live, unpaused snapshot.
+assert.equal(liveLabel(true,false,5),'Current');
+assert.equal(liveLabel(true,true,5),'Snapshot (paused)');
+assert.equal(liveLabel(true,false,121),'Stale');assert.equal(liveLabel(true,true,121),'Stale');assert.equal(liveLabel(true,false,null),'Stale');
+assert.equal(liveLabel(true,false,120),'Current');
+assert.equal(liveLabel(false,false,5),'Stale / unknown');assert.equal(liveLabel(false,true,5),'Stale / unknown');
 
 // Deadline failures are surfaced and cleaned up without a real 15-second wait.
 const originalSetTimeout = globalThis.setTimeout; const originalClearTimeout = globalThis.clearTimeout;

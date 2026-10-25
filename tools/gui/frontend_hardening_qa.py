@@ -146,6 +146,20 @@ class HardeningQA(BrowserQA):
         expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
         check(audit.count("/devices") == before + 1, "polling did not resume after reading")
 
+    def observation_badge_follows_pause_and_age(self, page, context, audit):
+        self.prepare(page)
+        page.clock.install(time=datetime.now(UTC).replace(minute=10, second=0, microsecond=0))
+        self.connect(page)
+        badge = page.locator("#content [data-live-current]").first
+        expect(badge).to_have_text("Current")
+        page.locator("#content .hour-strip").evaluate("element => {element.tabIndex=0; element.focus()}")
+        expect(badge).to_have_text("Snapshot (paused)")
+        page.clock.fast_forward(125000)
+        expect(badge).to_have_text("Stale")  # recomputed by the timer, no render or refresh
+        page.locator("#refresh").focus()
+        page.locator("#refresh").click()
+        expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
+
     def hidden_scope_change(self, page, context, audit):
         self.prepare(page)
         self.connect(page)
@@ -231,7 +245,8 @@ def main():
             env={**os.environ, "FONTCONFIG_FILE": str(config), "FONTCONFIG_PATH": "/etc/fonts"})
         try:
             for name in ("focus_lifecycle", "header_focus_during_request",
-                         "interaction_polling", "hidden_scope_change", "incomplete_coverage"):
+                         "interaction_polling", "observation_badge_follows_pause_and_age",
+                         "hidden_scope_change", "incomplete_coverage"):
                 qa.case(browser, name, getattr(qa, name),
                         network_errors=name == "hidden_scope_change")
         finally:
