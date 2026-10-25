@@ -16,28 +16,32 @@ wl-copy < /tmp/vigie-gui-preview-20261025-v1/read-token.private
 
 The assistant does not change the clipboard. The token is not bundled in public assets, URL, cookies or browser storage. Disconnect clears it from page memory and aborts outstanding requests. JSON API routes still require authentication; read-only tokens cannot write. The UI shell is public and serves only five packaged assets.
 
-Preview PID: `1923379`; native start ticks `13763246`; bound only to `127.0.0.1:18745`. It automatically exits after 8 hours from this preview process launch. A numeric PID alone is not a safe stop target after it exits. To stop the current preview early, run this identity-checked command on the native Tower; it refuses a different owner, start time or command and sends TERM through a pinned process descriptor:
+## Manage the owned preview safely
+
+Run these commands on the native Tower from the GUI worktree. The controller uses only Python's standard library, so status/start/stop need no manual `PYTHONPATH` or foreground server shell:
 
 ```sh
-python3 - <<'PYTHON'
-import json, os, pathlib, signal
-record = pathlib.Path("/tmp/vigie-gui-preview-20261025-v1/server-identity-attempt3.private.json")
-proof = json.loads(record.read_text())
-assert proof["pid"] == 1923379 and proof["start_ticks"] == "13763246"
-fd = os.pidfd_open(proof["pid"])
-try:
-    process = pathlib.Path("/proc") / str(proof["pid"])
-    assert process.stat().st_uid == os.getuid()
-    start = (process / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-    command = (process / "cmdline").read_bytes().replace(bytes([0]), b" ").decode().strip()
-    assert start == proof["start_ticks"] and command == proof["command"]
-    signal.pidfd_send_signal(fd, signal.SIGTERM)
-finally:
-    os.close(fd)
-PYTHON
+/usr/bin/python3 tools/gui/preview.py status --directory /tmp/vigie-gui-preview-20261025-v1
+/usr/bin/python3 tools/gui/preview.py start --directory /tmp/vigie-gui-preview-20261025-v1
+/usr/bin/python3 tools/gui/preview.py stop --directory /tmp/vigie-gui-preview-20261025-v1
 ```
 
-The private manifest, current server log and `server-identity-attempt3.private.json` are in `/tmp/vigie-gui-preview-20261025-v1/`. The previous process log is retained as `server-attempt2.log`, with its original identity record unchanged. A future preview gets a fresh directory; never overwrite a failed/existing seed. The PID identifies this development process, not a production service.
+Start reuses the existing verified synthetic seed; it never reseeds or overwrites databases. It remembers the installed package directory and child interpreter from the previous managed start. For the first managed start, the current default package is `/tmp/vigie-gui-wheel-target-attempt3` and the child interpreter is `/tmp/vigie-pr9-native-server-env/bin/python`. Override them explicitly for a newly reviewed wheel:
+
+```sh
+/usr/bin/python3 tools/gui/preview.py start \
+  --directory /tmp/vigie-gui-preview-20261025-v1 \
+  --package-dir /tmp/vigie-gui-wheel-target-attempt3 \
+  --python /tmp/vigie-pr9-native-server-env/bin/python
+```
+
+The native controller must support Linux process descriptors; it refuses before spawning on Python builds without them. The cached Python3.12 application interpreter is used only for the detached server. The server still binds only to `127.0.0.1:18745`, receives no production credential/configuration environment, uses private logs and stdin `/dev/null`, and exits after eight server-runtime hours.
+
+Status is read-only and prints the safe URL, source, token filepath, managed state and available process/log metadata; it never reads or prints the token. Start reports an already-running owned preview without restarting it, and refuses an occupied foreign port or an uncertain/changed process. Stop checks UID, boot ID, process start ticks and the complete recorded argument list, then uses a pinned process descriptor for TERM. It never guesses a PID, signals a process group or forces KILL.
+
+One fixed private lock protects port18745 across all preview directories. Each start preserves a new `managed-*.jsonl` attempt journal and `managed-*.log`, with an atomic `manager-current.json` pointer. Failed attempts, existing legacy logs and identity records remain intact. A partial or malformed receipt is refused rather than adopted. Do not remove receipts to bypass an uncertain state.
+
+The legacy preview PID1923379 is currently **unmanaged** by these new commands. The manager intentionally refuses to adopt or stop it. A separately identity-checked transition is required after the new helper's independent review; no transition has been performed during code preparation. This paragraph will be updated after that verified transition.
 
 ## Reproduce with existing native dependencies
 
@@ -52,7 +56,7 @@ PYTHONPATH=/tmp/vigie-gui-wheel-target-attempt3 \
 
 On the container workspace, prefix the command with `host-spawn /usr/bin/env` and place `PYTHONPATH=...` after `env`. The server uses no production DB/config/token mounts and opens no connection to the live API. No LAN listener, reverse proxy, firewall change or production deployment is performed.
 
-For another isolated instance after stopping the existing preview, create a NEW direct `/tmp/vigie-gui-preview-*` directory with the script's `seed` action, then `serve`. Only loopback port `18745` is supported; existing directories, symlinked/shared database files and non-synthetic manifests are refused. The seed command prints a safe manifest and token filepath, never the token.
+For another isolated instance after stopping the existing preview, create a NEW direct `/tmp/vigie-gui-preview-*` directory with the script's `seed` action, then `serve`. Only loopback port `18745` is supported. Seed refuses existing directories; serve/start reuse only privately owned synthetic files and refuse symlinked/shared databases or a non-synthetic manifest. The seed command prints a safe manifest and token filepath, never the token.
 
 ## Verification and future delivery
 
@@ -72,3 +76,5 @@ python3 tools/gui/browser_qa.py \
 ```
 
 Use a new output directory for each attempt. The QA tool reads the synthetic token privately, masks the token field for screenshots, and creates a private per-run browser font cache/configuration without changing host fonts or user caches. Backend regression validation remains 1,468 passed and one known expected failure with 95.30% coverage; the two final CSS/DOM presentation changes were followed by 23 focused fixtures and installed-wheel/served-asset checks rather than repeating that full suite.
+
+The preview-manager safety fixtures cover process identity reuse/drift, unmanaged listeners, readiness ownership, symlink/partial/malformed receipts, shared-lock exclusion, child environment/stdin/privacy, startup failures and TERM-only stopping. Tests use temporary namespaces and mocked children; they do not stop the current preview. A new managed start still requires independent review before any real process transition.

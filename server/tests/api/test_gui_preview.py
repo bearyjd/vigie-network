@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from vigie_api.app import create_app
@@ -95,7 +96,7 @@ def test_preview_server_ignores_production_environment_and_has_bounded_lifetime(
         def run(self):
             pass
 
-    monkeypatch.setattr(preview.uvicorn, "Server", Server)
+    monkeypatch.setattr(uvicorn, "Server", Server)
     preview.serve(root)
     assert len(configs) == 1
     config = configs[0]

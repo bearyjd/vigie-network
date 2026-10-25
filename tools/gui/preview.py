@@ -8,28 +8,35 @@ uses explicit own DB paths and automatically exits after8hours. No live collecto
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
+import math
 import os
+import re
+import select
+import signal
+import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
-
-import uvicorn
-
-from vigie_api import tokens
-from vigie_api.app import create_app
-from vigie_api.config import Settings
-from vigie_api.schema import open_overrides
-from vigie_ingest.db import iso_utc
-from vigie_pipeline.schema import open_pipeline_inventory
 
 COLLECTOR = "synthetic-preview"
 ATTACK_DEVICE = str(uuid.UUID(int=1))
 INCIDENT = "synthetic-incident-1"
 PREVIEW_SECONDS = 8 * 3600
 PREVIEW_PARENT = Path("/tmp")  # noqa: S108 -- absent owned0700 child required; never shared files.
+PORT = 18745
+LOCK = PREVIEW_PARENT / "vigie-gui-preview-18745.lock"
+DEFAULT_PACKAGE = PREVIEW_PARENT / "vigie-gui-wheel-target-attempt3"
+DEFAULT_PYTHON = PREVIEW_PARENT / "vigie-pr9-native-server-env/bin/python"
+CURRENT = "manager-current.json"
 
 
 def directory(value: str) -> Path:
@@ -53,6 +60,11 @@ def seed(root: Path) -> dict:
 
 
 def _seed(root: Path) -> dict:
+    from vigie_api import tokens
+    from vigie_api.schema import open_overrides
+    from vigie_ingest.db import iso_utc
+    from vigie_pipeline.schema import open_pipeline_inventory
+
     root.mkdir(mode=0o700)
     now = time.time()
     hour = int(now) // 3600 * 3600
@@ -190,7 +202,7 @@ def _seed(root: Path) -> dict:
         ov.close()
 
 
-def serve(root: Path) -> None:
+def validate_namespace(root: Path) -> dict:
     st = root.lstat()
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o777 != 0o700:
         raise ValueError("preview directory must be privately owned0700")
@@ -204,9 +216,33 @@ def serve(root: Path) -> None:
             or st.st_nlink != 1
         ):
             raise ValueError("preview files must be owned0600 regular single-link files")
-    manifest = json.loads((root / "manifest.json").read_text())
-    if manifest.get("synthetic") is not True or manifest.get("collector_id") != COLLECTOR:
+    manifest = read_private(root / "manifest.json", json_value=True)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("synthetic") is not True
+        or manifest.get("collector_id") != COLLECTOR
+        or manifest.get("token_file") != str(root / "read-token.private")
+        or manifest.get("url") != "http://127.0.0.1:18745/ui/?preview=synthetic"
+    ):
         raise ValueError("explicit synthetic seed manifest required")
+    return manifest
+
+
+def serve(root: Path, listen_fd: int | None = None) -> None:
+    import uvicorn
+
+    from vigie_api.app import create_app
+    from vigie_api.config import Settings
+
+    validate_namespace(root)
+    listener = None if listen_fd is None else socket.socket(fileno=listen_fd)
+    if listener is not None and (
+        listener.family != socket.AF_INET
+        or listener.getsockname() != ("127.0.0.1", PORT)
+        or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+    ):
+        listener.close()
+        raise ValueError("only the fixed loopback preview listener may be inherited")
     settings = Settings(
         data_dir=root,
         inventory_db=root / "inventory.db",
@@ -228,23 +264,526 @@ def serve(root: Path) -> None:
     timer.daemon = True
     timer.start()
     try:
-        server.run()
+        if listener is None:
+            server.run()
+        else:
+            server.run(sockets=[listener])
     finally:
         timer.cancel()
+        if listener is not None:
+            listener.close()
 
 
-def main() -> None:
+def read_private(path: Path, *, json_value: bool = False):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or stat.S_IMODE(st.st_mode) != 0o600
+            or st.st_nlink != 1
+            or st.st_size > 65536
+        ):
+            raise ValueError("unsafe manager/preview file")
+        raw = os.read(fd, 65537)
+        if len(raw) != st.st_size:
+            raise ValueError("preview file changed while reading")
+        return json.loads(raw) if json_value else raw
+    finally:
+        os.close(fd)
+
+
+def write_new(path: Path, raw: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.write(fd, raw) != len(raw):
+            raise OSError("short private receipt write")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def event(journal: Path, value: dict) -> None:
+    read_private(journal)  # Refuse symlink/metadata drift before opening for append.
+    fd = os.open(journal, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+    try:
+        raw = (json.dumps({**value, "wall": time.time()}) + "\n").encode()
+        if os.write(fd, raw) != len(raw):
+            raise OSError("short manager event write")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def manager_lock():
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        current = LOCK.lstat()
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or stat.S_IMODE(st.st_mode) != 0o600
+            or st.st_nlink != 1
+            or (st.st_dev, st.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("unsafe shared preview lock")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def listeners() -> set[str]:
+    found = set()
+    for name in ("tcp", "tcp6"):
+        rows = (Path("/proc/net") / name).read_text().splitlines()
+        if not rows:
+            raise ValueError("listener state unavailable")
+        for row in rows[1:]:
+            values = row.split()
+            if len(values) < 10:
+                raise ValueError("incomplete listener state")
+            if int(values[1].rsplit(":", 1)[1], 16) == PORT and values[3] == "0A":
+                found.add(values[9])
+    return found
+
+
+def process_identity(pid: int) -> dict | None:
+    process = Path("/proc") / str(pid)
+    try:
+        st = process.stat()
+        fields = (process / "stat").read_text().rsplit(") ", 1)[1].split()
+        if fields[0] == "Z":
+            return None
+        argv = [x.decode() for x in (process / "cmdline").read_bytes().split(b"\0") if x]
+        return {
+            "pid": pid,
+            "uid": st.st_uid,
+            "start_ticks": fields[19],
+            "argv": argv,
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        }
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def owns_listener(pid: int, inode: str) -> bool:
+    for path in (Path("/proc") / str(pid) / "fd").iterdir():
+        try:
+            if os.readlink(path) == f"socket:[{inode}]":
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def current_attempt(root: Path):
+    pointer = root / CURRENT
+    if not pointer.exists() and not pointer.is_symlink():
+        return None, []
+    pointer_value = read_private(pointer, json_value=True)
+    if not isinstance(pointer_value, dict) or set(pointer_value) != {"journal"}:
+        raise ValueError("invalid current preview pointer")
+    name = pointer_value["journal"]
+    if not isinstance(name, str):
+        raise ValueError("invalid current preview journal name")
+    if not re.fullmatch(r"managed-[0-9]+-[0-9a-f]{8}\.jsonl", name):
+        raise ValueError("invalid current preview receipt")
+    journal = root / name
+    raw = read_private(journal)
+    if not raw.endswith(b"\n"):
+        raise ValueError("incomplete manager receipt; retain it and do not adopt a process")
+    rows = [json.loads(line) for line in raw.splitlines()]
+    if (
+        not rows
+        or any(not isinstance(row, dict) for row in rows)
+        or rows[0].get("state") != "prepared"
+        or rows[0].get("directory") != str(root)
+    ):
+        raise ValueError("manager receipt does not belong to this synthetic directory")
+    required = {
+        "state",
+        "directory",
+        "argv",
+        "package_dir",
+        "listener_inode",
+        "log",
+        "runtime_limit_seconds",
+        "wall",
+    }
+    first = rows[0]
+    if (
+        set(first) != required
+        or not isinstance(first["listener_inode"], str)
+        or not first["listener_inode"].isdigit()
+        or first["log"] != journal.stem + ".log"
+        or first["runtime_limit_seconds"] != PREVIEW_SECONDS
+        or not isinstance(first["package_dir"], str)
+        or not Path(first["package_dir"]).is_absolute()
+        or type(first["wall"]) not in (int, float)
+        or not math.isfinite(first["wall"])
+    ):
+        raise ValueError("invalid prepared preview receipt")
+    expected = rows[0].get("argv")
+    if (
+        not isinstance(expected, list)
+        or len(expected) != 7
+        or any(not isinstance(value, str) or "\0" in value for value in expected)
+        or expected[1:5] != [str(Path(__file__).resolve()), "serve", "--directory", str(root)]
+        or expected[5] != "--listen-fd"
+        or not expected[6].isdigit()
+    ):
+        raise ValueError("invalid fixed child command in receipt")
+    transitions = {
+        "prepared": {"spawned", "failed-before-spawn", "startup-failed"},
+        "spawned": {"ready", "startup-failed"},
+        "ready": {"stop-requested"},
+        "startup-failed": {"stop-requested", "stopped"},
+        "stop-requested": {"stop-requested", "stopped"},
+        "stopped": set(),
+        "failed-before-spawn": set(),
+    }
+    previous = "prepared"
+    born = None
+    for row in rows[1:]:
+        state = row.get("state")
+        if not isinstance(state, str) or state not in transitions[previous]:
+            raise ValueError("invalid manager event ordering")
+        if "identity" in row:
+            identity = row["identity"]
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"pid", "uid", "start_ticks", "argv", "boot_id"}
+                or type(identity["pid"]) is not int
+                or identity["pid"] <= 1
+                or type(identity["uid"]) is not int
+                or identity["uid"] != os.getuid()
+                or not isinstance(identity["start_ticks"], str)
+                or not identity["start_ticks"].isdigit()
+                or identity["argv"] != expected
+                or not isinstance(identity["boot_id"], str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity["boot_id"]
+                )
+            ):
+                raise ValueError("invalid child identity receipt")
+            if state == "spawned":
+                born = identity
+            elif born is None or identity != born:
+                raise ValueError("manager events disagree about the original child")
+        elif state in {"spawned", "ready", "stop-requested", "stopped"}:
+            raise ValueError("manager event missing original child identity")
+        if state == "startup-failed" and born is None and row.get("child_exited") is not True:
+            raise ValueError("startup child outcome is uncertain; retain the attempt")
+        previous = state
+    return journal, rows
+
+
+def status(root: Path) -> dict:
+    manifest = validate_namespace(root)
+    journal, rows = current_attempt(root)
+    common = {
+        "url": manifest["url"],
+        "token_file": manifest["token_file"],
+        "collector_id": COLLECTOR,
+    }
+    inodes = listeners()
+    saved = next((row["identity"] for row in reversed(rows) if "identity" in row), None)
+    if saved is None:
+        complete = rows and (
+            rows[-1]["state"] == "failed-before-spawn"
+            or (rows[-1]["state"] == "startup-failed" and rows[-1].get("child_exited") is True)
+        )
+        state = (
+            "uncertain"
+            if rows and not complete
+            else ("unmanaged-listener" if inodes else "stopped")
+        )
+        return {**common, "state": state, "managed": False}
+    actual = process_identity(saved["pid"])
+    if actual is None:
+        return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
+    if actual != saved or actual["uid"] != os.getuid():
+        return {**common, "state": "identity-changed", "managed": False}
+    inode = str(rows[0]["listener_inode"])
+    owned = inodes == {inode} and owns_listener(saved["pid"], inode)
+    return {
+        **common,
+        "state": "running" if owned and rows[-1]["state"] == "ready" else "uncertain",
+        "managed": True,
+        "pid": saved["pid"],
+        "start_ticks": saved["start_ticks"],
+        "journal": str(journal),
+        "log": str(root / rows[0]["log"]),
+        "runtime_limit_seconds": PREVIEW_SECONDS,
+    }
+
+
+def guarded_pidfd(identity: dict) -> int:
+    require_pidfd()
+    fd = os.pidfd_open(identity["pid"])
+    try:
+        if process_identity(identity["pid"]) != identity or identity["uid"] != os.getuid():
+            raise ValueError("preview process identity changed; no signal sent")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def require_pidfd() -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise ValueError("use native /usr/bin/python3 with Linux pidfd support for start/stop")
+
+
+def _package(value: Path) -> Path:
+    root = value.absolute()
+    if (
+        root.resolve() != root
+        or not root.is_dir()
+        or root.stat().st_uid not in (0, os.getuid())
+        or root.stat().st_mode & 0o022
+    ):
+        raise ValueError("installed package directory must be trusted and without symlinks")
+    for parent in (root, *root.parents):
+        st = parent.lstat()
+        if st.st_uid not in (0, os.getuid()) or (
+            st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX
+        ):
+            raise ValueError("writable or foreign package ancestor")
+    required = [
+        "vigie_api/app.py",
+        "vigie_api/ui_static.py",
+        "vigie_ingest/db.py",
+        "vigie_pipeline/schema.py",
+    ]
+    required += [
+        "vigie_api/ui/" + x for x in ("index.html", "styles.css", "app.js", "client.js", "views.js")
+    ]
+    for name in required:
+        path = root / name
+        st = path.lstat()
+        if (
+            path.resolve() != path
+            or not stat.S_ISREG(st.st_mode)
+            or st.st_mode & 0o022
+            or st.st_uid not in (0, os.getuid())
+        ):
+            raise ValueError("unsafe or incomplete installed package")
+    return root
+
+
+def _health() -> bool:
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            return None
+
+    client = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with client.open(f"http://127.0.0.1:{PORT}/healthz", timeout=0.5) as response:
+        return response.status == 200 and json.loads(response.read(16385)).get("data") == "ok"
+
+
+def _ready(child, identity: dict, inode: str) -> None:
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if child.poll() is not None or process_identity(child.pid) != identity:
+            raise RuntimeError("preview exited or changed identity during startup")
+        if listeners() != {inode} or not owns_listener(child.pid, inode):
+            raise RuntimeError("readiness listener does not belong to the exact preview child")
+        try:
+            if _health():
+                return
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("preview readiness timed out")
+
+
+def cleanup_startup(child, pidfd: int | None) -> bool:
+    """Only our retained child; never a guessed PID, process group or forced kill."""
+    try:
+        if pidfd is not None:
+            with contextlib.suppress(ProcessLookupError):
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        else:
+            # If pidfd acquisition failed, WNOWAIT proves this PID is still our
+            # unreaped child before Popen's ownership-checked TERM operation.
+            pending = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if pending is None:
+                with contextlib.suppress(ProcessLookupError):
+                    child.terminate()
+        child.wait(timeout=6)
+        return True
+    except (ChildProcessError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
+    require_pidfd()  # Refuse unsupported controller runtimes before a child or receipt exists.
+    validate_namespace(root)
+    with manager_lock():
+        before = status(root)
+        if before["state"] == "running":
+            return {**before, "already_running": True}
+        if before["state"] != "stopped":
+            raise ValueError("unmanaged listener or uncertain process; no start/adoption performed")
+        _, prior = current_attempt(root)
+        package_dir = _package(
+            package_dir or Path(prior[0]["package_dir"] if prior else DEFAULT_PACKAGE)
+        )
+        python = (python or Path(prior[0]["argv"][0] if prior else DEFAULT_PYTHON)).absolute()
+        if (
+            not python.is_file()
+            or not os.access(python, os.X_OK)
+            or python.stat().st_uid not in (0, os.getuid())
+            or python.stat().st_mode & 0o022
+        ):
+            raise ValueError("native Python interpreter unavailable; pass --python")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", PORT))
+            listener.listen(128)
+            inode = str(os.fstat(listener.fileno()).st_ino)
+            attempt = f"managed-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+            journal, log = root / (attempt + ".jsonl"), root / (attempt + ".log")
+            argv = [
+                str(python),
+                str(Path(__file__).resolve()),
+                "serve",
+                "--directory",
+                str(root),
+                "--listen-fd",
+                str(listener.fileno()),
+            ]
+            prepared = {
+                "state": "prepared",
+                "directory": str(root),
+                "argv": argv,
+                "package_dir": str(package_dir),
+                "listener_inode": inode,
+                "log": log.name,
+                "runtime_limit_seconds": PREVIEW_SECONDS,
+                "wall": time.time(),
+            }
+            write_new(journal, (json.dumps(prepared) + "\n").encode())
+            temporary = root / (CURRENT + "." + uuid.uuid4().hex)
+            if (root / CURRENT).is_symlink():
+                raise ValueError("symlinked manager pointer")
+            write_new(temporary, json.dumps({"journal": journal.name}).encode())
+            os.replace(temporary, root / CURRENT)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            log_fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            child = None
+            pidfd = None
+            try:
+                child = subprocess.Popen(  # noqa: S603 -- fixed script/argv; checked interpreter.
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fd,
+                    stderr=subprocess.STDOUT,
+                    cwd=root,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=(listener.fileno(),),
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "LC_ALL": "C.UTF-8",
+                        "PYTHONPATH": str(package_dir),
+                        "PYTHONNOUSERSITE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                identity = process_identity(child.pid)
+                if identity is None or identity["uid"] != os.getuid() or identity["argv"] != argv:
+                    raise RuntimeError("could not establish exact child identity")
+                event(journal, {"state": "spawned", "identity": identity})
+                pidfd = guarded_pidfd(identity)
+                _ready(child, identity, inode)
+                event(journal, {"state": "ready", "identity": identity})
+            except (OSError, ValueError, RuntimeError) as exc:
+                exited = child is None or cleanup_startup(child, pidfd)
+                event(
+                    journal,
+                    {
+                        "state": "failed-before-spawn" if child is None else "startup-failed",
+                        "error_type": type(exc).__name__,
+                        "child_exited": exited,
+                        "child_pid": None if child is None else child.pid,
+                    },
+                )
+                raise RuntimeError(f"preview startup failed; retained private log {log}") from exc
+            finally:
+                os.close(log_fd)
+                if pidfd is not None:
+                    os.close(pidfd)
+        return status(root)
+
+
+def stop(root: Path) -> dict:
+    require_pidfd()
+    validate_namespace(root)
+    with manager_lock():
+        before = status(root)
+        if before["state"] == "stopped":
+            return before
+        if not before["managed"]:
+            raise ValueError("refusing to stop an unmanaged or changed process")
+        journal, rows = current_attempt(root)
+        identity = next(row["identity"] for row in reversed(rows) if "identity" in row)
+        fd = guarded_pidfd(identity)
+        try:
+            event(journal, {"state": "stop-requested", "identity": identity})
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            if not select.select([fd], [], [], 6)[0]:
+                raise RuntimeError("owned preview is stopping; no forced kill; use status")
+            event(journal, {"state": "stopped", "identity": identity})
+        finally:
+            os.close(fd)
+        return status(root)
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("seed", "serve"))
+    parser.add_argument("action", choices=("seed", "serve", "start", "status", "stop"))
     parser.add_argument("--directory", required=True)
+    parser.add_argument(
+        "--package-dir", type=Path, help="installed wheel target; remembers prior start"
+    )
+    parser.add_argument(
+        "--python", type=Path, help="child Python; defaults to the existing native3.12 env"
+    )
+    parser.add_argument("--listen-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
-    root = directory(args.directory)
-    if args.action == "seed":
-        print(json.dumps(seed(root)))  # Safe manifest only, never token material.
-    else:
-        serve(root)
+    try:
+        root = directory(args.directory)
+        if args.action == "seed":
+            print(json.dumps(seed(root)))  # Safe manifest only, never token material.
+        elif args.action == "serve":
+            serve(root, args.listen_fd)
+        elif args.action == "status":
+            print(json.dumps(status(root)))
+        elif args.action == "start":
+            print(json.dumps(start(root, args.package_dir, args.python)))
+        else:
+            print(json.dumps(stop(root)))
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"preview: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
