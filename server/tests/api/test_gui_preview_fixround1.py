@@ -609,7 +609,7 @@ def test_lock_refuses_a_lock_swapped_between_open_and_check(tmp_path, monkeypatc
     def swap(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
         if Path(path) == lock:
-            lock.unlink()
+            lock.rename(lock.with_name("moved.lock"))  # keeps nlink==1, so only the inode check can object
             real_open(lock, os.O_CREAT | os.O_RDWR, 0o600)  # same type/mode, new inode
         return fd
 
