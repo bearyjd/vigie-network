@@ -11,8 +11,36 @@ if [ "${VIGIE_TEST:-}" = 1 ]; then
 	COLLECTOR="${VIGIE_COLLECTOR_BIN:-$COLLECTOR}"
 	STATE="${VIGIE_RUN_STATE_DIR:-$STATE}"
 fi
-"$COLLECTOR" "$@"
-rc=$?
+# procd signals this PID only. Install flag-only traps before creating the child,
+# including the window before $! is assigned. Never signal an empty PID/group.
+stop_rc=0
+trap '[ "$stop_rc" -ne 0 ] || stop_rc=143' TERM
+trap '[ "$stop_rc" -ne 0 ] || stop_rc=130' INT
+[ "$stop_rc" -eq 0 ] || exit "$stop_rc"
+"$COLLECTOR" "$@" &
+child=$!
+if [ "$stop_rc" -eq 0 ]; then
+	wait "$child"
+	rc=$?
+else
+	# Stop arrived between the pre-launch check and the first wait.
+	rc=128
+fi
+if [ "$stop_rc" -ne 0 ]; then
+	# Further requests must not interrupt the final reap or cause repeated kills.
+	trap '' TERM INT
+	if [ "$rc" -ge 128 ]; then
+		# Async POSIX children may inherit INT ignored: normalize both stops to TERM.
+		# This is the dedicated UID's sole managed child, not atomic PID pinning.
+		kill -TERM "$child" 2>/dev/null || :
+		wait "$child"
+	fi
+	exit "$stop_rc"
+fi
+# A completed wait has consumed the child; late stop requests must not signal it.
+trap '' TERM INT
+[ "$stop_rc" -eq 0 ] || exit "$stop_rc"
+child=
 case $rc in
 77 | 78)
 	echo x >>"$STATE/fails" 2>/dev/null
