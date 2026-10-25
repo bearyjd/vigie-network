@@ -9,6 +9,7 @@ const titles = {overview: 'Overview', inventory: 'Inventory', activity: 'Activit
 const preview = new URLSearchParams(location.search).get('preview') === 'synthetic';
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
+function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
 function resetPage() { state.cursors = [null]; state.page = 0; state.next = null; }
 function range() { const to = Math.floor(Date.now() / 3600000) * 3600 + 3600; return {from: to - state.hours * 3600, to}; }
 function notice(message = '', retry = false) {
@@ -21,24 +22,24 @@ function chrome() {
   document.querySelectorAll('nav button[data-view]').forEach(button => { button.disabled = !state.connected; if (button.dataset.view === state.view && state.connected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
   byId('view-title').textContent = titles[state.view];
   byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
-  byId('refresh').disabled = state.loading || Date.now() < client.retryAt;
+  byId('refresh').setAttribute('aria-disabled', String(state.loading || Date.now() < client.retryAt));
   byId('content').setAttribute('aria-busy', String(state.loading));
-  byId('refresh-status').textContent = document.hidden ? 'Refresh paused while hidden' : state.loading ? 'Refreshing…' : state.updated ? `Updated ${utc(state.updated)} · refresh every 30s` : 'Refreshes every 30 seconds while visible';
+  byId('refresh-status').textContent = document.hidden ? 'Refresh paused while hidden' : state.loading ? 'Refreshing…' : interacting() ? `Refresh paused while interacting · snapshot ${utc(state.updated)}` : state.updated ? `Updated ${utc(state.updated)} · refresh every 30s` : 'Refreshes every 30 seconds while visible';
 }
-function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
+function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false, null, true), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
 function disconnected(message = '') {
   client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.selectedDevice = null; state.selectedIncident = null; resetPage(); clearTimeout(timer);
   byId('token').value = ''; byId('content').replaceChildren(); byId('collector').value = ''; chrome(); notice(message); byId('token').focus();
 }
-function selectDevice(id) { state.selectedDevice = id; load(true); }
+function selectDevice(id) { state.selectedDevice = id; load(true, '[aria-label="Identity detail"]'); }
 function activity(id) { state.selectedDevice = id; navigate('activity'); }
-function selectIncident(id) { state.selectedIncident = id; load(true); }
+function selectIncident(id) { state.selectedIncident = id; load(true, '[aria-label="Incident evidence"]'); }
 function page(direction) {
   if (direction > 0 && state.next) { state.cursors[state.page + 1] = state.next; state.page++; }
   else if (direction < 0 && state.page > 0) state.page--; else return;
-  state.selectedIncident = null; load(true);
+  state.selectedIncident = null; load(true, '#view-title');
 }
-function navigate(view) { if (!Object.hasOwn(titles, view)) return; state.view = view; resetPage(); load(true); byId('view-title').scrollIntoView({block: 'nearest'}); }
+function navigate(view) { if (!Object.hasOwn(titles, view)) return; state.view = view; resetPage(); load(true, '#view-title'); byId('view-title').scrollIntoView({block: 'nearest'}); }
 function failure(error) {
   if (error.status === 401) { disconnected('Authentication expired or was refused. The token and observations have been cleared. Connect again with a dedicated read-only token.'); return; }
   const messages = {0: 'The API could not return valid data. Check the connection and retry.', 400: 'This source or time range was refused by the API.', 403: 'This token cannot read the requested data.', 404: 'The selected source or record was not found.', 409: 'This identity scope is currently unavailable.', 422: 'The source, identity or range is invalid.', 429: `Request limit reached. Automatic retry after ${utc(error.retryAt / 1000)}.`, 503: 'Monitoring is temporarily unavailable. Qualifying data may not be ready.'};
@@ -46,11 +47,16 @@ function failure(error) {
   notice(`${reason}${state.updated ? ` Showing the previous snapshot from ${utc(state.updated)}; it may be stale.` : ' No current observations are displayed.'}`, true);
   if (!state.updated) byId('content').replaceChildren(empty('Data unavailable', 'The interface will retry without treating missing observations as healthy.'));
 }
-async function load(clear = false) {
-  if (!state.connected || document.hidden) return;
-  clearTimeout(timer); client.invalidate(); const generation = ++state.generation; state.loading = true;
+async function load(clear = false, focus = null, automatic = false) {
+  if (!state.connected) return;
+  if (!clear && document.hidden) return;
+  if (!clear && automatic && interacting()) { chrome(); schedule(); return; }
+  clearTimeout(timer); client.invalidate(); const generation = ++state.generation; state.loading = !document.hidden;
   if (clear) { state.updated = null; byId('content').replaceChildren(node('p', {class: 'loading'}, 'Loading observations…')); notice(); }
   chrome();
+  if (document.hidden) return;
+  if (clear) (focus === '#view-title' ? byId('view-title') : byId('content')).focus({preventScroll: true});
+  const focusAnchor = document.activeElement;
   try {
     const cursor = state.cursors[state.page]; let content; let next = null;
     if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
@@ -70,7 +76,9 @@ async function load(clear = false) {
       content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident), pager(state.page, list.data.length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
     }
     if (generation !== state.generation || !state.connected) return;
+    if (automatic && interacting()) return;
     state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice();
+    if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});
   } catch (error) {
     if (generation !== state.generation || error instanceof StaleResult || error.name === 'AbortError') return;
     failure(error instanceof ApiError ? error : new ApiError(0, 'malformed_response'));
@@ -79,17 +87,19 @@ async function load(clear = false) {
 byId('connect-form').addEventListener('submit', event => {
   event.preventDefault(); const token = byId('token').value.trim(); const collector = byId('connect-collector').value.trim(); byId('token').value = '';
   if (!token || !collector || collector.length > 64) { notice('Enter a collector ID and a dedicated read-only token.'); return; }
-  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true); }
+  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
   catch { disconnected('The connection inputs were invalid.'); }
 });
 byId('scope-form').addEventListener('submit', event => {
   event.preventDefault(); const collector = byId('collector').value.trim(); const hours = Number(byId('range').value);
   if (!collector || collector.length > 64 || ![24, 168].includes(hours)) { notice('Enter a collector ID and select a supported history range.'); return; }
-  state.collector = collector; state.hours = hours; state.selectedIncident = null; resetPage(); load(true);
+  state.collector = collector; state.hours = hours; state.selectedIncident = null; resetPage(); load(true, '#view-title');
 });
 byId('disconnect').addEventListener('click', () => disconnected());
-byId('refresh').addEventListener('click', () => load(false));
+byId('refresh').addEventListener('click', () => { if (!state.loading && Date.now() >= client.retryAt) load(false); });
 document.querySelectorAll('nav button[data-view]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.view)));
-document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (document.hidden) { client.invalidate(); state.generation++; state.loading = false; chrome(); } else if (state.connected) load(false); });
+byId('content').addEventListener('focusin', chrome);
+byId('content').addEventListener('focusout', () => queueMicrotask(chrome));
+document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (document.hidden) { client.invalidate(); state.generation++; state.loading = false; chrome(); } else if (state.connected) load(false, null, true); });
 window.addEventListener('pagehide', () => disconnected());
 chrome();

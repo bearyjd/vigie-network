@@ -31,6 +31,7 @@ export class ApiClient {
     try {
       const response = await fetch(url, {method: 'GET', headers: {Authorization: `Bearer ${this.#token}`, Accept: 'application/json'}, signal: request.signal, credentials: 'omit', cache: 'no-store', redirect: 'error', mode: 'same-origin', referrerPolicy: 'no-referrer'});
       if (generation !== this.#generation) throw new StaleResult();
+      if (!response.ok) response.body?.cancel().catch(() => {});
       if (response.status === 401) { this.disconnect(); throw new ApiError(401, 'unauthorized'); }
       if (response.status === 429) { this.retryAt = retryTime(response.headers.get('Retry-After')); throw new ApiError(429, 'rate_limited', this.retryAt); }
       if (!response.ok) throw new ApiError(response.status, 'request_failed');
@@ -46,12 +47,21 @@ export class ApiClient {
       throw new ApiError(0, 'offline');
     } finally { clearTimeout(deadline); parent.removeEventListener('abort', abort); }
   }
+  #monitoring(result, requested) {
+    const hours = result.data?.hours;
+    const count = (requested.to_hour - requested.from_hour) / 3600;
+    if (result.page?.next_cursor !== null || !Array.isArray(hours) || hours.length !== count ||
+        hours.some((hour, index) => !hour || hour.hour !== requested.from_hour + index * 3600)) {
+      throw new ApiError(0, 'malformed_response');
+    }
+    return result;
+  }
   #scope(collector) { return bounded(collector, 64); }
   #range(range) { if (!range || !Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 0 || range.to <= range.from || range.to - range.from > 168 * 3600 || range.from % 3600 || range.to % 3600) throw new ApiError(0, 'invalid_input'); return {from_hour: range.from, to_hour: range.to, limit: 200}; }
   devices(cursor = null) { if (cursor !== null) bounded(cursor, 256); return this.#get('/devices', {limit: 25, cursor}); }
   device(id) { return this.#get(`/devices/${segment(id)}`); }
-  coverage(collector, range) { return this.#get('/coverage', {collector_id: this.#scope(collector), ...this.#range(range)}); }
-  activity(id, collector, range) { return this.#get(`/devices/${segment(id)}/activity`, {collector_id: this.#scope(collector), ...this.#range(range)}); }
+  coverage(collector, range) { const requested = this.#range(range); return this.#get('/coverage', {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
+  activity(id, collector, range) { const requested = this.#range(range); return this.#get(`/devices/${segment(id)}/activity`, {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
   incidents(collector, cursor = null) { if (cursor !== null) bounded(cursor, 1024); return this.#get('/incidents', {collector_id: this.#scope(collector), limit: 25, cursor}); }
   incident(id, collector) { return this.#get(`/incidents/${segment(id)}`, {collector_id: this.#scope(collector)}); }
 }

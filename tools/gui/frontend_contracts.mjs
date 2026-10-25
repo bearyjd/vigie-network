@@ -18,4 +18,65 @@ await api.devices();assert.equal(calls[0].method,'GET');assert.equal(calls[0].cr
 let release;globalThis.fetch=()=>new Promise(resolve=>release=resolve);
 const stale=api.devices();api.invalidate();release(new Response(JSON.stringify({ok:true,data:[],page:null})));await assert.rejects(stale,StaleResult);
 globalThis.fetch=async()=>new Response('',{status:401});await assert.rejects(api.devices(),e=>e.status===401);await assert.rejects(api.devices(),e=>e.status===401);
-console.log('PASS: backlog known/unknown/future/stall semantics; fixed GET options; rejected dot/slash/control IDs; stale-response rejection; 401 memory-token clear; Retry-After over24h respected.');
+
+// Error bodies must release their stream even though the UI never renders their content.
+for (const status of [401, 429, 503]) {
+  const c = new ApiClient(); c.setToken('synthetic-only'); let cancelled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode('{"ok":false}')); },
+    cancel() { cancelled = true; },
+  }), {status, headers: {'Retry-After': '60'}});
+  await assert.rejects(c.devices(), error => error.status === status);
+  assert.equal(cancelled, true, `HTTP ${status} left its response stream open`);
+}
+const capped = new ApiClient(); capped.setToken('synthetic-only'); let capCancelled = false;
+globalThis.fetch = async () => new Response(new ReadableStream({
+  start(controller) { controller.enqueue(new Uint8Array(1048577)); },
+  cancel() { capCancelled = true; },
+}));
+await assert.rejects(capped.devices(), error => error.code === 'response_too_large');
+assert.equal(capCancelled, true);
+assert.equal(retryTime('Sun, 25 Oct 2026 12:05:00 GMT', now), now + 300000);
+assert.equal(retryTime('invalid', now), now + 30000);
+assert.equal(retryTime('9'.repeat(400), now), Number.MAX_SAFE_INTEGER);
+
+// Both monitoring endpoints return a full UTC grid; absent metrics remain null.
+const requested = {from: 0, to: 86400};
+const grid = Array.from({length: 24}, (_, i) => ({hour: i * 3600, state: 'missing',
+  observed_seconds: null, qualified_seconds: null, reasons: ['missing'],
+  bytes_up: null, bytes_down: null, flows: null, dns_queries: null}));
+for (const kind of ['coverage', 'activity']) {
+  const c = new ApiClient(); c.setToken('synthetic-only');
+  const call = range => kind === 'coverage' ? c.coverage('synthetic-preview', range)
+    : c.activity('synthetic-identity', 'synthetic-preview', range);
+  globalThis.fetch = async () => new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {hours: grid}}));
+  assert.deepEqual((await call(requested)).data.hours, grid);
+  for (const hours of [[], grid.slice(1), [...grid, {...grid.at(-1), hour: 86400}],
+    grid.map((h, i) => i === 1 ? {...h, hour: 0} : h), [...grid].reverse()]) {
+    globalThis.fetch = async () => new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {hours}}));
+    await assert.rejects(call(requested), error => error.code === 'malformed_response',
+      `${kind} accepted an incomplete, duplicated or unordered UTC grid`);
+  }
+  globalThis.fetch = async () => new Response(JSON.stringify({ok: true, page: {next_cursor: 'unexpected'}, data: {hours: grid}}));
+  await assert.rejects(call(requested), error => error.code === 'malformed_response');
+  let finish; globalThis.fetch = () => new Promise(resolve => finish = resolve);
+  const mutable = {...requested}; const pending = call(mutable); mutable.to += 3600;
+  finish(new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {hours: grid}})));
+  assert.equal((await pending).data.hours.length, 24, 'response validation used a later range');
+}
+
+// Deadline failures are surfaced and cleaned up without a real 15-second wait.
+const originalSetTimeout = globalThis.setTimeout; const originalClearTimeout = globalThis.clearTimeout;
+let expire; let deadlineCleared = false;
+try {
+  globalThis.setTimeout = callback => { expire = callback; return 123; };
+  globalThis.clearTimeout = timer => { assert.equal(timer, 123); deadlineCleared = true; };
+  const c = new ApiClient(); c.setToken('synthetic-only');
+  globalThis.fetch = (url, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+  });
+  const pending = c.devices(); expire();
+  await assert.rejects(pending, error => error.code === 'timeout');
+  assert.equal(deadlineCleared, true);
+} finally { globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout; }
+console.log('PASS: fixed GET/generation/auth/backlog contracts; complete UTC grids with null gaps; bounded/cancelled bodies and deadlines; numeric/HTTP-date Retry-After.');
