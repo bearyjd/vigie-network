@@ -140,7 +140,9 @@ def real_stop_signals(monkeypatch, child):
     sent = []
     monkeypatch.setattr(preview.os, "pidfd_open", lambda pid: os.dup(fd))
     monkeypatch.setattr(
-        preview.signal, "pidfd_send_signal", lambda _fd, sig: (sent.append(sig), os.kill(child.pid, sig))
+        preview.signal,
+        "pidfd_send_signal",
+        lambda _fd, sig: (sent.append(sig), os.kill(child.pid, sig)),
     )
     monkeypatch.setattr(preview.select, "select", lambda *args: ([fd], [], []))
     return sent
@@ -341,9 +343,7 @@ def test_prepared_only_receipt_never_adopts_a_look_alike_process(
     assert child.poll() is None
 
 
-def test_prepared_only_receipt_with_no_listener_is_not_a_permanent_wedge(
-    namespace, monkeypatch
-):
+def test_prepared_only_receipt_with_no_listener_is_not_a_permanent_wedge(namespace, monkeypatch):
     attempt(namespace, serve_argv(namespace, 7), "999999", [])
     monkeypatch.setattr(preview, "listeners", lambda: set())
     assert preview.status(namespace)["state"] == "stopped"
@@ -422,7 +422,10 @@ def _package_tree(tmp_path):
         "vigie_api/extra_module.py",
         "vigie_ingest/db.py",
         "vigie_pipeline/schema.py",
-        *("vigie_api/ui/" + n for n in ("index.html", "styles.css", "app.js", "client.js", "views.js")),
+        *(
+            "vigie_api/ui/" + n
+            for n in ("index.html", "styles.css", "app.js", "client.js", "views.js")
+        ),
     ]
     for name in names:
         path = root / name
@@ -480,7 +483,8 @@ def test_process_identity_reads_real_proc_start_ticks_uid_argv_and_boot(sleeper,
     fields = re.match(r"^\d+ \(.*\) (.*)$", raw, re.S).group(1).split()
     # Field 22 of proc(5) is starttime; an independent clock check rejects neighbouring fields.
     boot = next(
-        int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+        int(line.split()[1])
+        for line in Path("/proc/stat").read_text().splitlines()
         if line.startswith("btime")
     )
     started = boot + int(identity["start_ticks"]) / os.sysconf("SC_CLK_TCK")
@@ -508,17 +512,13 @@ def test_status_reports_identity_drift_for_a_live_pid(namespace, listener, sleep
     assert result["state"] == "identity-changed" and result["managed"] is False
 
 
-def test_status_is_running_only_when_child_owns_the_listener(
-    namespace, listener, sleeper
-):
+def test_status_is_running_only_when_child_owns_the_listener(namespace, listener, sleeper):
     child, argv, identity, inode = live(namespace, listener, sleeper, hold=True)
     attempt(namespace, argv, inode, ["spawned", "ready"], identity)
     assert preview.status(namespace)["state"] == "running"
 
 
-def test_status_not_running_when_listener_belongs_to_someone_else(
-    namespace, listener, sleeper
-):
+def test_status_not_running_when_listener_belongs_to_someone_else(namespace, listener, sleeper):
     child, argv, identity, inode = live(namespace, listener, sleeper, hold=False)
     attempt(namespace, argv, inode, ["spawned", "ready"], identity)
     result = preview.status(namespace)  # the test process, not the child, owns the listener
@@ -609,7 +609,9 @@ def test_lock_refuses_a_lock_swapped_between_open_and_check(tmp_path, monkeypatc
     def swap(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
         if Path(path) == lock:
-            lock.rename(lock.with_name("moved.lock"))  # keeps nlink==1, so only the inode check can object
+            lock.rename(
+                lock.with_name("moved.lock")
+            )  # keeps nlink==1, so only the inode check can object
             real_open(lock, os.O_CREAT | os.O_RDWR, 0o600)  # same type/mode, new inode
         return fd
 
@@ -618,9 +620,7 @@ def test_lock_refuses_a_lock_swapped_between_open_and_check(tmp_path, monkeypatc
         pass
 
 
-def test_serve_starts_the_daemon_eight_hour_timer_and_it_stops_the_server(
-    namespace, monkeypatch
-):
+def test_serve_starts_the_daemon_eight_hour_timer_and_it_stops_the_server(namespace, monkeypatch):
     import uvicorn
 
     timers = []
