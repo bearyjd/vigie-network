@@ -115,6 +115,8 @@ fn split_polls_and_window_flush_around_ack_and_options() {
     for l in feed(&mut asm, &lines[5..]) {
         win.add_lease(l);
     }
+    // The options line restarted the block's idle count: it closes after two quiet polls.
+    assert!(asm.end_poll().is_empty());
     for l in asm.end_poll() {
         win.add_lease(l);
     }

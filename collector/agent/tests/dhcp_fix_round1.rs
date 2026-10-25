@@ -104,6 +104,9 @@ fn a_flush_between_option_lines_never_publishes_a_truncated_list() {
     let flushed = win.take();
     assert!(flushed.leases.iter().all(no_fp), "{:?}", flushed.leases);
     let mut all = feed(&mut a, &[opts(1, "6:dns-server, 15:domain-name")]);
+    // The line restarted the block's idle count: it closes after two quiet polls.
+    all.extend(a.end_poll());
+    assert!(all.is_empty());
     all.extend(a.end_poll());
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].opt55, vec![1, 3, 6, 15]);

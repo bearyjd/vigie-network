@@ -86,8 +86,9 @@ impl Tail {
         if self.cur.is_none() {
             let first = !self.polled_once;
             if let Err(e) = self.open_new(first) {
+                // `out` holds no gap marker here: a pending gap is only ever set while a file
+                // is open (an error inside the step loop), and this branch needs none open.
                 self.open_failed += 1;
-                self.gap_pending |= out.contains(&None);
                 return Err(e);
             }
             self.polled_once = true;

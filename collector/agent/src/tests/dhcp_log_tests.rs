@@ -235,3 +235,20 @@ fn a_failed_open_never_turns_the_tail_of_a_torn_line_into_a_lease() {
     fs::remove_file(path.with_extension("1")).ok();
     fs::remove_file(path).ok();
 }
+
+#[test]
+fn k32_dhcp_counters_reach_the_window() {
+    let (mut a, path) = log_agent("k32");
+    let line = |pid: u32, rest: &str| format!("Oct 20 14:00:00 dnsmasq-dhcp[{pid}]: {rest}\n");
+    let mac = "02:00:00:00:00:01";
+    let mut text = String::new();
+    for (pid, x) in [(100, 7), (200, 8)] {
+        text += &line(pid, &format!("{x} DHCPREQUEST(br-lan) 192.0.2.10 {mac}"));
+        text += &line(pid, &format!("{x} DHCPACK(br-lan) 192.0.2.10 {mac}"));
+    }
+    append(&path, &text);
+    a.poll_log(1);
+    let drops = a.window.take_with_drops().1;
+    std::fs::remove_file(path).ok();
+    assert_eq!(drops.get("dhcp_block_superseded"), Some(&1), "{drops:?}");
+}

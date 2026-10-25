@@ -525,6 +525,7 @@ mod tests {
     }
 
     mod dhcp_log_tests;
+    mod dhcp_split_prop;
 
     struct Recorder(Vec<Vec<u8>>);
 

@@ -25,12 +25,15 @@ fn request(pid: u32, x: u32, ip: &str, mac: &str) -> String {
 fn ack(pid: u32, x: u32, ip: &str, mac: &str, host: &str) -> String {
     lp(pid, &format!("{x} DHCPACK(br-lan) {ip} {mac} {host}"))
 }
+/// One address per dnsmasq process: a verified ACK for an address supersedes the blocks held
+/// for it, so packets of different devices must not share one.
 fn head(pid: u32, x: u32, mac: &str, v: &str) -> Vec<String> {
+    let ip = format!("192.0.2.{}", 10 + pid % 97);
     vec![
         range(pid, x),
         lp(pid, &format!("{x} vendor class: {v}")),
-        request(pid, x, "192.0.2.10", mac),
-        lp(pid, &format!("{x} DHCPACK(br-lan) 192.0.2.10 {mac}")),
+        request(pid, x, &ip, mac),
+        lp(pid, &format!("{x} DHCPACK(br-lan) {ip} {mac}")),
     ]
 }
 fn opts(pid: u32, x: u32, list: &str) -> String {
@@ -112,17 +115,20 @@ fn p4_three_pids_hold_their_blocks_at_once() {
     lines.push(opts(100, 7, "1:netmask"));
     lines.push(opts(200, 8, "42:x"));
     lines.push(lp(300, "9 vendor class: vend-c"));
+    lines.push(request(300, 9, "192.0.2.12", C));
     lines.push(ack(200, 8, "192.0.2.11", B, "bee"));
+    lines.push(ack(300, 9, "192.0.2.12", C, "cee"));
+    lines.push(opts(300, 9, "6:dns-server"));
     let out = run(&lines);
     assert_eq!(
         fp(&out, A),
         vec![(vec![1], Some("vend-a".into()))],
         "{out:?}"
     );
-    assert!(
-        fp(&out, B)
-            .iter()
-            .all(|(o, v)| o == &vec![42] && v.is_none()),
+    assert_eq!(fp(&out, B), vec![(vec![42], None)], "{out:?}");
+    assert_eq!(
+        fp(&out, C),
+        vec![(vec![6], Some("vend-c".into()))],
         "{out:?}"
     );
 }
