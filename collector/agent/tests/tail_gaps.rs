@@ -95,3 +95,26 @@ fn an_error_with_only_gap_markers_surfaces_and_the_gap_is_kept() {
     assert_eq!(t.poll_with_gaps().unwrap(), vec![None, s("new1")]);
     fs::remove_dir_all(d).unwrap();
 }
+
+#[test]
+fn a_reset_gap_found_before_a_failing_stat_is_reported_on_the_next_poll() {
+    let d = tmp("pending");
+    let sub = d.join("logs");
+    fs::create_dir_all(&sub).unwrap();
+    let log = sub.join("dnsmasq.log");
+    fs::write(&log, "seed\n").unwrap();
+    let mut t = Tail::new(log.clone());
+    t.poll().unwrap();
+    // Truncated in place (a cursor reset), and the directory cannot be searched right now.
+    fs::write(&log, "").unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::metadata(&log).is_ok() {
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        println!("SKIP: directory modes are not enforced for this user (root?)");
+        return;
+    }
+    assert!(t.poll_with_gaps().is_err());
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(t.poll_with_gaps().unwrap(), vec![None]);
+    fs::remove_dir_all(d).unwrap();
+}

@@ -23,6 +23,9 @@ fn range(x: u32) -> String {
 fn vendor(x: u32, v: &str) -> String {
     l(&format!("{x} vendor class: {v}"))
 }
+fn name(x: u32, n: &str) -> String {
+    l(&format!("{x} client provides name: {n}"))
+}
 fn req(x: u32, mac: &str) -> String {
     l(&format!("{x} DHCPREQUEST(br-lan) 192.0.2.10 {mac}"))
 }
@@ -268,10 +271,15 @@ fn m08_a_marked_packet_of_a_foreign_mac_never_reaches_the_owner() {
         req(1, A),
         range(1),
         vendor(1, "b-vendor"),
+        name(1, "b-name"),
         req(1, B),
         ack(1, A),
     ]);
-    assert!(got.iter().all(|x| x.opt60.is_none()), "{got:?}");
+    assert!(
+        got.iter()
+            .all(|x| x.opt60.is_none() && x.hostname.is_none()),
+        "{got:?}"
+    );
 }
 
 #[test]
