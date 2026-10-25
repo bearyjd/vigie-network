@@ -197,11 +197,12 @@ fn dns_fixture_correlates_answers_and_attributes_macs() {
 #[test]
 fn dhcp_fixture_assembles_leases_with_fingerprint() {
     let mut a = DhcpAssembler::default();
-    let leases: Vec<_> = DHCP_FIXTURE
+    let mut leases: Vec<_> = DHCP_FIXTURE
         .lines()
         .filter_map(parse_line)
-        .filter_map(|ev| a.feed(&ev))
+        .flat_map(|ev| a.feed(&ev))
         .collect();
+    leases.extend(a.break_context());
     assert_eq!(leases.len(), 7);
     let l = &leases[0];
     assert_eq!(l.mac, "c2:11:22:33:44:01");

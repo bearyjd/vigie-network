@@ -73,9 +73,17 @@ impl Window {
     /// Latest lease per MAC wins (a later DHCPACK carries the fuller fingerprint).
     /// The fingerprint (opt55, opt60) is one unit: a lease carrying any non-empty field replaces
     /// the stored pair exactly as received (never mixed with the old one), and an entirely empty
-    /// lease never overwrites it, within the window or across windows (see `fingerprints`).
+    /// lease (or one whose only field repeats the stored vendor class) never overwrites it, within the window or across windows (see `fingerprints`).
     /// When the memory is full the least recently stored MAC is evicted.
     pub fn add_lease(&mut self, mut l: Lease) {
+        // An options-less lease must not shrink a stored pair either: one that adds nothing
+        // (no vendor class, or the same one) is as good as an empty lease.
+        let adds_nothing = |stored: &(Vec<u8>, Option<String>, u64)| {
+            l.opt55.is_empty() && !stored.0.is_empty() && (l.opt60.is_none() || l.opt60 == stored.1)
+        };
+        if self.fingerprints.get(&l.mac).is_some_and(adds_nothing) {
+            l.opt60 = None;
+        }
         if l.opt55.is_empty() && l.opt60.is_none() {
             if let Some((o, c, _)) = self.fingerprints.get(&l.mac) {
                 l.opt55 = o.clone();

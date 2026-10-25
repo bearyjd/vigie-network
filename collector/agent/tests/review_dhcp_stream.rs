@@ -20,9 +20,10 @@ fn run(lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line(s) {
             Some(ev) => out.extend(a.feed(&ev)),
-            None => a.break_context(),
+            None => out.extend(a.break_context()),
         }
     }
+    out.extend(a.break_context());
     out
 }
 

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
 use vigie_agent::config::{load_key, parse_config, wipe, Config};
-use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
+use vigie_agent::dnsmasq::{parse_line_pid, DhcpAssembler, DnsCorrelator, LogEvent};
 use vigie_agent::dropin::{check_dropin, QuietDetector};
 use vigie_agent::ids;
 use vigie_agent::leases::parse_leases;
@@ -154,21 +154,26 @@ impl Agent {
                 for line in &lines {
                     // `None`: bytes were lost here, so nothing may attach across it.
                     let Some(line) = line else {
-                        self.dhcp.break_context();
+                        self.dhcp.lose_context();
                         continue;
                     };
-                    match parse_line(line) {
-                        Some(ev) => {
+                    match parse_line_pid(line) {
+                        Some((pid, ev)) => {
                             self.dns.feed(&ev, now);
-                            self.on_dhcp(&ev);
+                            self.on_dhcp(pid, &ev);
                         }
                         // Anything unparsed sits between packet lines: no attaching across it.
-                        None => self.dhcp.break_context(),
+                        None => {
+                            let done = self.dhcp.break_context();
+                            self.on_leases(done);
+                        }
                     }
                 }
             }
             Err(e) => eprintln!("dnsmasq log: {e}"),
         }
+        let done = self.dhcp.end_poll();
+        self.on_leases(done);
         for q in self.dns.take_ready(&self.ip_to_mac) {
             self.window.add_dns(q);
         }
@@ -182,8 +187,13 @@ impl Agent {
         }
     }
 
-    fn on_dhcp(&mut self, ev: &LogEvent) {
-        if let Some(lease) = self.dhcp.feed(ev) {
+    fn on_dhcp(&mut self, pid: u64, ev: &LogEvent) {
+        let leases = self.dhcp.feed_pid(pid, ev);
+        self.on_leases(leases);
+    }
+
+    fn on_leases(&mut self, leases: Vec<Lease>) {
+        for lease in leases {
             self.on_lease(lease);
         }
     }
@@ -577,6 +587,8 @@ mod tests {
         assert_eq!(leases[0].opt60, None);
         std::fs::remove_file(path).ok();
     }
+
+    mod dhcp_log_tests;
 
     struct Recorder(Vec<Vec<u8>>);
 

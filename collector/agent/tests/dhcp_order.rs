@@ -43,14 +43,17 @@ fn dns(x: u32) -> String {
 /// Mirrors `Agent::poll_log`: unparsed lines break the attach context.
 fn run(lines: &[String]) -> Vec<Lease> {
     let mut a = DhcpAssembler::default();
-    feed(&mut a, lines)
+    let mut out = feed(&mut a, lines);
+    // End of the stream finishes a block that is still open.
+    out.extend(a.break_context());
+    out
 }
 fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     let mut out = Vec::new();
     for s in lines {
         match parse_line(s) {
             Some(ev) => out.extend(a.feed(&ev)),
-            None => a.break_context(),
+            None => out.extend(a.break_context()),
         }
     }
     out
@@ -81,12 +84,17 @@ fn captured_order_fixture_yields_the_full_fingerprint() {
     assert_eq!(fin.hostname.as_deref(), Some("fixture-client"));
 }
 
+// Superseded: the old test expected the ACK to publish (no options, vendor) and then an
+// update per options line. That truncated/empty-first publication is the bug fixed in round 1.
 #[test]
-fn ack_lease_carries_vendor_then_options_update_it_cumulatively() {
+fn ack_publishes_no_fingerprint_and_the_finished_block_publishes_it_once() {
     let got = run(&packet(1, A, "v", "1:netmask, 3:router"));
     assert_eq!(got.len(), 2);
-    assert!(got[0].opt55.is_empty());
-    assert_eq!(got[0].opt60.as_deref(), Some("v"));
+    assert!(
+        got[0].opt55.is_empty() && got[0].opt60.is_none(),
+        "{:?}",
+        got[0]
+    );
     assert_eq!(got[1].opt55, vec![1, 3]);
     assert_eq!(got[1].opt60.as_deref(), Some("v"));
 }
@@ -99,10 +107,15 @@ fn split_polls_and_window_flush_around_ack_and_options() {
     for l in feed(&mut asm, &lines[..5]) {
         win.add_lease(l);
     }
+    // End of the first poll: the block is held, nothing partial is published.
+    assert!(asm.end_poll().is_empty());
     let first: Sections = win.take();
     assert_eq!(first.leases.len(), 1);
-    assert_eq!(first.leases[0].opt60.as_deref(), Some("v"));
+    assert!(first.leases[0].opt55.is_empty() && first.leases[0].opt60.is_none());
     for l in feed(&mut asm, &lines[5..]) {
+        win.add_lease(l);
+    }
+    for l in asm.end_poll() {
         win.add_lease(l);
     }
     let second = win.take();
@@ -281,15 +294,17 @@ fn bounded_memory_over_a_long_replay() {
     for i in 0..20_000u32 {
         let mac = format!("02:00:00:00:{:02x}:{:02x}", (i >> 8) & 0xff, i & 0xff);
         n += feed(&mut a, &packet(i + 1, &mac, "v", "1:netmask")).len();
-        // Unterminated packets must not pile up either.
-        feed(
+        // Unterminated packets must not pile up either. (Their first line finishes the
+        // previous packet's block, which is counted here.)
+        n += feed(
             &mut a,
             &[
                 range(i + 100_000),
                 vendor(i + 100_000, "x"),
                 req(i + 100_000, &mac),
             ],
-        );
+        )
+        .len();
     }
     assert_eq!(n, 40_000);
     assert!(format!("{a:?}").len() < 100_000);
@@ -305,7 +320,7 @@ fn poll_into(t: &mut Tail, a: &mut DhcpAssembler) -> Vec<Lease> {
     for line in t.poll_with_gaps().unwrap() {
         match line {
             Some(s) => out.extend(feed(a, &[s])),
-            None => a.break_context(),
+            None => a.lose_context(),
         }
     }
     out

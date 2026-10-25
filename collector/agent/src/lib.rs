@@ -7,6 +7,7 @@ pub mod config;
 pub mod ctfold;
 pub mod ctparse;
 pub mod ctsock;
+pub mod dhcp_assembler;
 pub mod dnsmasq;
 pub mod dropin;
 pub mod httpdate;

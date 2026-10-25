@@ -8,8 +8,10 @@
 //!   bytes before its cursor and compares them on every poll. A shorter file or different bytes
 //!   restart at offset 0 and drop the partial line, so a cursor that now sits inside a line
 //!   somebody else wrote is never trusted. Resets and lost bytes are counted (`take_counts`).
-//! - `poll_with_gaps` also reports where bytes were lost (reset, rotation dropping a partial
-//!   line, overlong line) as `None`, so the DHCP assembler can drop its attach contexts there.
+//! - `poll_with_gaps` also reports where continuity cannot be shown as `None`: a cursor reset,
+//!   an overlong line, and EVERY switch to a different file (even with nothing partial pending:
+//!   two rotations between polls would hide a whole intermediate file, and an inode alone cannot
+//!   tell). The DHCP assembler drops its attach contexts at each `None`.
 //! - Bounded: lines over `MAX_LINE` bytes are dropped, at most `MAX_POLL_BYTES` read per poll.
 
 use std::collections::BTreeMap;
@@ -29,6 +31,8 @@ pub struct Tail {
     carry: Vec<u8>,
     skipping: bool,
     polled_once: bool,
+    /// A gap was found in a poll that then failed with an error: report it on the next poll.
+    gap_pending: bool,
     /// The (up to) 64 bytes of the file just before `pos`.
     fingerprint: Vec<u8>,
     resets: u64,
@@ -45,6 +49,7 @@ impl Tail {
             carry: Vec::new(),
             skipping: false,
             polled_once: false,
+            gap_pending: false,
             fingerprint: Vec::new(),
             resets: 0,
             skipped: 0,
@@ -61,21 +66,35 @@ impl Tail {
     pub fn poll_with_gaps(&mut self) -> io::Result<Vec<Option<String>>> {
         let mut out = Vec::new();
         let mut budget = MAX_POLL_BYTES;
+        if std::mem::take(&mut self.gap_pending) {
+            push_gap(&mut out);
+        }
         if self.cur.is_none() {
-            self.open_new(!self.polled_once)?;
+            let first = !self.polled_once;
+            self.open_new(first)?;
             self.polled_once = true;
+            // A file that reappears after a failed switch or a missing path: nothing is known
+            // about what happened in between.
+            if !first && self.cur.is_some() {
+                push_gap(&mut out);
+            }
         }
         loop {
             match self.step(&mut budget, &mut out) {
                 Ok(true) => {}
                 Ok(false) => break,
                 // Lines already drained are returned; the failure is counted, and the next poll
-                // retries (and reports the error itself when it has nothing to return).
-                Err(_) if !out.is_empty() => {
+                // retries (and reports the error itself when it has no line to return; gap
+                // markers alone are not data, so the error still surfaces and the gap is kept
+                // for the next poll).
+                Err(_) if out.iter().any(Option::is_some) => {
                     self.open_failed += 1;
                     break;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.gap_pending |= out.contains(&None);
+                    return Err(e);
+                }
             }
         }
         Ok(out)
@@ -87,9 +106,7 @@ impl Tail {
         if !self.rotated()? || *budget == 0 {
             return Ok(false);
         }
-        if !self.carry.is_empty() {
-            out.push(None);
-        }
+        push_gap(out);
         self.open_new(false)?;
         Ok(self.cur.is_some())
     }
@@ -191,6 +208,13 @@ impl Tail {
                 self.skipped += 1;
             }
         }
+    }
+}
+
+/// A gap marker, unless the last item already is one.
+fn push_gap(out: &mut Vec<Option<String>>) {
+    if out.last() != Some(&None) {
+        out.push(None);
     }
 }
 

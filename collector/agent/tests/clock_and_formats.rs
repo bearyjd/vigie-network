@@ -93,11 +93,13 @@ fn split_requested_option_lines_accumulate() {
         "Oct 20 14:00:00 dnsmasq-dhcp[5]: 77 DHCPACK(br-lan) 192.168.1.50 c2:11:22:33:44:01 Pixel",
     ];
     let mut a = DhcpAssembler::default();
-    let lease = lines
+    let mut leases: Vec<_> = lines
         .iter()
         .filter_map(|l| parse_line(l))
-        .find_map(|e| a.feed(&e))
-        .unwrap();
+        .flat_map(|e| a.feed(&e))
+        .collect();
+    leases.extend(a.break_context());
+    let lease = leases.pop().unwrap();
     assert_eq!(lease.opt55, vec![1, 3, 6, 15, 28]);
 }
 
