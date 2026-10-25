@@ -29,8 +29,8 @@ config/key check. The [2026-10-25 field report](monitoring-field-status-2026-10-
 proofs separate from the actual running collector wrapper/child kernel checks, which have also
 passed, including renewed checks after the LAN correction. A controlled stop proved the wrapper
 and Rust child gone; a repaired portable UID scan and new controlled stop/restart also passed,
-with the earlier unsupported auxiliary check retained as failed evidence. Remaining recovery
-and boot acceptance are separate. Neither
+with the earlier unsupported auxiliary check retained as failed evidence. The bounded outage, controlled drop-in repair and read-only-reconciled helper respawn passed.
+Natural rotation and boot acceptance remain separate. Neither
 unit fixtures nor the earlier disposable launcher substitutes for those field checks.
 
 This helper is required because the observed firmware accepted procd `no_new_privs` configuration but left kernel NNP 0 without its unavailable jail machinery. Merely publishing that boolean is insufficient. Filesystem boot guards, bounded retries, DNS logging/ownership, reboot/recovery and real 48-hour acceptance remain separate deployment gates; see [router log filesystem](router-logfs.md).

@@ -7,8 +7,8 @@ records three healthy owned server roles, installed router files/account and the
 scope yields fresh source flags 0 and earlier flagged history is retained. Controlled drain and
 stop/restart passed. Six owned boot links and the scoped root cron job are installed; a bounded
 125-second ingest outage recovered with zero drops and drain to zero. PR12 processing-age source
-is merged, but its candidate image awaits deployment. Repair/rotation and cold-boot evidence
-remain pending. The metrics key is not installed and awaits
+and its API image are deployed and verified. Controlled drop-in repair and read-only-reconciled
+helper respawn passed; natural rotation and cold-boot evidence remain pending. The metrics key is not installed and awaits
 owner approval; the 48-hour monitor has not started.
 
 ## Rootless Tower units
@@ -31,6 +31,13 @@ The meter runs without `SSH_AUTH_SOCK`, stdin or caller environment, with a 10-s
 
 Meter execution requires native Linux `memfd` sealing, `/proc/self/fd`, `waitid(WNOWAIT)` and exclusive single-threaded child supervision with the default SIGCHLD disposition; unsupported environments fail closed. All source ancestors are opened without following symlinks and must be trusted; arbitrary writable parents are refused (trusted sticky temporary directories are permitted). The exact copied bytes are hashed and sealed against in-place writes before execution; pathname replacement cannot change the executed snapshot. Scripts must use fixed absolute resource paths, since `$0` names the sealed descriptor. The supervisor retains the leader PID until its process group is terminated, including when the leader exited before its children; only then is the leader reaped. Reviewed adapters must not daemonize or change sessions/process groups. This is supervision of a reviewed fixed adapter, not a sandbox for hostile arbitrary code. Native subprocess regressions run on the host; a container mapping trusted root directories to UID65534 will correctly refuse them rather than weaken ownership checks.
 
+Processing acceptance uses `processing_backlog_age_s <= 180`, not raw backlog count equal to
+zero. Raw count remains visible: a positive count with a fresh oldest receipt is normal handoff.
+The API must provide exact `oldest_pending_received_at` and typed cap fields; zero backlog requires
+null oldest receipt. Missing, capped, malformed or inconsistent receipt/count evidence is unknown
+and cannot produce a pass. Future timestamps do not create a favorable age. Keep the original
+raw count/caps alongside age; do not hide stalled receipts by relabeling them normal handoff.
+
 The live meter's collector RSS is authoritative for resource acceptance. API coverage uses the exact `backlog_capped`/`summary_capped` booleans; absent or capped detail makes relevant counts unknown and blocks a favorable partial result. The API's older RSS report is retained separately as `api_collector_rss_kib` and cannot replace it. A resumed collection appends failure or missing evidence durably before applying gates, so retrying cannot silently omit that observation.
 
 The meter returns one JSON object with the following fields only (other fields are discarded):
@@ -45,9 +52,9 @@ The meter returns one JSON object with the following fields only (other fields a
 
 A runtime forced-command wrapper must reject supplied commands/arguments, check a fixed root-owned expiry deadline, verify fixed process executables/UIDs before reading counters, and expose only this schema. Its dedicated key must prohibit PTY, forwarding, agent and X11. Do not assume OpenSSH `restrict`/expiry key options exist on Dropbear. Root must review actual firmware behavior before key installation. The owned 20 MiB log tmpfs has passed mount and pre-writer capacity checks; consumer/recovery/reboot behavior remains a separate field gate. The monitor itself does not mount anything.
 
-Acceptance requires 172800 actual seconds, 60-second cadence, maximum 180-second gap and ≥99% valid sample slots. Collector RSS is strictly below 9765 KiB; helper below 65536 KiB; available RAM at least 65536 KiB; log capacity/usage no more than 20480 KiB; collector average CPU ≤2% of one logical CPU using counter ratios. Unexpected restart, clock/suspend inconsistency, topology/counter reset, backlog, fresh dropped batches, source flags or hard resource violations fail. Missing metrics, DNS silence or stale parsed-DNS evidence block success; unmapped conntrack stays a visible attribution caveat. Historical drops are currently a strict zero gate, so start a new scoped healthy collector enrollment after resolving prior failures rather than hiding them.
+Acceptance requires 172800 actual seconds, 60-second cadence, maximum 180-second gap and ≥99% valid sample slots. Collector RSS is strictly below 9765 KiB; helper below 65536 KiB; available RAM at least 65536 KiB; log capacity/usage no more than 20480 KiB; collector average CPU ≤2% of one logical CPU using counter ratios. Unexpected restart, clock/suspend inconsistency, topology/counter reset, processing backlog age above 180 seconds, fresh dropped batches, source flags or hard resource violations fail. Missing metrics, DNS silence or stale parsed-DNS evidence block success; unmapped conntrack stays a visible attribution caveat. Historical drops are currently a strict zero gate, so start a new scoped healthy collector enrollment after resolving prior failures rather than hiding them.
 
-Journals are locked, private 0600, append-only and fsynced, including directory creation. Resume requires the identical configuration hash/contract; partial records are retained and rejected. Failure evidence survives resume. Host reboot or a gap over 180 seconds invalidates the strict run; begin a separately recorded new run after recovery. Interrupting the runner leaves a pending report and durable history. Unit fixtures exercise these transitions with fake clocks, without claiming real elapsed time.
+Journals are locked, private 0600, append-only and fsynced, including directory creation. The journal contract is schema 2; schema-1 journals cannot resume under it. Resume requires the identical configuration hash/contract; partial records are retained and rejected. Failure evidence survives resume. Host reboot or a gap over 180 seconds invalidates the strict run; begin a separately recorded new run after recovery. Interrupting the runner leaves a pending report and durable history. Unit fixtures exercise these transitions with fake clocks, without claiming real elapsed time.
 
 ## Router startup state and recovery boundary
 

@@ -7,8 +7,8 @@ mount boundaries, private creation modes and individual service restarts; see th
 [2026-10-25 field status](monitoring-field-status-2026-10-25.md) records three healthy deployed
 server roles, real router logging/signed parsed-DNS delivery and actual collector privileges.
 The LAN correction now yields fresh source flags 0 while retaining earlier degraded history.
-Controlled drain and portable stop/restart passed; the processing-age candidate-image deployment,
-remaining repair/rotation, host reboot/restore and the
+Controlled drain, portable stop/restart, API-only processing-age deployment, drop-in repair and
+read-only-reconciled helper respawn passed. Natural rotation, host reboot/restore and the
 not-yet-started 48-hour soak remain pending. A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
 marked *unverified* still require their own operational validation.
 
@@ -29,7 +29,7 @@ reviewed correction/restart, retaining previously flagged history as degraded ev
 
 ## Permission model: three processes, three volumes
 
-Ownership follows the PRP section 5 table. The candidate image's real mounts and write boundaries
+Ownership follows the PRP section 5 table. The deployed images' real mounts and write boundaries
 were checked in an isolated synthetic pilot, alongside the existing bubblewrap tests. The entrypoint
 uses `umask 077` so newly created private files, including fresh SQLite database/WAL/SHM files,
 are 0600. This does not repair pre-existing file modes; inspect and handle existing volumes explicitly

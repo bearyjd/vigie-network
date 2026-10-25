@@ -9,7 +9,8 @@ Status on 2026-10-25: the five source foundations and follow-up shutdown/DNS-pro
 merged after review and CI. The [dated field report](../monitoring-field-status-2026-10-25.md)
 records actual server/router activation, corrected LAN scope, controlled drain and stop/restart
 evidence, scoped boot-link/cron installation and bounded ingest-outage recovery. PR12 processing-age
-source is merged; candidate-image deployment and remaining repair/rotation gates are pending. Flagged history is retained,
+source and its API image are deployed and verified; controlled repair and reconciled helper
+respawn passed. Natural rotation and cold-boot gates remain pending. Flagged history is retained,
 not reset to make acceptance pass; the runtime metrics key still requires owner approval.
 The real 48-hour run has not started; later UI/feedback work and mature field baselines remain
 separate roadmap stages.

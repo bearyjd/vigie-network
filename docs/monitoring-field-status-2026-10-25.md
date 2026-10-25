@@ -5,8 +5,8 @@ reviewed collector shutdown and DNS-probe fixes. The owned server deployment is 
 router installation, DNS logging and signed parsed-DNS delivery have passed their checkpoints.
 Actual collector privilege checks passed. The LAN configuration correction is applied and a
 post-correction parsed-DNS observation has source flags 0. A backlog of 1 was normal pipeline
-handoff; a controlled drain reached 0. The processing-age acceptance contract is merged, but its newly built server image remains
-a deployment candidate; its live API contract has not yet been verified. Full acceptance and
+handoff; a controlled drain reached 0. The processing-age acceptance contract is merged and its API-only image update is deployed
+and independently verified, including the additive field and null-at-zero behavior. Full acceptance and
 soak readiness are not claimed. The real 48-hour run has
 **not started**.
 
@@ -19,8 +19,8 @@ claim. The earlier [container validation](deployment-validation-2026-10-24.md) a
 | Area | Merged source | Measured field status |
 |---|---|---|
 | Device characterization | Versioned, expiring same-MAC service evidence; qualitative strength, conflicts/unknown and human-override precedence | Classification accuracy and household role coverage remain unmeasured |
-| DNS and source coverage | Retryable deployment recovery, typed observation/probe windows, authenticated coverage API, strict bounded direct-answer DNS probe | LAN correction applied; fresh signed parsed-DNS window has source flags 0. Earlier flags-8 history is retained; controlled drain reached backlog 0; processing-age contract is merged; candidate image deployment remains pending |
-| Persistent deployment | Rootless units, dependency recovery, fixed router logfs and privilege transition, bounded collector shutdown | Three owned server roles and router collection are running; actual collector privileges and server restart checkpoints passed; remaining recovery/boot acceptance is pending |
+| DNS and source coverage | Retryable deployment recovery, typed observation/probe windows, authenticated coverage API, strict bounded direct-answer DNS probe | LAN correction applied; fresh signed parsed-DNS window has source flags 0. Earlier flags-8 history is retained; controlled drain reached backlog 0; processing-age API update deployed and verified; normal handoff remains distinct from a stall |
+| Persistent deployment | Rootless units, dependency recovery, fixed router logfs and privilege transition, bounded collector shutdown | Three owned server roles and router collection are running; actual collector privileges and server restart checkpoints passed; bounded outage, drop-in repair and reconciled helper respawn passed; natural rotation/cold boot remain pending |
 | Long-duration testing | Durable real-clock monitor with missing-data, clock/gap, resource and source-quality gates | No real 48-hour run has started; no pass is claimed from fixture clocks or short probes |
 | Baselines and incidents | Collector-scoped hourly measurements, versioned pooled references, fixed and qualified learned upload incidents, bounded read APIs | Last snapshot: 31 identities all typed unknown, first three inspected activity records learning, zero incidents. No mature field baseline, labeled accuracy result or monitoring UI is claimed |
 
@@ -37,6 +37,12 @@ Unrelated workloads were preserved. Controlled API and pipeline restarts passed 
 pinned image. An initial API check ran before readiness and failed; its evidence was retained,
 and the settled TLS/health check subsequently passed. This does not establish host cold-boot or
 restore behavior.
+
+The API-only processing-age deployment completed in 2.82 seconds. Its new field/null-at-zero
+contract and actual UID/GID 10001, zero capabilities, NNP 1 and role constraints were independently
+corroborated. All 85 other containers in the 86-container host inventory were unchanged; ingest
+and pipeline retained their previous image, whose relevant application code is byte-identical.
+Only the API role changed. This does not imply a whole-stack image replacement.
 
 The router checkpoint installed sixteen reviewed files and the dedicated UID/GID 20061 account.
 Its journal contains twenty-three ordered prepared/verified step pairs. Installed file hashes,
@@ -90,8 +96,9 @@ The runtime metrics key is **not installed**. The proposed append was blocked be
 explicit owner approval remains pending. Expiry arming and the strict 48-hour monitor have not run.
 
 The additive oldest-pending-receipt API field and greater-than-180-second processing-age stall
-gate are merged in PR12; the raw backlog count is preserved. The new server image (`fcdd` hash
-prefix) has been built as a candidate, but is not yet deployed or verified here. A transient
+gate are merged in PR12; the raw backlog count is preserved. The API image (`fcdd` hash prefix) is now deployed and verified; ingest and pipeline were
+preserved. The durable runner uses schema 2 and the processing-age contract; its version-2
+service is staged only, not running. A transient
 handoff count and a stalled pipeline must not be presented as the same failure.
 
 A bounded 125-second ingest outage passed its scoped recovery checkpoint: nine of nine DNS
@@ -100,6 +107,27 @@ RAM spool, dropped batches remained zero, backlog drained to zero and the collec
 remained stable. Recovery used the same ingest image. An initial readiness check failed before
 the service settled; that result was retained and subsequent readiness passed. This proves the
 bounded tested outage, not arbitrary-duration buffering, cold boot or restore.
+
+The controlled owned drop-in repair completed in 0.79 seconds. Exact restored-file and applied-marker
+checks passed, followed by 144 positive control DNS queries, fresh signed parsed-DNS delivery,
+source flags 0, backlog 0 and zero drops. The continuity recorder was explicitly stopped with its
+stop event retained. The natural log size was about 4.4 MiB, below the 8 MiB rotation threshold;
+no forced fill or rotation was performed. Natural rotation/reopen and cold boot remain untested.
+
+One service-scoped helper TERM RPC caused procd to respawn the root helper with a new process
+start and socket inode, while the collector wrapper/Rust process identities stayed unchanged.
+The original proof rejected procd's successful empty acknowledgement because it expected `{}`;
+its prepared/failed record and stderr remain intact. A separately approved **read-only** reconciliation
+used the old baseline and unchanged functional guards, without sending a second signal. It reached
+reconciled state after a fresh full signed post-fault window, source flags 0, zero drops, drain to
+zero, stable collector boot and positive external/local DNS checks. A future acknowledgement fix
+has fixture evidence but was not used to repeat the fault.
+
+The helper fault interval is **partial conntrack evidence**: newly primed cumulative counters avoid
+replaying old traffic, but the interruption can undercount traffic without raising source flags.
+Flags 0 and zero reported drops do not prove a gap-free interval or zero activity. The
+[roadmap](roadmap.md#execution-stages) records a transport-gap/sequence-reset quality-latch
+hardening seam; this report does not claim that latch is implemented.
 
 A read-only NextDNS assessment succeeded and confirmed available query/device metadata. Provider
 history has not been ingested into Vigie. A future adapter belongs to the richer context stage:
@@ -114,11 +142,10 @@ proposal is a draft for M1b, not implemented or approved for implementation.
 
 ## Remaining measured gates
 
-1. Deploy and verify the merged processing-age contract candidate. Complete remaining
-   scoped boot/cron proofs, preserving the
+1. Complete remaining scoped boot/first-cron proofs, preserving the
    already-recorded degraded windows and all failure evidence.
-2. Complete the owned drop-in repair and natural-threshold rotation/reopen proofs, retain
-   the completed bounded-outage evidence, and verify
+2. Complete natural-threshold rotation/reopen proof, retain the completed drop-in repair,
+   bounded-outage and read-only-reconciled helper evidence, and verify
    final healthy source/resource state. Cold-boot/reboot behavior needs its own reviewed test;
    installation and simulated manager tests do not establish it.
 3. Obtain the required owner approval before installing the read-only runtime meter credential.
@@ -129,6 +156,6 @@ proposal is a draft for M1b, not implemented or approved for implementation.
    seven-day pilot follow their [roadmap stages](roadmap.md#execution-stages); a 48-hour resource
    run cannot establish fourteen-date baseline maturity or detection accuracy.
 
-The next checkpoint is candidate-image deployment and the remaining operational proofs;
+The next checkpoint is credential authorization and the remaining operational proofs;
 update this report only from
 captured results, keeping pending items distinct from completed evidence.

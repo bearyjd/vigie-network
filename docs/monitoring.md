@@ -10,7 +10,8 @@ Source is merged through the reviewed DNS-probe fixes. The
 [2026-10-25 field status](monitoring-field-status-2026-10-25.md) records healthy server deployment
 and actual router logging/parsed-DNS and collector privilege evidence. A LAN correction produced
 fresh source flags 0; flagged history is retained and controlled drain reached backlog0.
-PR12 processing-age source is merged; its new image and remaining repair/rotation checks are pending. The
+PR12 processing-age API is deployed and verified. Bounded outage, drop-in repair and reconciled
+helper respawn passed; natural rotation and cold boot remain pending. The
 48-hour run has not started. No fourteen-date mature
 field reference is claimed.
 
@@ -131,5 +132,5 @@ Tests cover independent worked sums/replays, hour boundaries, atomic crash recov
 lineage round-trips/name-only edits, cold-start fixed incidents and service expiry/same-MAC limits.
 Full CI and independent review remain release evidence recorded in the PR, not an accuracy claim.
 The [field report](monitoring-field-status-2026-10-25.md) separates completed installation and logfs
-capacity, parsed-DNS, scoped persistence and bounded-outage recovery proof from pending image deployment, repair/rotation, reboot behavior and
+capacity, parsed-DNS, scoped persistence and bounded-outage recovery proof, deployed processing-age API and controlled repair/reconciled helper recovery from pending natural rotation, reboot behavior and
 long-duration learning. D1–D6 owner decisions remain unchanged.

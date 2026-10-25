@@ -16,7 +16,7 @@ features remain unimplemented until their own acceptance evidence exists.
 | Stage | Scope | State / prerequisite |
 |---|---|---|
 | M0 | Inventory, reversible identity decisions and rules, API, bounded real-router pilot | Foundation merged; ten-minute field evidence recorded separately from production readiness |
-| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Processing-age update, remaining recovery/boot gates, credential approval, real48h acceptance and field baseline maturity remain pending; see [field status](monitoring-field-status-2026-10-25.md) |
+| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Processing-age API deployment and controlled recovery passed; natural rotation/boot gates, credential approval, real48h acceptance and field baseline maturity remain pending; see [field status](monitoring-field-status-2026-10-25.md) |
 | M1b | Local overview, device charts/history, coverage panel and incident inbox | Queued after M1a API/data contracts; necessary for the eventual monitoring MVP |
 | M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Queued after persisted incident state; external delivery needs a configured owner-controlled destination |
 | M2 | Time-of-day patterns, destination/port novelty, essential-device absence, network-wide shifts, incident correlation and calibrated characterization | Queued after sufficient qualified history and owner-labeled evaluation |
@@ -168,3 +168,9 @@ Provider DNS logs, including NextDNS, are proposed M2 context adapters. Use raw 
 provider/time coverage, pagination and deduplication. Do not import cloud history into router-local
 baseline training, automatically merge identities, or give an observation adapter enforcement authority.
 The read-only M1b GUI proposal remains a draft; implementation has not been approved.
+
+M1c field hardening includes a transport-gap/sequence-reset quality latch: when a helper restarts
+and cumulative counters re-prime, retain the interrupted interval as partial even if current source
+flags are zero. TDD seams should cover restart, missing sequence, reconnect and reset without
+replay/double counting; assert preserved gap provenance and abstention from confident baseline
+training. This is proposed hardening, not implemented or evidence of malicious traffic.

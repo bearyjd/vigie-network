@@ -22,7 +22,7 @@ The public helper has passed a harmless real procd/kernel proof, as recorded in 
 [field report](monitoring-field-status-2026-10-25.md) and [privilege contract](privdrop.md).
 The actual running collector wrapper/child has also passed its kernel privilege checks;
 the controlled wrapper/child stop, portable UID scan and new stop/restart also passed. Remaining
-drop-in repair, natural-threshold rotation and boot behavior are separate gates. Six owned
+drop-in repair passed; natural-threshold rotation and boot behavior remain separate gates. Six owned
 boot links and the scoped root cron job have been installed; installation does not prove a
 first cron execution or cold boot. The earlier
 firmware probe accepted a bare procd `no_new_privs` setting but left kernel NNP 0; that boolean
