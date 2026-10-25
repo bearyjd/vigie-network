@@ -82,6 +82,10 @@ assert.equal(liveLabel(true,true,5),'Snapshot (paused)');
 assert.equal(liveLabel(true,false,121),'Stale');assert.equal(liveLabel(true,true,121),'Stale');assert.equal(liveLabel(true,false,null),'Stale');
 assert.equal(liveLabel(true,false,120),'Current');
 assert.equal(liveLabel(false,false,5),'Stale / unknown');assert.equal(liveLabel(false,true,5),'Stale / unknown');
+// M2: the observation itself ages; a young snapshot of an aged observation is not 'Current'.
+assert.equal(liveLabel(true,false,5,121),'Stale');assert.equal(liveLabel(true,true,5,121),'Stale');
+assert.equal(liveLabel(true,false,5,120),'Current');assert.equal(liveLabel(true,false,5,null),'Stale');
+assert.equal(liveLabel(false,false,5,500),'Stale / unknown');
 
 // Deadline failures are surfaced and cleaned up without a real 15-second wait.
 const originalSetTimeout = globalThis.setTimeout; const originalClearTimeout = globalThis.clearTimeout;

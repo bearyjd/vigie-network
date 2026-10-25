@@ -17,16 +17,21 @@ export function processingState(c, now = Date.now()) {
   if (age === null) return {label: 'Unknown', tone: '', age: null};
   return {label: age > 180 ? 'Stalled' : 'Awaiting processing', tone: age > 180 ? 'bad' : '', age};
 }
-/* 'Current' is only true at render time: a held or aged snapshot must not keep claiming it. */
-export function liveLabel(current, paused, snapshotAge) {
+/* 'Current' needs a fresh observation NOW, not at render: both the snapshot and the observation itself age. */
+export function liveLabel(current, paused, snapshotAge, observedAge = 0) {
   if (!current) return 'Stale / unknown';
-  if (snapshotAge === null || snapshotAge > 120) return 'Stale';
+  if (snapshotAge === null || snapshotAge > 120 || observedAge === null || observedAge > 120) return 'Stale';
   return paused ? 'Snapshot (paused)' : 'Current';
 }
-export function refreshLiveLabels(root, paused, snapshotAge) {
-  root.querySelectorAll('[data-live-current]').forEach(el => { el.textContent = liveLabel(el.getAttribute('data-live-current') === 'true', paused, snapshotAge); });
+export function refreshLiveLabels(root, paused, snapshotAge, now = Date.now() / 1000) {
+  root.querySelectorAll('[data-live-current]').forEach(el => {
+    const observed = Number(el.getAttribute('data-live-observed'));
+    const observedAge = el.getAttribute('data-live-observed') === null || el.getAttribute('data-live-observed') === '' || !Number.isFinite(observed) ? null : now - observed;
+    el.textContent = liveLabel(el.getAttribute('data-live-current') === 'true', paused, snapshotAge, observedAge);
+  });
 }
-const liveValue = current => node('span', {'data-live-current': String(current)}, current ? 'Current' : 'Stale / unknown');
+/* observed: epoch seconds of the OLDEST evidence behind the label, kept so freshness is recomputed later. */
+const liveValue = (current, observed) => node('span', {'data-live-current': String(current), 'data-live-observed': Number.isFinite(observed) ? String(observed) : ''}, current ? 'Current' : 'Stale / unknown');
 export function badge(value, tone = '') { return node('span', {class: `badge ${tone}`}, text(value)); }
 const quiet = value => node('span', {class: 'muted'}, value);
 export function heading(title, note) { return node('div', {class: 'section-head'}, node('h2', {}, title), note ? node('p', {}, note) : null); }
@@ -46,8 +51,9 @@ export function coverageView(data) {
   const windowAge = finite(c.latest_window_end) ? Date.now() / 1000 - c.latest_window_end : null;
   const dnsWindowAge = finite(c.latest_dns_observation_window_end) ? Date.now() / 1000 - c.latest_dns_observation_window_end : null;
   const fresh = age => age !== null && age >= 0 && age <= 120;
+  const oldest = (received, windowEnd) => Math.min(Date.parse(received) / 1000, windowEnd);
   const proc = processingState(c); const count = value => Number.isInteger(value) && value >= 0 ? String(value) : 'Unknown';
-  const strip = node('div', {class: 'health-strip'}, metric('Observation', liveValue(fresh(currentAge) && fresh(windowAge)), `Received ${utc(c.latest_observation_received_at)}`), metric('Parsed DNS', liveValue(fresh(dnsAge) && fresh(dnsWindowAge)), `Received ${utc(c.latest_dns_observation_received_at)}`), metric('Source flags', c.source_flags_latest === 0 ? '0 · None reported' : c.source_flags_latest === null || c.source_flags_latest === undefined ? 'Unknown' : String(c.source_flags_latest), c.source_flags_latest === 8 ? 'Multicast discovery unavailable' : 'Latest observation only; history remains below'), metric('Processing', badge(proc.label, proc.tone), `${count(c.backlog_batches)} pending${c.backlog_capped ? ' (capped)' : ''} · oldest ${proc.age === null ? 'unknown' : `${Math.round(proc.age)}s`}`));
+  const strip = node('div', {class: 'health-strip'}, metric('Observation', liveValue(fresh(currentAge) && fresh(windowAge), oldest(c.latest_observation_received_at, c.latest_window_end)), `Received ${utc(c.latest_observation_received_at)}`), metric('Parsed DNS', liveValue(fresh(dnsAge) && fresh(dnsWindowAge), oldest(c.latest_dns_observation_received_at, c.latest_dns_observation_window_end)), `Received ${utc(c.latest_dns_observation_received_at)}`), metric('Source flags', c.source_flags_latest === 0 ? '0 · None reported' : c.source_flags_latest === null || c.source_flags_latest === undefined ? 'Unknown' : String(c.source_flags_latest), c.source_flags_latest === 8 ? 'Multicast discovery unavailable' : 'Latest observation only; history remains below'), metric('Processing', badge(proc.label, proc.tone), `${count(c.backlog_batches)} pending${c.backlog_capped ? ' (capped)' : ''} · oldest ${proc.age === null ? 'unknown' : `${Math.round(proc.age)}s`}`));
   const counts = Object.fromEntries(['eligible', 'partial', 'missing', 'open'].map(s => [s, data.hours.filter(h => h.state === s).length]));
   const hours = node('div', {class: 'hour-strip', role: 'img', 'aria-label': `Coverage: ${counts.eligible} qualified, ${counts.partial} partial, ${counts.missing} missing, ${counts.open} open hours`}, data.hours.map(h => node('span', {class: `hour ${['eligible', 'partial', 'missing', 'open'].includes(h.state) ? h.state : 'missing'}`, title: `${utc(h.hour)} · ${text(h.state)} · ${(h.reasons || []).join(', ') || 'no reported reasons'}`})));
   const qualityRows = data.hours.filter(h => h.state !== 'eligible').map(h => node('tr', {}, node('td', {}, utc(h.hour)), node('td', {}, badge(h.state, h.state === 'partial' ? 'warn' : '')), node('td', {}, finite(h.qualified_seconds) ? `${h.qualified_seconds}s` : 'Unavailable'), node('td', {}, (h.reasons || []).join(', ') || 'Hour still open')));

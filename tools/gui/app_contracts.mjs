@@ -42,12 +42,12 @@ let intervalTick = null; globalThis.setInterval = callback => { intervalTick = c
 globalThis.setTimeout = () => 1; globalThis.clearTimeout = () => {};
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
-let mode = 'ok'; let retryAfter = '60';
+let mode = 'ok'; let retryAfter = '60'; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
   const from = Number(url.searchParams.get('from_hour')); const to = Number(url.searchParams.get('to_hour'));
   const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
-  const now = clock / 1000; const stamp = new Date(clock - 10000).toISOString();
-  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - 10, latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - 10, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
+  const now = clock / 1000; const stamp = new Date(clock - lag * 1000).toISOString();
+  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - lag, latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - lag, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
 globalThis.fetch = async url => {
@@ -88,6 +88,23 @@ assert.deepEqual(labels(), ['Current', 'Current']);
 clock += 119000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], '119 s is still current');
 clock += 2000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'recomputed by timer alone');
 
+// M2 / J9: a 100 s old observation is Current at render, but 30 s later (snapshot only 30 s old) it is not.
+lag = 100; refresh.fire('click'); await flush();
+assert.deepEqual(labels(), ['Current', 'Current'], 'a 100 s old observation is still fresh at render');
+const observed = content.querySelectorAll('[data-live-current]').map(e => Number(e.getAttribute('data-live-observed')));
+assert.ok(observed.every(t => Math.abs(t - (clock / 1000 - 100)) < 1), 'observation epoch is stored for later recompute');
+clock += 19000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], 'observation 119 s old');
+clock += 2000; intervalTick();
+assert.deepEqual(labels(), ['Stale', 'Stale'], 'observation 121 s old while the snapshot is only 21 s old');
+document.hidden = true; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'pausing never revives an aged observation');
+document.hidden = false;
+// An observation already stale at render never says Current, and the first chrome() keeps it that way.
+lag = 200; refresh.fire('click'); await flush();
+assert.deepEqual(labels(), ['Stale / unknown', 'Stale / unknown'], 'stale at render is unknown, not Current');
+intervalTick(); assert.deepEqual(labels(), ['Stale / unknown', 'Stale / unknown']);
+lag = 0; refresh.fire('click'); await flush();
+assert.deepEqual(labels(), ['Current', 'Current']);
+
 // L3 / J11: Refresh aria-disabled follows the rate-limit window without any chrome() trigger other than the timer.
 mode = '429'; refresh.fire('click'); await flush();
 assert.equal(refresh.getAttribute('aria-disabled'), 'true', 'rate limited refresh must be aria-disabled');
@@ -109,6 +126,15 @@ assert.equal(document.activeElement, notice, 'a disabled Retry hands focus to th
 clock += 61000; intervalTick(); mode = 'ok'; retry().focus(); retry().fire('click'); await flush();
 assert.equal(notice.hidden, true);
 assert.equal(document.activeElement, elements['view-title'], 'a cleared notice hands focus to the view title');
+
+// J7: a notice rebuilt while focus is elsewhere in the page must not steal it.
+mode = '503';
+const keeper = content.querySelector('[data-live-current]'); keeper.focus(); assert.equal(document.activeElement, keeper);
+refresh.fire('click'); await flush();
+assert.equal(notice.hidden, false, 'the failed refresh shows a notice');
+assert.equal(document.activeElement, keeper, 'a notice that did not hold focus never takes it');
+mode = 'ok'; refresh.fire('click'); await flush(); assert.equal(document.activeElement, keeper);
+body.focus();
 
 Date.now = realNow;
 console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts.');
