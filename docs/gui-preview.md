@@ -43,6 +43,14 @@ One fixed private lock protects port18745 across all preview directories. Each s
 
 The legacy preview PID1923379 is currently **unmanaged** by these new commands. The manager intentionally refuses to adopt or stop it. A separately identity-checked transition is required after the new helper's independent review; no transition has been performed during code preparation. This paragraph will be updated after that verified transition.
 
+### Trust checks and recovery
+
+Before spawning, `start` verifies: the package directory, every ancestor and **every entry below it** are owned by root or the current user, not group/world-writable, and contain no symlinks; the child interpreter is resolved and its binary, launch directory, venv root (the folder holding `pyvenv.cfg`) and every `lib*/python*/site-packages` tree get the same check. Anything else is refused with no child and no receipt.
+
+A start that is interrupted (Ctrl-C, SIGTERM, SIGHUP) terminates only its own retained child, records the outcome and re-raises. `stopped`, `startup-failed` (child exited) and `failed-before-spawn` receipts are terminal: their PIDs are never probed, so a reused PID cannot block a new start. If the controller is killed outright (SIGKILL, power loss) between spawning and recording the child, `status` reports `orphaned` only when exactly one process of the current user has the receipt's full argv and owns the receipt's listener; `stop` then re-verifies it, records it and sends TERM through the same pidfd-guarded path. Anything less certain stays `uncertain` and is never signalled.
+
+**Known limitation (fixed port):** the preview always uses loopback port 18745. Another local user or process that binds the port first only causes `start` to refuse (`unmanaged listener`); the manager never adopts or signals it. A process that squats the port blocks the preview until it exits; there is no port fallback by design, because the documented URL and the QA tools pin that origin.
+
 ## Reproduce with existing native dependencies
 
 The current preview runs an offline-built wheel installed into `/tmp/vigie-gui-wheel-target-attempt3`; its package location was verified outside the checkout. Current wheel SHA256: `373f3a06ae4c0b5501cb27d012822c799b0c37f370b5f71c3f57b1d5c260ee4c`. All five installed and served asset hashes match source. No runtime dependency or frontend build system was added. Start uses explicit own database paths, ignoring inherited `VIGIE_*` database settings:
