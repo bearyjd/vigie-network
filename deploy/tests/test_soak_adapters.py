@@ -1,4 +1,5 @@
 import importlib.util
+import struct
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,181 @@ SPEC = importlib.util.spec_from_file_location(
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+class DnsProbeTests(unittest.TestCase):
+    QUESTION = b"\x07example\x03com\0\0\1\0\1"
+
+    def reply(
+        self,
+        owner,
+        *,
+        question=None,
+        flags=0x8180,
+        kind=1,
+        dns_class=1,
+        data=b"\xc0\x00\x02\x14",
+    ):
+        question = self.QUESTION if question is None else question
+        return (
+            struct.pack("!5H", flags, 1, 1, 0, 0)
+            + question
+            + owner
+            + struct.pack("!HHIH", kind, dns_class, 60, len(data))
+            + data
+        )
+
+    def probe(self, response, wrong_id=False):
+        class Socket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def connect(self, target):
+                self.target = target
+
+            def send(self, packet):
+                self.request = packet
+
+            def recv(self, size):
+                ident = self.request[:2]
+                if wrong_id:
+                    ident = bytes([ident[0] ^ 255, ident[1]])
+                return ident + response
+
+        socket = Socket()
+        with patch.object(runner.socket, "socket", return_value=socket):
+            result = runner.dns_probe("192.0.2.1")
+        self.assertEqual(socket.target, ("192.0.2.1", 53))
+        self.assertEqual(socket.request[12:], self.QUESTION)
+        return result
+
+    def test_unrelated_owner_and_self_pointer_are_not_dns_success(self):
+        answer_offset = 12 + len(self.QUESTION)
+        for owner in (b"\x04evil\x03com\0", bytes([0xC0, answer_offset])):
+            with self.subTest(owner=owner):
+                self.assertFalse(self.probe(self.reply(owner)))
+
+    def test_direct_plain_compressed_and_casefolded_names_succeed(self):
+        for owner in (b"\x07example\x03com\0", b"\xc0\x0c", b"\x07EXAMPLE\x03COM\0"):
+            with self.subTest(owner=owner):
+                self.assertTrue(self.probe(self.reply(owner)))
+        self.assertTrue(
+            self.probe(
+                self.reply(b"\xc0\x0c", question=b"\x07EXAMPLE\x03COM\0\0\1\0\1")
+            )
+        )
+
+    def test_dotted_single_labels_cannot_impersonate_question_or_owner(self):
+        dotted = b"\x0bexample.com\0"
+        self.assertFalse(self.probe(self.reply(dotted)))
+        self.assertFalse(
+            self.probe(self.reply(b"\xc0\x0c", question=dotted + b"\0\1\0\1"))
+        )
+
+    def test_malformed_pointer_targets_are_not_followed_or_skipped(self):
+        for owner in (
+            b"\xc0\x1d",  # self
+            b"\xc0\x1f\xc0\x1d",  # two-pointer cycle, first jump forward
+            b"\xc0\x29",  # forward into RDATA
+            b"\xc0\x00",  # header
+            b"\xc0\x0d",  # middle of question label
+            b"\xff\xff",  # out of packet
+            b"\x40" + b"x" * 64 + b"\0",  # invalid label prefix/length
+        ):
+            with self.subTest(owner=owner):
+                self.assertFalse(self.probe(self.reply(owner)))
+        header_question = struct.pack("!5H", 0x8180, 1, 1, 0, 0) + self.QUESTION
+        self.assertFalse(self.probe(header_question + b"\xc0"))
+
+    def test_positive_first_answer_cannot_hide_overlong_or_truncated_tail(self):
+        good = self.reply(b"\xc0\x0c")
+        overlong = (b"\x3f" + b"x" * 63) * 4 + b"\0"
+        second = overlong + struct.pack("!HHIH", 1, 1, 60, 4) + b"\xc0\x00\x02\x14"
+        two = struct.pack("!5H", 0x8180, 1, 2, 0, 0) + good[10:] + second
+        self.assertFalse(self.probe(two))
+        self.assertFalse(self.probe(good[:-1]))
+        self.assertFalse(self.probe(good + b"\0"))
+        self.assertFalse(self.probe(good + b"x" * 4096))
+
+    def test_flags_question_fields_record_types_and_transaction_are_checked(self):
+        for flags in (0x0180, 0x8380, 0x8183, 0x8980):
+            with self.subTest(flags=flags):
+                self.assertFalse(self.probe(self.reply(b"\xc0\x0c", flags=flags)))
+        for tail in (b"\0\x1c\0\1", b"\0\1\0\3"):
+            self.assertFalse(
+                self.probe(self.reply(b"\xc0\x0c", question=self.QUESTION[:-4] + tail))
+            )
+        self.assertFalse(self.probe(self.reply(b"\xc0\x0c", kind=28, data=b"x" * 16)))
+        self.assertFalse(self.probe(self.reply(b"\xc0\x0c", dns_class=3)))
+        self.assertFalse(self.probe(self.reply(b"\xc0\x0c"), wrong_id=True))
+        too_many = (
+            struct.pack("!5H", 0x8180, 1, 1, 0, 128) + self.reply(b"\xc0\x0c")[10:]
+        )
+        self.assertFalse(self.probe(too_many))
+
+    def test_authority_or_additional_address_is_not_a_direct_answer(self):
+        packet = self.reply(b"\xc0\x0c", kind=5, data=b"\x04evil\x03com\0")
+        address = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + b"\xc0\x00\x02\x14"
+        for ns, ar in ((1, 0), (0, 1)):
+            response = struct.pack("!5H", 0x8180, 1, 1, ns, ar) + packet[10:] + address
+            self.assertFalse(self.probe(response))
+
+    def test_direct_answer_with_ns_rdata_compressed_glue_is_valid(self):
+        # RFC1035 4.1.4: glue owner may point at the name inside prior NS RDATA.
+        direct = self.reply(b"\xc0\x0c")[10:]
+        server = b"\x01a\x0ciana-servers\x03net\0"
+        ns = b"\xc0\x0c" + struct.pack("!HHIH", 2, 1, 60, len(server)) + server
+        server_offset = 12 + len(direct) + 12
+        self.assertEqual(server_offset, 57)  # independently worked wire offset
+        glue = (
+            bytes([0xC0, server_offset])
+            + struct.pack("!HHIH", 1, 1, 60, 4)
+            + b"\xc7\x2b\x87\x35"
+        )
+        response = struct.pack("!5H", 0x8180, 1, 1, 1, 1) + direct + ns + glue
+        self.assertTrue(self.probe(response))
+
+    def test_ns_rdata_has_exact_wire_bounds_and_opaque_data_is_not_a_name(self):
+        direct = self.reply(b"\xc0\x0c")[10:]
+        server = b"\x01a\x0ciana-servers\x03net\0"
+
+        def response(data, *, kind=2, length=None, glue_offset=57):
+            ns = (
+                b"\xc0\x0c"
+                + struct.pack(
+                    "!HHIH", kind, 1, 60, len(data) if length is None else length
+                )
+                + data
+            )
+            glue = (
+                bytes([0xC0, glue_offset])
+                + struct.pack("!HHIH", 1, 1, 60, 4)
+                + b"\xc7\x2b\x87\x35"
+            )
+            return struct.pack("!5H", 0x8180, 1, 1, 1, 1) + direct + ns + glue
+
+        # NS RDATA itself may compress a suffix against the prior question.
+        self.assertTrue(self.probe(response(b"\x01a\xc0\x14")))
+        for data in (
+            b"",
+            server[:-1],
+            server + b"x",
+            b"\xc0\x39",
+            b"\xc0\0",
+            b"\x40" + b"x" * 64 + b"\0",
+        ):
+            with self.subTest(data=data):
+                self.assertFalse(self.probe(response(data)))
+        for length in (1, len(server) + 1):
+            self.assertFalse(self.probe(response(server, length=length)))
+        self.assertFalse(self.probe(response(server, glue_offset=58)))
+        self.assertFalse(self.probe(response(server, kind=16)))  # opaque TXT bytes
 
 
 class AdapterTests(unittest.TestCase):
