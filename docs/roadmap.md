@@ -1,7 +1,8 @@
 # Vigie roadmap — discovery, baselines and unusual behavior
 
-Draft recommendation, 2026-10-24. This roadmap extends the identity MVP; it does not claim that the current
-build detects network anomalies. The user wants an app that discovers and characterizes devices AND the
+Execution status updated 2026-10-25; later stages remain proposals. This roadmap extends the identity MVP.
+Initial deterministic characterization and upload-incident source is merged; field efficacy remains
+unmeasured. The user wants an app that discovers and characterizes devices AND the
 network, learns normal activity, and makes strange behavior understandable. Implementation beyond the
 approved current build requires its own reviewed scope. [Research and primary sources](research/network-monitoring-features-2026-10-24.md).
 
@@ -15,7 +16,7 @@ features remain unimplemented until their own acceptance evidence exists.
 | Stage | Scope | State / prerequisite |
 |---|---|---|
 | M0 | Inventory, reversible identity decisions and rules, API, bounded real-router pilot | Foundation merged; ten-minute field evidence recorded separately from production readiness |
-| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | Authorized and in progress; do not infer completion from this plan or an open PR |
+| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Processing-age API deployment and controlled recovery passed; natural rotation/boot gates, credential approval, real48h acceptance and field baseline maturity remain pending; see [field status](monitoring-field-status-2026-10-25.md) |
 | M1b | Local overview, device charts/history, coverage panel and incident inbox | Queued after M1a API/data contracts; necessary for the eventual monitoring MVP |
 | M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Queued after persisted incident state; external delivery needs a configured owner-controlled destination |
 | M2 | Time-of-day patterns, destination/port novelty, essential-device absence, network-wide shifts, incident correlation and calibrated characterization | Queued after sufficient qualified history and owner-labeled evaluation |
@@ -49,11 +50,11 @@ proposed acceptance targets to calibrate with owner-labeled data, not demonstrat
 |---|---|---|---|
 | M0 — identity foundation | Inventory, reversible human identity decisions/rules, bounded stitching, API workflow, CI and honest deployment docs | Foundation merged after independent review and CI. Real deployment acceptance remains explicitly separate. | M, completed foundation |
 | M1 — monitoring MVP, next | Real collection validation; coverage panel; hourly device/network aggregates; cold-start baseline status; fixed large-upload and qualified upload-deviation alerts; bounded DNS/reachability probes; minimal local UI/inbox and notification lifecycle | Deterministic replay without duplicate counts/alerts; injected collection failure visible within two configured collection windows; injected sustained upload and probe outage visible within two detector windows. Seven-day normal-LAN pilot reports alert volume and owner judgments, target ≤1 unwanted external notification/network/day. | L |
-| M2 — richer behavior/context | Day/time patterns, destination/port novelty, network-wide shifts, measured type rules, incident correlation and feedback | ≥14 valid observation days before evaluating initial learned deviations; chronological held-out replay includes backups/updates, sleeping devices, restarts, IPv6 and gaps. Report precision/recall per detector, abstentions and coverage, never a single unsupported accuracy score. | L |
+| M2 — richer behavior/context | Read-only provider DNS context with provenance and explicit attribution; day/time patterns, destination/port novelty, network-wide shifts, measured type rules, incident correlation and feedback | ≥14 valid observation days before evaluating initial learned deviations; chronological held-out replay includes backups/updates, sleeping devices, restarts, IPv6 and gaps. Report precision/recall per detector, abstentions and coverage, never a single unsupported accuracy score. | L |
 | M3 — richer optional visibility | Approved multi-network adapters and external Zeek/Suricata metadata sensor on a capable host, with suitable TAP/SPAN placement | Fixture/replay contracts; malformed/flooded inputs bounded; missing sensor flagged; duplicate overlapping observations do not inflate totals. Demonstrate exactly which traffic is observable before enabling scan/beacon claims. | L |
 | M4 — measured learning | Robust per-device drift first; optional classifier/AI explanations only if rules leave a useful residual | Compare against deterministic baseline on owner-labeled chronological holdout; predeclare false-alert budget; no regression in explainability, privacy or resource bounds. Cancel models that add no measurable value. | M–L, conditional |
 
-The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. Prioritize visible source coverage and characterization backed by measured confidence before learned baseline alerts. This field evidence informs M1; it does not establish M1 as implemented.
+The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. This historical result motivated the merged coverage/characterization source. The [current field status](monitoring-field-status-2026-10-25.md) records actual parsed-DNS delivery and corrected LAN scope while retaining the earlier flagged windows and pending recovery, long-duration and accuracy gates; M1a source delivery does not complete the UI/feedback stages or the full monitoring MVP.
 
 M1 includes network health, not only identity. Passive DNS error-rate/latency analysis is outside M1's existing
 batch contract; start with explicitly labeled probes, or approve a separate response-telemetry extension.
@@ -162,3 +163,14 @@ A future lease-only collection mode avoids dnsmasq changes but loses fingerprint
 rather than promising identical coverage. Safe fixture-driven development can proceed while field-dependent
 acceptance waits. UI framework, external sensor placement, final alert budget and retention beyond current
 policy remain proposed choices to settle in each milestone's design review.
+
+Provider DNS logs, including NextDNS, are proposed M2 context adapters. Use raw events with explicit
+provider/time coverage, pagination and deduplication. Do not import cloud history into router-local
+baseline training, automatically merge identities, or give an observation adapter enforcement authority.
+The read-only M1b GUI proposal remains a draft; implementation has not been approved.
+
+M1c field hardening includes a transport-gap/sequence-reset quality latch: when a helper restarts
+and cumulative counters re-prime, retain the interrupted interval as partial even if current source
+flags are zero. TDD seams should cover restart, missing sequence, reconnect and reset without
+replay/double counting; assert preserved gap provenance and abstention from confident baseline
+training. This is proposed hardening, not implemented or evidence of malicious traffic.

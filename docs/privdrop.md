@@ -20,6 +20,17 @@ Host tests and static ARM release build:
 
 The command requests the musl target and inherits the workspace size optimization and abort-on-panic profile. Record source commit, compiler/target, binary hash and static linkage before deployment. Build commands alone do not establish those runtime facts. Copy `vigie-privdrop` alongside the other two binaries; the installation printer installs it as `/usr/bin/vigie-privdrop`, root:root 0755. Verify it and the wrapper/scripts remain root-owned, non-writable by the collector, without SUID/SGID or file capabilities. Stop owned services before any reviewed replacement and retain the exact journaled prior files for rollback.
 
-Tests cover canonical argv, unsafe IDs/paths/NULs, Linux64 ABI record layout, real inherited-FD flags, complete/malformed process-status fixtures and actual kernel non-root refusal. A root test runner drops only its test child before the refusal probe; production exposes no test bypass. These tests do not claim a completed privileged transition on the router. A separate reviewed harmless procd service must execute the public release helper and prove actual UID/GID/groups, all five masks, NNP and core limits, then the real collector wrapper/child must be checked independently. The earlier disposable launcher proof cannot certify this permanent artifact.
+Tests cover canonical argv, unsafe IDs/paths/NULs, Linux64 ABI record layout, real inherited-FD flags, complete/malformed process-status fixtures and actual kernel non-root refusal. A root test runner drops only its test child before the refusal probe; production exposes no test bypass.
+
+The public static release helper has now passed a separately reviewed harmless procd service
+on the real router: dedicated UID/GID, empty supplementary groups, all five zero capability
+masks, NNP 1 and zero core limits were observed. The installed helper also passed the collector
+config/key check. The [2026-10-25 field report](monitoring-field-status-2026-10-25.md) keeps these
+proofs separate from the actual running collector wrapper/child kernel checks, which have also
+passed, including renewed checks after the LAN correction. A controlled stop proved the wrapper
+and Rust child gone; a repaired portable UID scan and new controlled stop/restart also passed,
+with the earlier unsupported auxiliary check retained as failed evidence. The bounded outage, controlled drop-in repair and read-only-reconciled helper respawn passed.
+Natural rotation and boot acceptance remain separate. Neither
+unit fixtures nor the earlier disposable launcher substitutes for those field checks.
 
 This helper is required because the observed firmware accepted procd `no_new_privs` configuration but left kernel NNP 0 without its unavailable jail machinery. Merely publishing that boolean is insufficient. Filesystem boot guards, bounded retries, DNS logging/ownership, reboot/recovery and real 48-hour acceptance remain separate deployment gates; see [router log filesystem](router-logfs.md).

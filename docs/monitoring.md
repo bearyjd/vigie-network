@@ -6,6 +6,15 @@ activity, identity trust, enforcement, calibrated classification accuracy, or pr
 A baseline cannot mature before real qualifying history exists; synthetic fixtures prove arithmetic,
 not detection accuracy. A local monitoring UI and notifications remain subsequent product work.
 
+Source is merged through the reviewed DNS-probe fixes. The
+[2026-10-25 field status](monitoring-field-status-2026-10-25.md) records healthy server deployment
+and actual router logging/parsed-DNS and collector privilege evidence. A LAN correction produced
+fresh source flags 0; flagged history is retained and controlled drain reached backlog0.
+PR12 processing-age API is deployed and verified. Bounded outage, drop-in repair and reconciled
+helper respawn passed; natural rotation and cold boot remain pending. The
+48-hour run has not started. No fourteen-date mature
+field reference is claimed.
+
 ## Rollout and ownership
 
 Deploy the new server before new collectors: the new optional top-level `observation_kind` is
@@ -122,5 +131,6 @@ Tests cover independent worked sums/replays, hour boundaries, atomic crash recov
 19/20 hours and13/14 dates, exact10MiB median/50vs51MiB learned thresholds, missing-pair breaks,
 lineage round-trips/name-only edits, cold-start fixed incidents and service expiry/same-MAC limits.
 Full CI and independent review remain release evidence recorded in the PR, not an accuracy claim.
-Real router DNS coverage, persistent deployment, resource bounds, reboot behavior and long-duration
-learning require their separate measured deployment gates. D1–D6 owner decisions remain unchanged.
+The [field report](monitoring-field-status-2026-10-25.md) separates completed installation and logfs
+capacity, parsed-DNS, scoped persistence and bounded-outage recovery proof, deployed processing-age API and controlled repair/reconciled helper recovery from pending natural rotation, reboot behavior and
+long-duration learning. D1–D6 owner decisions remain unchanged.
