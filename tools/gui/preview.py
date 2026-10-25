@@ -37,6 +37,7 @@ LOCK = PREVIEW_PARENT / "vigie-gui-preview-18745.lock"
 DEFAULT_PACKAGE = PREVIEW_PARENT / "vigie-gui-wheel-target-attempt3"
 DEFAULT_PYTHON = PREVIEW_PARENT / "vigie-pr9-native-server-env/bin/python"
 CURRENT = "manager-current.json"
+_TERMINATION = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
 
@@ -88,7 +89,13 @@ def _seed(root: Path) -> dict:
             inv.execute(
                 "INSERT INTO observations(mac,device_id,is_randomized,hostname,link_source,"
                 "first_seen,last_seen) VALUES (?,?,0,?,'self',?,?)",
-                (mac, device, f"synthetic-host-{number:02d}", iso_utc(now - 86400), stamp),
+                (
+                    mac,
+                    device,
+                    f"synthetic-host-{number:02d}",
+                    iso_utc(now - 86400),
+                    stamp,
+                ),
             )
             name = (
                 '<img src=x onerror="window.__guiInjected=1">'
@@ -103,7 +110,8 @@ def _seed(root: Path) -> dict:
             if number % 3:
                 address = f"192.0.2.{number}" if number % 3 == 1 else f"2001:db8::{number:x}"
                 inv.execute(
-                    "INSERT INTO mac_last_ip VALUES (?,?,?,'lease')", (mac, address, int(now))
+                    "INSERT INTO mac_last_ip VALUES (?,?,?,'lease')",
+                    (mac, address, int(now)),
                 )
             for offset in range(1, 6):
                 if offset == 3:
@@ -364,7 +372,8 @@ def process_identity(pid: int) -> dict | None:
         fields = (process / "stat").read_text().rsplit(") ", 1)[1].split()
         if fields[0] == "Z":
             return None
-        argv = [x.decode() for x in (process / "cmdline").read_bytes().split(b"\0") if x]
+        raw = (process / "cmdline").read_bytes().split(b"\0")
+        argv = [x.decode("utf-8", "surrogateescape") for x in raw if x]
         return {
             "pid": pid,
             "uid": st.st_uid,
@@ -436,11 +445,11 @@ def current_attempt(root: Path):
     expected = rows[0].get("argv")
     if (
         not isinstance(expected, list)
-        or len(expected) != 7
+        or len(expected) != 11
         or any(not isinstance(value, str) or "\0" in value for value in expected)
-        or expected[1:5] != [str(Path(__file__).resolve()), "serve", "--directory", str(root)]
-        or expected[5] != "--listen-fd"
-        or not expected[6].isdigit()
+        or not expected[-1].isdigit()
+        or expected
+        != child_argv(Path(expected[0]), root, Path(first["package_dir"]), int(expected[-1]))
     ):
         raise ValueError("invalid fixed child command in receipt")
     transitions = {
@@ -488,30 +497,41 @@ def current_attempt(root: Path):
     return journal, rows
 
 
-def _orphan(rows: list, inodes: set[str]) -> dict | None:
-    """The one process that is exactly our prepared child: same UID, full argv and listener."""
-    inode = rows[0]["listener_inode"]
-    if inodes != {inode}:
-        return None
+def _lookalikes(rows: list) -> list[dict]:
+    """Every same-UID process whose full argv equals the prepared child's (listener unchecked)."""
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             identity = process_identity(int(entry.name))
-            if (
-                identity is not None
-                and identity["uid"] == os.getuid()
-                and identity["argv"] == rows[0]["argv"]
-                and owns_listener(identity["pid"], inode)
-            ):
+        except (OSError, ValueError):
+            continue
+        if (
+            identity is not None
+            and identity["uid"] == os.getuid()
+            and identity["argv"] == rows[0]["argv"]
+        ):
+            found.append(identity)
+    return found
+
+
+def _orphan(rows: list, inodes: set[str]) -> dict | None:
+    """The one process that is exactly our prepared child: same UID, full argv and listener."""
+    inode = rows[0]["listener_inode"]
+    if inodes != {inode}:
+        return None
+    found = []
+    for identity in _lookalikes(rows):
+        try:
+            if owns_listener(identity["pid"], inode):
                 found.append(identity)
         except OSError:
             continue
     return found[0] if len(found) == 1 else None
 
 
-def status(root: Path) -> dict:
+def status(root: Path, *, locked: bool = False) -> dict:
     manifest = validate_namespace(root)
     journal, rows = current_attempt(root)
     common = {
@@ -525,7 +545,11 @@ def status(root: Path) -> dict:
         last["state"] in {"stopped", "failed-before-spawn"}
         or (last["state"] == "startup-failed" and last.get("child_exited") is True)
     ):  # Terminal: the recorded child is gone, so its PID may belong to anyone now.
-        return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
+        return {
+            **common,
+            "state": "unmanaged-listener" if inodes else "stopped",
+            "managed": False,
+        }
     saved = next((row["identity"] for row in reversed(rows) if "identity" in row), None)
     if saved is None:
         if not rows:
@@ -534,6 +558,12 @@ def status(root: Path) -> dict:
                 "state": "unmanaged-listener" if inodes else "stopped",
                 "managed": False,
             }
+        if not locked:  # A start holding the lock is between `prepared` and `spawned`.
+            try:
+                with manager_lock():
+                    return status(root, locked=True)
+            except BlockingIOError:
+                return {**common, "state": "starting", "managed": False}
         orphan = _orphan(rows, inodes)
         if orphan is not None:  # Crash between spawn and the `spawned` receipt.
             return {
@@ -546,11 +576,20 @@ def status(root: Path) -> dict:
                 "log": str(root / rows[0]["log"]),
                 "runtime_limit_seconds": PREVIEW_SECONDS,
             }
-        # Our listener dies with a crashed manager; with none open no child can exist.
-        return {**common, "state": "uncertain" if inodes else "stopped", "managed": False}
+        # A child that closed its listener may still be shutting down: never call that stopped.
+        pending = bool(inodes) or bool(_lookalikes(rows))
+        return {
+            **common,
+            "state": "uncertain" if pending else "stopped",
+            "managed": False,
+        }
     actual = process_identity(saved["pid"])
     if actual is None:
-        return {**common, "state": "unmanaged-listener" if inodes else "stopped", "managed": False}
+        return {
+            **common,
+            "state": "unmanaged-listener" if inodes else "stopped",
+            "managed": False,
+        }
     if actual != saved or actual["uid"] != os.getuid():
         return {**common, "state": "identity-changed", "managed": False}
     inode = str(rows[0]["listener_inode"])
@@ -584,6 +623,23 @@ def require_pidfd() -> None:
         raise ValueError("use native /usr/bin/python3 with Linux pidfd support for start/stop")
 
 
+def child_argv(python: Path, root: Path, package_dir: Path, fd: int) -> list[str]:
+    """Fixed child command: isolated (-I: no env, no user site, no script-dir sys.path), no .pyc."""
+    return [
+        str(python),
+        "-I",
+        "-B",
+        str(Path(__file__).resolve()),
+        "serve",
+        "--directory",
+        str(root),
+        "--package-dir",
+        str(package_dir),
+        "--listen-fd",
+        str(fd),
+    ]
+
+
 def _owners() -> tuple[int, ...]:
     return (*SYSTEM_UIDS, os.getuid())
 
@@ -595,9 +651,16 @@ def _trusted_chain(path: Path, message: str) -> None:
             raise ValueError(message)
 
 
-def _trusted_tree(root: Path, message: str) -> None:
-    """Every entry below root: no symlink, owned by root/us, not group/world-writable."""
-    for current, names, files in os.walk(root, followlinks=False):
+def _trusted_tree(root: Path, message: str, skip: frozenset[str] = frozenset()) -> None:
+    """Every entry below root: no symlink, owned by root/us, not group/world-writable.
+
+    An unreadable subdirectory is refused, never skipped. Names in `skip` are not descended.
+    """
+
+    def unreadable(exc: OSError) -> None:
+        raise ValueError(message) from exc
+
+    for current, names, files in os.walk(root, followlinks=False, onerror=unreadable):
         for name in (*names, *files):
             st = (Path(current) / name).lstat()
             if (
@@ -607,6 +670,7 @@ def _trusted_tree(root: Path, message: str) -> None:
                 or st.st_mode & 0o022
             ):
                 raise ValueError(message)
+        names[:] = [name for name in names if name not in skip]
 
 
 def _package(value: Path) -> Path:
@@ -643,16 +707,78 @@ def _package(value: Path) -> Path:
     return root
 
 
-def _interpreter(value: Path) -> Path:
-    """Trust the resolved binary, the directory holding the launch path and any venv it names.
+def _resolve_trusted(path: Path, message: str) -> Path:
+    """Resolve `path` hop by hop; every symlink must be ours/root's and sit in a trusted chain."""
+    pending = list(path.parts[1:])
+    current = Path("/")
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if not candidate.is_symlink():
+            current = candidate
+            continue
+        hops += 1
+        if hops > 40 or candidate.lstat().st_uid not in _owners():
+            raise ValueError(message)
+        _trusted_chain(current, message)
+        target = os.readlink(candidate)
+        if target.startswith("/"):
+            current = Path("/")
+        pending = [*Path(target).parts[1 if target.startswith("/") else 0 :], *pending]
+    return current
 
-    The venv root (the folder holding pyvenv.cfg) and every lib*/python*/site-packages tree
-    below it are checked as _package is: ancestors, owner, no group/world write, no symlinks.
+
+def _venv_home(cfg: Path, message: str) -> tuple[Path, bool]:
+    """(`home`, include-system-site-packages) from a vetted pyvenv.cfg; `home` is required."""
+    values = {}
+    for line in cfg.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key.strip().lower()] = value.strip()
+    if "home" not in values or not Path(values["home"]).is_absolute():
+        raise ValueError(message)
+    return Path(values["home"]), values.get("include-system-site-packages") == "true"
+
+
+def _stdlib(prefix: Path, message: str, *, site_packages: bool) -> None:
+    """Trust prefix/lib*/python3*: the code `python -I` imports from. site-packages is walked
+    only when it is on sys.path (a non-venv interpreter or include-system-site-packages)."""
+    skip = frozenset() if site_packages else frozenset({"site-packages", "dist-packages"})
+    trees = [
+        tree
+        for lib in ("lib", "lib64")
+        if os.path.lexists(prefix / lib)
+        for tree in (prefix / lib).resolve(strict=True).glob("python3*")
+        if tree.is_dir()
+    ]
+    if not trees:
+        raise ValueError(message)
+    for tree in trees:
+        _trusted_chain(tree, message)
+        _trusted_tree(tree, message, skip)
+
+
+def _interpreter(value: Path) -> Path:
+    """Trust everything the child interpreter will execute, then return the path to exec.
+
+    Rule: every symlink hop of the launch path, the resolved binary and its directories, the
+    stdlib below the binary's prefix (lib and lib64, no symlinks, root/us-owned, not group/
+    world-writable) and, for a venv, its pyvenv.cfg, a `home` that is exactly the resolved
+    binary's directory, the venv root and its site-packages. A non-venv interpreter also has
+    its own site-packages walked, so one with foreign or symlinked packages must be wrapped in
+    a clean venv. A venv keeps its launch path (pyvenv.cfg is found beside it) now that every
+    hop and directory on it is trusted; otherwise the resolved binary is returned.
     """
     unavailable = "native Python interpreter unavailable or untrusted; pass --python"
     python = value.absolute()
     try:
-        resolved = python.resolve(strict=True)
+        resolved = _resolve_trusted(python, unavailable)
         if (
             python.parent.resolve() != python.parent
             or not resolved.is_file()
@@ -661,6 +787,8 @@ def _interpreter(value: Path) -> Path:
             raise ValueError(unavailable)
         _trusted_chain(resolved, unavailable)
         _trusted_chain(python.parent, unavailable)
+        site_packages = True
+        launch = resolved
         for base in (python.parent, python.parent.parent):
             if not os.path.lexists(base / "pyvenv.cfg"):
                 continue
@@ -671,16 +799,21 @@ def _interpreter(value: Path) -> Path:
                 or (cfg.st_mode & 0o022)
             ):
                 raise ValueError(unavailable)
+            home, site_packages = _venv_home(base / "pyvenv.cfg", unavailable)
+            if home.resolve(strict=True) != resolved.parent:
+                raise ValueError(unavailable)
             _trusted_chain(base, unavailable)
+            launch = python
             for lib in ("lib", "lib64"):
                 if os.path.lexists(base / lib):
                     for site in (base / lib).resolve(strict=True).glob("python*/site-packages"):
                         _trusted_chain(site, unavailable)
                         _trusted_tree(site, unavailable)
             break
+        _stdlib(resolved.parent.parent, unavailable, site_packages=site_packages)
     except OSError as exc:
         raise ValueError(unavailable) from exc
-    return python
+    return launch
 
 
 def _health() -> bool:
@@ -729,27 +862,40 @@ def cleanup_startup(child, pidfd: int | None) -> bool:
         return False
 
 
-def _spawn_and_wait(journal, log, argv, listener, log_fd, root, package_dir, inode) -> None:
+def _unblock_signals() -> None:
+    """Child-side (between fork and exec): the manager's blocked mask must not be inherited."""
+    signal.pthread_sigmask(signal.SIG_SETMASK, ())
+
+
+def _spawn_and_wait(journal, log, argv, listener, log_fd, root, inode) -> None:
     child = None
     pidfd = None
+    popen_refused = False
     try:
-        child = subprocess.Popen(  # noqa: S603 -- fixed script/argv; checked interpreter.
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            cwd=root,
-            start_new_session=True,
-            close_fds=True,
-            pass_fds=(listener.fileno(),),
-            env={
-                "PATH": "/usr/bin:/bin",
-                "LC_ALL": "C.UTF-8",
-                "PYTHONPATH": str(package_dir),
-                "PYTHONNOUSERSITE": "1",
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
-        )
+        # Termination signals stay blocked until `child` is bound, so none can unwind Popen
+        # between fork and return; the child unblocks them itself before exec.
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, _TERMINATION)
+        try:
+            child = subprocess.Popen(  # noqa: S603 -- fixed script/argv; checked interpreter.
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                cwd=root,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=(listener.fileno(),),
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LC_ALL": "C.UTF-8",
+                },  # -I ignores PYTHON* anyway.
+                preexec_fn=_unblock_signals,  # Manager is single-threaded: fork-time hook is safe.
+            )
+        except OSError:
+            popen_refused = True  # Popen reaped its own failed child: nothing is running.
+            raise
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         identity = process_identity(child.pid)
         if identity is None or identity["uid"] != os.getuid() or identity["argv"] != argv:
             raise RuntimeError("could not establish exact child identity")
@@ -758,6 +904,8 @@ def _spawn_and_wait(journal, log, argv, listener, log_fd, root, package_dir, ino
         _ready(child, identity, inode)
         event(journal, {"state": "ready", "identity": identity})
     except BaseException as exc:  # Includes KeyboardInterrupt/SystemExit: never strand the child.
+        if child is None and not popen_refused:
+            raise  # Fork outcome unknown: stay prepared-only so the orphan scan can recover it.
         exited = child is None or cleanup_startup(child, pidfd)
         event(
             journal,
@@ -780,7 +928,7 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
     require_pidfd()  # Refuse unsupported controller runtimes before a child or receipt exists.
     validate_namespace(root)
     with manager_lock():
-        before = status(root)
+        before = status(root, locked=True)
         if before["state"] == "running":
             return {**before, "already_running": True}
         if before["state"] != "stopped":
@@ -797,15 +945,7 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
             inode = str(os.fstat(listener.fileno()).st_ino)
             attempt = f"managed-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
             journal, log = root / (attempt + ".jsonl"), root / (attempt + ".log")
-            argv = [
-                str(python),
-                str(Path(__file__).resolve()),
-                "serve",
-                "--directory",
-                str(root),
-                "--listen-fd",
-                str(listener.fileno()),
-            ]
+            argv = child_argv(python, root, package_dir, listener.fileno())
             prepared = {
                 "state": "prepared",
                 "directory": str(root),
@@ -830,17 +970,17 @@ def start(root: Path, package_dir: Path | None, python: Path | None) -> dict:
                     os.fsync(parent_fd)
                 finally:
                     os.close(parent_fd)
-                _spawn_and_wait(journal, log, argv, listener, log_fd, root, package_dir, inode)
+                _spawn_and_wait(journal, log, argv, listener, log_fd, root, inode)
             finally:
                 os.close(log_fd)
-        return status(root)
+        return status(root, locked=True)
 
 
 def stop(root: Path) -> dict:
     require_pidfd()
     validate_namespace(root)
     with manager_lock():
-        before = status(root)
+        before = status(root, locked=True)
         if before["state"] == "stopped":
             return before
         if not before["managed"]:
@@ -863,7 +1003,7 @@ def stop(root: Path) -> dict:
             event(journal, {"state": "stopped", "identity": identity})
         finally:
             os.close(fd)
-        return status(root)
+        return status(root, locked=True)
 
 
 def _exit_on_signal(number: int, frame) -> None:
@@ -878,7 +1018,9 @@ def main() -> int:
         "--package-dir", type=Path, help="installed wheel target; remembers prior start"
     )
     parser.add_argument(
-        "--python", type=Path, help="child Python; defaults to the existing native3.12 env"
+        "--python",
+        type=Path,
+        help="child Python; defaults to the existing native3.12 env",
     )
     parser.add_argument("--listen-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -890,6 +1032,8 @@ def main() -> int:
         if args.action == "seed":
             print(json.dumps(seed(root)))  # Safe manifest only, never token material.
         elif args.action == "serve":
+            if args.package_dir is not None:  # -I ignores PYTHONPATH; the parent vetted this dir.
+                sys.path.insert(0, str(args.package_dir))
             serve(root, args.listen_fd)
         elif args.action == "status":
             print(json.dumps(status(root)))

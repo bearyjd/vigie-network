@@ -13,6 +13,7 @@ from vigie_api.config import Settings
 SPEC = importlib.util.spec_from_file_location(
     "gui_preview", Path(__file__).resolve().parents[3] / "tools/gui/preview.py"
 )
+assert SPEC is not None and SPEC.loader is not None
 preview = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preview)
 

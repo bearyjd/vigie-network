@@ -16,8 +16,10 @@ import pytest
 SPEC = importlib.util.spec_from_file_location(
     "gui_preview_manager", Path(__file__).resolve().parents[3] / "tools/gui/preview.py"
 )
+assert SPEC is not None and SPEC.loader is not None
 preview = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preview)
+REAL_INTERPRETER = preview._interpreter
 BOOT = "01234567-89ab-cdef-0123-456789abcdef"
 
 
@@ -41,15 +43,7 @@ def namespace(tmp_path):
 
 
 def receipt(root, state="ready", pid=123456):
-    argv = [
-        sys.executable,
-        str(Path(preview.__file__).resolve()),
-        "serve",
-        "--directory",
-        str(root),
-        "--listen-fd",
-        "42",
-    ]
+    argv = preview.child_argv(Path(sys.executable), root, Path("/installed/package"), 42)
     identity = {"pid": pid, "uid": os.getuid(), "start_ticks": "100", "argv": argv, "boot_id": BOOT}
     journal = root / "managed-123-abcd1234.jsonl"
     rows = [
@@ -97,7 +91,7 @@ def test_plain_native_cli_status_needs_no_application_imports_or_pythonpath():
     preview.seed(root)
     try:
         result = subprocess.run(  # noqa: S603 -- our interpreter and reviewed local script only.
-            [sys.executable, "-I", "-S", preview.__file__, "status", "--directory", str(root)],
+            [sys.executable, "-I", "-S", str(preview.__file__), "status", "--directory", str(root)],
             capture_output=True,
             text=True,
             check=True,
@@ -222,7 +216,9 @@ def test_readiness_cannot_adopt_a_foreign_health_endpoint(monkeypatch):
 def test_duplicate_start_does_not_restart_owned_running_preview(namespace, monkeypatch, tmp_path):
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
     monkeypatch.setattr(preview, "_package", lambda path: path)
-    monkeypatch.setattr(preview, "status", lambda root: {"state": "running", "managed": True})
+    monkeypatch.setattr(
+        preview, "status", lambda root, **_kw: {"state": "running", "managed": True}
+    )
     spawn = Mock()
     monkeypatch.setattr(preview.subprocess, "Popen", spawn)
     result = preview.start(namespace, Path("/unused"), Path(sys.executable))
@@ -263,7 +259,7 @@ def test_start_uses_devnull_clean_environment_private_log_and_passed_listener(
     monkeypatch.setattr(preview, "PORT", 0)
     monkeypatch.setattr(preview, "_package", lambda path: path)
     states = iter([{"state": "stopped"}, {"state": "running", "managed": True}])
-    monkeypatch.setattr(preview, "status", lambda root: next(states))
+    monkeypatch.setattr(preview, "status", lambda root, **_kw: next(states))
     captured = {}
     child = Mock(pid=123456)
 
@@ -291,15 +287,11 @@ def test_start_uses_devnull_clean_environment_private_log_and_passed_listener(
     )
     assert captured["stdin"] == subprocess.DEVNULL and captured["start_new_session"] is True
     assert captured["close_fds"] is True and len(captured["pass_fds"]) == 1
-    assert set(captured["env"]) == {
-        "PATH",
-        "LC_ALL",
-        "PYTHONPATH",
-        "PYTHONNOUSERSITE",
-        "PYTHONDONTWRITEBYTECODE",
-    }
+    assert captured["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
     assert "must-not-pass" not in json.dumps(captured["env"])
-    assert captured["env"]["PYTHONPATH"] == "/installed/package"
+    assert captured["argv"][1:3] == ["-I", "-B"], "isolated child: no env, user site or script dir"
+    assert captured["argv"][captured["argv"].index("--package-dir") + 1] == "/installed/package"
+    assert captured["preexec_fn"] is preview._unblock_signals
     _, rows = preview.current_attempt(namespace)
     assert [row["state"] for row in rows] == ["prepared", "spawned", "ready"]
     assert rows[0]["runtime_limit_seconds"] == 8 * 3600
@@ -313,7 +305,7 @@ def test_pidfd_failure_cleans_only_proven_unreaped_child_and_records_exit(
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
     monkeypatch.setattr(preview, "PORT", 0)
     monkeypatch.setattr(preview, "_package", lambda path: path)
-    monkeypatch.setattr(preview, "status", lambda root: {"state": "stopped"})
+    monkeypatch.setattr(preview, "status", lambda root, **_kw: {"state": "stopped"})
     captured = {}
     child = Mock(pid=123456)
 
@@ -364,7 +356,7 @@ def test_fast_child_exit_is_retained_without_untracked_adoption(namespace, monke
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
     monkeypatch.setattr(preview, "PORT", 0)
     monkeypatch.setattr(preview, "_package", lambda path: path)
-    monkeypatch.setattr(preview, "status", lambda root: {"state": "stopped"})
+    monkeypatch.setattr(preview, "status", lambda root, **_kw: {"state": "stopped"})
     child = Mock(pid=123456)
     monkeypatch.setattr(preview.subprocess, "Popen", Mock(return_value=child))
     monkeypatch.setattr(preview, "process_identity", lambda pid: None)
@@ -397,7 +389,7 @@ def test_stop_sends_only_guarded_term_and_preserves_receipt(namespace, monkeypat
     journal, identity = receipt(namespace)
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
     states = iter([{"state": "running", "managed": True}, {"state": "stopped", "managed": False}])
-    monkeypatch.setattr(preview, "status", lambda root: next(states))
+    monkeypatch.setattr(preview, "status", lambda root, **_kw: next(states))
     fd = os.open(os.devnull, os.O_RDONLY)
     monkeypatch.setattr(preview, "guarded_pidfd", lambda saved: fd)
     sender = Mock()
@@ -426,3 +418,51 @@ def test_package_symlink_or_writable_directory_is_refused(tmp_path):
     target.chmod(0o777)
     with pytest.raises(ValueError, match="trusted"):
         preview._package(target)
+
+
+def test_start_end_to_end_through_the_real_interpreter_check_with_a_throwaway_venv(
+    namespace, monkeypatch, tmp_path
+):
+    """The autouse bypass is undone: a clean venv layout is vetted, then really exec'd."""
+    host = Path(sys.executable).resolve()
+    monkeypatch.setattr(preview, "SYSTEM_UIDS", (0, Path("/tmp").lstat().st_uid))  # noqa: S108
+    try:
+        preview._stdlib(host.parent.parent, "host", site_packages=False)
+    except ValueError:
+        pytest.skip("host interpreter's own stdlib is not root/user-owned and symlink-free")
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(host)
+    (venv / "pyvenv.cfg").write_text(f"home = {host.parent}\n")
+    (venv / "lib" / "python3" / "site-packages").mkdir(parents=True)
+    script = tmp_path / "sleeper-preview.py"
+    script.write_text("import time\ntime.sleep(120)\n")
+    monkeypatch.setattr(preview, "__file__", str(script))
+    monkeypatch.setattr(preview, "_interpreter", REAL_INTERPRETER)
+    monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
+    monkeypatch.setattr(preview, "PORT", 0)
+    monkeypatch.setattr(preview, "_package", lambda path: path)
+    monkeypatch.setattr(preview, "listeners", lambda: set())
+    monkeypatch.setattr(preview, "_ready", lambda *args: None)
+    monkeypatch.setattr(preview.os, "pidfd_open", lambda pid: os.open(os.devnull, os.O_RDONLY))
+    monkeypatch.setattr(preview.signal, "pidfd_send_signal", Mock())
+    seen = {}
+    real_popen = subprocess.Popen
+
+    def spawn(argv, **kwargs):
+        seen["child"] = real_popen(argv, **{**kwargs, "stdout": subprocess.DEVNULL})
+        return seen["child"]
+
+    monkeypatch.setattr(preview.subprocess, "Popen", spawn)
+    try:
+        preview.start(namespace, Path("/installed/package"), venv / "bin" / "python")
+        _, rows = preview.current_attempt(namespace)
+        assert [row["state"] for row in rows] == ["prepared", "spawned", "ready"]
+        argv = rows[0]["argv"]
+        assert argv[:3] == [str(venv / "bin" / "python"), "-I", "-B"]
+        assert preview.process_identity(seen["child"].pid)["argv"] == argv
+    finally:
+        child = seen.get("child")
+        if child is not None:
+            child.kill()
+            child.wait()

@@ -22,9 +22,9 @@ from unittest.mock import Mock
 
 import pytest
 
-SPEC = importlib.util.spec_from_file_location(
-    "gui_preview_fixround1", Path(__file__).resolve().parents[3] / "tools/gui/preview.py"
-)
+PREVIEW_PATH = Path(__file__).resolve().parents[3] / "tools/gui/preview.py"
+SPEC = importlib.util.spec_from_file_location("gui_preview_fixround1", PREVIEW_PATH)
+assert SPEC is not None and SPEC.loader is not None
 preview = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preview)
 IDENTITY_STATES = {"spawned", "ready", "stop-requested", "stopped"}
@@ -63,16 +63,18 @@ def listener(monkeypatch):
 
 
 @pytest.fixture
-def sleeper(tmp_path):
-    site = tmp_path / "sleeper-site"
-    site.mkdir()
-    (site / "sitecustomize.py").write_text("import time\ntime.sleep(120)\n")
+def sleeper(tmp_path, monkeypatch):
+    # The child command embeds the manager script path; point it at a script that only sleeps,
+    # so a throwaway child carries the exact production argv without serving anything.
+    script = tmp_path / "sleeper-preview.py"
+    script.write_text("import time\ntime.sleep(120)\n")
+    monkeypatch.setattr(preview, "__file__", str(script))
     children = []
 
     def spawn(argv, pass_fds=()):
         child = subprocess.Popen(  # noqa: S603 -- throwaway test child, argv is ours.
             argv,
-            env={"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"},
+            env={"PATH": "/usr/bin:/bin"},
             pass_fds=pass_fds,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -89,15 +91,7 @@ def sleeper(tmp_path):
 
 
 def serve_argv(root, fd):
-    return [
-        sys.executable,
-        str(Path(preview.__file__).resolve()),
-        "serve",
-        "--directory",
-        str(root),
-        "--listen-fd",
-        str(fd),
-    ]
+    return preview.child_argv(Path(sys.executable), root, Path("/installed/package"), fd)
 
 
 def attempt(root, argv, inode, states, identity=None, **extra):
@@ -138,13 +132,13 @@ def real_stop_signals(monkeypatch, child):
     """Stand-in for pidfd_send_signal that signals only the retained throwaway child."""
     fd = os.open(os.devnull, os.O_RDONLY)
     sent = []
-    monkeypatch.setattr(preview.os, "pidfd_open", lambda pid: os.dup(fd))
+    monkeypatch.setattr(preview.os, "pidfd_open", lambda _pid: os.dup(fd))
     monkeypatch.setattr(
         preview.signal,
         "pidfd_send_signal",
         lambda _fd, sig: (sent.append(sig), os.kill(child.pid, sig)),
     )
-    monkeypatch.setattr(preview.select, "select", lambda *args: ([fd], [], []))
+    monkeypatch.setattr(preview.select, "select", lambda *_args: ([fd], [], []))
     return sent
 
 
@@ -243,7 +237,7 @@ def _mocked_start(namespace, monkeypatch, *, ready):
             "boot_id": "01234567-89ab-cdef-0123-456789abcdef",
         },
     )
-    monkeypatch.setattr(preview.os, "pidfd_open", lambda pid: os.open(os.devnull, os.O_RDONLY))
+    monkeypatch.setattr(preview.os, "pidfd_open", lambda _pid: os.open(os.devnull, os.O_RDONLY))
     sender = Mock()
     monkeypatch.setattr(preview.signal, "pidfd_send_signal", sender)
     monkeypatch.setattr(preview, "_ready", ready)
@@ -264,14 +258,14 @@ def test_keyboard_interrupt_during_readiness_terms_child_records_and_reraises(
     _, rows = preview.current_attempt(namespace)
     assert [row["state"] for row in rows] == ["prepared", "spawned", "startup-failed"]
     assert rows[-1]["child_exited"] is True and rows[-1]["error_type"] == "KeyboardInterrupt"
-    monkeypatch.setattr(preview, "process_identity", lambda pid: pytest.fail("probed"))
+    monkeypatch.setattr(preview, "process_identity", lambda _pid: pytest.fail("probed"))
     assert preview.status(namespace)["state"] == "stopped"
 
 
 def test_interrupt_between_spawn_and_receipt_never_leaves_unregistered_child(
     namespace, monkeypatch
 ):
-    child, _ = _mocked_start(namespace, monkeypatch, ready=lambda *args: None)
+    child, _ = _mocked_start(namespace, monkeypatch, ready=lambda *_args: None)
     monkeypatch.setattr(preview.os, "pidfd_open", Mock(side_effect=OSError("no pidfd")))
     waitid = Mock(return_value=None)
     monkeypatch.setattr(preview.os, "waitid", waitid)
@@ -292,7 +286,7 @@ def test_interrupt_between_spawn_and_receipt_never_leaves_unregistered_child(
 
 
 def test_log_is_opened_before_any_receipt_or_pointer(namespace, monkeypatch):
-    _mocked_start(namespace, monkeypatch, ready=lambda *args: None)
+    _mocked_start(namespace, monkeypatch, ready=lambda *_args: None)
     real_open = os.open
 
     def fail_log(path, *args, **kwargs):
@@ -353,20 +347,27 @@ def test_prepared_only_receipt_with_no_listener_is_not_a_permanent_wedge(namespa
 
 
 def _venv(tmp_path, *, name="venv"):
-    real = tmp_path / "real"
-    real.mkdir(exist_ok=True)
-    binary = real / "python3.12"
+    """prefix/{bin/python3.12, lib/python3.12/os.py} plus a venv whose home is prefix/bin."""
+    prefix = tmp_path / "real"
+    (prefix / "bin").mkdir(parents=True, exist_ok=True)
+    binary = prefix / "bin" / "python3.12"
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o755)
+    stdlib = prefix / "lib" / "python3.12"
+    stdlib.mkdir(parents=True, exist_ok=True)
+    (stdlib / "os.py").write_text("")
     root = tmp_path / name
     (root / "bin").mkdir(parents=True)
     (root / "bin" / "python").symlink_to(binary)
-    (root / "pyvenv.cfg").write_text("home = /x\n")
+    (root / "pyvenv.cfg").write_text(f"home = {prefix / 'bin'}\n")
     site = root / "lib" / "python3.12" / "site-packages"
     site.mkdir(parents=True)
     (site / "uvicorn.py").write_text("")
-    for path in (tmp_path, real, root, root / "bin", root / "lib", site.parent, site):
+    for path in (tmp_path, prefix, prefix / "bin", prefix / "lib", stdlib, root):
         path.chmod(0o700)
+    for path in (root / "bin", root / "lib", site.parent, site):
+        path.chmod(0o700)
+    (stdlib / "os.py").chmod(0o644)
     return root, binary, site
 
 
@@ -464,10 +465,10 @@ def test_health_with_non_object_json_is_unhealthy_not_an_exception(monkeypatch):
         response = Mock(status=200)
         response.read.return_value = body
         response.__enter__ = lambda self: self
-        response.__exit__ = lambda *args: None
+        response.__exit__ = lambda *_args: None
         opener = Mock()
         opener.open.return_value = response
-        monkeypatch.setattr(preview.urllib.request, "build_opener", lambda *a, _o=opener: _o)
+        monkeypatch.setattr(preview.urllib.request, "build_opener", lambda *_a, _o=opener: _o)
         assert preview._health() is False
 
 
@@ -480,7 +481,9 @@ def test_process_identity_reads_real_proc_start_ticks_uid_argv_and_boot(sleeper,
     identity = preview.process_identity(child.pid)
     after = time.time()
     raw = Path(f"/proc/{child.pid}/stat").read_text()
-    fields = re.match(r"^\d+ \(.*\) (.*)$", raw, re.S).group(1).split()
+    parsed = re.match(r"^\d+ \(.*\) (.*)$", raw, re.S)
+    assert parsed is not None
+    fields = parsed.group(1).split()
     # Field 22 of proc(5) is starttime; an independent clock check rejects neighbouring fields.
     boot = next(
         int(line.split()[1])
