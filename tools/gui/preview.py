@@ -50,6 +50,10 @@ _BENIGN_PTH = {
     "a1_coverage.pth": "ef2ed06d19867ec669c09a804060666a9cd5e383af0a9d11aa2de79b77d448e8",
     "distutils-precedence.pth": "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
 }
+# Line breaks beyond \n and \r\n: str.splitlines() (site.py 3.12+) splits on them, older site.py
+# (universal newlines) does not, and a lone \r is split by only one reading. A .pth carrying any of
+# them is refused whole, so the vet and every child interpreter version agree on the lines.
+_PTH_AMBIGUOUS = re.compile("[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]|\r(?!\n)")
 MAX_PTH_TREE_ENTRIES = 100_000  # A .pth directory line with more entries is refused, not walked.
 SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
@@ -822,7 +826,8 @@ def _vet_pth(site: Path, message: str) -> None:
 
     A file is accepted only if it is one of the exact known-benign files (by name AND sha256), or
     every line is blank, a column-0 `#` comment or a bare directory line, read exactly as site.py
-    reads it (utf-8-sig, universal newlines, `#` only in column 0, no stripping). A line with
+    reads it (utf-8-sig, str.splitlines() after refusing other line breaks, `#` only in column 0,
+    no stripping). A line with
     leading/trailing whitespace, beginning `import`, or containing `;` or NUL is refused (site.py
     would exec or mis-read it). A directory line that exists must be a symlink-free directory
     whose chain and whole tree are root/us-owned, not group/world-writable and bounded in size
@@ -839,7 +844,9 @@ def _vet_pth(site: Path, message: str) -> None:
             text = raw.decode("utf-8-sig")  # exactly what site.py decodes (BOM dropped)
         except UnicodeDecodeError:
             raise ValueError(message) from None
-        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _PTH_AMBIGUOUS.search(text):  # splitlines() and older universal newlines disagree here
+            raise ValueError(message)
+        for line in text.splitlines():  # exactly site.py 3.12+
             if line.startswith("#") or not line.strip():
                 continue
             if line != line.strip() or line.startswith("import") or ";" in line or "\0" in line:
