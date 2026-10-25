@@ -48,8 +48,12 @@ def _tokens_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("create", help="create an app token (printed once)")
     create.add_argument("--id", dest="token_id", default=None, help="label [A-Za-z0-9_-]{1,32}")
-    create.add_argument(
+    privileges = create.add_mutually_exclusive_group()
+    privileges.add_argument(
         "--rules-write", action="store_true", help="grant control-app rules:write privilege"
+    )
+    privileges.add_argument(
+        "--read-only", action="store_true", help="create a readonly GUI/observation token"
     )
     revoke = sub.add_parser("revoke", help="revoke a token by id")
     revoke.add_argument("token_id")
@@ -97,16 +101,24 @@ def _tokens_main(argv: list[str]) -> int:
     conn = open_overrides(settings.overrides_path)
     try:
         if args.command == "create":
-            return _create_token(conn, args.token_id, rules_write=args.rules_write)
+            return _create_token(
+                conn, args.token_id, rules_write=args.rules_write, read_only=args.read_only
+            )
         return _revoke_token(conn, args.token_id)
     finally:
         conn.close()
 
 
-def _create_token(conn: sqlite3.Connection, label: str | None, *, rules_write: bool = False) -> int:
+def _create_token(
+    conn: sqlite3.Connection, label: str | None, *,
+    rules_write: bool = False, read_only: bool = False,
+) -> int:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        token_id, token = tokens.create_token(conn, label, rules_write=rules_write)
+        token_id, token = tokens.create_token(
+            conn, label, rules_write=rules_write,
+            scope="read-only" if read_only else tokens.SCOPE_APP,
+        )
         tokens.audit(conn, CLI_PRINCIPAL, "token.create", token_id, iso_utc(time.time()))
         conn.execute("COMMIT")
     except (ValueError, sqlite3.IntegrityError) as exc:

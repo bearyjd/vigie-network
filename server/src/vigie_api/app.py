@@ -43,6 +43,7 @@ from vigie_api.models import (
 )
 from vigie_api.ratelimit import FailureLimiter
 from vigie_api.schema import open_inventory_ro, open_overrides
+from vigie_api.ui_static import mount_ui
 from vigie_ingest.db import iso_utc
 from vigie_ingest.keeper import Keeper
 from vigie_ingest.ratelimit import RateLimiter
@@ -115,6 +116,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     )
     open_overrides(settings.overrides_path).close()  # create + migrate at startup
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
+    mount_ui(app)
 
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
