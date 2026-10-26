@@ -1,4 +1,5 @@
 """One last observed source address per MAC; never an identity or current-IP claim."""
+
 from __future__ import annotations
 
 import ipaddress
@@ -13,7 +14,10 @@ if TYPE_CHECKING:
 
 
 def address_candidate(
-    raw: str, stamp: int, source: str, received_ts: float | None,
+    raw: str,
+    stamp: int,
+    source: str,
+    received_ts: float | None,
 ) -> tuple[int, int, str, str] | None:
     """Equal-time ties prefer lease over neighbour, then lexical canonical address.
 
@@ -25,14 +29,14 @@ def address_candidate(
     ):
         return None
     try:
-        if '%' in raw:
+        if "%" in raw:
             return None
         ip = ipaddress.ip_address(raw)
     except ValueError:
         return None
-    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or str(ip) == '255.255.255.255':
+    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or str(ip) == "255.255.255.255":
         return None
-    return stamp, int(source == 'lease'), str(ip), source
+    return stamp, int(source == "lease"), str(ip), source
 
 
 def save_last_ips(inv: sqlite3.Connection, acts: Mapping[str, MacActivity]) -> None:
@@ -43,6 +47,9 @@ def save_last_ips(inv: sqlite3.Connection, acts: Mapping[str, MacActivity]) -> N
         "source=excluded.source WHERE "
         "(excluded.observed_at,excluded.source='lease',excluded.ip) > "
         "(mac_last_ip.observed_at,mac_last_ip.source='lease',mac_last_ip.ip)",
-        [(mac, act.last_ip[2], act.last_ip[0], act.last_ip[3])
-         for mac, act in acts.items() if act.last_ip is not None],
+        [
+            (mac, act.last_ip[2], act.last_ip[0], act.last_ip[3])
+            for mac, act in acts.items()
+            if act.last_ip is not None
+        ],
     )

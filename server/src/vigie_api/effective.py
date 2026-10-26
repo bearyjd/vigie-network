@@ -271,15 +271,22 @@ def iter_devices(
 def add_last_ips(inv: sqlite3.Connection, items: list[dict], links: dict[str, str]) -> None:
     """One indexed page-scoped query; canonical groups are resolved afresh on every read."""
     wanted = {resolve(links, item["id"]) for item in items}
-    members = {member: resolve(links, member) for member in {*wanted, *links}
-               if resolve(links, member) in wanted}
-    found = rows(
-        inv,
-        "SELECT o.device_id,o.mac,p.ip,p.observed_at,p.source FROM observations o "
-        "JOIN mac_last_ip p ON p.mac=o.mac "
-        "WHERE o.device_id IN (SELECT value FROM json_each(?))",
-        (json.dumps(sorted(members)),),
-    ) if members else []
+    members = {
+        member: resolve(links, member)
+        for member in {*wanted, *links}
+        if resolve(links, member) in wanted
+    }
+    found = (
+        rows(
+            inv,
+            "SELECT o.device_id,o.mac,p.ip,p.observed_at,p.source FROM observations o "
+            "JOIN mac_last_ip p ON p.mac=o.mac "
+            "WHERE o.device_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(members)),),
+        )
+        if members
+        else []
+    )
     latest = {}
     for row in found:
         key = members[row["device_id"]]
