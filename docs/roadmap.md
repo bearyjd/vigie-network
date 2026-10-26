@@ -141,8 +141,26 @@ Phases, each shippable and reviewed on its own:
 Constraints that apply to every phase:
 - Imports are manual or explicitly scheduled, versioned, checksummed and reversible; the Tower keeps working with no
   network access. No telemetry, no cloud lookups of household data, no remote LLM.
-- Record source, license, refresh date and false-positive notes for each dataset before import (existing rule).
-- Incidents reuse the existing lifecycle and rate budgets; an alert budget and a cold-start disclosure apply.
+- Before importing any dataset record its source, version, update mechanism, license and redistribution compatibility
+  (the repository is AGPL-3.0; many blocklists are GPL or non-commercial), refresh date and false-positive notes
+  (existing rule, stated in full).
+- Incidents reuse the existing incident lifecycle; a per-detector alert budget must be set before enabling, and a
+  cold-start disclosure applies. Adding `dns_reputation` extends the detector contract in `docs/api.md`.
+- Known-issue notes are a separate entity with their own API write path, scopes and audit actions (the incident API has
+  no free-text note and no "not applicable" state); they never raise attention or notify. A human can mark one expected
+  or not applicable, with an audit entry.
+- An OUI alone never qualifies a device for a known-issue note: it identifies the network-chip vendor, not the product.
+  Require a product-level signal and show the signal used.
+- Reputation lists: security categories only (malware, phishing, command-and-control), fetched from pinned HTTPS
+  sources; reject an update whose size or entry churn exceeds a threshold without review; keep a local allowlist. A
+  checksum proves integrity, not trustworthiness. A match means a query was made, not that the domain was contacted.
+- Matched domains appear only in local incident detail, obey the seven-day raw window, and never appear in notifications.
+- Provider block/category verdicts are labelled third-party opinion and never raise incident severity by themselves.
+  Roaming (off-LAN) query history is opt-in under D8 and held to the same raw window. The provider API key is a secret:
+  stored privately, never logged, and treated as having full account scope until proven otherwise.
+- Acceptance: phase 1 exits with a measured share of devices that have a product-level signal; phase 2 passes a
+  seven-day pilot report of `dns_reputation` volume against an owner-labelled precision target; phase 3 starts only if
+  phase 1 coverage is useful. Proposed targets, to be calibrated with owner-labelled data.
 - Tests: fixture-replayed lists with benign and malicious domains, list-update and rollback, partial-DNS-coverage
   abstention, duplicate/overlapping sources, and a negative suite proving a match never changes trust or groups.
 
@@ -151,17 +169,23 @@ Constraints that apply to every phase:
 Vigie's per-device DNS truth is the router-local dnsmasq log, which records which device asked. Whatever resolver
 sits upstream (NextDNS, AdGuard Home, another) only answers. Keep these roles separate:
 - **Local dnsmasq log (Vigie source).** Device attribution, coverage flags and baselines come from here.
-- **Upstream filtering resolver.** NextDNS is a cloud resolver with profiles that follow the owner away from home and
-  blocklists/threat categories; AdGuard Home is a self-hosted LAN resolver with local logs and filters that does not
+- **Upstream filtering resolver.** NextDNS is a cloud resolver whose profiles follow the owner away from home on devices configured to use it, with
+  blocklists/threat categories and configurable log retention and storage region; AdGuard Home is a self-hosted LAN resolver with local logs and filters that does not
   leave home unless the owner exposes it through a VPN. Either can be dnsmasq's upstream.
 - **Provider logs as optional context.** Provider history is imported only by the read-only M2 adapter: raw events,
   explicit provider/time coverage, pagination, deduplication and timestamped attribution. If every home device queries
-  through the router, the provider sees one client, so device names there need client-info forwarding; even then no
-  automatic identity merge and no training of the router-local baseline on cloud history (existing rule).
+  through the router, the provider sees one client. Per-device names at the provider require a forwarder (for example
+  the NextDNS CLI) that sends LAN device names to the provider: that is a cloud disclosure and a dnsmasq/router change
+  gated by D2 and D8, not a default. Even then there is no automatic identity merge and no training of the router-local
+  baseline on cloud history (existing rule).
 - **Recommendation to settle in D8:** keep NextDNS for roaming and threat-category filtering, keep the router's
   dnsmasq as the single home DNS entry point so Vigie attributes queries per device, and add AdGuard Home only if the
   owner wants provider-independent local logs or a self-hosted filter. A hybrid (AdGuard Home at home, a NextDNS
-  profile on roaming devices) avoids a hard choice. This changes no Vigie code; it changes which context sources exist.
+  profile on roaming devices) avoids a hard choice only if those profiles are disabled on the home network: a phone
+  or laptop with a NextDNS profile or Android Private DNS sends encrypted DNS straight to the provider even at home,
+  bypasses dnsmasq, and must then show as DNS-coverage `degraded`, never as quiet. This changes no Vigie code; it
+  changes which context sources exist. The owner has a paid NextDNS plan, so query limits are not a factor; log
+  retention, storage region and the API key's scope are inputs to D8.
 
 ## Privacy, coverage and operating budgets
 
