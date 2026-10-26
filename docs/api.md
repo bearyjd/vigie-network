@@ -198,3 +198,42 @@ schema also returns null. Merge and undo recompute the view from current member
 MACs. Device filtering and pagination are unchanged, with one indexed address
 query scoped to each returned page. Existing clients can ignore the additive
 fields; terminal viewers should use `.get` for compatibility with older APIs.
+
+## Incidents and review lifecycle
+
+Monitoring incidents (`GET /incidents`, `GET /incidents/{id}?collector_id=`) carry two independent axes.
+The pipeline alone owns `state` (`open`, `resolved`, `superseded`). Humans own `review`, an overlay kept
+in `overrides.db`; the API never writes `inventory.db` and the pipeline never reads decisions.
+`review` is `null` or `{status, snooze_until, version, decided_by, decided_at}` (`decided_by` is `app`;
+the token id is not exposed). `attention` is derived: true only while `state` is `open` and no decision
+covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers it strictly before
+`snooze_until`, after which the incident returns to attention (the decision and its version are kept).
+A snooze on an incident that later resolves stays as history with `attention` false. `GET /incidents`
+also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
+
+Actions are `POST /incidents/{incident_id}/{action}?collector_id=...` with action `acknowledge`,
+`snooze`, `mark-expected` or `clear` (deletes the decision, which un-snoozes). Any status can move to
+any other. The body is strict (unknown fields are 422; there is no free-text note):
+`{"expected_version": n}`, plus `"until"` for snooze. `expected_version` is the incident's own decision
+version: 0 when it has no decision, +1 on every write, 0 again after `clear`. A stale value is
+`409 version_conflict`. It is unrelated to the device `identity_override_version`.
+
+- `until`: RFC 3339 UTC (`Z` or `+00:00`, whole seconds), from 60 seconds to the cap after now. The cap
+  is 7 days, configurable with `VIGIE_API_INCIDENT_SNOOZE_MAX_S`. Anything else is `422 invalid_until`.
+- Allowed on `open`, `resolved` and `superseded`: acknowledge, mark-expected, clear. Snooze needs an open
+  incident (`409 incident_not_open`). `clear` with nothing to clear is `409 no_decision`.
+- Scopes: `app` and `app rules:write` tokens only; `read-only`, `service` and `integration` get `403`.
+  The usual per-token rate limit and body limit apply (`429`, `413`).
+- Errors: `401`, `403 forbidden`, `404 incident_not_found` (also for another collector's incident),
+  `409 version_conflict | idempotency_conflict | incident_not_open | no_decision`, `422`, `503`.
+- Idempotency: `X-Request-ID` replays the first result for an identical body and is
+  `409 idempotency_conflict` for a different one. Without it, the receipt key is the principal, action,
+  incident id and body, so retries of one decision are no-ops while decisions on two incidents never collide.
+- Audit: `monitoring.incident.acknowledge | snooze | mark_expected | clear`, target the incident id,
+  with the before/after review and the copied incident identity. `GET /events` shows these with
+  `device_id: null` and the incident id in the summary.
+- Retention: only the current decision is stored (history is in the audit log). A recurrence is a new
+  incident with a new id, so a decision never carries over to it. Decision rows of incidents the pipeline
+  has pruned are invisible, and are deleted (at most 100 per write, once older than 120 days).
+- `expected` is a per-incident label, not a suppression. It does not touch baselines, the suspicious
+  hours the detector tracks, or later incidents.
