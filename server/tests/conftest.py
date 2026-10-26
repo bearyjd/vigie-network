@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -166,3 +167,21 @@ def make_env(tmp_path: Path) -> Callable[..., Env]:
 @pytest.fixture
 def env(make_env: Callable[..., Env]) -> Env:
     return make_env(rate_limit_per_window=1000)
+
+
+REAL_PREVIEW_LOCK = "/tmp/vigie-gui-preview-18745.lock"  # noqa: S108 -- the path under guard.
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_real_preview_lock(request, monkeypatch):
+    """GUI preview tests must never open the user's real preview lock (they patch LOCK)."""
+    if not request.module.__name__.startswith(("test_gui_preview", "gui_preview")):
+        return
+    real_open = os.open
+
+    def guarded(path, *args, **kwargs):
+        if os.fspath(path) == REAL_PREVIEW_LOCK:
+            raise AssertionError(f"{request.node.nodeid} opened the real preview lock")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", guarded)

@@ -373,11 +373,10 @@ def test_an_unavailable_end_to_end_lane_skips_locally_and_fails_under_ci(monkeyp
         end_to_end_unavailable("no clean interpreter")
 
 
-def test_the_lane_selects_the_first_interpreter_the_real_trust_check_accepts(
-    tmp_path, monkeypatch
-):
-    import gui_preview_native_lane as lane
+def test_the_lane_selects_the_first_interpreter_the_real_trust_check_accepts(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
+    import gui_preview_native_lane as lane
 
     first, second, third = (tmp_path / name / "bin" / "python3" for name in "abc")
     for path in (first, second, third):

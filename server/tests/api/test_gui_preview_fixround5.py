@@ -192,7 +192,13 @@ def test_a_verified_holder_older_than_a_minute_is_wedged_with_instructions(names
 
 @pytest.mark.parametrize(
     "line",
-    ["999999999 1 x", "{pid} 1 x", "{pid} {ticks} 01234567-89ab-cdef-0123-456789abcdef", "junk", ""],
+    [
+        "999999999 1 x",
+        "{pid} 1 x",
+        "{pid} {ticks} 01234567-89ab-cdef-0123-456789abcdef",
+        "junk",
+        "",
+    ],
 )
 def test_an_unverifiable_old_holder_is_never_called_wedged(namespace, line):
     me = preview.process_identity(os.getpid())
@@ -366,7 +372,10 @@ def preview_required_files() -> list[str]:
         "vigie_api/ui_static.py",
         "vigie_ingest/db.py",
         "vigie_pipeline/schema.py",
-        *("vigie_api/ui/" + x for x in ("index.html", "styles.css", "app.js", "client.js", "views.js")),
+        *(
+            "vigie_api/ui/" + x
+            for x in ("index.html", "styles.css", "app.js", "client.js", "views.js")
+        ),
     ]
 
 
@@ -380,3 +389,16 @@ def test_a_pinned_startup_hook_hash_is_the_only_way_through(sandbox_owners, tmp_
     path.write_text("import os\n")  # same name, other bytes
     path.chmod(0o644)
     _refuses(root)
+
+
+def test_docs_describe_the_round_five_behaviour():
+    docs = (Path(__file__).resolve().parents[3] / "docs" / "gui-preview.md").read_text()
+    for needle in (
+        "`str.splitlines()`",
+        "`wedged-start`",
+        "`holder_pid`",
+        "`/proc/<PID>/cmdline`",
+        "opens the lock non-blocking",
+        "`sitecustomize`",
+    ):
+        assert needle in docs, needle
