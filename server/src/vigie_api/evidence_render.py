@@ -153,7 +153,7 @@ def _truncated(pack: Pack, section_id: str, keep: int) -> Pack:
 
 
 def fit(pack: Pack, fmt: str, cap: int = MAX_PACK_BYTES) -> tuple[Pack, bytes]:
-    """Render, halving the largest section until the document fits; 413 if nothing is left to cut."""
+    """Render, halving the largest section until it fits; 413 if nothing is left to cut."""
     render = {"json": render_json, "markdown": render_markdown}[fmt]
     current = pack
     while True:
@@ -161,7 +161,7 @@ def fit(pack: Pack, fmt: str, cap: int = MAX_PACK_BYTES) -> tuple[Pack, bytes]:
         if len(data) <= cap:
             return current, data
         sizes = {sid: len(s["items"]) for sid, s in current.body["sections"].items()}
-        largest = max(sorted(sizes), key=sizes.get, default=None)
+        largest = max(sorted(sizes), key=lambda sid: sizes[sid], default=None)
         if largest is None or sizes[largest] == 0:
             raise ApiError(413, "pack_too_large", "evidence pack exceeds the size cap")
         current = _truncated(current, largest, sizes[largest] // 2)

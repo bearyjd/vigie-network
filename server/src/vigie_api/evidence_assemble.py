@@ -161,7 +161,8 @@ def _candidates(inv, ov, canonical: str, limits: Limits) -> dict[str, Any]:
     where = f"device_a IN ({marks}) OR device_b IN ({marks})"
     params = (*members, *members)
     total = inv.execute(
-        f"SELECT COUNT(*) FROM identity_candidates WHERE {where}", params  # noqa: S608
+        f"SELECT COUNT(*) FROM identity_candidates WHERE {where}",  # noqa: S608
+        params,
     ).fetchone()[0]
     found = inv.execute(
         f"SELECT * FROM identity_candidates WHERE {where} ORDER BY score DESC, id LIMIT ?",  # noqa: S608
@@ -238,4 +239,3 @@ def assemble(inv, ov, device_id: str, *, now: float, limits: Limits, vigie_versi
             "search_queries": [],
         }
     )
-

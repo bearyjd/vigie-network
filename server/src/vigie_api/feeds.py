@@ -10,6 +10,8 @@ from typing import Any
 
 from vigie_api.effective import PROSE_ALLOWED_ACTIONS, decode_cursor, encode_cursor, rows
 from vigie_api.errors import ApiError
+from vigie_api.evidence_redact import LEVELS
+from vigie_api.evidence_writes import AUDIT_ACTION
 from vigie_api.textsafe import PROSE_MAX, display_json, display_text
 
 SUGGESTION_STATES = ("pending", "accepted", "rejected", "expired")
@@ -64,28 +66,42 @@ def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
     if severity not in (None, "info"):  # human actions are always informational
         return []
     sql = (
-        "SELECT rowid AS rid, id, target, ts, principal, action FROM audit_log"
+        "SELECT rowid AS rid, id, target, ts, principal, action, detail FROM audit_log"
         " WHERE rowid > ? AND action NOT LIKE 'token.%'"  # token lifecycle is not app-visible
     )
     params: list[Any] = [after]
     if kind:
         sql, params = sql + " AND action = ?", [*params, kind]
     found = rows(ov, sql + " ORDER BY rowid LIMIT ?", (*params, limit))
-    return [
-        {
-            "rid": r["rid"],
-            "id": r["id"],
-            "device_id": None if r["action"].startswith("monitoring.incident.") else r["target"],
-            "ts": r["ts"],
-            "kind": display_text(r["action"]),
-            "severity": "info",
-            "summary": display_text(
-                f"{_actor(r['principal'])} {r['action']} {r['target'] or ''}".strip()
-            ),
-            "source": "audit",
-        }
-        for r in found
-    ]
+    return [_audit_event(r) for r in found]
+
+
+def _export_level(detail: str | None) -> str:
+    try:
+        level = json.loads(detail or "")["level"]
+    except (ValueError, TypeError, KeyError):
+        return "unknown"
+    return level if level in LEVELS else "unknown"
+
+
+def _audit_event(r: sqlite3.Row) -> dict[str, Any]:
+    """Incident and evidence-export events carry no device id; an export shows level and ref."""
+    shown = f"{_actor(r['principal'])} {r['action']} {r['target'] or ''}".strip()
+    exported = r["action"] == AUDIT_ACTION
+    if exported:
+        shown = f"{_actor(r['principal'])} {r['action']} {_export_level(r['detail'])} {r['target']}"
+    return {
+        "rid": r["rid"],
+        "id": r["id"],
+        "device_id": None
+        if exported or r["action"].startswith("monitoring.incident.")
+        else r["target"],
+        "ts": r["ts"],
+        "kind": display_text(r["action"]),
+        "severity": "info",
+        "summary": display_text(shown),
+        "source": "audit",
+    }
 
 
 def list_events(

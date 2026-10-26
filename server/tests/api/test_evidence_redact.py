@@ -7,10 +7,11 @@ import json
 import re
 
 import pytest
+from evidence_helpers import MAC, SALT_A, SALT_B, sample, section
 
 from vigie_api.evidence_redact import LEVELS, redact
-from evidence_helpers import MAC, SALT_A, SALT_B, sample, section
 from vigie_api.evidence_types import Pack, Sensitive, find_sensitive
+
 
 def dumped(pack: Pack) -> str:
     return json.dumps(pack.body, sort_keys=True)

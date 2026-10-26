@@ -15,7 +15,6 @@ from vigie_api import incident_decisions, monitoring
 from vigie_api.effective import override_map, rows
 from vigie_api.evidence_redact import SERVICE_RE
 from vigie_api.evidence_types import (
-    Sensitive,
     capped_section,
     has_table,
     make_section,

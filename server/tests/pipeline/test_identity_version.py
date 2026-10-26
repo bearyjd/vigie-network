@@ -175,6 +175,7 @@ WRITE_PATHS = {
         ("_apply", "UPDATE", "device_overrides"),
         ("_audit", "INSERT", "audit_log"),
     ],
+    "evidence_writes.py": [("record_export", "INSERT", "audit_log")],
     "identity_writes.py": [
         ("atomic", "INSERT", "audit_log"),
         ("atomic", "INSERT", "api_write_receipts"),
