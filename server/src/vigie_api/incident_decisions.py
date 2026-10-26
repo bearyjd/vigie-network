@@ -23,6 +23,7 @@ ACTION_STATUS = {"acknowledge": "acknowledged", "snooze": "snoozed", "mark-expec
 MIN_SNOOZE_S = 60
 RETENTION_DAYS = 120
 PRUNE_BATCH = 100
+PRUNE_SCAN = 500
 AUDIT_PREFIX = "monitoring.incident."
 _RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|\+00:00)")
 
@@ -90,12 +91,15 @@ def _prune_orphans(inv: sqlite3.Connection, ov: sqlite3.Connection, now: float) 
     cutoff = iso_utc(now - timedelta(days=RETENTION_DAYS).total_seconds())
     stale = ov.execute(
         "SELECT incident_id FROM incident_decisions WHERE decided_at<? ORDER BY decided_at LIMIT ?",
-        (cutoff, PRUNE_BATCH),
+        (cutoff, PRUNE_SCAN),
     ).fetchall()
-    for row in stale:
-        if inv.execute("SELECT 1 FROM monitoring_incidents WHERE id=?", (row[0],)).fetchone():
-            continue
-        ov.execute("DELETE FROM incident_decisions WHERE incident_id=?", (row[0],))
+    orphans = [
+        row[0]
+        for row in stale
+        if not inv.execute("SELECT 1 FROM monitoring_incidents WHERE id=?", (row[0],)).fetchone()
+    ]
+    for incident_id in orphans[:PRUNE_BATCH]:
+        ov.execute("DELETE FROM incident_decisions WHERE incident_id=?", (incident_id,))
 
 
 def _write_decision(ov, incident, action, until, version, principal, now_iso):  # noqa: ANN001

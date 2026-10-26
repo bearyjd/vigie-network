@@ -117,7 +117,7 @@ def test_retention_prunes_only_old_orphans_at_most_100_per_write(e):
     incident(e, "old-live", lineage="l2")
     for n in range(150):
         put(e, f"orphan{n:03d}", "acknowledged", decided_at=OLD)
-    put(e, "old-live", "acknowledged", decided_at=OLD)
+    put(e, "old-live", "acknowledged", decided_at="2025-01-01T00:00:00Z")  # oldest: scanned first
     put(e, "fresh-orphan", "acknowledged", decided_at=until(-3600))
     assert post(e, "inc1", "acknowledge").status_code == 200
     left = {d["incident_id"] for d in decisions(e)}
@@ -146,3 +146,16 @@ def test_incident_audit_events_have_no_device_id_and_token_events_stay_hidden(e)
         " VALUES ('d','x','p','device.patch','d1')"
     )
     assert any(x["device_id"] == "d1" for x in e.get("/events").json()["data"])
+
+
+def test_retention_is_not_starved_by_old_rows_whose_incident_still_exists(e):
+    incident(e, "inc1")
+    for n in range(120):
+        incident(e, f"live{n:03d}", lineage=f"l{n}")
+        put(e, f"live{n:03d}", "acknowledged", decided_at="2025-01-01T00:00:00Z")
+    for n in range(10):
+        put(e, f"orphan{n}", "acknowledged", decided_at=OLD)
+    assert post(e, "inc1", "acknowledge").status_code == 200
+    left = {d["incident_id"] for d in decisions(e)}
+    assert not [i for i in left if i.startswith("orphan")]
+    assert len([i for i in left if i.startswith("live")]) == 120
