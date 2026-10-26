@@ -205,6 +205,20 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
             for action in ("INSERT", "UPDATE", "DELETE")
         ),
     ),
+    (
+        # Current human review per monitoring incident. No cross-DB FK: identity fields and
+        # episode_start are copied so audit/orphan rows stay readable after the incident prune.
+        """CREATE TABLE incident_decisions (
+          incident_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, device_id TEXT NOT NULL,
+          lineage TEXT NOT NULL, detector TEXT NOT NULL, episode_start INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('acknowledged','snoozed','expected')),
+          snooze_until INTEGER,
+          version INTEGER NOT NULL CHECK (version>=1),
+          decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, id TEXT NOT NULL,
+          CHECK ((status='snoozed') = (snooze_until IS NOT NULL))
+        )""",
+        "CREATE INDEX idx_incident_decisions_decided ON incident_decisions(decided_at)",
+    ),
 )
 
 
