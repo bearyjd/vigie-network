@@ -262,9 +262,10 @@ def test_a_shared_status_probe_does_not_block_start_or_stop_for_long(namespace):
     assert time.monotonic() - started < 2.0
 
 
-def test_status_never_creates_the_lock_file(namespace, listener, sleeper):
+def test_status_never_creates_the_lock_file(namespace, listener, sleeper, monkeypatch):
     child, argv, identity, inode = live(namespace, listener, sleeper)
     attempt(namespace, argv, inode, [])
+    monkeypatch.setattr(preview, "listeners", lambda: {inode})  # not netns-wide tcp/tcp6 counts
     assert not preview.LOCK.exists()
     assert preview.status(namespace)["state"] == "orphaned"
     assert not preview.LOCK.exists()  # "read-only" includes the lock file

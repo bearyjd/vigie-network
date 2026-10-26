@@ -40,6 +40,7 @@ DEFAULT_PACKAGE = PREVIEW_PARENT / "vigie-gui-wheel-target-attempt3"
 DEFAULT_PYTHON = PREVIEW_PARENT / "vigie-pr9-native-server-env/bin/python"
 CURRENT = "manager-current.json"
 _TERMINATION = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+STARTING_SECONDS = 60.0  # A holder this old is no longer "starting": it is wedged.
 LOCK_WAIT_SECONDS = 2.0  # start/stop wait this long for a concurrent command; status never waits.
 # The only .pth files a vetted venv may carry besides plain directory lines: name -> sha256 of the
 # exact bytes. _virtualenv.pth: virtualenv/uv `import _virtualenv`. a1_coverage.pth: coverage's
@@ -347,31 +348,68 @@ def event(journal: Path, value: dict) -> None:
         os.close(fd)
 
 
-def _recorded_holder(fd: int) -> str:
-    """Hint naming the exclusive holder's PID (a bare integer written by the holder) if alive."""
+class UnsafeLock(ValueError):
+    """The lock path holds something other than our private regular file (or cannot be read)."""
+
+
+class LockBusy(BlockingIOError):
+    """Another preview command holds the lock; `holder` is its verified identity, if any."""
+
+    holder: dict | None = None
+    age: float | None = None
+
+
+def _holder(fd: int) -> dict | None:
+    """The exclusive holder named in the lock file, only if that exact process is still alive.
+
+    The holder writes `PID START_TICKS BOOT_ID`; a recycled PID (other start time or boot) or any
+    unparseable text names nobody, so a stale or forged line can never be blamed or signalled.
+    """
     try:
-        pid = os.pread(fd, 32, 0).decode("ascii", "replace").strip()
-    except OSError:
-        return ""
-    return f" (PID {pid})" if pid.isdigit() and Path("/proc", pid).exists() else ""
+        pid, ticks, boot = os.pread(fd, 128, 0).decode("ascii", "replace").split()
+    except (OSError, ValueError):
+        return None
+    if not pid.isdigit():
+        return None
+    identity = process_identity(int(pid))
+    if identity is None or identity["start_ticks"] != ticks or identity["boot_id"] != boot:
+        return None
+    return {"pid": int(pid), "start_ticks": ticks}
+
+
+def _own_holder_line() -> str:
+    try:
+        ticks = Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except (OSError, IndexError):
+        return f"{os.getpid()}\n"  # unverifiable: status will report `starting`, never a wedge
+    return f"{os.getpid()} {ticks} {boot}\n"
+
+
+def _open_lock(shared: bool) -> int:
+    if not shared:
+        return os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # O_NONBLOCK: a FIFO planted at the path must not block open(2); fstat then refuses it.
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_NOFOLLOW
+    try:
+        return os.open(LOCK, flags)
+    except FileNotFoundError:
+        return -1
+    except OSError as exc:
+        raise UnsafeLock(f"unsafe shared preview lock {LOCK}: {exc.strerror}") from exc
 
 
 @contextlib.contextmanager
 def manager_lock(wait: float = 0.0, *, shared: bool = False):
     """Exclusive lock (start/stop) or, with `shared`, a read-only probe (status).
 
-    Retries for up to `wait` seconds, then raises BlockingIOError. The exclusive holder writes its
-    PID into the lock file (cleared on release) so a stuck holder can be named. A shared probe
-    never creates the file: an absent file means nobody holds it. Shared probes do not exclude
-    each other, so concurrent read-only status calls cannot report `starting` for one another.
+    Retries for up to `wait` seconds, then raises LockBusy. The exclusive holder writes its PID,
+    start ticks and boot id into the lock file (cleared on release) so a stuck holder can be named
+    and verified. A shared probe never creates the file: an absent file means nobody holds it.
+    Shared probes do not exclude each other, so concurrent status calls cannot report `starting`
+    for one another.
     """
-    flags = os.O_RDONLY if shared else os.O_RDWR | os.O_CREAT
-    try:
-        fd = os.open(LOCK, flags | os.O_NOFOLLOW, 0o600)
-    except FileNotFoundError:
-        if not shared:
-            raise
-        fd = -1
+    fd = _open_lock(shared)
     if fd < 0:
         yield
         return
@@ -386,7 +424,7 @@ def manager_lock(wait: float = 0.0, *, shared: bool = False):
             or st.st_nlink != 1
             or (st.st_dev, st.st_ino) != (current.st_dev, current.st_ino)
         ):
-            raise ValueError(
+            raise UnsafeLock(
                 f"unsafe shared preview lock {LOCK}: it must be a regular single-link file owned "
                 f"by you with mode 0600 (found mode {stat.S_IMODE(st.st_mode):04o}); fix it or "
                 "remove it while no preview command is running"
@@ -398,16 +436,19 @@ def manager_lock(wait: float = 0.0, *, shared: bool = False):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise BlockingIOError(
-                        errno.EAGAIN,
-                        f"another preview command holds the lock{_recorded_holder(fd)}; "
-                        "retry shortly",
-                    ) from None
+                    holder = _holder(fd)
+                    hint = f" (PID {holder['pid']})" if holder else ""
+                    busy = LockBusy(
+                        errno.EAGAIN, f"another preview command holds the lock{hint}; retry shortly"
+                    )
+                    busy.holder = holder
+                    busy.age = max(0.0, time.time() - os.fstat(fd).st_mtime)
+                    raise busy from None
                 time.sleep(0.05)
         if not shared:
             held = True
             os.ftruncate(fd, 0)
-            os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+            os.pwrite(fd, _own_holder_line().encode(), 0)
         yield
     finally:
         if held:
@@ -597,21 +638,41 @@ def _orphan(rows: list, inodes: set[str], candidates: list[dict] | None = None) 
     return found[0] if len(found) == 1 else None
 
 
+def _busy(common: dict, exc: LockBusy) -> dict:
+    """`starting` while a verified-or-unknown holder is young; `wedged-start` once it is old."""
+    holder, age = exc.holder, exc.age
+    outcome = {**common, "state": "starting", "managed": False}
+    if holder is None or age is None:  # unverifiable holder text never proves a wedge
+        return outcome
+    outcome |= {"holder_pid": holder["pid"], "lock_age_seconds": round(age)}
+    if age >= STARTING_SECONDS:
+        pid = holder["pid"]
+        outcome["state"] = "wedged-start"
+        outcome["advice"] = (
+            f"PID {pid} has held the preview lock for {round(age)}s. Read /proc/{pid}/cmdline: "
+            "only if it is this preview.py start/stop command, send it TERM (or CONT if it is "
+            "stopped, then TERM); then run `stop` and `status`. Never signal a PID whose "
+            "command line differs."
+        )
+    return outcome
+
+
 def status(root: Path, *, locked: bool = False) -> dict:
     manifest = validate_namespace(root)
-    journal, rows = current_attempt(root)
     common = {
         "url": manifest["url"],
         "token_file": manifest["token_file"],
         "collector_id": COLLECTOR,
     }
     busy = {**common, "state": "starting", "managed": False}
-    if not locked:  # A start/stop holding the lock is mid-flight: report it, never wait.
+    if locked:
+        journal, rows = current_attempt(root)
+    else:  # A start/stop holding the lock is mid-flight: report it, never wait or read its rows.
         try:
-            with manager_lock(shared=True):  # Probe only: the slow scan below runs without it.
-                pass
-        except BlockingIOError:
-            return busy
+            with manager_lock(shared=True):  # No writer can append while the receipt is read.
+                journal, rows = current_attempt(root)
+        except LockBusy as exc:
+            return _busy(common, exc)
     inodes = listeners()
     last = rows[-1] if rows else None
     if last is not None and (

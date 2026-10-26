@@ -66,7 +66,10 @@ def receipt(root, state="ready", pid=123456):
     return journal, identity
 
 
-def test_status_is_readonly_and_never_adopts_existing_unmanaged_listener(namespace, monkeypatch):
+def test_status_is_readonly_and_never_adopts_existing_unmanaged_listener(
+    namespace, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
     token = (namespace / "read-token.private").read_text().strip()
     before = {path.name: path.read_bytes() for path in namespace.iterdir()}
     monkeypatch.setattr(preview, "listeners", lambda: {"foreign"})
@@ -86,12 +89,33 @@ def test_malformed_manifest_refuses_cleanly_without_process_or_receipt(namespace
     assert not list(namespace.glob("managed-*"))
 
 
-def test_plain_native_cli_status_needs_no_application_imports_or_pythonpath():
+# The CLI has no lock-path option, so the child loads the script as a module and redirects LOCK.
+CLI_WITH_PRIVATE_LOCK = (
+    "import importlib.util, sys\n"
+    "spec = importlib.util.spec_from_file_location('preview_cli', sys.argv[1])\n"
+    "module = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(module)\n"
+    "module.LOCK = type(module.LOCK)(sys.argv[2])\n"
+    "sys.argv = ['preview', 'status', '--directory', sys.argv[3]]\n"
+    "raise SystemExit(module.main())\n"
+)
+
+
+def test_plain_native_cli_status_needs_no_application_imports_or_pythonpath(tmp_path):
     root = Path("/tmp") / ("vigie-gui-preview-test-" + uuid.uuid4().hex)  # noqa: S108
     preview.seed(root)
     try:
         result = subprocess.run(  # noqa: S603 -- our interpreter and reviewed local script only.
-            [sys.executable, "-I", "-S", str(preview.__file__), "status", "--directory", str(root)],
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                CLI_WITH_PRIVATE_LOCK,
+                str(preview.__file__),
+                str(tmp_path / "private.lock"),
+                str(root),
+            ],
             capture_output=True,
             text=True,
             check=True,
