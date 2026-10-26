@@ -25,6 +25,13 @@ RETENTION_DAYS = 120
 PRUNE_BATCH = 100
 PRUNE_SCAN = 500
 AUDIT_PREFIX = "monitoring.incident."
+DESCRIPTION = (
+    "Human review of one monitoring incident (overrides-side overlay; the pipeline's incident "
+    "state is untouched). `expected_version` is the incident's decision version (0 when it "
+    "has none); a stale value is a 409 `version_conflict`. Errors: 404 `incident_not_found`, "
+    "409 `incident_not_open` (snooze on a resolved/superseded incident), 409 `no_decision` "
+    "(clear with nothing to clear), 409 `idempotency_conflict`."
+)
 _RFC3339_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|\+00:00)")
 
 
@@ -146,8 +153,7 @@ def decide(
     body,
     until,
     principal,
-    now,
-    now_iso,
+    clock,
     request_id,
     snooze_max_s=None,
 ):  # noqa: ANN001
@@ -160,7 +166,13 @@ def decide(
     if _find(inv, incident_id, collector_id) is None:  # before any receipt can answer
         raise ApiError(404, "incident_not_found", "incident not found")
 
+    sampled: dict[str, float] = {}
+
     def operation():
+        # sampled only now: after the write lock and the receipt lookup, so a long lock wait
+        # cannot make a snooze lead look longer than it is
+        now = sampled["now"] = clock()
+        now_iso = iso_utc(now)
         incident = _find(inv, incident_id, collector_id)
         if incident is None:
             raise ApiError(404, "incident_not_found", "incident not found")
@@ -193,7 +205,7 @@ def decide(
         target=incident_id,
         body=body,
         request_id=request_id or str(uuid.uuid4()),
-        now=now_iso,
+        now=lambda: iso_utc(sampled["now"]),
         operation=operation,
     )
 

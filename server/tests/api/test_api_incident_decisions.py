@@ -411,3 +411,73 @@ def test_tombstone_row_is_no_review_but_keeps_its_version(e):
     no = post(e, "inc1", "clear", {"expected_version": 5})
     assert (no.status_code, no.json()["error"]["code"]) == (409, "no_decision")
     assert post(e, "inc1", "acknowledge", {"expected_version": 5}).json()["data"]["version"] == 6
+
+
+def test_snooze_lead_is_judged_at_the_write_not_before_the_lock_wait(env):
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from vigie_api.app import create_app
+    from vigie_api.config import Settings
+    from vigie_api.schema import open_overrides
+
+    seed_collector(env)
+    incident(env, "inc1")
+    clock = [NOW]
+    app = create_app(Settings(data_dir=env.root), clock=lambda: clock[0])
+    holder = open_overrides(env.root / "overrides.db")
+    holder.execute("BEGIN IMMEDIATE")
+    out = {}
+    with TestClient(app) as client:
+
+        def request():
+            out["r"] = client.post(
+                "/incidents/inc1/snooze",
+                params={"collector_id": "c1"},
+                json={"expected_version": 0, "until": until(61)},
+                headers=env.auth,
+            )
+
+        worker = threading.Thread(target=request)
+        worker.start()
+        time.sleep(0.5)  # the request is now waiting for the write lock
+        clock[0] = NOW + 4  # until is only 57 s away by the time it may write
+        holder.execute("ROLLBACK")
+        worker.join(10)
+    holder.close()
+    assert out["r"].status_code == 422, out["r"].text
+    assert decisions(env) == []
+
+
+@pytest.mark.parametrize("scope", ["read-only", "service", "integration"])
+@pytest.mark.parametrize("action", ["clear", "snooze", "acknowledge"])
+@pytest.mark.parametrize(
+    ("content", "ctype"),
+    [
+        (b"{", "application/json"),
+        (b"", "application/json"),
+        (b'{"expected_version": 0}', "text/plain"),
+        (b"\xff\xfe\x00", "application/json"),
+    ],
+)
+def test_non_writer_gets_403_even_for_an_undecodable_body(e, scope, action, content, ctype):
+    _, token = tokens.create_token(e.ov, f"u{scope[:3]}", scope=scope)
+    r = e.client.post(
+        f"/incidents/inc1/{action}",
+        params={"collector_id": "c1"},
+        content=content,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": ctype},
+    )
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden")
+
+
+def test_anonymous_undecodable_body_is_401(e):
+    r = e.client.post(
+        "/incidents/inc1/clear",
+        params={"collector_id": "c1"},
+        content=b"{",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 401
