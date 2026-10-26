@@ -65,6 +65,7 @@ reviewer (PRP section 17), not run in production.
 | Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Live helper/socket path exercised; it remains a separate root service. Lifecycle, boot and long-soak acceptance remain separate gates |
 | DHCP log, conntrack and `ubus` output formats | router | Leases, neighbors, conntrack, selected procd metadata and parsed DNS have been observed. DHCP option 55/60 capture and remaining firmware cases await field verification |
 | Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Real logging, renewed privilege checks, portable UID scan and controlled stop/restart passed; 20 MiB logfs capacity proof passed before writers. Boot links and scoped cron installation passed; drop-in repair and read-only-reconciled helper respawn passed; natural rotation and cold boot remain pending |
+| Endpoint connection events (`endpoint-ingest`) | [`docs/prp/003-endpoint-events.md`](docs/prp/003-endpoint-events.md) | Proposed (design only); nothing built |
 | LLM / ML classification stages | none | **Not built** |
 | Control app | separate project | Out of scope here |
 
