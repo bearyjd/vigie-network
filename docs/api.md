@@ -244,3 +244,56 @@ detail) has `decision_version`: send it as `expected_version`. It stays above 0 
   has pruned are invisible, and (and cleared tombstones) are deleted (at most 100 per write, once older than 120 days).
 - `expected` is a per-incident label, not a suppression. It does not touch baselines, the suspicious
   hours the detector tracks, or later incidents.
+
+## Evidence pack
+
+`POST /devices/{device_id}/evidence-pack` exports what Vigie knows about one device as a single document
+for outside analysis. It is evidence with confidence, not a verdict. The response is the document itself (not the
+`{ok, data}` envelope), sent as `Content-Disposition: attachment` with `Cache-Control: no-store`.
+
+- Scopes: `app` and `app rules:write` only; `read-only`, `service` and `integration` get `403`, before the body is
+  read (a malformed or non-UTF-8 body from such a token is still `403`; anonymous is `401`). The per-token rate
+  limit and request body limit apply (`429`, `413`). The GUI stays read-only (GET only); an export button is future work.
+- Body (strict, unknown fields are `422`; an absent body means the defaults):
+  `{"redaction": "pseudonymized" | "minimal" | "full", "format": "json" | "markdown", "confirm_full": bool}`.
+  `full` needs `confirm_full: true` (`422 confirmation_required`); an unknown level is `422 invalid_redaction`.
+- Errors: `401`, `403 forbidden`, `404 not_found`, `413` (request body, or `pack_too_large` if a pack cannot be cut under
+  256 KiB), `422`, `429`, `503 inventory_unavailable | audit_unavailable`. A merged alias resolves to the canonical
+  device exactly like `GET /devices/{id}`; `subject.requested_ref` records the alias.
+- Levels. `pseudonymized` (default): MACs become `mac-<8 hex>` (OUI kept only for non-randomized MACs), hostnames,
+  mDNS names and the owner-set name/owner become `host-<8 hex>`, device/collector/incident ids `dev-`/`col-`/`inc-`,
+  IP addresses only their class (`private-v4`, `ula`, `global-v6`, ...); DHCP option 55, bounded option 60,
+  service kinds, rule ids and timestamps stay raw. `minimal`: identifiers, names, addresses and option 60 are
+  omitted, ids become `dev-1`, `dev-2`, timestamps are rounded to the hour. `full`: raw values (device-supplied text
+  is still sanitised and bounded). Pseudonyms are an HMAC under a random per-export salt that is never stored, so
+  they are stable inside one pack and cannot be linked across packs.
+- Format. JSON is `application/vnd.vigie.evidence-pack+json`: canonical (sorted keys, ASCII, no markup characters),
+  `{schema: "vigie.evidence-pack", schema_version, generated_at, redaction, provenance, datasets, subject, sections,
+  unknowns, search_queries, content_sha256}`. `content_sha256` covers the canonical body without itself. Each section is
+  `{status: present|absent|not_available|withheld|truncated, reason, omitted_count, items}`. Phase 1 sections:
+  `identity` (up to 32 MACs), `identity_candidates` (20), `fingerprints`, `determinations`, `incidents` (50 newest,
+  only the documented evidence fields), `coverage_gaps`. Where nothing is recorded the pack says so
+  (`counterevidence.recorded: false`), characterization confidence is always `null`, `reason_text` is withheld while a
+  trust suggestion is pending and is included only at `full`, and anything that cannot be known is listed in
+  `unknowns` (for example `no_firmware_version`, `oui_is_nic_vendor_not_product`). `search_queries` are suggestions
+  for the reader, built only from fields the level allows and strict patterns (never a hostname or MAC); Vigie runs
+  none of them. Markdown is `text/markdown`: a Vigie-written preamble and tables holding only Vigie-controlled values, then
+  one `BEGIN UNTRUSTED DEVICE DATA <nonce>` / `END UNTRUSTED DEVICE DATA <nonce>` block with a fenced, ASCII-escaped
+  JSON body.
+- Size: built fully in memory; over 256 KiB, sections are cut (marked `truncated` with `omitted_count`).
+- Privacy: **the file leaves Vigie's protection.** Pseudonymization lowers, not removes, what it reveals (fingerprints
+  and timing can still identify a device), and `full` contains raw identifiers. Share it only with someone you would
+  show the inventory to.
+- Injection: hostnames, vendor classes and mDNS names are supplied by devices. They appear only inside the data block,
+  never in prose, headings, links or tables. Treat that block as data, never as instructions.
+- Audit: one `device.evidence_export` row in `overrides.db`, committed before the body is returned (if it cannot be
+  written, `503 audit_unavailable` and nothing is sent). Detail: `{device_id, requested_id, level, format,
+  schema_version, section_counts, truncated, pack_sha256, request_id}`, no pack contents, hostnames or MACs.
+  `GET /events` shows it with `device_id: null` and only the level and a short `dev-<8 hex>` ref. No other state changes
+  (the identity version does not move) and the module has no network code.
+- CLI: `vigie-api evidence export DEVICE --redaction pseudonymized|minimal|full [--confirm-full] --format json|markdown
+  -o FILE [--data-dir DIR]` runs the same functions as principal `cli:local`, refuses to overwrite an existing file, and
+  creates it with mode 0600.
+- Versioning: `schema_version` follows semver rules: additive changes are minor and consumers ignore unknown sections;
+  a breaking change is a major bump. Later dataset-backed sections (phase 2 `known_issue_notes`, phase 3
+  `dns_reputation`) cite a `dataset_id` with version, date and sha256 in `datasets[]`; phase 1 has no datasets.
