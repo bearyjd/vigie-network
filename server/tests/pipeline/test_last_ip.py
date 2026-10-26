@@ -87,6 +87,9 @@ def test_ties_are_deterministic_across_sources_and_batch_arrival(data):
         "::ffff:224.0.0.1",
         "::ffff:169.254.1.1",
         "::ffff:0.0.0.0",
+        "2001:db8::1%eth0",
+        "fd00::1%br-lan",
+        "::ffff:192.168.1.7%eth0",
     ],
 )
 def test_invalid_or_nonclient_addresses_are_not_projected(data, ip):

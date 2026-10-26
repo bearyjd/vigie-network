@@ -28,9 +28,11 @@ def address_candidate(
     # win over newer data, and the delta-only collector never re-sends a pairing.
     if received_ts is None or stamp > received_ts + ACTIVITY_SKEW_S:
         return None
+    if "%" in raw:  # Python accepts scoped IPv6 spellings ("fe80::1%eth0"); never store them
+        return None
     try:
         ip = ipaddress.ip_address(raw)
-    except ValueError:  # includes scoped "fe80::1%eth0" spellings
+    except ValueError:
         return None
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
