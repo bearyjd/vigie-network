@@ -373,24 +373,33 @@ def test_an_unavailable_end_to_end_lane_skips_locally_and_fails_under_ci(monkeyp
         end_to_end_unavailable("no clean interpreter")
 
 
-def test_the_lane_prefers_a_uv_interpreter_without_distro_symlinks(tmp_path, monkeypatch):
+def test_the_lane_selects_the_first_interpreter_the_real_trust_check_accepts(
+    tmp_path, monkeypatch
+):
     import gui_preview_native_lane as lane
+    from types import SimpleNamespace
 
-    clean = tmp_path / "uv" / "bin" / "python3.12"
-    clean.parent.mkdir(parents=True)
-    clean.write_text("")
-    (tmp_path / "uv" / "lib" / "python3.12").mkdir(parents=True)
-    monkeypatch.setattr(lane, "uv_interpreters", lambda: [clean])
-    real = lane.stdlib_symlinks
-    monkeypatch.setattr(
-        lane,
-        "stdlib_symlinks",
-        lambda prefix: real(prefix) if prefix == tmp_path / "uv" else ["/usr/lib/sitecustomize.py"],
-    )
-    assert lane.child_interpreter() == (clean.resolve(), "")
-    monkeypatch.setattr(lane, "uv_interpreters", lambda: [])
-    interpreter, reason = lane.child_interpreter()
-    assert interpreter is None and "sitecustomize.py" in reason
+    first, second, third = (tmp_path / name / "bin" / "python3" for name in "abc")
+    for path in (first, second, third):
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+    monkeypatch.setattr(lane, "uv_interpreters", lambda: [first, second])
+    monkeypatch.setattr(lane, "NATIVE_FALLBACK", third)
+    tried = []
+
+    def trust(venv_python):  # stands in for pv._interpreter: refuses all but the third
+        tried.append((venv_python.parent / ".." / "pyvenv.cfg").read_text())
+        if f"home = {third.parent}" not in tried[-1]:
+            raise ValueError("native Python interpreter unavailable or untrusted")
+        return venv_python
+
+    pv = SimpleNamespace(_interpreter=trust)
+    chosen, reason = lane.child_interpreter(pv, tmp_path / "work")
+    assert reason == "" and chosen is not None and chosen.name == "python"
+    assert len(tried) == 3
+    pv = SimpleNamespace(_interpreter=lambda _p: (_ for _ in ()).throw(ValueError("untrusted")))
+    chosen, reason = lane.child_interpreter(pv, tmp_path / "work2")
+    assert chosen is None and "untrusted" in reason and "CI" not in reason
 
 
 def test_docs_describe_the_round_four_behaviour():

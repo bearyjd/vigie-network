@@ -181,23 +181,6 @@ def stop_with_real_pidfd(pv, root: Path, work: Path) -> dict:
     return out
 
 
-def stdlib_symlinks(prefix: Path) -> list[str]:
-    """Symlinks in the stdlib the venv check walks (base site-packages is not walked)."""
-    found = []
-    for lib in ("lib", "lib64"):
-        if not (prefix / lib).exists():
-            continue
-        for tree in (prefix / lib).resolve().glob("python3*"):
-            for current, names, files in os.walk(tree, followlinks=False):
-                found += [
-                    str(Path(current) / n)
-                    for n in (*names, *files)
-                    if (Path(current) / n).is_symlink()
-                ]
-                names[:] = [n for n in names if n not in ("site-packages", "dist-packages")]
-    return found
-
-
 def uv_interpreters() -> list[Path]:
     """Interpreters uv manages (no distro symlinks in their stdlib); empty without uv."""
     found = []
@@ -214,44 +197,53 @@ def uv_interpreters() -> list[Path]:
     return found
 
 
-def child_interpreter() -> tuple[Path | None, str]:
-    """The first interpreter whose stdlib the trust check can accept, preferring uv's.
+NATIVE_FALLBACK = Path("/usr/bin/python3")
 
-    Returns (resolved binary, "") or (None, reason) when every candidate is distro-patched.
-    """
-    example = ""
-    for candidate in [*uv_interpreters(), Path("/usr/bin/python3")]:
-        resolved = candidate.resolve()
-        links = stdlib_symlinks(resolved.parent.parent)
-        if not links:
-            return resolved, ""
-        example = example or links[0]
-    return None, (
-        f"host stdlib contains symlinks (e.g. {example}); the interpreter "
-        "trust check would refuse it, so this lane needs a clean native Python or uv"
+
+def venv_over(interpreter: Path, venv: Path) -> Path:
+    """A venv shell over `interpreter`: the exact shape start() is asked to trust."""
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "bin" / "python").unlink(missing_ok=True)
+    (venv / "bin" / "python").symlink_to(interpreter)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {interpreter.parent}\ninclude-system-site-packages = false\n"
     )
+    (venv / "lib" / "python3" / "site-packages").mkdir(parents=True, exist_ok=True)
+    return venv / "bin" / "python"
+
+
+def child_interpreter(pv, work: Path) -> tuple[Path | None, str]:
+    """The first candidate venv that preview's own trust check (`pv._interpreter`) accepts.
+
+    Selection uses the very predicate start() applies (ownership, group/world-write bits, symlinks
+    in the stdlib), so a candidate is never picked only to be refused later. Returns
+    (venv python, "") or (None, reason naming each refusal).
+    """
+    refusals = []
+    for index, candidate in enumerate([*uv_interpreters(), NATIVE_FALLBACK]):
+        venv_python = venv_over(candidate.resolve(), work / f"venv{index}")
+        try:
+            pv._interpreter(venv_python)
+        except (OSError, ValueError) as exc:
+            refusals.append(f"{candidate}: {exc}")
+            continue
+        return venv_python, ""
+    return None, "no interpreter passes the preview trust check (" + "; ".join(refusals) + ")"
 
 
 def start_end_to_end(pv, root: Path, work: Path) -> dict:
     """start -> ready -> running -> stop -> stopped through the REAL _interpreter and pidfd."""
-    interpreter, reason = child_interpreter()
-    if interpreter is None:  # The trust check refuses symlinked stdlib files by design.
-        return {"skipped": reason}
     fresh(root, pv)
     pv.PORT = free_port()
     pv._package = lambda p: p
     health = work / "health_preview.py"
     health.write_text(HEALTH)
     pv.__file__ = str(health)
-    venv = work / "venv"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(interpreter)
-    (venv / "pyvenv.cfg").write_text(
-        f"home = {interpreter.parent}\ninclude-system-site-packages = false\n"
-    )
-    (venv / "lib" / "python3" / "site-packages").mkdir(parents=True)
     pv.SYSTEM_UIDS = (0, os.stat("/tmp").st_uid)  # noqa: S108 -- sandboxed /tmp owner
-    started = pv.start(root, work / "pkg", venv / "bin" / "python")
+    python, reason = child_interpreter(pv, work)
+    if python is None:  # The trust check refuses this host's interpreters by design.
+        return {"skipped": reason}
+    started = pv.start(root, work / "pkg", python)
     child_pid = started["pid"]
     out = {
         "started": started["state"],

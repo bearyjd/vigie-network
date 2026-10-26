@@ -26,6 +26,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
 )
 from test_gui_preview_fixround3 import _hold_lock, _pth
 from test_gui_preview_fixround4 import _refuses
+from test_gui_preview_native import end_to_end_unavailable
 
 REAL_LOCK = "/tmp/vigie-gui-preview-18745.lock"  # noqa: S108 -- only ever compared, never opened.
 
@@ -288,3 +289,15 @@ def test_a_sticky_group_writable_missing_target_anchor_is_refused(sandbox_owners
     shared.chmod(0o1770)
     _pth(site, "e.pth", f"{shared / 'gone'}\n")
     _refuses(root)
+
+
+# ------------------------------------ M32: the CI guard can fail but never turn into a skip
+
+
+def test_under_ci_the_unavailable_lane_guard_fails_and_cannot_skip(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(pytest.fail.Exception, match="CI must exercise"):
+        try:
+            end_to_end_unavailable("why")
+        except pytest.skip.Exception:
+            pytest.fail("under CI the lane guard skipped instead of failing", pytrace=False)

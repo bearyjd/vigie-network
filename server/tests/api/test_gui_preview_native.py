@@ -43,7 +43,11 @@ pytestmark = pytest.mark.skipif(
 def end_to_end_unavailable(reason: str) -> None:
     """Skip locally; under CI a lane that cannot run is a failure, not a quiet skip."""
     if os.environ.get("CI"):
-        pytest.fail(f"CI must exercise the real-interpreter end-to-end lane, but: {reason}")
+        pytest.fail(
+            f"CI must exercise the real-interpreter end-to-end lane, but: {reason}. Install a "
+            "Python whose lib tree is root/runner-owned and not group/world-writable (for "
+            "example uv-managed under a private directory), or fix the toolcache modes."
+        )
     pytest.skip(reason)
 
 

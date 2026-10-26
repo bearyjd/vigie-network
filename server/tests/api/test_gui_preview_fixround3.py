@@ -32,6 +32,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     serve_argv,
     sleeper,
 )
+from test_gui_preview_native import end_to_end_unavailable
 
 UNTRUSTED = "untrusted"
 VIRTUALENV_PTH = "import _virtualenv"
@@ -511,7 +512,7 @@ def test_real_serve_imports_the_vetted_package_dir_ahead_of_every_other_vigie_ap
         timeout=120,
     )
     if made.returncode != 0:
-        pytest.skip("cannot create a throwaway venv")
+        end_to_end_unavailable("cannot create a throwaway venv")
     python = venv / "bin" / "python"
     decoy = _copy_package(source, tmp_path / "decoy", "MARK-DECOY")
     vetted = _copy_package(source, tmp_path / "vetted", "MARK-VETTED")
@@ -530,7 +531,9 @@ def test_real_serve_imports_the_vetted_package_dir_ahead_of_every_other_vigie_ap
         text=True,
     )
     if probe.returncode != 0 or str(decoy) not in probe.stdout:
-        pytest.skip(f"throwaway venv cannot import the app dependencies: {probe.stderr[-200:]}")
+        end_to_end_unavailable(
+            f"throwaway venv cannot import the app dependencies: {probe.stderr[-200:]}"
+        )
     base = tmp_path.resolve()
     root = base / "vigie-gui-preview-r3"
     preview.seed(root)
@@ -593,30 +596,12 @@ def test_real_serve_imports_the_vetted_package_dir_ahead_of_every_other_vigie_ap
 # ---------------------------------------------------------------- CI portability of the native lane
 
 
-def _prefix(tmp_path: Path) -> Path:
-    stdlib = tmp_path / "prefix" / "lib" / "python3.12"
-    (stdlib / "site-packages").mkdir(parents=True)
-    (stdlib / "os.py").write_text("")
-    return tmp_path / "prefix"
-
-
-def test_stdlib_symlink_probe_reports_debian_style_symlinks_and_ignores_site_packages(tmp_path):
-    prefix = _prefix(tmp_path)
-    assert lane.stdlib_symlinks(prefix) == []
-    (prefix / "lib" / "python3.12" / "site-packages" / "x.py").symlink_to("/etc/hostname")
-    assert lane.stdlib_symlinks(prefix) == []  # a venv never walks the base site-packages
-    (prefix / "lib" / "python3.12" / "sitecustomize.py").symlink_to(
-        "/etc/python3.12/sitecustomize.py"
-    )
-    assert lane.stdlib_symlinks(prefix) == [str(prefix / "lib" / "python3.12" / "sitecustomize.py")]
-    (prefix / "lib" / "python3.12" / "sitecustomize.py").unlink()
-    (prefix / "lib" / "python3.12" / "pkg").symlink_to(tmp_path, target_is_directory=True)
-    assert len(lane.stdlib_symlinks(prefix)) == 1
-
-
 def test_end_to_end_lane_reports_a_skip_with_a_reason_instead_of_failing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(lane, "fresh", lambda root, pv: None)
     monkeypatch.setattr(
-        lane, "stdlib_symlinks", lambda prefix: ["/usr/lib/python3/sitecustomize.py"]
+        lane, "child_interpreter", lambda pv, work: (None, "no interpreter passes: group-writable")
     )
-    out = lane.start_end_to_end(None, tmp_path, tmp_path)
-    assert "sitecustomize.py" in out["skipped"] and "symlinks" in out["skipped"]
+    out = lane.start_end_to_end(SimpleNamespace(), tmp_path, tmp_path)
+    assert out == {"skipped": "no interpreter passes: group-writable"}
