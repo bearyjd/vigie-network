@@ -1,3 +1,22 @@
+<!-- glowup:hero start -->
+<div align="center">
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg">
+    <img src="docs/assets/banner-light.svg" alt="Vigie" width="880">
+  </picture>
+</h1>
+
+[![License](https://img.shields.io/badge/license-AGPL--3.0-1E2430?style=for-the-badge)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+![OpenWrt](https://img.shields.io/badge/OpenWrt-00B5E2?style=for-the-badge&logo=openwrt&logoColor=white)
+![Podman](https://img.shields.io/badge/Podman-892CA0?style=for-the-badge&logo=podman&logoColor=white)
+</div>
+<!-- glowup:hero end -->
+
 # Vigie
 
 License: AGPL-3.0 (see `LICENSE`).
