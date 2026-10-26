@@ -66,6 +66,10 @@ Untrusted = Field(description=UNTRUSTED)
 class ErrorBody(BaseModel):
     code: str
     message: str
+    current_version: int | None = Field(
+        default=None,
+        description="Only on incident `version_conflict`: the incident's current decision_version.",
+    )
 
 
 class Page(BaseModel):
@@ -414,6 +418,11 @@ class IncidentOut(BaseModel):
     review: IncidentReview | None = Field(
         description="Current human decision, or null. A separate axis from `state`: `expected` "
         "is a per-incident label, not a suppression."
+    )
+    decision_version: int = Field(
+        description="Version to send as `expected_version` for the next review write: 0 when the "
+        "incident never had a decision, otherwise the last write's version (a cleared incident "
+        "keeps its version, so this can be > 0 while `review` is null)."
     )
     attention: bool = Field(
         description="True while the incident is open and no decision covers it (an expired "

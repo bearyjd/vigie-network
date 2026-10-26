@@ -1154,6 +1154,18 @@
             "title": "Code",
             "type": "string"
           },
+          "current_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only on incident `version_conflict`: the incident's current decision_version.",
+            "title": "Current Version"
+          },
           "message": {
             "title": "Message",
             "type": "string"
@@ -1678,6 +1690,11 @@
             "title": "Current Lineage",
             "type": "boolean"
           },
+          "decision_version": {
+            "description": "Version to send as `expected_version` for the next review write: 0 when the incident never had a decision, otherwise the last write's version (a cleared incident keeps its version, so this can be > 0 while `review` is null).",
+            "title": "Decision Version",
+            "type": "integer"
+          },
           "detected_at": {
             "title": "Detected At",
             "type": "string"
@@ -1758,6 +1775,7 @@
           "baseline_id",
           "evidence",
           "review",
+          "decision_version",
           "attention"
         ],
         "title": "IncidentOut",

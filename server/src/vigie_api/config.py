@@ -12,6 +12,7 @@ MAX_MERGE_OBSERVATIONS = 1024
 MAX_MERGE_ACTIVITY_ROWS = 8192
 MAX_MERGE_FLATTEN_WRITES = 256
 INCIDENT_SNOOZE_MAX_S = 7 * 24 * 3600
+MIN_SNOOZE_S = 60
 
 
 def _opt_path(value: str | None) -> Path | None:
@@ -48,8 +49,8 @@ class Settings:
             < 1
         ):
             raise ValueError("merge limits must be positive")
-        if self.incident_snooze_max_s < 1:
-            raise ValueError("incident_snooze_max_s must be positive")
+        if self.incident_snooze_max_s < 2 * MIN_SNOOZE_S:
+            raise ValueError(f"incident_snooze_max_s must be at least {2 * MIN_SNOOZE_S}")
 
     @property
     def inventory_path(self) -> Path:

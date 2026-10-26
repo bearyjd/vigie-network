@@ -279,6 +279,7 @@ def incident_row(inv, ov, row, review, now):
         "baseline_id": row["baseline_id"],
         "evidence": json.loads(row["evidence"]),
         "review": review_view(review),
+        "decision_version": review["version"] if review else 0,
         "attention": attention(row["state"], review, now),
     }
 
@@ -290,11 +291,11 @@ def incident_list(inv, ov, collector, device, cursor, limit, state, now):
             value = json.loads(decode_cursor(cursor))
             if (
                 not isinstance(value, list)
-                or len(value) != 4
-                or value[:3] != ["incidents", collector, device]
+                or len(value) != 5
+                or value[:4] != ["incidents", collector, device, state]
             ):
                 raise ValueError
-            after = value[3]
+            after = value[4]
             if type(after) is not int or not 0 <= after < 2**63:
                 raise ValueError
         except (ValueError, TypeError) as exc:
@@ -316,7 +317,7 @@ def incident_list(inv, ov, collector, device, cursor, limit, state, now):
     reviews = reviews_for(ov, [row["id"] for row in page])
     items = [incident_row(inv, ov, row, reviews.get(row["id"]), now) for row in page]
     nxt = (
-        encode_cursor(json.dumps(["incidents", collector, device, rows[limit - 1]["seq"]]))
+        encode_cursor(json.dumps(["incidents", collector, device, state, rows[limit - 1]["seq"]]))
         if len(rows) > limit
         else None
     )

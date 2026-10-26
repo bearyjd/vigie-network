@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from vigie_api.config import MIN_SNOOZE_S
 from vigie_api.errors import ApiError
 from vigie_api.feeds import _actor
 from vigie_api.identity_writes import atomic
@@ -20,7 +21,6 @@ from vigie_ingest.db import iso_utc
 STATUSES = ("acknowledged", "snoozed", "expected")
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 ACTION_STATUS = {"acknowledge": "acknowledged", "snooze": "snoozed", "mark-expected": "expected"}
-MIN_SNOOZE_S = 60
 RETENTION_DAYS = 120
 PRUNE_BATCH = 100
 PRUNE_SCAN = 500
@@ -42,23 +42,26 @@ def attention(state: str, review: dict[str, Any] | None, now: float) -> bool:
     return not (review["status"] == "snoozed" and now < review["snooze_until"])
 
 
-def parse_until(value: str, now: float, max_s: int) -> int:
-    """Whole-second RFC 3339 UTC instant within [now + MIN_SNOOZE_S, now + max_s]."""
+def parse_until(value: str) -> int:
+    """Syntax only: a whole-second RFC 3339 UTC instant. The window is checked at write time."""
     if not _RFC3339_UTC.fullmatch(value):
         raise ApiError(
             422, "invalid_until", "until must be RFC 3339 UTC, e.g. 2026-01-01T00:00:00Z"
         )
     try:
-        instant = int(datetime.fromisoformat(value).timestamp())
+        return int(datetime.fromisoformat(value).timestamp())
     except (ValueError, OverflowError):
         raise ApiError(422, "invalid_until", "until is not a valid instant") from None
+
+
+def check_window(instant: int, now: float, max_s: int) -> None:
+    """Relative window; evaluated inside the write so a receipt replay never re-checks it."""
     if not now + MIN_SNOOZE_S <= instant <= now + max_s:
         raise ApiError(
             422,
             "invalid_until",
             f"until must be between {MIN_SNOOZE_S} seconds and {max_s} seconds from now",
         )
-    return instant
 
 
 def review_view(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -88,18 +91,28 @@ def reviews_for(ov: sqlite3.Connection, incident_ids: list[str]) -> dict[str, sq
 
 
 def _prune_orphans(inv: sqlite3.Connection, ov: sqlite3.Connection, now: float) -> None:
+    """Scan stale rows from a persisted (decided_at, id) cursor, wrapping at the end."""
     cutoff = iso_utc(now - timedelta(days=RETENTION_DAYS).total_seconds())
+    saved = ov.execute("SELECT decided_at,incident_id FROM incident_decision_prune").fetchone()
+    after = (saved[0], saved[1]) if saved else ("", "")
     stale = ov.execute(
-        "SELECT incident_id FROM incident_decisions WHERE decided_at<? ORDER BY decided_at LIMIT ?",
-        (cutoff, PRUNE_SCAN),
+        "SELECT decided_at,incident_id FROM incident_decisions WHERE decided_at<? AND"
+        " (decided_at,incident_id)>(?,?) ORDER BY decided_at,incident_id LIMIT ?",
+        (cutoff, *after, PRUNE_SCAN),
     ).fetchall()
-    orphans = [
-        row[0]
-        for row in stale
-        if not inv.execute("SELECT 1 FROM monitoring_incidents WHERE id=?", (row[0],)).fetchone()
-    ]
-    for incident_id in orphans[:PRUNE_BATCH]:
+    deleted, last = 0, after
+    for decided_at, incident_id in stale:
+        if inv.execute("SELECT 1 FROM monitoring_incidents WHERE id=?", (incident_id,)).fetchone():
+            last = (decided_at, incident_id)
+            continue
+        if deleted == PRUNE_BATCH:
+            break
         ov.execute("DELETE FROM incident_decisions WHERE incident_id=?", (incident_id,))
+        deleted, last = deleted + 1, (decided_at, incident_id)
+    if len(stale) < PRUNE_SCAN:
+        last = ("", "")  # reached the end: start over next time
+    ov.execute("DELETE FROM incident_decision_prune")
+    ov.execute("INSERT INTO incident_decision_prune VALUES (?,?)", last)
 
 
 def _write_decision(ov, incident, action, until, version, principal, now_iso):  # noqa: ANN001
@@ -115,28 +128,55 @@ def _write_decision(ov, incident, action, until, version, principal, now_iso):  
     )  # fmt: skip
 
 
+def _find(inv, incident_id, collector_id):  # noqa: ANN001
+    return inv.execute(
+        "SELECT id,collector_id,device_id,lineage,detector,state,episode_start"
+        " FROM monitoring_incidents WHERE id=? AND collector_id=?",
+        (incident_id, collector_id),
+    ).fetchone()
+
+
 def decide(
-    inv, ov, *, incident_id, collector_id, action, body, until, principal, now, now_iso, request_id
+    inv,
+    ov,
+    *,
+    incident_id,
+    collector_id,
+    action,
+    body,
+    until,
+    principal,
+    now,
+    now_iso,
+    request_id,
+    snooze_max_s=None,
 ):  # noqa: ANN001
-    """Apply one review action under per-incident CAS, a receipt and an audit row."""
+    """Apply one review action under per-incident CAS, a receipt and an audit row.
+
+    Receipts replay only for an explicit X-Request-ID; without one every call gets a fresh key,
+    so a stale expected_version is always a 409 and never a replay of an older success.
+    """
     principal.require_write()
+    if _find(inv, incident_id, collector_id) is None:  # before any receipt can answer
+        raise ApiError(404, "incident_not_found", "incident not found")
 
     def operation():
-        incident = inv.execute(
-            "SELECT id,collector_id,device_id,lineage,detector,state,episode_start"
-            " FROM monitoring_incidents WHERE id=? AND collector_id=?",
-            (incident_id, collector_id),
-        ).fetchone()
+        incident = _find(inv, incident_id, collector_id)
         if incident is None:
             raise ApiError(404, "incident_not_found", "incident not found")
-        if action == "snooze" and incident["state"] != "open":
-            raise ApiError(409, "incident_not_open", "only an open incident can be snoozed")
+        if action == "snooze":
+            check_window(until, now, snooze_max_s)
+            if incident["state"] != "open":
+                raise ApiError(409, "incident_not_open", "only an open incident can be snoozed")
         old = ov.execute(
             "SELECT * FROM incident_decisions WHERE incident_id=?", (incident_id,)
         ).fetchone()
         current = old["version"] if old else 0
         if current != body.expected_version:
-            raise ApiError(409, "version_conflict", "decision version no longer matches")
+            raise ApiError(
+                409, "version_conflict", "decision version no longer matches",
+                extra={"current_version": current},
+            )  # fmt: skip
         if action == "clear" and (old is None or old["status"] is None):
             raise ApiError(409, "no_decision", "incident has no decision to clear")
         _write_decision(ov, incident, action, until, current + 1, principal.name, now_iso)
@@ -152,7 +192,7 @@ def decide(
         action=AUDIT_PREFIX + action.replace("-", "_"),
         target=incident_id,
         body=body,
-        request_id=request_id,
+        request_id=request_id or str(uuid.uuid4()),
         now=now_iso,
         operation=operation,
     )

@@ -216,19 +216,24 @@ Actions are `POST /incidents/{incident_id}/{action}?collector_id=...` with actio
 any other. The body is strict (unknown fields are 422; there is no free-text note):
 `{"expected_version": n}`, plus `"until"` for snooze. `expected_version` is the incident's own decision
 version: 0 when it has never had one, +1 on every write including `clear` (it never goes backwards). A stale value is
-`409 version_conflict`. It is unrelated to the device `identity_override_version`.
+`409 version_conflict`, whose error body carries `current_version`. Every incident read (list and
+detail) has `decision_version`: send it as `expected_version`. It stays above 0 after `clear`, when
+`review` is null. It is unrelated to the device `identity_override_version`.
 
 - `until`: RFC 3339 UTC (`Z` or `+00:00`, whole seconds), from 60 seconds to the cap after now. The cap
-  is 7 days, configurable with `VIGIE_API_INCIDENT_SNOOZE_MAX_S`. Anything else is `422 invalid_until`.
+  is 7 days, configurable with `VIGIE_API_INCIDENT_SNOOZE_MAX_S` (at least 120). Anything else is
+  `422 invalid_until`. The window is judged when a write is applied, so a replay of an accepted
+  `X-Request-ID` request still succeeds after time has passed.
 - Allowed on `open`, `resolved` and `superseded`: acknowledge, mark-expected, clear. Snooze needs an open
   incident (`409 incident_not_open`). `clear` with nothing to clear is `409 no_decision`.
 - Scopes: `app` and `app rules:write` tokens only; `read-only`, `service` and `integration` get `403`.
   The usual per-token rate limit and body limit apply (`429`, `413`).
 - Errors: `401`, `403 forbidden`, `404 incident_not_found` (also for another collector's incident),
   `409 version_conflict | idempotency_conflict | incident_not_open | no_decision`, `422`, `503`.
-- Idempotency: `X-Request-ID` replays the first result for an identical body and is
-  `409 idempotency_conflict` for a different one. Without it, the receipt key is the principal, action,
-  incident id and body, so retries of one decision are no-ops while decisions on two incidents never collide.
+- Idempotency: only an explicit `X-Request-ID` replays: the first result for an identical body, and
+  `409 idempotency_conflict` for a different one. Without it every call is applied or refused on its
+  `expected_version` alone, so a stale retry is always `409 version_conflict`, never a replay. The
+  incident must belong to `collector_id` (else 404) before any replay is served.
 - Audit: `monitoring.incident.acknowledge | snooze | mark_expected | clear`, target the incident id,
   with the before/after review and the copied incident identity. `GET /events` shows these with
   `device_id: null` and the incident id in the summary.

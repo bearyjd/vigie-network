@@ -132,7 +132,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
         return JSONResponse(
-            error_envelope(exc.code, exc.message), status_code=exc.status, headers=exc.headers
+            error_envelope(exc.code, exc.message, exc.extra),
+            status_code=exc.status,
+            headers=exc.headers,
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -358,7 +360,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     ):
         principal.require_write()  # before validating `until`: a non-writer always sees 403
         now = clock()
-        until = incident_decisions.parse_until(body.until, now, settings.incident_snooze_max_s)
+        until = incident_decisions.parse_until(body.until)
         return envelope(
             incident_decisions.decide(
                 inv,
@@ -372,6 +374,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
                 now=now,
                 now_iso=iso_utc(now),
                 request_id=x_request_id,
+                snooze_max_s=settings.incident_snooze_max_s,
             )  # fmt: skip
         )
 

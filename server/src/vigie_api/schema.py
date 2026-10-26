@@ -209,7 +209,8 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         # Current human review per monitoring incident. `clear` keeps a NULL-status tombstone so
         # the version never goes backwards (a deleted row would let an old receipt replay). No
         # cross-DB FK: identity fields and episode_start are copied so audit/orphan rows stay
-        # readable after the incident prune.
+        # readable after the incident prune. Migration 7 changed before any release (no tag ships
+        # it); a database migrated by an earlier branch commit must be recreated.
         """CREATE TABLE incident_decisions (
           incident_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, device_id TEXT NOT NULL,
           lineage TEXT NOT NULL, detector TEXT NOT NULL, episode_start INTEGER NOT NULL,
@@ -220,6 +221,9 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
           CHECK ((status='snoozed') = (snooze_until IS NOT NULL))
         )""",
         "CREATE INDEX idx_incident_decisions_decided ON incident_decisions(decided_at)",
+        # retention scan position; one row, rewritten by every incident write
+        "CREATE TABLE incident_decision_prune (decided_at TEXT NOT NULL,"
+        " incident_id TEXT NOT NULL)",
     ),
 )
 

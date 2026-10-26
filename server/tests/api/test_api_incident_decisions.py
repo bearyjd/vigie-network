@@ -210,8 +210,10 @@ def test_snooze_cap_is_configurable(env):
 def test_settings_reads_snooze_cap_from_env_and_rejects_nonpositive(tmp_path):
     from vigie_api.config import Settings
 
-    s = Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_API_INCIDENT_SNOOZE_MAX_S": "5"})
-    assert s.incident_snooze_max_s == 5
+    s = Settings.from_env(
+        {"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_API_INCIDENT_SNOOZE_MAX_S": "300"}
+    )
+    assert s.incident_snooze_max_s == 300
     with pytest.raises(ValueError):
         Settings(data_dir=tmp_path, incident_snooze_max_s=0)
 
@@ -265,8 +267,8 @@ def test_ack_clear_ack_without_request_id_is_not_a_stale_receipt_replay(e):
     assert (cleared["status"], cleared["version"]) == (None, 2)
     third = post(e, "inc1", "acknowledge", {"expected_version": 2})
     assert third.status_code == 200 and third.json()["data"]["version"] == 3
-    replay = post(e, "inc1", "acknowledge", {"expected_version": 0})  # a stale retry of call 1
-    assert replay.json()["data"]["version"] == 1  # idempotent replay, nothing written
+    stale = post(e, "inc1", "acknowledge", {"expected_version": 0})  # a stale retry of call 1
+    assert stale.status_code == 409  # no X-Request-ID: never a replay, nothing written
     assert len([a for a in audits(e) if a["action"].endswith("acknowledge")]) == 2
     assert e.get("/incidents/inc1", collector_id="c1").json()["data"]["attention"] is False
 
@@ -285,3 +287,86 @@ def test_read_only_token_with_bad_until_gets_403_not_422(e):
     r = post(e, "inc1", "snooze", {"expected_version": 0, "until": "junk"},
              headers={"Authorization": f"Bearer {token}"})  # fmt: skip
     assert r.status_code == 403
+
+
+def test_decision_version_is_visible_after_clear_and_second_client_can_write(e):
+    def versions():
+        one = e.get("/incidents/inc1", collector_id="c1").json()["data"]
+        many = e.get("/incidents", collector_id="c1").json()["data"][0]
+        assert one["decision_version"] == many["decision_version"]
+        return one["decision_version"], one["review"]
+
+    assert versions() == (0, None)
+    post(e, "inc1", "acknowledge")
+    assert versions()[0] == 1
+    post(e, "inc1", "clear", {"expected_version": 1})
+    assert versions() == (2, None)  # the tombstone's version stays discoverable
+    other = post(e, "inc1", "acknowledge", {"expected_version": 2})
+    assert other.status_code == 200 and other.json()["data"]["version"] == 3
+
+
+def test_version_conflict_reports_the_current_version(e):
+    post(e, "inc1", "acknowledge")
+    post(e, "inc1", "clear", {"expected_version": 1})
+    stale = post(e, "inc1", "acknowledge", {"expected_version": 0})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["current_version"] == 2
+
+
+def test_stale_retry_without_request_id_is_409_never_a_receipt_replay(e):
+    post(e, "inc1", "acknowledge", {"expected_version": 0})
+    post(e, "inc1", "clear", {"expected_version": 1})
+    stale = post(e, "inc1", "acknowledge", {"expected_version": 0})
+    assert (stale.status_code, stale.json()["error"]["code"]) == (409, "version_conflict")
+    assert len([a for a in audits(e) if a["action"].endswith("acknowledge")]) == 1
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Request-ID": "r-1"}])
+def test_replay_never_bypasses_the_collector_check(e, headers):
+    assert post(e, "inc1", "acknowledge", headers=headers).status_code == 200
+    again = post(e, "inc1", "acknowledge", collector="c2", headers=headers)
+    assert (again.status_code, again.json()["error"]["code"]) == (404, "incident_not_found")
+
+
+def test_snooze_receipt_replays_after_time_passes(env):
+    from fastapi.testclient import TestClient
+
+    from vigie_api.app import create_app
+    from vigie_api.config import Settings
+
+    seed_collector(env)
+    incident(env, "inc1")
+    clock = [NOW]
+    app = create_app(Settings(data_dir=env.root), clock=lambda: clock[0])
+    with TestClient(app) as client:
+
+        def call(action, body):
+            return client.post(
+                f"/incidents/inc1/{action}",
+                params={"collector_id": "c1"},
+                json=body,
+                headers={**env.auth, "X-Request-ID": f"id-{action}-{body['expected_version']}"},
+            )
+
+        snooze = {"expected_version": 0, "until": until(120)}
+        first = call("snooze", snooze)
+        assert first.status_code == 200
+        assert call("acknowledge", {"expected_version": 1}).status_code == 200
+        clock[0] = NOW + 61  # until is now only 59 s away: below the lead of a fresh request
+        retry = call("snooze", snooze)
+        assert retry.status_code == 200 and retry.json() == first.json()
+        late = client.post(
+            "/incidents/inc1/snooze",
+            params={"collector_id": "c1"},
+            json={"expected_version": 2, "until": until(120)},
+            headers={**env.auth, "X-Request-ID": "fresh"},
+        )
+        assert late.status_code == 422  # a new request still needs the lead time
+
+
+def test_snooze_cap_below_the_minimum_lead_is_rejected_at_startup(tmp_path):
+    from vigie_api.config import Settings
+
+    with pytest.raises(ValueError):
+        Settings(data_dir=tmp_path, incident_snooze_max_s=60)
+    assert Settings(data_dir=tmp_path, incident_snooze_max_s=120).incident_snooze_max_s == 120

@@ -136,7 +136,9 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
 - `incident_decisions` (human incident reviews, `overrides.db`) keeps the current decision only;
   history is in `audit_log`. Each incident write deletes up to 100 rows whose `decided_at` is older
   than 120 days and whose incident the pipeline has already pruned (incidents live 90 days).
-  `VIGIE_API_INCIDENT_SNOOZE_MAX_S` caps a snooze (default 604800 = 7 days).
+  `VIGIE_API_INCIDENT_SNOOZE_MAX_S` caps a snooze (default 604800 = 7 days, minimum 120).
+  The scan position is kept in `incident_decision_prune`. Overrides schema 7 changed before any
+  release: recreate an `overrides.db` migrated by an earlier branch build of it.
 - Event and hostname retention (PRP section 9, 90 days) is **not implemented**: no setting exists, so
   `events` and hostnames in `inventory.db` are kept. Until it exists, never `VACUUM` `inventory.db` and never
   delete the newest `events` rows (see "Event cursors" in `server/README.md`).

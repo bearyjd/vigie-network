@@ -159,3 +159,44 @@ def test_retention_is_not_starved_by_old_rows_whose_incident_still_exists(e):
     left = {d["incident_id"] for d in decisions(e)}
     assert not [i for i in left if i.startswith("orphan")]
     assert len([i for i in left if i.startswith("live")]) == 120
+
+
+def test_retention_cursor_reaches_orphans_behind_more_than_a_scan_of_live_rows(e):
+    from vigie_api.incident_decisions import PRUNE_SCAN
+
+    incident(e, "inc1")
+    rows = [
+        (f"live{n:04d}", "c1", "d1", "line", "large_upload", 1, "acknowledged", None, 1,
+         "app:test", "2025-01-01T00:00:00Z", "x")
+        for n in range(PRUNE_SCAN + 100)
+    ]  # fmt: skip
+    for r in rows:
+        incident(e, r[0], lineage=r[0])
+    e.ov.executemany(
+        "INSERT INTO incident_decisions (incident_id,collector_id,device_id,lineage,detector,"
+        "episode_start,status,snooze_until,version,decided_by,decided_at,id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    put(e, "orphan", "acknowledged", decided_at=OLD)  # newer than every live row
+    for n in range(4):
+        post(e, "inc1", "acknowledge" if n % 2 == 0 else "mark-expected", {"expected_version": n})
+        if "orphan" not in {d["incident_id"] for d in decisions(e)}:
+            break
+    left = {d["incident_id"] for d in decisions(e)}
+    assert "orphan" not in left
+    assert len([i for i in left if i.startswith("live")]) == PRUNE_SCAN + 100
+
+
+def test_cursor_is_bound_to_the_state_filter(e):
+    for n in range(3):
+        incident(e, f"o{n}", lineage=str(n))
+    first = e.get("/incidents", collector_id="c1", state="open", limit=1)
+    cursor = first.json()["page"]["next_cursor"]
+    assert (
+        e.get("/incidents", collector_id="c1", state="open", limit=1, cursor=cursor).status_code
+        == 200
+    )
+    for other in ({}, {"state": "resolved"}):
+        r = e.get("/incidents", collector_id="c1", limit=1, cursor=cursor, **other)
+        assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_cursor")
