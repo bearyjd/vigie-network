@@ -237,3 +237,36 @@ fn k_n22_evicted_ctx_publishes_no_truncated_list() {
     l.push(ack(1, 7, "192.0.2.10", A, "ha"));
     assert!(fp(&run(&l), A).is_empty(), "{:?}", fp(&run(&l), A));
 }
+
+// ---- Codex re-check: options retained across a repeated same-key REQUEST ----
+
+fn repeated_request_log(mid: String) -> Vec<String> {
+    vec![
+        request(123, 1, "192.0.2.10", A),
+        vendor(123, 1, "VA"),
+        opts(123, 1, "1:netmask, 3:router"),
+        request(123, 1, "192.0.2.10", A),
+        mid,
+        opts(123, 1, "6:dns-server, 15:domain-name"),
+        ack(123, 1, "192.0.2.10", A, "ha"),
+    ]
+}
+
+#[test]
+fn r6_repeated_request_keeps_the_retained_prefix_unpublished_after_an_unparsed_line() {
+    let out = run(&repeated_request_log(fwd(999)));
+    assert!(fp(&out, A).is_empty(), "{:?}", fp(&out, A));
+}
+
+#[test]
+fn r6_repeated_request_keeps_the_retained_prefix_unpublished_after_a_query() {
+    let out = run(&repeated_request_log(query(123)));
+    assert!(fp(&out, A).is_empty(), "{:?}", fp(&out, A));
+}
+
+#[test]
+fn r6_repeated_request_without_interruption_replaces_the_retained_list() {
+    let mut l = repeated_request_log(opts(123, 1, "1:netmask, 3:router"));
+    l.retain(|s| !s.contains("tags"));
+    assert_eq!(fp(&run(&l), A), full_va());
+}

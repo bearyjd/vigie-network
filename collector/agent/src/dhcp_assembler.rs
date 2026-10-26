@@ -288,13 +288,12 @@ impl DhcpAssembler {
     /// keeps the pair it stored. Held blocks are untouched (the line may be foreign): they end
     /// by their own process's next line, by inactivity, a gap or a supersede.
     pub fn break_context(&mut self) {
-        let keys: Vec<Key> = (self
-            .ctxs
-            .drain(..)
-            .filter(|c| c.opts_started)
-            .map(|c| c.key))
-        .chain(self.pres.drain(..).map(|p| p.key))
-        .collect();
+        let ctxs = std::mem::take(&mut self.ctxs);
+        let mut keys: Vec<Key> = (ctxs.into_iter())
+            .filter(|c| self.holds_options(c))
+            .map(|c| c.key)
+            .collect();
+        keys.extend(self.pres.drain(..).map(|p| p.key));
         for k in keys {
             self.entry(&k).go_stale();
         }
@@ -382,12 +381,22 @@ impl DhcpAssembler {
         (!p.unusable() && p.mac == c.mac).then_some((p, &mut c.opts_started))
     }
 
+    /// The context collected options, or its entry still holds some (kept across a repeated
+    /// `DHCPREQUEST` of the same serial): dropping it unfinished would leave a prefix behind.
+    fn holds_options(&self, c: &Context) -> bool {
+        c.opts_started
+            || self
+                .partial
+                .get(&c.key)
+                .is_some_and(|p| !p.opt55.is_empty())
+    }
+
     /// Drops the attach context of the line being fed, unless it is `keep`'s. A context that
     /// already collected options and is dropped by a line that does not continue it leaves a
     /// possibly truncated list behind: its entry goes stale, so its ACK publishes nothing.
     fn drop_ctx(&mut self, keep: Option<&Key>) {
         if let Some(c) = self.ctx.take() {
-            if c.opts_started && Some(&c.key) != keep {
+            if self.holds_options(&c) && Some(&c.key) != keep {
                 self.entry(&c.key).go_stale();
             }
         }
