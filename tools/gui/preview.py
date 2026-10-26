@@ -55,6 +55,10 @@ _BENIGN_PTH = {
 # (universal newlines) does not, and a lone \r is split by only one reading. A .pth carrying any of
 # them is refused whole, so the vet and every child interpreter version agree on the lines.
 _PTH_AMBIGUOUS = re.compile("[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]|\r(?!\n)")
+# Startup hooks `python -I` imports from any sys.path directory: file name -> sha256 allowed. None
+# are pinned; a sitecustomize/usercustomize anywhere in a vetted tree is otherwise refused.
+_BENIGN_STARTUP_HOOKS: dict[str, str] = {}
+_STARTUP_HOOK = re.compile(r"(?:site|user)customize(?:\..*)?")
 MAX_PTH_TREE_ENTRIES = 100_000  # A .pth directory line with more entries is refused, not walked.
 SYSTEM_UIDS = (0,)  # Accepted non-self owners of trusted paths; tests widen it for sandboxed /tmp.
 
@@ -785,6 +789,15 @@ def _trusted_chain(path: Path, message: str) -> None:
             raise ValueError(message)
 
 
+def _pinned_hook(path: Path) -> bool:
+    """A sitecustomize/usercustomize is accepted only as an exact allowlisted regular file."""
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return _BENIGN_STARTUP_HOOKS.get(path.name) == digest
+
+
 def _trusted_tree(
     root: Path, message: str, skip: frozenset[str] = frozenset(), limit: int | None = None
 ) -> None:
@@ -802,6 +815,8 @@ def _trusted_tree(
         for name in (*names, *files):
             count += 1
             if limit is not None and count > limit:
+                raise ValueError(message)
+            if _STARTUP_HOOK.fullmatch(name) and not _pinned_hook(Path(current) / name):
                 raise ValueError(message)
             st = (Path(current) / name).lstat()
             if (

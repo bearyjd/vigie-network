@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import os
 import sys
 import threading
@@ -301,3 +302,81 @@ def test_under_ci_the_unavailable_lane_guard_fails_and_cannot_skip(monkeypatch):
             end_to_end_unavailable("why")
         except pytest.skip.Exception:
             pytest.fail("under CI the lane guard skipped instead of failing", pytrace=False)
+
+
+# ------------------------------------ F6: site-wide startup hooks inside vetted trees
+
+
+STARTUP_HOOKS = [
+    "sitecustomize.py",
+    "sitecustomize.pyc",
+    "sitecustomize.cpython-312-x86_64-linux-gnu.so",
+    "usercustomize.py",
+    "__pycache__/sitecustomize.cpython-312.pyc",
+]
+
+
+def _hook(directory: Path, name: str, text: str = "import os\n") -> Path:
+    path = directory / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o644)
+    return path
+
+
+@pytest.mark.parametrize("name", STARTUP_HOOKS)
+def test_a_startup_hook_in_site_packages_is_refused(sandbox_owners, tmp_path, name):
+    root, _, site = _venv(tmp_path)
+    _hook(site, name)
+    _refuses(root)
+
+
+@pytest.mark.parametrize("name", STARTUP_HOOKS)
+def test_a_startup_hook_in_the_stdlib_is_refused(sandbox_owners, tmp_path, name):
+    root, binary, _ = _venv(tmp_path)
+    _hook(binary.parent.parent / "lib" / "python3.12", name)
+    _refuses(root)
+
+
+def test_a_startup_hook_in_a_pth_target_is_refused(sandbox_owners, tmp_path):
+    root, _, site = _venv(tmp_path)
+    target = tmp_path / "editable"
+    target.mkdir()
+    target.chmod(0o755)
+    _hook(target, "sitecustomize.py")
+    _pth(site, "e.pth", f"{target}\n")
+    _refuses(root)
+
+
+def test_a_startup_hook_in_the_package_dir_is_refused(sandbox_owners, tmp_path):
+    package = tmp_path / "pkg"
+    for name in preview_required_files():
+        _hook(package, name, "")
+    _hook(package, "sitecustomize.py")
+    for path in (tmp_path, package, *package.rglob("*")):
+        if path.is_dir():
+            path.chmod(0o755)
+    with pytest.raises(ValueError, match="unsafe or incomplete installed package"):
+        preview._package(package)
+
+
+def preview_required_files() -> list[str]:
+    return [
+        "vigie_api/app.py",
+        "vigie_api/ui_static.py",
+        "vigie_ingest/db.py",
+        "vigie_pipeline/schema.py",
+        *("vigie_api/ui/" + x for x in ("index.html", "styles.css", "app.js", "client.js", "views.js")),
+    ]
+
+
+def test_a_pinned_startup_hook_hash_is_the_only_way_through(sandbox_owners, tmp_path, monkeypatch):
+    root, _, site = _venv(tmp_path)
+    path = _hook(site, "sitecustomize.py", "# audited\n")
+    _refuses(root)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(preview, "_BENIGN_STARTUP_HOOKS", {"sitecustomize.py": digest})
+    preview._interpreter(root / "bin" / "python")
+    path.write_text("import os\n")  # same name, other bytes
+    path.chmod(0o644)
+    _refuses(root)
