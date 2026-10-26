@@ -6,6 +6,7 @@ import json
 
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
+from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 MAX_MACS = 64
@@ -257,7 +258,7 @@ def baseline_view(inv, collector, device, key):
     }
 
 
-def incident_row(inv, ov, row):
+def incident_row(inv, ov, row, review, now):
     try:
         current = device_macs(inv, ov, row["device_id"])[2] == row["lineage"]
     except ApiError:
@@ -277,41 +278,46 @@ def incident_row(inv, ov, row):
         "threshold_bytes": row["threshold_bytes"],
         "baseline_id": row["baseline_id"],
         "evidence": json.loads(row["evidence"]),
+        "review": review_view(review),
+        "decision_version": review["version"] if review else 0,
+        "attention": attention(row["state"], review, now),
     }
 
 
-def incident_list(inv, ov, collector, device, cursor, limit):
+def incident_list(inv, ov, collector, device, cursor, limit, state, now):
     after = 0
     if cursor:
         try:
             value = json.loads(decode_cursor(cursor))
             if (
                 not isinstance(value, list)
-                or len(value) != 4
-                or value[:3] != ["incidents", collector, device]
+                or len(value) != 5
+                or value[:4] != ["incidents", collector, device, state]
             ):
                 raise ValueError
-            after = value[3]
+            after = value[4]
             if type(after) is not int or not 0 <= after < 2**63:
                 raise ValueError
         except (ValueError, TypeError) as exc:
             raise ApiError(400, "invalid_cursor", "invalid incident cursor") from exc
     if device is None:
         rows = inv.execute(
-            "SELECT * FROM monitoring_incidents WHERE collector_id=? AND seq>? ORDER B"
-            "Y seq LIMIT ?",
-            (collector, after, limit + 1),
+            "SELECT * FROM monitoring_incidents WHERE collector_id=? AND seq>? AND (? IS NULL"
+            " OR state=?) ORDER BY seq LIMIT ?",
+            (collector, after, state, state, limit + 1),
         ).fetchall()
     else:
         canonical = device_macs(inv, ov, device)[0]
         rows = inv.execute(
             "SELECT * FROM monitoring_incidents WHERE collector_id=? AND device_id=? A"
-            "ND seq>? ORDER BY seq LIMIT ?",
-            (collector, canonical, after, limit + 1),
+            "ND seq>? AND (? IS NULL OR state=?) ORDER BY seq LIMIT ?",
+            (collector, canonical, after, state, state, limit + 1),
         ).fetchall()
-    items = [incident_row(inv, ov, row) for row in rows[:limit]]
+    page = rows[:limit]
+    reviews = reviews_for(ov, [row["id"] for row in page])
+    items = [incident_row(inv, ov, row, reviews.get(row["id"]), now) for row in page]
     nxt = (
-        encode_cursor(json.dumps(["incidents", collector, device, rows[limit - 1]["seq"]]))
+        encode_cursor(json.dumps(["incidents", collector, device, state, rows[limit - 1]["seq"]]))
         if len(rows) > limit
         else None
     )

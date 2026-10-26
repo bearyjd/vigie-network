@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -13,7 +13,15 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from vigie_api import effective, feeds, identity_writes, monitoring, tokens, writes
+from vigie_api import (
+    effective,
+    feeds,
+    identity_writes,
+    incident_decisions,
+    monitoring,
+    tokens,
+    writes,
+)
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
@@ -29,7 +37,10 @@ from vigie_api.models import (
     EventsResponse,
     HealthResponse,
     IdentityState,
+    IncidentDecisionResponse,
+    IncidentDecisionWrite,
     IncidentResponse,
+    IncidentSnoozeWrite,
     IncidentsResponse,
     MacResponse,
     PatchResponse,
@@ -121,11 +132,22 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
         return JSONResponse(
-            error_envelope(exc.code, exc.message), status_code=exc.status, headers=exc.headers
+            error_envelope(exc.code, exc.message, exc.extra),
+            status_code=exc.status,
+            headers=exc.headers,
         )
 
+    async def _authorize(request: Request) -> JSONResponse | None:
+        try:
+            await run_in_threadpool(reject_if_unauthorized, request)
+        except ApiError as err:
+            return await _api_error(request, err)
+
     @app.exception_handler(StarletteHTTPException)
-    async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        if exc.status_code == 400 and is_incident_write(request):  # undecodable body
+            if denied := await _authorize(request):
+                return denied
         code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "error")
         return JSONResponse(error_envelope(code, str(exc.detail)), status_code=exc.status_code)
 
@@ -166,18 +188,21 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     def _rate_limited(wait: int | float) -> ApiError:
         return ApiError(429, "rate_limited", "too many requests", {"Retry-After": str(wait)})
 
-    def reject_if_unauthenticated(request: Request) -> None:
-        check_auth(request, request.headers.get("authorization"))
+    def is_incident_write(request: Request) -> bool:
+        return request.method == "POST" and request.url.path.startswith("/incidents/")
+
+    def reject_if_unauthorized(request: Request) -> None:
+        principal = check_auth(request, request.headers.get("authorization"))
+        if is_incident_write(request):  # a non-writer sees 403 whatever is wrong with the body
+            principal.require_write()
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         # A body that fails to parse is rejected before FastAPI runs the auth dependency;
         # authenticate here so an anonymous caller always sees the uniform 401, never a 422.
         if not getattr(request.state, "authenticated", False) and request.url.path != "/healthz":
-            try:
-                await run_in_threadpool(reject_if_unauthenticated, request)
-            except ApiError as err:
-                return await _api_error(request, err)
+            if denied := await _authorize(request):
+                return denied
         detail = "; ".join(
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
         )
@@ -208,6 +233,15 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         return check_auth(request, authorization)
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
+
+    def writer(principal: Principal) -> tokens.Principal:
+        principal.require_write()  # a dependency: runs before body validation, so 403 not 422
+        return principal
+
+    Writer = Annotated[tokens.Principal, Depends(writer)]
+    RequestId = Annotated[
+        str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    ]
 
     @app.get(
         "/healthz", tags=["health"], summary="Liveness (unauthenticated)",
@@ -283,12 +317,15 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         ov: Ov,
         collector_id: Annotated[str, Query(min_length=1, max_length=64)],
         device_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        state: Annotated[Literal["open", "resolved", "superseded"] | None, Query()] = None,
         cursor: Annotated[str | None, Query(max_length=1024)] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
     ) -> dict[str, Any]:
         monitoring.required(inv)
         monitoring.collector_summary(inv, collector_id)
-        items, nxt = monitoring.incident_list(inv, ov, collector_id, device_id, cursor, limit)
+        items, nxt = monitoring.incident_list(
+            inv, ov, collector_id, device_id, cursor, limit, state, clock()
+        )
         return envelope(items, page={"next_cursor": nxt})
 
     @app.get(
@@ -311,7 +348,76 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         ).fetchone()
         if row is None:
             raise ApiError(404, "incident_not_found", "incident not found")
-        return envelope(monitoring.incident_row(inv, ov, row))
+        review = incident_decisions.reviews_for(ov, [incident_id]).get(incident_id)
+        return envelope(monitoring.incident_row(inv, ov, row, review, clock()))
+
+    incident_errors = _errors(401, 403, 404, 409, 413, 422, 429, 503)
+
+    @app.post(
+        "/incidents/{incident_id}/snooze",
+        tags=["monitoring"],
+        description=incident_decisions.DESCRIPTION + " Snooze needs an open incident and `until`.",
+        response_model=IncidentDecisionResponse,
+        responses=incident_errors,
+    )
+    def snooze_incident(
+        incident_id: DeviceId,
+        body: IncidentSnoozeWrite,
+        principal: Writer,
+        inv: Inv,
+        ov: Ov,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        x_request_id: RequestId = None,
+    ):
+        until = incident_decisions.parse_until(body.until)
+        return envelope(
+            incident_decisions.decide(
+                inv,
+                ov,
+                incident_id=incident_id,
+                collector_id=collector_id,
+                action="snooze",
+                body=body,
+                until=until,
+                principal=principal,
+                clock=clock,
+                request_id=x_request_id,
+                snooze_max_s=settings.incident_snooze_max_s,
+            )  # fmt: skip
+        )
+
+    @app.post(
+        "/incidents/{incident_id}/{action}",
+        tags=["monitoring"],
+        description=incident_decisions.DESCRIPTION
+        + " `clear` removes the decision (un-snooze) but the version keeps rising.",
+        response_model=IncidentDecisionResponse,
+        responses=incident_errors,
+    )
+    def decide_incident(
+        incident_id: DeviceId,
+        action: Literal["acknowledge", "mark-expected", "clear"],
+        body: IncidentDecisionWrite,
+        principal: Writer,
+        inv: Inv,
+        ov: Ov,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        x_request_id: RequestId = None,
+    ):
+        return envelope(
+            incident_decisions.decide(
+                inv,
+                ov,
+                incident_id=incident_id,
+                collector_id=collector_id,
+                action=action,
+                body=body,
+                until=None,
+                principal=principal,
+                clock=clock,
+                request_id=x_request_id,
+            )  # fmt: skip
+        )
 
     @app.get(
         "/devices",
@@ -466,9 +572,6 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
         return envelope(items, page={"next_cursor": nxt})
 
-    RequestId = Annotated[
-        str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
-    ]
     write_errors = _errors(401, 403, 404, 409, 410, 413, 422, 429, 503)
     pipeline_config = PipelineConfig.from_env()
     write_description = (

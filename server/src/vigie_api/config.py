@@ -11,6 +11,8 @@ MAX_MERGE_ALIASES = 256
 MAX_MERGE_OBSERVATIONS = 1024
 MAX_MERGE_ACTIVITY_ROWS = 8192
 MAX_MERGE_FLATTEN_WRITES = 256
+INCIDENT_SNOOZE_MAX_S = 7 * 24 * 3600
+MIN_SNOOZE_S = 60
 
 
 def _opt_path(value: str | None) -> Path | None:
@@ -32,6 +34,7 @@ class Settings:
     max_merge_observations: int = MAX_MERGE_OBSERVATIONS
     max_merge_activity_rows: int = MAX_MERGE_ACTIVITY_ROWS
     max_merge_flatten_writes: int = MAX_MERGE_FLATTEN_WRITES
+    incident_snooze_max_s: int = INCIDENT_SNOOZE_MAX_S
 
     def __post_init__(self) -> None:
         if min(self.max_body_bytes, self.rate_limit_per_window, self.rate_limit_window_s) < 1:
@@ -46,6 +49,8 @@ class Settings:
             < 1
         ):
             raise ValueError("merge limits must be positive")
+        if self.incident_snooze_max_s < 2 * MIN_SNOOZE_S:
+            raise ValueError(f"incident_snooze_max_s must be at least {2 * MIN_SNOOZE_S}")
 
     @property
     def inventory_path(self) -> Path:
@@ -74,5 +79,8 @@ class Settings:
             ),
             max_merge_flatten_writes=int(
                 source.get("VIGIE_API_MAX_MERGE_FLATTEN_WRITES", MAX_MERGE_FLATTEN_WRITES)
+            ),
+            incident_snooze_max_s=int(
+                source.get("VIGIE_API_INCIDENT_SNOOZE_MAX_S", INCIDENT_SNOOZE_MAX_S)
             ),
         )

@@ -164,7 +164,14 @@ def atomic(ov, *, principal, action, target, body, request_id, now, operation: C
         detail = {"request_id": request_id or str(uuid.uuid4()), "before": before, "after": after}
         ov.execute(
             "INSERT INTO audit_log (id,ts,principal,action,target,detail) VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), now, principal, action, target, dump(detail)),
+            (
+                str(uuid.uuid4()),
+                now() if callable(now) else now,
+                principal,
+                action,
+                target,
+                dump(detail),
+            ),  # fmt: skip
         )
         ov.execute(
             "INSERT INTO api_write_receipts (id,fingerprint,result) VALUES (?,?,?)",

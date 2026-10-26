@@ -66,6 +66,10 @@ Untrusted = Field(description=UNTRUSTED)
 class ErrorBody(BaseModel):
     code: str
     message: str
+    current_version: int | None = Field(
+        default=None,
+        description="Only on incident `version_conflict`: the incident's current decision_version.",
+    )
 
 
 class Page(BaseModel):
@@ -388,6 +392,14 @@ class IncidentEvidence(BaseModel):
     distinct_days: int | None = None
 
 
+class IncidentReview(BaseModel):
+    status: Literal["acknowledged", "snoozed", "expected"]
+    snooze_until: str | None
+    version: int
+    decided_by: str
+    decided_at: str
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
@@ -403,6 +415,19 @@ class IncidentOut(BaseModel):
     threshold_bytes: int
     baseline_id: str | None
     evidence: IncidentEvidence
+    review: IncidentReview | None = Field(
+        description="Current human decision, or null. A separate axis from `state`: `expected` "
+        "is a per-incident label, not a suppression."
+    )
+    decision_version: int = Field(
+        description="Version to send as `expected_version` for the next review write: 0 when the "
+        "incident never had a decision, otherwise the last write's version (a cleared incident "
+        "keeps its version, so this can be > 0 while `review` is null)."
+    )
+    attention: bool = Field(
+        description="True while the incident is open and no decision covers it (an expired "
+        "snooze returns it here)."
+    )
 
 
 class IncidentsResponse(_Envelope):
@@ -411,3 +436,35 @@ class IncidentsResponse(_Envelope):
 
 class IncidentResponse(_Envelope):
     data: IncidentOut
+
+
+class IncidentDecisionWrite(BaseModel):
+    """Per-incident review write; the version is the incident's own decision version (0 = none)."""
+
+    model_config = ConfigDict(extra="forbid")
+    expected_version: Version
+
+
+class IncidentSnoozeWrite(IncidentDecisionWrite):
+    until: str = Field(
+        max_length=40,
+        description="RFC 3339 UTC instant (`Z` or `+00:00`, whole seconds) between now + 60 s "
+        "and now + the configured snooze cap (7 days by default).",
+    )
+
+
+class IncidentDecisionResult(BaseModel):
+    incident_id: str
+    status: Literal["acknowledged", "snoozed", "expected"] | None = Field(
+        description="Null after `clear`."
+    )
+    snooze_until: str | None
+    version: int = Field(
+        description="The incident's decision version; it never goes backwards, `clear` included."
+    )
+    decided_by: str
+    decided_at: str
+
+
+class IncidentDecisionResponse(_Envelope):
+    data: IncidentDecisionResult
