@@ -19,6 +19,14 @@ def sample() -> Pack:
         "schema_version": 1,
         "generated_at": Sensitive("ts", "2026-10-26T10:34:56Z"),
         "redaction": {},
+        "provenance": {
+            "vigie_version": "0.1.0",
+            "pipeline_schema": 9,
+            "api_schema": 8,
+            "characterization_model": "services-v1",
+            "inventory_newest_batch": Sensitive("ts", "2026-10-26T10:30:00Z"),
+        },
+        "datasets": [],
         "subject": {
             "type": "tv",
             "status": "active",

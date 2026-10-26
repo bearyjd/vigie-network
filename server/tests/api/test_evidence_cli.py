@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 
 import pytest
 from api_helpers import NOW, Env, env  # noqa: F401
 from incident_helpers import seed_collector
 
-from vigie_api import cli
+from vigie_api import cli, evidence_cli
 
 MAC = "aa:bb:cc:12:34:56"
 
@@ -38,7 +39,12 @@ def audit_rows(e: Env) -> list[dict]:
 
 def test_export_writes_a_private_file_and_audits_as_cli_local(e, tmp_path):
     out = tmp_path / "pack.json"
-    assert run(e, out) == 0
+    previous = os.umask(0)  # the mode must come from the code, not from main()'s umask
+    try:
+        argv = ["--data-dir", str(e.root), "export", "d1", "-o", str(out)]
+        assert evidence_cli.main(argv, "t") == 0
+    finally:
+        os.umask(previous)
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
     doc = json.loads(out.read_text())
     assert doc["redaction"]["level"] == "pseudonymized" and "cli-canary-host" not in out.read_text()

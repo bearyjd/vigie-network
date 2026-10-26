@@ -204,3 +204,34 @@ def test_fit_returns_413_when_even_empty_sections_do_not_fit():
 
 def test_cap_is_256_kib():
     assert MAX_PACK_BYTES == 256 * 1024
+
+
+def validate_v1(doc: dict) -> None:
+    """What a v1 consumer checks: required keys and section shape; unknown sections are ignored."""
+    assert doc["schema"] == "vigie.evidence-pack" and doc["schema_version"] // 1 == 1
+    for key in ("generated_at", "redaction", "provenance", "datasets", "subject", "sections",
+                "unknowns", "search_queries", "content_sha256"):  # fmt: skip
+        assert key in doc, key
+    for name, sec in doc["sections"].items():
+        assert set(sec) >= {"status", "reason", "omitted_count", "items"}, name
+        assert sec["status"] in {"present", "absent", "not_available", "withheld", "truncated"}
+
+
+def test_a_v1_validator_accepts_a_pack_with_extra_phase_two_sections():
+    body = {**fixed().body, "datasets": [{"dataset_id": "kev-2026-10-26", "sha256": "0" * 64}]}
+    body["sections"] = {
+        **body["sections"],
+        "known_issue_notes": section([{"id": "note-1", "dataset_id": "kev-2026-10-26"}]),
+        "dns_reputation": section([], status="not_available"),
+    }
+    doc = json.loads(render_json(Pack(body, redacted=True)))
+    validate_v1(doc)
+    assert doc["sections"]["known_issue_notes"]["items"][0]["dataset_id"] == "kev-2026-10-26"
+    assert "known_issue_notes" in render_markdown(Pack(body, redacted=True)).decode()
+
+
+def test_the_v1_validator_rejects_a_pack_missing_required_parts():
+    doc = json.loads(render_json(fixed()))
+    del doc["sections"]["identity"]["omitted_count"]
+    with pytest.raises(AssertionError):
+        validate_v1(doc)
