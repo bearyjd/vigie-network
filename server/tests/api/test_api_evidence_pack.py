@@ -325,7 +325,8 @@ def test_incident_evidence_allowlist_holds_through_the_endpoint(e):
 def test_incident_lineage_is_pseudonymized_not_raw(e):
     incident(e, "i1", device=DEVICE, lineage="canary-lineage-xyz")
     e.inv.execute(
-        "UPDATE monitoring_incidents SET evidence=json_set(evidence,'$.lineage','canary-lineage-xyz')"
+        "UPDATE monitoring_incidents"
+        " SET evidence=json_set(evidence,'$.lineage','canary-lineage-xyz')"
     )
     text = export(e).text
     assert "canary-lineage-xyz" not in text and re.search(r"lin-[0-9a-f]{8}", text)
