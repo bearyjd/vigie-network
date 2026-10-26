@@ -98,8 +98,8 @@ class DeviceOut(BaseModel):
     )
     last_observed_ip_at: str | None = Field(
         default=None,
-        description="Sensor batch-window-end observation time in UTC; "
-        "not lease expiry or server receipt time.",
+        description="Batch window end in UTC of the snapshot that last reported this "
+        "pairing (collector sends deltas); not last-seen, lease expiry or server receipt time.",
     )
     name: str | None = Untrusted
     owner: str | None = Untrusted

@@ -754,7 +754,7 @@
                 "type": "null"
               }
             ],
-            "description": "Sensor batch-window-end observation time in UTC; not lease expiry or server receipt time.",
+            "description": "Batch window end in UTC of the snapshot that last reported this pairing (collector sends deltas); not last-seen, lease expiry or server receipt time.",
             "title": "Last Observed Ip At"
           },
           "last_seen": {
@@ -914,7 +914,7 @@
                 "type": "null"
               }
             ],
-            "description": "Sensor batch-window-end observation time in UTC; not lease expiry or server receipt time.",
+            "description": "Batch window end in UTC of the snapshot that last reported this pairing (collector sends deltas); not last-seen, lease expiry or server receipt time.",
             "title": "Last Observed Ip At"
           },
           "last_seen": {
