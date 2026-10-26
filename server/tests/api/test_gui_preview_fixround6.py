@@ -368,12 +368,12 @@ def test_a_tight_status_loop_cannot_starve_stop(namespace, listener, monkeypatch
             with contextlib.suppress(Exception):
                 preview.status(namespace)
 
-    workers = [threading.Thread(target=loop, daemon=True) for _ in range(3)]
+    workers = [threading.Thread(target=loop, daemon=True) for _ in range(8)]
     for worker in workers:
         worker.start()
     try:
         started = time.monotonic()
-        for _ in range(3):
+        for _ in range(10):
             assert preview.stop(namespace)["state"] == "stopped"
         assert time.monotonic() - started < 1.5
     finally:
@@ -527,3 +527,37 @@ def test_a_clean_crlf_directory_line_is_accepted(sandbox_owners, tmp_path):
     (site / "e.pth").write_bytes(f"# note\r\n{target}\r\n".encode())
     (site / "e.pth").chmod(0o644)
     assert preview._interpreter(root / "bin" / "python")
+
+
+def test_a_writer_appearing_during_the_scan_without_touching_the_receipt_is_starting(
+    namespace, listener, sleeper, monkeypatch
+):
+    child, argv, identity, inode = live(namespace, listener, sleeper, hold=False)
+    attempt(namespace, argv, inode, ["spawned", "stop-requested", "stopped"], identity=identity)
+    fds: list[int] = []
+
+    def scan() -> set[str]:
+        fds.append(_grab_exclusive(preview.LOCK))  # a start has taken the lock, receipt untouched
+        return {inode}
+
+    preview.LOCK.touch(mode=0o600)
+    monkeypatch.setattr(preview, "listeners", scan)
+    try:
+        assert preview.status(namespace)["state"] == "starting"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def test_an_unpinned_startup_hook_name_is_never_opened(sandbox_owners, tmp_path, monkeypatch):
+    root, _, site = _venv(tmp_path)
+    (site / "sitecustomize.py").write_text("")
+    (site / "sitecustomize.py").chmod(0o644)
+    real = os.open
+
+    def spy(path, *args, **kwargs):
+        assert "sitecustomize" not in os.fsdecode(path), "opened a startup hook by name"
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(preview.os, "open", spy)
+    _refuses(root)
