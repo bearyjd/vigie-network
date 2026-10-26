@@ -1,6 +1,7 @@
 """Incident lifecycle writes: acknowledge / snooze / mark-expected / clear (overrides overlay)."""
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -130,3 +131,127 @@ def test_rules_write_scope_and_anonymous(e):
     ok = post(e, "inc1", "acknowledge", headers={"Authorization": f"Bearer {token}"})
     assert ok.status_code == 200
     assert post(e, "inc1", "acknowledge", auth=False).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"expected_version": -1},
+        {"expected_version": "0"},
+        {"expected_version": True},
+        {"expected_version": 1.5},
+        {"expected_version": 0, "note": "hi"},
+        {"expected_versions": {"inc1": 0}},
+        {"expected_version": 0, "until": until(3600)},  # only snooze takes `until`
+    ],
+)
+def test_bad_bodies_are_422_and_write_nothing(e, body):
+    for action in ("acknowledge", "mark-expected", "clear"):
+        assert post(e, "inc1", action, body).status_code == 422
+    assert decisions(e) == [] and audits(e) == []
+
+
+WEEK = 7 * 24 * 3600
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        until(-10),  # past
+        until(30),  # too soon
+        until(59),
+        until(WEEK + 1),  # over the cap
+        "2026-10-21T12:00:00",  # naive
+        "2026-10-21T12:00:00+02:00",  # non-UTC offset
+        "2026-10-21",
+        "not a date",
+        "20261021T120000Z",
+        "2026-10-21T12:00:00.5Z",
+        "",
+    ],
+)
+def test_snooze_until_must_be_a_utc_instant_inside_the_window(e, value):
+    r = post(e, "inc1", "snooze", {"expected_version": 0, "until": value})
+    assert r.status_code == 422, r.text
+    assert decisions(e) == []
+
+
+def test_snooze_until_boundaries_are_inclusive_and_required(e):
+    assert post(e, "inc1", "snooze", {"expected_version": 0}).status_code == 422
+    low = post(e, "inc1", "snooze", {"expected_version": 0, "until": until(60)})
+    assert low.status_code == 200, low.text
+    high = post(e, "inc1", "snooze", {"expected_version": 1, "until": until(WEEK)})
+    assert high.status_code == 200, high.text
+    offset = post(e, "inc1", "snooze", {"expected_version": 2, "until": until(120)[:-1] + "+00:00"})
+    assert offset.status_code == 200, offset.text
+
+
+def test_snooze_cap_is_configurable(env):
+    from fastapi.testclient import TestClient
+
+    from vigie_api.app import create_app
+    from vigie_api.config import Settings
+
+    seed_collector(env)
+    incident(env, "inc1")
+    app = create_app(Settings(data_dir=env.root, incident_snooze_max_s=600), clock=lambda: NOW)
+    with TestClient(app) as client:
+        body = {"expected_version": 0, "until": until(601)}
+        url = "/incidents/inc1/snooze"
+        r = client.post(url, params={"collector_id": "c1"}, json=body, headers=env.auth)
+        assert r.status_code == 422
+        body["until"] = until(600)
+        r = client.post(url, params={"collector_id": "c1"}, json=body, headers=env.auth)
+        assert r.status_code == 200
+
+
+def test_settings_reads_snooze_cap_from_env_and_rejects_nonpositive(tmp_path):
+    from vigie_api.config import Settings
+
+    s = Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_API_INCIDENT_SNOOZE_MAX_S": "5"})
+    assert s.incident_snooze_max_s == 5
+    with pytest.raises(ValueError):
+        Settings(data_dir=tmp_path, incident_snooze_max_s=0)
+
+
+def test_inventory_is_opened_read_only_and_missing_inventory_is_503(e, monkeypatch):
+    import vigie_api.app as app_mod
+
+    opened = []
+    real = sqlite3.connect
+
+    def spy(target, *a, **kw):
+        opened.append(str(target))
+        return real(target, *a, **kw)
+
+    monkeypatch.setattr(app_mod.sqlite3, "connect", spy)
+    monkeypatch.setattr("vigie_api.schema.sqlite3.connect", spy)
+    assert post(e, "inc1", "acknowledge").status_code == 200
+    inventory_opens = [t for t in opened if "inventory.db" in t]
+    assert inventory_opens and all("mode=ro" in t for t in inventory_opens)
+    (e.root / "inventory.db").rename(e.root / "gone.db")
+    assert post(e, "inc1", "clear", {"expected_version": 1}).status_code == 503
+
+
+def test_rate_limit_and_body_limit_apply(e):
+    from fastapi.testclient import TestClient
+
+    from vigie_api.app import create_app
+    from vigie_api.config import Settings
+
+    app = create_app(
+        Settings(data_dir=e.root, rate_limit_per_window=2, max_body_bytes=64), clock=lambda: NOW
+    )
+    with TestClient(app) as client:
+        url = "/incidents/inc1/acknowledge"
+        big = client.post(url, params={"collector_id": "c1"}, json={"expected_version": 0,
+                          "pad": "x" * 200}, headers=e.auth)  # fmt: skip
+        assert big.status_code == 413
+        ok = client.post(url, params={"collector_id": "c1"}, json={"expected_version": 0},
+                         headers=e.auth)  # fmt: skip
+        assert ok.status_code == 200
+        for _ in range(3):
+            limited = client.post(url, params={"collector_id": "c1"},
+                                  json={"expected_version": 1}, headers=e.auth)  # fmt: skip
+        assert limited.status_code == 429
