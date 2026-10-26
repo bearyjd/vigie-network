@@ -206,12 +206,14 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         ),
     ),
     (
-        # Current human review per monitoring incident. No cross-DB FK: identity fields and
-        # episode_start are copied so audit/orphan rows stay readable after the incident prune.
+        # Current human review per monitoring incident. `clear` keeps a NULL-status tombstone so
+        # the version never goes backwards (a deleted row would let an old receipt replay). No
+        # cross-DB FK: identity fields and episode_start are copied so audit/orphan rows stay
+        # readable after the incident prune.
         """CREATE TABLE incident_decisions (
           incident_id TEXT PRIMARY KEY, collector_id TEXT NOT NULL, device_id TEXT NOT NULL,
           lineage TEXT NOT NULL, detector TEXT NOT NULL, episode_start INTEGER NOT NULL,
-          status TEXT NOT NULL CHECK (status IN ('acknowledged','snoozed','expected')),
+          status TEXT CHECK (status IN ('acknowledged','snoozed','expected')),  -- NULL = cleared
           snooze_until INTEGER,
           version INTEGER NOT NULL CHECK (version>=1),
           decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, id TEXT NOT NULL,

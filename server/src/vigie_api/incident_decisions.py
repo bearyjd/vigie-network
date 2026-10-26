@@ -62,7 +62,7 @@ def parse_until(value: str, now: float, max_s: int) -> int:
 
 def review_view(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Public shape of a decision row (the stored principal is shown as its actor)."""
-    if row is None:
+    if row is None or row["status"] is None:  # a cleared tombstone is "no review"
         return None
     until = row["snooze_until"]
     return {
@@ -106,7 +106,7 @@ def _write_decision(ov, incident, action, until, version, principal, now_iso):  
         " status=excluded.status,snooze_until=excluded.snooze_until,version=excluded.version,"
         "decided_by=excluded.decided_by,decided_at=excluded.decided_at,id=excluded.id",
         (incident["id"], incident["collector_id"], incident["device_id"], incident["lineage"],
-         incident["detector"], incident["episode_start"], ACTION_STATUS[action], until, version,
+         incident["detector"], incident["episode_start"], ACTION_STATUS.get(action), until, version,
          principal, now_iso, str(uuid.uuid4())),
     )  # fmt: skip
 
@@ -133,12 +133,9 @@ def decide(
         current = old["version"] if old else 0
         if current != body.expected_version:
             raise ApiError(409, "version_conflict", "decision version no longer matches")
-        if action == "clear" and old is None:
+        if action == "clear" and (old is None or old["status"] is None):
             raise ApiError(409, "no_decision", "incident has no decision to clear")
-        if action == "clear":
-            ov.execute("DELETE FROM incident_decisions WHERE incident_id=?", (incident_id,))
-        else:
-            _write_decision(ov, incident, action, until, current + 1, principal.name, now_iso)
+        _write_decision(ov, incident, action, until, current + 1, principal.name, now_iso)
         _prune_orphans(inv, ov, now)
         new = ov.execute(
             "SELECT * FROM incident_decisions WHERE incident_id=?", (incident_id,)
@@ -166,7 +163,7 @@ def _outcome(incident, old, new, principal, now_iso):  # noqa: ANN001
         "incident_id": incident["id"],
         "status": shown["status"] if shown else None,
         "snooze_until": shown["snooze_until"] if shown else None,
-        "version": shown["version"] if shown else 0,
+        "version": new["version"],
         "decided_by": _actor(principal.name),
         "decided_at": now_iso,
     }

@@ -212,10 +212,10 @@ A snooze on an incident that later resolves stays as history with `attention` fa
 also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
 
 Actions are `POST /incidents/{incident_id}/{action}?collector_id=...` with action `acknowledge`,
-`snooze`, `mark-expected` or `clear` (deletes the decision, which un-snoozes). Any status can move to
+`snooze`, `mark-expected` or `clear` (removes the decision, which un-snoozes; a tombstone row keeps the version). Any status can move to
 any other. The body is strict (unknown fields are 422; there is no free-text note):
 `{"expected_version": n}`, plus `"until"` for snooze. `expected_version` is the incident's own decision
-version: 0 when it has no decision, +1 on every write, 0 again after `clear`. A stale value is
+version: 0 when it has never had one, +1 on every write including `clear` (it never goes backwards). A stale value is
 `409 version_conflict`. It is unrelated to the device `identity_override_version`.
 
 - `until`: RFC 3339 UTC (`Z` or `+00:00`, whole seconds), from 60 seconds to the cap after now. The cap
@@ -234,6 +234,6 @@ version: 0 when it has no decision, +1 on every write, 0 again after `clear`. A 
   `device_id: null` and the incident id in the summary.
 - Retention: only the current decision is stored (history is in the audit log). A recurrence is a new
   incident with a new id, so a decision never carries over to it. Decision rows of incidents the pipeline
-  has pruned are invisible, and are deleted (at most 100 per write, once older than 120 days).
+  has pruned are invisible, and (and cleared tombstones) are deleted (at most 100 per write, once older than 120 days).
 - `expected` is a per-incident label, not a suppression. It does not touch baselines, the suspicious
   hours the detector tracks, or later incidents.

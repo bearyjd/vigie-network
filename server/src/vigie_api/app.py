@@ -356,6 +356,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         collector_id: Annotated[str, Query(min_length=1, max_length=64)],
         x_request_id: RequestId = None,
     ):
+        principal.require_write()  # before validating `until`: a non-writer always sees 403
         now = clock()
         until = incident_decisions.parse_until(body.until, now, settings.incident_snooze_max_s)
         return envelope(
@@ -377,7 +378,8 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     @app.post(
         "/incidents/{incident_id}/{action}",
         tags=["monitoring"],
-        description=incident_description + " `clear` deletes the decision (un-snooze).",
+        description=incident_description
+        + " `clear` removes the decision (un-snooze) but the version keeps rising.",
         response_model=IncidentDecisionResponse,
         responses=incident_errors,
     )

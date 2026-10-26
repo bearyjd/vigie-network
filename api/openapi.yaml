@@ -1482,7 +1482,7 @@
             "title": "Status"
           },
           "version": {
-            "description": "The incident's decision version; 0 once cleared.",
+            "description": "The incident's decision version; it never goes backwards, `clear` included.",
             "title": "Version",
             "type": "integer"
           }
@@ -5025,7 +5025,7 @@
     },
     "/incidents/{incident_id}/{action}": {
       "post": {
-        "description": "Human review of one monitoring incident (overrides-side overlay; the pipeline's incident state is untouched). `expected_version` is the incident's decision version (0 when it has none); a stale value is a 409 `version_conflict`. Errors: 404 `incident_not_found`, 409 `incident_not_open` (snooze on a resolved/superseded incident), 409 `no_decision` (clear with nothing to clear), 409 `idempotency_conflict`. `clear` deletes the decision (un-snooze).",
+        "description": "Human review of one monitoring incident (overrides-side overlay; the pipeline's incident state is untouched). `expected_version` is the incident's decision version (0 when it has none); a stale value is a 409 `version_conflict`. Errors: 404 `incident_not_found`, 409 `incident_not_open` (snooze on a resolved/superseded incident), 409 `no_decision` (clear with nothing to clear), 409 `idempotency_conflict`. `clear` removes the decision (un-snooze) but the version keeps rising.",
         "operationId": "decide_incident_incidents__incident_id___action__post",
         "parameters": [
           {

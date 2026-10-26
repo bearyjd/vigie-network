@@ -450,7 +450,9 @@ class IncidentDecisionResult(BaseModel):
         description="Null after `clear`."
     )
     snooze_until: str | None
-    version: int = Field(description="The incident's decision version; 0 once cleared.")
+    version: int = Field(
+        description="The incident's decision version; it never goes backwards, `clear` included."
+    )
     decided_by: str
     decided_at: str
 

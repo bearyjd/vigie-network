@@ -54,4 +54,8 @@ def test_pipeline_run_with_decisions_matches_run_without(tmp_path):
         run_once(PipelineConfig(data_dir=plain), now=now)
         run_once(PipelineConfig(data_dir=decided), now=now)
     assert dump(plain)["monitoring_incidents"]
+    for root in (plain, decided):  # the new schema must not make overrides "unreadable"
+        inv = open_inventory(root / "inventory.db")
+        assert not inv.execute("SELECT 1 FROM events WHERE kind='stitching_skipped'").fetchall()
+        inv.close()
     assert dump(plain) == dump(decided)

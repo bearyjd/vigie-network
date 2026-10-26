@@ -56,7 +56,7 @@ def test_cas_increments_and_stale_version_is_409(e):
     assert decisions(e)[0]["snooze_until"] is None
 
 
-def test_clear_deletes_the_row_and_needs_a_decision(e):
+def test_clear_leaves_a_tombstone_and_needs_a_decision(e):
     miss = post(e, "inc1", "clear", {"expected_version": 0})
     assert (miss.status_code, miss.json()["error"]["code"]) == (409, "no_decision")
     post(e, "inc1", "acknowledge")
@@ -64,8 +64,8 @@ def test_clear_deletes_the_row_and_needs_a_decision(e):
     cleared = post(e, "inc1", "clear", {"expected_version": 1})
     assert cleared.status_code == 200, cleared.text
     assert cleared.json()["data"]["status"] is None
-    assert cleared.json()["data"]["version"] == 0
-    assert decisions(e) == []
+    assert cleared.json()["data"]["version"] == 2
+    assert [(d["status"], d["version"]) for d in decisions(e)] == [(None, 2)]
     assert [a["action"] for a in audits(e)][-1] == "monitoring.incident.clear"
     detail = json.loads(audits(e)[-1]["detail"])
     assert detail["before"]["review"]["status"] == "acknowledged"
@@ -165,6 +165,7 @@ WEEK = 7 * 24 * 3600
         "2026-10-21T12:00:00",  # naive
         "2026-10-21T12:00:00+02:00",  # non-UTC offset
         "2026-10-21",
+        "2026-02-30T00:00:00Z",
         "not a date",
         "20261021T120000Z",
         "2026-10-21T12:00:00.5Z",
@@ -255,3 +256,32 @@ def test_rate_limit_and_body_limit_apply(e):
             limited = client.post(url, params={"collector_id": "c1"},
                                   json={"expected_version": 1}, headers=e.auth)  # fmt: skip
         assert limited.status_code == 429
+
+
+def test_ack_clear_ack_without_request_id_is_not_a_stale_receipt_replay(e):
+    """clear must keep versions monotonic, or the third call replays the first receipt."""
+    assert post(e, "inc1", "acknowledge", {"expected_version": 0}).json()["data"]["version"] == 1
+    cleared = post(e, "inc1", "clear", {"expected_version": 1}).json()["data"]
+    assert (cleared["status"], cleared["version"]) == (None, 2)
+    third = post(e, "inc1", "acknowledge", {"expected_version": 2})
+    assert third.status_code == 200 and third.json()["data"]["version"] == 3
+    replay = post(e, "inc1", "acknowledge", {"expected_version": 0})  # a stale retry of call 1
+    assert replay.json()["data"]["version"] == 1  # idempotent replay, nothing written
+    assert len([a for a in audits(e) if a["action"].endswith("acknowledge")]) == 2
+    assert e.get("/incidents/inc1", collector_id="c1").json()["data"]["attention"] is False
+
+
+def test_cleared_incident_reads_as_unreviewed_and_cannot_be_cleared_twice(e):
+    post(e, "inc1", "acknowledge")
+    post(e, "inc1", "clear", {"expected_version": 1})
+    data = e.get("/incidents/inc1", collector_id="c1").json()["data"]
+    assert data["review"] is None and data["attention"] is True
+    again = post(e, "inc1", "clear", {"expected_version": 2})
+    assert (again.status_code, again.json()["error"]["code"]) == (409, "no_decision")
+
+
+def test_read_only_token_with_bad_until_gets_403_not_422(e):
+    _, token = tokens.create_token(e.ov, "ro", scope="read-only")
+    r = post(e, "inc1", "snooze", {"expected_version": 0, "until": "junk"},
+             headers={"Authorization": f"Bearer {token}"})  # fmt: skip
+    assert r.status_code == 403
