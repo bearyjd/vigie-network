@@ -148,3 +148,53 @@ transaction, including direct group and `auto_inherit` edits.
   acceptance does not provide a cross-database atomic snapshot through commit.
 - **Attach availability.** Relevant writes delay attaches by one pass; irrelevant writes do
   not. Sustained relevant changes can keep invalidating plans despite per-token rate limits.
+
+
+## Last observed address
+
+Device list and detail responses include nullable `last_observed_ip` and
+`last_observed_ip_at`. They report the latest valid source-address association
+from DHCP lease or neighbour evidence for the identity's MACs, including its
+currently merged members. `last_observed_ip_at` is the collector batch window
+end of the snapshot that most recently *reported* the pairing. The collector
+sends lease and neighbour changes as deltas, so it is not "last seen at this
+address", lease expiry, packet arrival time, or server receipt time. This
+historical observation does not guarantee the device's current address. An
+address never creates an identity link or changes a human label.
+
+IPv4 and IPv6 are supported. IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are
+normalised to IPv4 before filtering and storage. Excluded classes: unparseable
+or scoped (`%zone`) spellings, unspecified (`0.0.0.0`, `::`), the IPv4 `0.0.0.0/8`
+block, multicast, loopback, link-local (`169.254.0.0/16`, `fe80::/10`), and
+the IPv4 reserved `240.0.0.0/4` block, which includes limited broadcast
+`255.255.255.255`. Observations stamped more than 300 s after the batch was
+received (collector clock skew) are excluded. Older stamps are accepted for
+any spool age the ingest endpoint accepts, because the upsert is monotonic: a
+late batch can never replace a newer observation. The newest sensor
+stamp wins; equal stamps prefer lease evidence, then the lexically greatest
+canonical address (and MAC for an otherwise equal identity-level tie). This is a
+deterministic presentation choice, not proof of address ownership.
+
+Caveats. The same address can be reported for several MACs after a DHCP
+reassignment or a duplicate address; the previous holder keeps showing it until
+newer evidence for that MAC arrives. A collector whose clock runs up to 300 s
+fast can out-stamp a correct collector's newer pairing. Neither case is
+resolved by the server.
+
+Visibility. Every valid token scope (app, service, integration, read-only)
+that can read `/devices` sees these fields; there is no per-field gating. No
+IP addresses were exposed by the API before this field was added. Treat any
+token that can read devices as allowed to see local and global addresses.
+
+Incremental sync. `updated_at` and `updated_since` do not move when only a
+merged member MAC's address changes (they follow the canonical device's own row
+and overrides). Clients that need address changes should refresh the pages they
+display rather than rely on `updated_since` alone.
+
+Pipeline schema 10 retains one latest association per observed MAC. It does not
+replay processed batches or backfill old raw data. Fields remain null until new
+qualifying lease/neighbour evidence arrives; an API reading an older pipeline
+schema also returns null. Merge and undo recompute the view from current member
+MACs. Device filtering and pagination are unchanged, with one indexed address
+query scoped to each returned page. Existing clients can ignore the additive
+fields; terminal viewers should use `.get` for compatibility with older APIs.

@@ -256,9 +256,14 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE TABLE characterization_dirty (device_id TEXT PRIMARY KEY)",
         "ALTER TABLE devices ADD COLUMN inferred_valid_until REAL",
     ),
+    (
+        "CREATE TABLE mac_last_ip (mac TEXT PRIMARY KEY,ip TEXT NOT NULL,"
+        "observed_at INTEGER NOT NULL,source TEXT NOT NULL CHECK(source IN ('lease','neigh')))",
+    ),
 )
 
 PIPELINE_TABLES = (
+    "mac_last_ip",
     "events",
     "identity_candidates",
     "pipeline_cursor",

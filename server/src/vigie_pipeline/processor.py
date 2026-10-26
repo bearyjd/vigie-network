@@ -20,6 +20,7 @@ from vigie_pipeline.characterization_store import (
     save_services,
 )
 from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
@@ -151,7 +152,7 @@ def _process_batches(
     for collector in sorted(collectors):
         for rowid, batch_id, received in _pending(inv, collector):
             try:
-                acts, skipped = read_batch(config.data_dir, collector, batch_id)
+                acts, skipped = read_batch(config.data_dir, collector, batch_id, _epoch(received))
                 measured = read_measurements(inv, config.data_dir, collector, batch_id)
                 services = read_services(config.data_dir, measured)
             except ShardReadError as exc:
@@ -160,6 +161,7 @@ def _process_batches(
                 break
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
+                save_last_ips(inv, acts)
                 record_activity(
                     inv, acts, config.activity_gap_s, _epoch(received), config.activity_retention_s
                 )

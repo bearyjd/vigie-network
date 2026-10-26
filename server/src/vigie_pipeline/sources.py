@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from vigie_ingest.db import SHARD_RE
+from vigie_pipeline.last_ip import address_candidate
 from vigie_pipeline.logs import log
 from vigie_pipeline.sanitize import clean_text
 
@@ -41,6 +42,7 @@ class MacActivity:
     opt55: str | None = None
     opt60: str | None = None
     mdns_name: str | None = None
+    last_ip: tuple[int, int, str, str] | None = None
 
 
 def normalize_mac(raw: str | None) -> str | None:
@@ -101,11 +103,22 @@ def _note(
 
 
 def _steps(
-    acts: dict[str, MacActivity], skipped: set[str]
+    acts: dict[str, MacActivity], skipped: set[str], received_ts: float | None
 ) -> tuple[tuple[str, str, Callable[[sqlite3.Row], object]], ...]:
+    def note_ip(act: MacActivity, r: sqlite3.Row, source: str) -> None:
+        candidate = address_candidate(r["ip"], r["ts"], source, received_ts)
+        if candidate is not None and (act.last_ip is None or candidate > act.last_ip):
+            act.last_ip = candidate
+
+    def neighbor(r: sqlite3.Row) -> None:
+        act = _note(acts, skipped, r["mac"], r["ts"])
+        if act:
+            note_ip(act, r, "neigh")
+
     def lease(r: sqlite3.Row) -> None:
         act = _note(acts, skipped, r["mac"], r["ts"])
         if act:
+            note_ip(act, r, "lease")
             act.hostname = _clean(r["hostname"]) or act.hostname
             act.opt55 = opt55_string(r["opt55"]) or act.opt55
             act.opt60 = _clean(r["opt60"]) or act.opt60
@@ -116,8 +129,8 @@ def _steps(
             act.mdns_name = _clean(r["name"]) or act.mdns_name
 
     return (
-        ("raw_lease", "ts, mac, hostname, opt55, opt60", lease),
-        ("raw_neigh", "ts, mac", lambda r: _note(acts, skipped, r["mac"], r["ts"])),
+        ("raw_lease", "ts, mac, ip, hostname, opt55, opt60", lease),
+        ("raw_neigh", "ts, mac, ip", neighbor),
         ("raw_sighting", "ts, mac, kind, name", sighting),
         ("raw_dns", "ts, device_mac", lambda r: _note(acts, skipped, r["device_mac"], r["ts"])),
         ("raw_flow", "ts, device_mac", lambda r: _note(acts, skipped, r["device_mac"], r["ts"])),
@@ -130,10 +143,11 @@ def _fold_shard(
     acts: dict[str, MacActivity],
     skipped: set[str],
     shard: str,
+    received_ts: float | None,
 ) -> list[str]:
     """Read each table independently so every failure is reported; returns failed tables."""
     failed: list[str] = []
-    for table, columns, handle in _steps(acts, skipped):
+    for table, columns, handle in _steps(acts, skipped, received_ts):
         sql = (
             f"SELECT {columns} FROM {table} "  # noqa: S608  (fixed names, not user input)
             "WHERE collector_id=? AND batch_id=? ORDER BY ts, rowid"
@@ -150,7 +164,7 @@ def _fold_shard(
 
 
 def read_batch(
-    data_dir: Path, collector_id: str, batch_id: str
+    data_dir: Path, collector_id: str, batch_id: str, received_ts: float | None = None
 ) -> tuple[dict[str, MacActivity], int]:
     """Fold a recorded batch's rows across every shard it spans. Returns (acts, skipped_macs).
     A shard FILE that is gone (retention) is skipped; any other failure raises ShardReadError
@@ -169,7 +183,9 @@ def read_batch(
             continue
         conn.row_factory = sqlite3.Row
         try:
-            failed = _fold_shard(conn, (collector_id, batch_id), acts, skipped, path.name)
+            failed = _fold_shard(
+                conn, (collector_id, batch_id), acts, skipped, path.name, received_ts
+            )
         finally:
             conn.close()
         failures.extend(f"{path.name}:{t}" for t in failed)

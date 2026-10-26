@@ -91,6 +91,16 @@ class TypeProvenance(BaseModel):
 
 class DeviceOut(BaseModel):
     id: str
+    last_observed_ip: str | None = Field(
+        default=None,
+        description="Last source address observed for this identity's MACs; "
+        "not a current address or identity key. Nullable until new lease/neighbour evidence.",
+    )
+    last_observed_ip_at: str | None = Field(
+        default=None,
+        description="Batch window end in UTC of the snapshot that last reported this "
+        "pairing (collector sends deltas); not last-seen, lease expiry or server receipt time.",
+    )
     name: str | None = Untrusted
     owner: str | None = Untrusted
     type: str

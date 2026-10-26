@@ -129,6 +129,10 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   startup and hourly.
 - `batches` rows (dedupe records) are purged after 7 days; not configurable.
 - `VIGIE_MAX_SPOOL_AGE_S` - how old a collector window may be (default 24 h).
+- `mac_last_ip` (last observed address per MAC) is never pruned. It holds at most one row per MAC
+  in observations, and devices are retired, not deleted, so it is bounded by the MACs ever seen.
+  It is visible to every API token scope that can read `/devices` (no per-field gating); no IP
+  addresses were exposed by the API before it was added.
 - Event and hostname retention (PRP section 9, 90 days) is **not implemented**: no setting exists, so
   `events` and hostnames in `inventory.db` are kept. Until it exists, never `VACUUM` `inventory.db` and never
   delete the newest `events` rows (see "Event cursors" in `server/README.md`).
