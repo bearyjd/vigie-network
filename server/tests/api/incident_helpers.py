@@ -65,7 +65,9 @@ def until(offset: float) -> str:
 
 
 def decisions(env: Env) -> list[dict[str, Any]]:
-    return [dict(r) for r in env.ov.execute("SELECT * FROM incident_decisions ORDER BY incident_id")]
+    return [
+        dict(r) for r in env.ov.execute("SELECT * FROM incident_decisions ORDER BY incident_id")
+    ]
 
 
 def audits(env: Env, prefix: str = "monitoring.incident.") -> list[dict[str, Any]]:

@@ -6,6 +6,7 @@ import json
 
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
+from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 MAX_MACS = 64
@@ -257,7 +258,7 @@ def baseline_view(inv, collector, device, key):
     }
 
 
-def incident_row(inv, ov, row):
+def incident_row(inv, ov, row, review, now):
     try:
         current = device_macs(inv, ov, row["device_id"])[2] == row["lineage"]
     except ApiError:
@@ -277,10 +278,12 @@ def incident_row(inv, ov, row):
         "threshold_bytes": row["threshold_bytes"],
         "baseline_id": row["baseline_id"],
         "evidence": json.loads(row["evidence"]),
+        "review": review_view(review),
+        "attention": attention(row["state"], review, now),
     }
 
 
-def incident_list(inv, ov, collector, device, cursor, limit):
+def incident_list(inv, ov, collector, device, cursor, limit, state, now):
     after = 0
     if cursor:
         try:
@@ -298,18 +301,20 @@ def incident_list(inv, ov, collector, device, cursor, limit):
             raise ApiError(400, "invalid_cursor", "invalid incident cursor") from exc
     if device is None:
         rows = inv.execute(
-            "SELECT * FROM monitoring_incidents WHERE collector_id=? AND seq>? ORDER B"
-            "Y seq LIMIT ?",
-            (collector, after, limit + 1),
+            "SELECT * FROM monitoring_incidents WHERE collector_id=? AND seq>? AND (? IS NULL"
+            " OR state=?) ORDER BY seq LIMIT ?",
+            (collector, after, state, state, limit + 1),
         ).fetchall()
     else:
         canonical = device_macs(inv, ov, device)[0]
         rows = inv.execute(
             "SELECT * FROM monitoring_incidents WHERE collector_id=? AND device_id=? A"
-            "ND seq>? ORDER BY seq LIMIT ?",
-            (collector, canonical, after, limit + 1),
+            "ND seq>? AND (? IS NULL OR state=?) ORDER BY seq LIMIT ?",
+            (collector, canonical, after, state, state, limit + 1),
         ).fetchall()
-    items = [incident_row(inv, ov, row) for row in rows[:limit]]
+    page = rows[:limit]
+    reviews = reviews_for(ov, [row["id"] for row in page])
+    items = [incident_row(inv, ov, row, reviews.get(row["id"]), now) for row in page]
     nxt = (
         encode_cursor(json.dumps(["incidents", collector, device, rows[limit - 1]["seq"]]))
         if len(rows) > limit

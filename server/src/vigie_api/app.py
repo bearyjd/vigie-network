@@ -297,12 +297,15 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         ov: Ov,
         collector_id: Annotated[str, Query(min_length=1, max_length=64)],
         device_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        state: Annotated[Literal["open", "resolved", "superseded"] | None, Query()] = None,
         cursor: Annotated[str | None, Query(max_length=1024)] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
     ) -> dict[str, Any]:
         monitoring.required(inv)
         monitoring.collector_summary(inv, collector_id)
-        items, nxt = monitoring.incident_list(inv, ov, collector_id, device_id, cursor, limit)
+        items, nxt = monitoring.incident_list(
+            inv, ov, collector_id, device_id, cursor, limit, state, clock()
+        )
         return envelope(items, page={"next_cursor": nxt})
 
     @app.get(
@@ -325,7 +328,8 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         ).fetchone()
         if row is None:
             raise ApiError(404, "incident_not_found", "incident not found")
-        return envelope(monitoring.incident_row(inv, ov, row))
+        review = incident_decisions.reviews_for(ov, [incident_id]).get(incident_id)
+        return envelope(monitoring.incident_row(inv, ov, row, review, clock()))
 
     incident_errors = _errors(401, 403, 404, 409, 413, 422, 429, 503)
     incident_description = (
@@ -356,8 +360,16 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         until = incident_decisions.parse_until(body.until, now, settings.incident_snooze_max_s)
         return envelope(
             incident_decisions.decide(
-                inv, ov, incident_id=incident_id, collector_id=collector_id, action="snooze",
-                body=body, until=until, principal=principal, now=now, now_iso=iso_utc(now),
+                inv,
+                ov,
+                incident_id=incident_id,
+                collector_id=collector_id,
+                action="snooze",
+                body=body,
+                until=until,
+                principal=principal,
+                now=now,
+                now_iso=iso_utc(now),
                 request_id=x_request_id,
             )  # fmt: skip
         )
@@ -382,8 +394,16 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         now = clock()
         return envelope(
             incident_decisions.decide(
-                inv, ov, incident_id=incident_id, collector_id=collector_id, action=action,
-                body=body, until=None, principal=principal, now=now, now_iso=iso_utc(now),
+                inv,
+                ov,
+                incident_id=incident_id,
+                collector_id=collector_id,
+                action=action,
+                body=body,
+                until=None,
+                principal=principal,
+                now=now,
+                now_iso=iso_utc(now),
                 request_id=x_request_id,
             )  # fmt: skip
         )

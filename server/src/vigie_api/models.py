@@ -388,6 +388,14 @@ class IncidentEvidence(BaseModel):
     distinct_days: int | None = None
 
 
+class IncidentReview(BaseModel):
+    status: Literal["acknowledged", "snoozed", "expected"]
+    snooze_until: str | None
+    version: int
+    decided_by: str
+    decided_at: str
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
@@ -403,6 +411,14 @@ class IncidentOut(BaseModel):
     threshold_bytes: int
     baseline_id: str | None
     evidence: IncidentEvidence
+    review: IncidentReview | None = Field(
+        description="Current human decision, or null. A separate axis from `state`: `expected` "
+        "is a per-incident label, not a suppression."
+    )
+    attention: bool = Field(
+        description="True while the incident is open and no decision covers it (an expired "
+        "snooze returns it here)."
+    )
 
 
 class IncidentsResponse(_Envelope):

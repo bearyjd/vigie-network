@@ -75,7 +75,7 @@ def _audit_events(ov, after, kind, severity, limit) -> list[dict[str, Any]]:
         {
             "rid": r["rid"],
             "id": r["id"],
-            "device_id": r["target"],
+            "device_id": None if r["action"].startswith("monitoring.incident.") else r["target"],
             "ts": r["ts"],
             "kind": display_text(r["action"]),
             "severity": "info",
