@@ -8,9 +8,10 @@ evidence: Snitchwatch repo,
 
 Vigie sees the LAN from the router. A computer running Snitchwatch (OpenSnitch
 underneath) knows, for each outbound connection, the program and the firewall
-decision. OpenSnitch can already write those decisions as JSON to syslog; a
-standard TLS log shipper on that computer would forward an allowlisted subset
-to Vigie. No bespoke protocol, and no Snitchwatch code in the path.
+decision. OpenSnitch's built-in `remote` logger can already send those
+decisions as JSON lines. It sends them over loopback to a local rsyslog, which
+forwards an allowlisted subset to Vigie over TLS syslog (RFC 5425). No bespoke
+protocol, and no Snitchwatch code in the path.
 
 The main value is an external check on the endpoint firewall. Vigie compares
 what the router saw from that computer with what OpenSnitch reported, and
@@ -28,9 +29,12 @@ upload-baseline incidents.
 ## What Vigie would need
 
 1. **A new source kind,** "endpoint event (OpenSnitch)", with provenance like
-   the router sources. Open: a new ingest endpoint for the shipper's format, or
-   a new record kind in the signed batch (`api/batch.schema.json`), produced by
-   a small relay.
+   the router sources. Each event arrives as one JSON object per TLS syslog
+   message from rsyslog's `omfwd`.
+   - **The input.** Open: a TLS syslog listener service on the server, mutual
+     TLS or a pinned client certificate per host, versus a relay that turns
+     these events into a new record kind in the signed batch
+     (`api/batch.schema.json`).
 2. **Host identity.** A configured host id from the shipper, joined to the
    device inventory. It is never inferred from the event's IP alone.
 3. **The join.** Protocol, source port, destination IP and port, and time
