@@ -164,5 +164,48 @@ mode = 'ok'; refresh.fire('click'); await flush();
 assert.equal(document.activeElement, refresh, 'a vanished live label hands focus to Refresh, never <body>');
 body.focus();
 
+// C5/C6 / J02 / J06: focus follows a stable data-focus-key, not mutable text or rank.
+{
+  const control = (key, label, text, extra = {}) => { const el = new FakeElement('button'); if (key) el.setAttribute('data-focus-key', key); if (label) el.setAttribute('aria-label', label); for (const [k, v] of Object.entries(extra)) el.setAttribute(k, v); el.append(new FakeText(text)); return el; };
+  let extras = () => [];
+  const render = content.replaceChildren.bind(content);
+  content.replaceChildren = (...items) => { render(...items); content.append(...extras()); };
+  const refreshWith = async next => { extras = next; refresh.fire('click'); await flush(); };
+  const focusOf = () => document.activeElement.getAttribute('data-focus-key');
+  mode = 'ok';
+  // changed text ('Copy ID' -> 'Copied') keeps focus on the same logical control
+  await refreshWith(() => [control('copy:a', null, 'Copy ID')]);
+  content.querySelector('[data-focus-key]').focus(); content.fire('focusin');
+  await refreshWith(() => [control('copy:a', null, 'Copied')]);
+  assert.equal(focusOf(), 'copy:a'); assert.equal(document.activeElement.textContent, 'Copied');
+  // two same-text controls reordered: the logical SECOND one (key b) is refocused, not the same rank
+  await refreshWith(() => [control('identity:a', null, 'Open'), control('identity:b', null, 'Open')]);
+  content.querySelectorAll('[data-focus-key]')[1].focus(); content.fire('focusin');
+  await refreshWith(() => [control('identity:b', null, 'Open'), control('identity:a', null, 'Open')]);
+  assert.equal(focusOf(), 'identity:b', 'reorder must not hand focus to the same-rank control');
+  // same text, different aria-label, second focused
+  await refreshWith(() => [control('t:1', 'First table', 'Open'), control('t:2', 'Second table', 'Open')]);
+  content.querySelectorAll('[data-focus-key]')[1].focus(); content.fire('focusin');
+  await refreshWith(() => [control('t:1', 'First table', 'Open'), control('t:2', 'Second table', 'Open')]);
+  assert.equal(focusOf(), 't:2');
+  // a key whose replacement is DISABLED (Next after the last page) falls back to Refresh
+  await refreshWith(() => [control('pager:next', null, 'Next')]);
+  content.querySelector('[data-focus-key]').focus(); content.fire('focusin');
+  assert.equal(focusOf(), 'pager:next');
+  await refreshWith(() => [control('pager:next', null, 'Next', {disabled: ''})]);
+  assert.equal(document.activeElement, refresh, 'a disabled replacement hands focus to Refresh');
+  // aria-disabled replacement is not focus-restorable either
+  await refreshWith(() => [control('pager:next', null, 'Next')]);
+  content.querySelector('[data-focus-key]').focus(); content.fire('focusin');
+  await refreshWith(() => [control('pager:next', null, 'Next', {'aria-disabled': 'true'})]);
+  assert.equal(document.activeElement, refresh);
+  // a keyed control that vanished does not land on a same-text control with another key
+  await refreshWith(() => [control('identity:x', null, 'Open')]);
+  content.querySelector('[data-focus-key]').focus(); content.fire('focusin');
+  await refreshWith(() => [control('identity:y', null, 'Open')]);
+  assert.equal(document.activeElement, refresh);
+  content.replaceChildren = render; extras = () => []; body.focus(); refresh.fire('click'); await flush(); body.focus();
+}
+
 Date.now = realNow;
 console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts.');

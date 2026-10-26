@@ -183,9 +183,10 @@ def test_the_bounded_walk_refuses_past_the_limit_and_accepts_within_it(
 
 def test_a_busy_lock_names_the_holder_pid_and_clears_it_when_released(namespace, monkeypatch):
     monkeypatch.setattr(preview, "LOCK_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(preview, "_is_controller", lambda argv: True)  # pytest stands in
     thread = _hold_lock(1.0)
     try:
-        with pytest.raises(BlockingIOError, match=rf"PID {os.getpid()}\b"):
+        with pytest.raises(BlockingIOError, match=rf"\(PID {os.getpid()}\)"):
             preview.stop(namespace)
     finally:
         thread.join(5)

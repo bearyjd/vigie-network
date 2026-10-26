@@ -619,7 +619,7 @@ def test_lock_refuses_a_lock_swapped_between_open_and_check(tmp_path, monkeypatc
         return fd
 
     monkeypatch.setattr(preview.os, "open", swap)
-    with pytest.raises(ValueError, match="unsafe shared preview lock"), preview.manager_lock():
+    with pytest.raises(ValueError, match="unsafe preview lock"), preview.manager_lock():
         pass
 
 

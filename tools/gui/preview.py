@@ -42,6 +42,9 @@ CURRENT = "manager-current.json"
 _TERMINATION = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 STARTING_SECONDS = 60.0  # A holder this old is no longer "starting": it is wedged.
 LOCK_WAIT_SECONDS = 2.0  # start/stop wait this long for a concurrent command; status never waits.
+LOCK_POLL_START = 0.001  # start/stop re-try the lock after this long, doubling up to the cap below,
+LOCK_POLL_CAP = 0.05  # so a burst of momentary status probes cannot keep them out.
+MAX_HOOK_BYTES = 65536  # A pinned startup hook larger than this is refused unread.
 # The only .pth files a vetted venv may carry besides plain directory lines: name -> sha256 of the
 # exact bytes. _virtualenv.pth: virtualenv/uv `import _virtualenv`. a1_coverage.pth: coverage's
 # no-op unless COVERAGE_PROCESS_START is set (inert only while the child env is exactly
@@ -368,6 +371,8 @@ def _holder(fd: int) -> dict | None:
 
     The holder writes `PID START_TICKS BOOT_ID`; a recycled PID (other start time or boot) or any
     unparseable text names nobody, so a stale or forged line can never be blamed or signalled.
+    A live match proves process identity, not lock ownership (any process can be named), so
+    `verified` is true only for our own UID running this controller's start/stop.
     """
     try:
         pid, ticks, boot = os.pread(fd, 128, 0).decode("ascii", "replace").split()
@@ -378,7 +383,17 @@ def _holder(fd: int) -> dict | None:
     identity = process_identity(int(pid))
     if identity is None or identity["start_ticks"] != ticks or identity["boot_id"] != boot:
         return None
-    return {"pid": int(pid), "start_ticks": ticks}
+    verified = identity["uid"] == os.getuid() and _is_controller(identity["argv"])
+    return {"pid": int(pid), "start_ticks": ticks, "verified": verified}
+
+
+def _is_controller(argv: list[str]) -> bool:
+    """argv is `<interpreter> [flags] <this script> start|stop ...`."""
+    script = str(Path(__file__).resolve())
+    return any(
+        value == script and following in ("start", "stop")
+        for value, following in zip(argv, argv[1:], strict=False)
+    )
 
 
 def _own_holder_line() -> str:
@@ -429,11 +444,13 @@ def manager_lock(wait: float = 0.0, *, shared: bool = False):
             or (st.st_dev, st.st_ino) != (current.st_dev, current.st_ino)
         ):
             raise UnsafeLock(
-                f"unsafe shared preview lock {LOCK}: it must be a regular single-link file owned "
-                f"by you with mode 0600 (found mode {stat.S_IMODE(st.st_mode):04o}); fix it or "
-                "remove it while no preview command is running"
+                f"unsafe {'shared ' if shared else ''}preview lock {LOCK}: it must be a regular "
+                f"single-link file owned by you with mode 0600 (found mode "
+                f"{stat.S_IMODE(st.st_mode):04o}); fix it or remove it while no preview command "
+                "is running"
             )
         deadline = time.monotonic() + wait
+        delay = LOCK_POLL_START
         while True:
             try:
                 fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
@@ -441,14 +458,18 @@ def manager_lock(wait: float = 0.0, *, shared: bool = False):
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     holder = _holder(fd)
-                    hint = f" (PID {holder['pid']})" if holder else ""
+                    hint = ""
+                    if holder:
+                        label = "PID" if holder["verified"] else "unverified PID"
+                        hint = f" ({label} {holder['pid']})"
                     busy = LockBusy(
                         errno.EAGAIN, f"another preview command holds the lock{hint}; retry shortly"
                     )
                     busy.holder = holder
                     busy.age = max(0.0, time.time() - os.fstat(fd).st_mtime)
                     raise busy from None
-                time.sleep(0.05)
+                time.sleep(delay)
+                delay = min(delay * 2, LOCK_POLL_CAP)
         if not shared:
             held = True
             os.ftruncate(fd, 0)
@@ -643,11 +664,14 @@ def _orphan(rows: list, inodes: set[str], candidates: list[dict] | None = None) 
 
 
 def _busy(common: dict, exc: LockBusy) -> dict:
-    """`starting` while a verified-or-unknown holder is young; `wedged-start` once it is old."""
+    """`starting` while a holder is young, unverifiable or unverified; `wedged-start` once a
+    verified start/stop holder is old. An unverified PID is only reported, never blamed."""
     holder, age = exc.holder, exc.age
     outcome = {**common, "state": "starting", "managed": False}
     if holder is None or age is None:  # unverifiable holder text never proves a wedge
         return outcome
+    if not holder["verified"]:  # a live process was named, but it is not our start/stop
+        return outcome | {"unverified_holder_pid": holder["pid"], "lock_age_seconds": round(age)}
     outcome |= {"holder_pid": holder["pid"], "lock_age_seconds": round(age)}
     if age >= STARTING_SECONDS:
         pid = holder["pid"]
@@ -661,6 +685,33 @@ def _busy(common: dict, exc: LockBusy) -> dict:
     return outcome
 
 
+def _probe() -> LockBusy | None:
+    """Is a start/stop holding the lock right now? Takes and drops the shared lock at once, so
+    status never keeps a writer waiting while it reads or scans."""
+    try:
+        with manager_lock(shared=True):
+            return None
+    except LockBusy as exc:
+        return exc
+
+
+def _recheck(common: dict, root: Path, rows: list) -> dict | None:
+    """`starting` if a start/stop is running, or changed the receipt, since `rows` were read."""
+    try:
+        _, again = current_attempt(root)
+    except (OSError, ValueError):  # a torn append is only an error when no writer is mid-append
+        exc = _probe()
+        if exc is None:
+            raise
+        return _busy(common, exc)
+    exc = _probe()
+    if exc is not None:
+        return _busy(common, exc)
+    if again != rows:
+        return {**common, "state": "starting", "managed": False}
+    return None
+
+
 def status(root: Path, *, locked: bool = False) -> dict:
     manifest = validate_namespace(root)
     common = {
@@ -668,15 +719,26 @@ def status(root: Path, *, locked: bool = False) -> dict:
         "token_file": manifest["token_file"],
         "collector_id": COLLECTOR,
     }
-    busy = {**common, "state": "starting", "managed": False}
     if locked:
         journal, rows = current_attempt(root)
     else:  # A start/stop holding the lock is mid-flight: report it, never wait or read its rows.
-        try:
-            with manager_lock(shared=True):  # No writer can append while the receipt is read.
-                journal, rows = current_attempt(root)
-        except LockBusy as exc:
-            return _busy(common, exc)
+        mid_flight = _probe()
+        if mid_flight is not None:
+            return _busy(common, mid_flight)
+        try:  # Unlocked read: a torn row or a changed receipt is caught by `_recheck` below.
+            journal, rows = current_attempt(root)
+        except (OSError, ValueError):
+            mid_flight = _probe()
+            if mid_flight is None:
+                raise
+            return _busy(common, mid_flight)
+    outcome = _classify(root, common, journal, rows)
+    if not locked:  # Any scan-derived verdict is stale if a start/stop began meanwhile.
+        return _recheck(common, root, rows) or outcome
+    return outcome
+
+
+def _classify(root: Path, common: dict, journal, rows: list) -> dict:
     inodes = listeners()
     last = rows[-1] if rows else None
     if last is not None and (
@@ -718,8 +780,6 @@ def status(root: Path, *, locked: bool = False) -> dict:
             }
         else:
             outcome = {**common, "state": "stopped", "managed": False}
-        if not locked and current_attempt(root)[1] != rows:  # A start swapped the attempt mid-scan.
-            return busy
         return outcome
     actual = process_identity(saved["pid"])
     if actual is None:
@@ -790,12 +850,28 @@ def _trusted_chain(path: Path, message: str) -> None:
 
 
 def _pinned_hook(path: Path) -> bool:
-    """A sitecustomize/usercustomize is accepted only as an exact allowlisted regular file."""
+    """A sitecustomize/usercustomize is accepted only as an exact allowlisted regular file.
+
+    The name alone refuses it unread unless pinned; a pinned name is opened O_NOFOLLOW|O_NONBLOCK
+    (a FIFO or symlink cannot hang or redirect the read), must be a small regular file, then hashed.
+    """
+    pinned = _BENIGN_STARTUP_HOOKS.get(path.name)
+    if pinned is None:
+        return False
     try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)
     except OSError:
         return False
-    return _BENIGN_STARTUP_HOOKS.get(path.name) == digest
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_HOOK_BYTES:
+            return False
+        raw = os.read(fd, MAX_HOOK_BYTES + 1)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return len(raw) <= MAX_HOOK_BYTES and hashlib.sha256(raw).hexdigest() == pinned
 
 
 def _trusted_tree(
@@ -807,6 +883,9 @@ def _trusted_tree(
     More than `limit` entries (when given) is refused, so a `/` line cannot stall the lock holder.
     """
     count = 0
+    top = root.lstat()  # The root itself: sticky or not, nobody else may add entries to it.
+    if top.st_uid not in _owners() or top.st_mode & 0o022:
+        raise ValueError(message)
 
     def unreadable(exc: OSError) -> None:
         raise ValueError(message) from exc
@@ -927,6 +1006,8 @@ def _vet_pth(site: Path, message: str) -> None:
                 continue
             if line != line.strip() or line.startswith("import") or ";" in line or "\0" in line:
                 raise ValueError(message)
+            if ".." in line.split("/"):  # site.py joins unresolved; a lexical `..` can move
+                raise ValueError(message)
             target = Path(os.path.normpath(site / line))
             if target in seen:
                 continue
@@ -1029,11 +1110,19 @@ def _interpreter(value: Path) -> Path:
             _trusted_chain(base, unavailable)
             launch = python
             for lib in ("lib", "lib64"):
-                if os.path.lexists(base / lib):
-                    for site in (base / lib).resolve(strict=True).glob("python*/site-packages"):
-                        _trusted_chain(site, unavailable)
-                        _trusted_tree(site, unavailable)
-                        _vet_pth(site, unavailable)
+                if not os.path.lexists(base / lib):
+                    continue
+                if (base / lib).is_symlink():
+                    # Only a same-directory alias (lib64 -> lib); its real directory is vetted
+                    # under its own name. Any other target shifts what `..` means to site.py.
+                    real = Path(os.path.realpath(base / lib))
+                    if real.parent != base.resolve() or real.name not in ("lib", "lib64"):
+                        raise ValueError(unavailable)
+                    continue
+                for site in (base / lib).glob("python*/site-packages"):  # unresolved, as site.py
+                    _trusted_chain(site, unavailable)
+                    _trusted_tree(site, unavailable)
+                    _vet_pth(site, unavailable)
             break
         _stdlib(resolved.parent.parent, unavailable, site_packages=site_packages)
     except OSError as exc:

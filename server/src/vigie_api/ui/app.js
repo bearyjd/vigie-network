@@ -10,20 +10,28 @@ const preview = new URLSearchParams(location.search).get('preview') === 'synthet
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
 function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
-// Which control inside #content holds focus, as tag + label + text + its rank among identical ones,
-// so a re-render can hand focus to the same logical control instead of dropping it to <body>.
+// Which control inside #content holds focus. Controls carry a stable data-focus-key (kind + id);
+// text and rank are only the fallback for unkeyed controls, so a re-render that changes a label
+// ('Copy ID' -> 'Copied') or reorders identical-looking rows still hands focus to the same one.
 function focusSignature(el) { return [el.localName, el.getAttribute('aria-label') ?? '', el.textContent].join('\u0000'); }
 function focusedInContent() {
   const box = byId('content'); const active = document.activeElement;
   if (active === box || !box.contains(active)) return null;
+  const key = active.getAttribute('data-focus-key');
+  if (key) return {key};
   const signature = focusSignature(active);
-  const same = [...box.querySelectorAll('*')].filter(el => focusSignature(el) === signature);
+  const same = [...box.querySelectorAll('*')].filter(el => !el.getAttribute('data-focus-key') && focusSignature(el) === signature);
   return {signature, rank: same.indexOf(active)};
 }
+function focusable(el) { return !el.disabled && el.getAttribute('aria-disabled') !== 'true'; }
 function restoreContentFocus(held) {
   if (!held) return;
-  const match = [...byId('content').querySelectorAll('*')].filter(el => focusSignature(el) === held.signature)[held.rank];
-  (match ?? byId('refresh')).focus({preventScroll: true});
+  const all = [...byId('content').querySelectorAll('*')];
+  const match = held.key
+    ? all.find(el => el.getAttribute('data-focus-key') === held.key)
+    : all.filter(el => !el.getAttribute('data-focus-key') && focusSignature(el) === held.signature)[held.rank];
+  if (match && focusable(match)) match.focus({preventScroll: true});
+  if (!match || document.activeElement !== match) byId('refresh').focus({preventScroll: true});
 }
 function resetPage() { state.cursors = [null]; state.page = 0; state.next = null; }
 function range() { const to = Math.floor(Date.now() / 3600000) * 3600 + 3600; return {from: to - state.hours * 3600, to}; }

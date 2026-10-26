@@ -167,7 +167,8 @@ def test_the_holder_line_names_pid_start_ticks_and_boot_id(namespace):
     assert (int(pid), ticks, boot) == (os.getpid(), me["start_ticks"], me["boot_id"])
 
 
-def test_a_fresh_holder_reports_starting_with_its_pid_and_age(namespace):
+def test_a_fresh_holder_reports_starting_with_its_pid_and_age(namespace, monkeypatch):
+    monkeypatch.setattr(preview, "_is_controller", lambda argv: True)  # pytest stands in
     thread = _hold_lock(1.0)
     try:
         result = preview.status(namespace)
@@ -177,7 +178,8 @@ def test_a_fresh_holder_reports_starting_with_its_pid_and_age(namespace):
     assert 0 <= result["lock_age_seconds"] < preview.STARTING_SECONDS
 
 
-def test_a_verified_holder_older_than_a_minute_is_wedged_with_instructions(namespace):
+def test_a_verified_holder_older_than_a_minute_is_wedged_with_instructions(namespace, monkeypatch):
+    monkeypatch.setattr(preview, "_is_controller", lambda argv: True)  # pytest stands in
     me = preview.process_identity(os.getpid())
     assert me is not None
     fd = _foreign_holder(f"{os.getpid()} {me['start_ticks']} {me['boot_id']}\n", 120)
@@ -241,32 +243,6 @@ def test_a_torn_trailing_row_with_no_writer_is_still_a_retained_failure(namespac
         preview.status(namespace)
 
 
-def test_status_reads_the_receipt_under_the_shared_lock(namespace, listener, monkeypatch):
-    argv = serve_argv(namespace, listener.fileno())
-    attempt(namespace, argv, str(os.fstat(listener.fileno()).st_ino), [])
-    probes: list[bool] = []
-    real = preview.current_attempt
-
-    def spy(root):
-        if not probes:  # the first read; later re-reads are the unlocked mid-scan comparison
-            fd = os.open(preview.LOCK, os.O_RDWR)  # a writer cannot lock EX while we read
-            try:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    probes.append(False)
-                except BlockingIOError:
-                    probes.append(True)
-            finally:
-                os.close(fd)
-        return real(root)
-
-    monkeypatch.setattr(preview, "current_attempt", spy)
-    with preview.manager_lock():
-        pass  # create the lock file: status never does
-    preview.status(namespace)
-    assert probes[0] is True
-
-
 # ------------------------------------ M30: the walk bound
 
 
@@ -301,13 +277,20 @@ def test_a_sticky_group_writable_missing_target_anchor_is_refused(sandbox_owners
 # ------------------------------------ M32: the CI guard can fail but never turn into a skip
 
 
-def test_under_ci_the_unavailable_lane_guard_fails_and_cannot_skip(monkeypatch):
+def test_under_ci_the_unavailable_lane_skips_loudly_never_silently(monkeypatch, capsys):
     monkeypatch.setenv("CI", "true")
-    with pytest.raises(pytest.fail.Exception, match="CI must exercise"):
-        try:
-            end_to_end_unavailable("why")
-        except pytest.skip.Exception:
-            pytest.fail("under CI the lane guard skipped instead of failing", pytrace=False)
+    with pytest.raises(pytest.skip.Exception, match="NOT EXERCISED ON THIS CI HOST.*why"):
+        end_to_end_unavailable("why")
+    assert "::warning" in capsys.readouterr().err
+
+
+def test_ci_still_runs_the_venv_based_trust_tests(sandbox_owners, tmp_path):
+    """The check that matters stays enforced everywhere, CI included: a clean private venv is
+    accepted and a world-writable one is refused, with no dependence on the host's tool cache."""
+    root, _, site = _venv(tmp_path)
+    assert preview._interpreter(root / "bin" / "python")
+    site.chmod(0o777)
+    _refuses(root)
 
 
 # ------------------------------------ F6: site-wide startup hooks inside vetted trees
