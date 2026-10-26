@@ -172,6 +172,13 @@ sits upstream (NextDNS, AdGuard Home, another) only answers. Keep these roles se
 - **Upstream filtering resolver.** NextDNS is a cloud resolver whose profiles follow the owner away from home on devices configured to use it, with
   blocklists/threat categories and configurable log retention and storage region; AdGuard Home is a self-hosted LAN resolver with local logs and filters that does not
   leave home unless the owner exposes it through a VPN. Either can be dnsmasq's upstream.
+- **Couvre-feu boundary (checked against its docs, 2026-10-26).** Couvre-feu enforces by MAC on the router (fw3/iptables
+  forwarding rules and schedules) and, for child devices only, redirects IPv4 port 53 to the router and blocks DoT/DoQ and
+  known DoH addresses. It does no content or category filtering (that stays with the upstream resolver), it never changes
+  dnsmasq configuration, adult and control devices are unaffected, and roaming/cellular/VPN are outside its coverage. So
+  Vigie has guaranteed per-device DNS only for devices whose DNS is forced through the router; adult devices that use
+  NextDNS directly or DoH are invisible to the dnsmasq log and must show as DNS-coverage `degraded`. Couvre-feu's own
+  decision list (its D1-D6 build decisions) is unrelated to Vigie's owner gates D1-D6; do not conflate them.
 - **Provider logs as optional context.** Provider history is imported only by the read-only M2 adapter: raw events,
   explicit provider/time coverage, pagination, deduplication and timestamped attribution. If every home device queries
   through the router, the provider sees one client. Per-device names at the provider require a forwarder (for example
