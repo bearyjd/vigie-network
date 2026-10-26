@@ -10,6 +10,21 @@ const preview = new URLSearchParams(location.search).get('preview') === 'synthet
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
 function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
+// Which control inside #content holds focus, as tag + label + text + its rank among identical ones,
+// so a re-render can hand focus to the same logical control instead of dropping it to <body>.
+function focusSignature(el) { return [el.localName, el.getAttribute('aria-label') ?? '', el.textContent].join('\u0000'); }
+function focusedInContent() {
+  const box = byId('content'); const active = document.activeElement;
+  if (active === box || !box.contains(active)) return null;
+  const signature = focusSignature(active);
+  const same = [...box.querySelectorAll('*')].filter(el => focusSignature(el) === signature);
+  return {signature, rank: same.indexOf(active)};
+}
+function restoreContentFocus(held) {
+  if (!held) return;
+  const match = [...byId('content').querySelectorAll('*')].filter(el => focusSignature(el) === held.signature)[held.rank];
+  (match ?? byId('refresh')).focus({preventScroll: true});
+}
 function resetPage() { state.cursors = [null]; state.page = 0; state.next = null; }
 function range() { const to = Math.floor(Date.now() / 3600000) * 3600 + 3600; return {from: to - state.hours * 3600, to}; }
 function notice(message = '', retry = false) {
@@ -84,7 +99,8 @@ async function load(clear = false, focus = null, automatic = false) {
     }
     if (generation !== state.generation || !state.connected) return;
     if (automatic && interacting()) return;
-    state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice();
+    const held = focusedInContent();
+    state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice(); restoreContentFocus(held);
     if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});
   } catch (error) {
     if (generation !== state.generation || error instanceof StaleResult || error.name === 'AbortError') return;

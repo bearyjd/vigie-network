@@ -10,7 +10,9 @@ class FakeElement extends FakeNode {
   getAttribute(key) { return this.attrs.has(key) ? this.attrs.get(key) : null; }
   removeAttribute(key) { this.attrs.delete(key); if (key === 'disabled') this.disabled = false; }
   append(...items) { for (const item of items) { item.parent = this; this.children.push(item); } }
-  replaceChildren(...items) { for (const old of this.children) old.parent = null; this.children = []; this.append(...items); }
+  // Like a browser: removing the focused node (or an ancestor) drops focus to <body>.
+  replaceChildren(...items) { if (this.contains(document.activeElement) && document.activeElement !== this) document.activeElement = body; for (const old of this.children) old.parent = null; this.children = []; this.append(...items); }
+  get localName() { return this.tag; }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
   fire(type, event = {preventDefault() {}}) { for (const listener of this.listeners[type] || []) listener(event); }
   contains(other) { for (let n = other; n; n = n.parent) if (n === this) return true; return false; }
@@ -18,7 +20,7 @@ class FakeElement extends FakeNode {
   scrollIntoView() {}
   get textContent() { return this.children.map(c => (c instanceof FakeText ? c.data : c.textContent)).join(''); }
   set textContent(value) { for (const old of this.children) old.parent = null; this.children = []; if (value !== '') this.append(new FakeText(String(value))); }
-  matches(selector) { return selector.startsWith('[') ? this.attrs.has(selector.slice(1, -1)) : this.tag === selector; }
+  matches(selector) { if (selector === '*') return true; return selector.startsWith('[') ? this.attrs.has(selector.slice(1, -1)) : this.tag === selector; }
   querySelectorAll(selector) { const found = []; for (const c of this.children) if (c instanceof FakeElement) { if (c.matches(selector)) found.push(c); found.push(...c.querySelectorAll(selector)); } return found; }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
 }
@@ -50,7 +52,9 @@ function coverageBody(url) {
   const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
+let gate = null;  // when set, responses wait for it: a slow manual refresh
 globalThis.fetch = async url => {
+  if (gate) await gate;
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
@@ -132,13 +136,32 @@ clock += 61000; intervalTick(); mode = 'ok'; retry().focus(); retry().fire('clic
 assert.equal(notice.hidden, true);
 assert.equal(document.activeElement, elements['view-title'], 'a cleared notice hands focus to the view title');
 
+// CODEX-A: a slow MANUAL refresh that lands while keyboard focus sits on a content control must
+// restore focus to the same logical control, or to Refresh when that control is gone.
+mode = 'ok';
+const region = () => content.querySelector('[aria-label]');  // stands in for any labelled control
+assert.ok(region(), 'the overview renders a labelled element');
+let release; gate = new Promise(resolve => { release = resolve; });
+refresh.focus(); refresh.fire('click'); await flush();   // keyboard user presses Refresh; response is slow
+const before = region(); before.focus(); content.fire('focusin');   // ...then tabs into the content
+release(); gate = null; await flush();
+assert.notEqual(region(), before, 'content was re-rendered');
+assert.equal(document.activeElement, region(), 'focus returns to the same logical control');
+assert.equal(document.activeElement.getAttribute('aria-label'), before.getAttribute('aria-label'));
+const vanishing = new FakeElement('button'); vanishing.append(new FakeText('Gone after refresh')); content.append(vanishing);
+gate = new Promise(resolve => { release = resolve; }); refresh.fire('click'); await flush();
+vanishing.focus(); content.fire('focusin'); release(); gate = null; await flush();
+assert.equal(document.activeElement, refresh, 'a vanished control hands focus to Refresh, never <body>');
+body.focus();
+
 // J7: a notice rebuilt while focus is elsewhere in the page must not steal it.
 mode = '503';
 const keeper = content.querySelector('[data-live-current]'); keeper.focus(); assert.equal(document.activeElement, keeper);
 refresh.fire('click'); await flush();
 assert.equal(notice.hidden, false, 'the failed refresh shows a notice');
 assert.equal(document.activeElement, keeper, 'a notice that did not hold focus never takes it');
-mode = 'ok'; refresh.fire('click'); await flush(); assert.equal(document.activeElement, keeper);
+mode = 'ok'; refresh.fire('click'); await flush();
+assert.equal(document.activeElement, refresh, 'a vanished live label hands focus to Refresh, never <body>');
 body.focus();
 
 Date.now = realNow;
