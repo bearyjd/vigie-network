@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import builtins
+import io
 import json
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -166,3 +169,34 @@ def make_env(tmp_path: Path) -> Callable[..., Env]:
 @pytest.fixture
 def env(make_env: Callable[..., Env]) -> Env:
     return make_env(rate_limit_per_window=1000)
+
+
+REAL_PREVIEW_LOCK = "/tmp/vigie-gui-preview-18745.lock"  # noqa: S108 -- the path under guard.
+
+
+def _is_real_preview_lock(path) -> bool:
+    """True for any spelling (bytes, Path, `//`, `/./`, `..`, relative to the cwd) of the lock."""
+    try:
+        name = os.path.normpath(os.path.abspath(os.fsdecode(path)))
+        return "/" + name.lstrip("/") == REAL_PREVIEW_LOCK  # POSIX keeps a leading `//`
+    except (TypeError, ValueError):  # an int fd or other non-path: not a path spelling
+        return False
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_real_preview_lock(request, monkeypatch):
+    """GUI preview tests must never open the user's real preview lock (they patch LOCK)."""
+    if not request.module.__name__.startswith(("test_gui_preview", "gui_preview")):
+        return
+
+    def guard(real_open):
+        def guarded(path, *args, **kwargs):
+            if _is_real_preview_lock(path):
+                raise AssertionError(f"{request.node.nodeid} opened the real preview lock")
+            return real_open(path, *args, **kwargs)
+
+        return guarded
+
+    monkeypatch.setattr(os, "open", guard(os.open))
+    monkeypatch.setattr(io, "open", guard(io.open))
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
