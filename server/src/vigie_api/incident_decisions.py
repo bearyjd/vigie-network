@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from vigie_api.errors import ApiError
@@ -44,7 +44,9 @@ def attention(state: str, review: dict[str, Any] | None, now: float) -> bool:
 def parse_until(value: str, now: float, max_s: int) -> int:
     """Whole-second RFC 3339 UTC instant within [now + MIN_SNOOZE_S, now + max_s]."""
     if not _RFC3339_UTC.fullmatch(value):
-        raise ApiError(422, "invalid_until", "until must be RFC 3339 UTC, e.g. 2026-01-01T00:00:00Z")
+        raise ApiError(
+            422, "invalid_until", "until must be RFC 3339 UTC, e.g. 2026-01-01T00:00:00Z"
+        )
     try:
         instant = int(datetime.fromisoformat(value).timestamp())
     except (ValueError, OverflowError):

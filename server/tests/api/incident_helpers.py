@@ -49,8 +49,16 @@ def incident(
     return incident_id
 
 
-def post(env: Env, incident_id: str, action: str, body: dict[str, Any] | None = None, *,
-         collector: str = "c1", headers: dict[str, str] | None = None, auth: bool = True):  # fmt: skip
+def post(
+    env: Env,
+    incident_id: str,
+    action: str,
+    body: dict[str, Any] | None = None,
+    *,
+    collector: str = "c1",
+    headers: dict[str, str] | None = None,
+    auth: bool = True,
+):
     sent = {**(env.auth if auth else {}), **(headers or {})}
     return env.client.post(
         f"/incidents/{incident_id}/{action}",
