@@ -277,3 +277,21 @@ fn k38_aged_ctx_of_an_evicted_entry_leaves_a_tainted_stub() {
     close(&mut a, &mut out);
     assert!(fp(&out, A).is_empty(), "{out:?}");
 }
+
+// ---- per-pid slots are bounded: past the cap the oldest preamble goes stale ----
+
+#[test]
+fn r5_a_preamble_evicted_by_the_slot_cap_publishes_nothing_for_its_entry() {
+    let mut a = DhcpAssembler::default();
+    let mut lines = vec![range(100, 7), vendor(100, 7, "VA")];
+    // Four more processes open a preamble: the fifth slot evicts pid 100's.
+    lines.extend((1..=4).map(|i| range(200 + i, 9)));
+    lines.extend([
+        request(100, 7, "192.0.2.10", A),
+        ack(100, 7, "192.0.2.10", A, "ha"),
+        opts(100, 7, "1:netmask"),
+    ]);
+    let mut out = feed(&mut a, &lines);
+    close(&mut a, &mut out);
+    assert!(fp(&out, A).is_empty(), "{out:?}");
+}
