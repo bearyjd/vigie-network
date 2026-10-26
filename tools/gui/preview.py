@@ -44,6 +44,8 @@ STARTING_SECONDS = 60.0  # A holder this old is no longer "starting": it is wedg
 LOCK_WAIT_SECONDS = 2.0  # start/stop wait this long for a concurrent command; status never waits.
 LOCK_POLL_START = 0.001  # start/stop re-try the lock after this long, doubling up to the cap below,
 LOCK_POLL_CAP = 0.05  # so a burst of momentary status probes cannot keep them out.
+READ_RETRIES = 5  # a receipt read that fails with no writer is retried this often (5 ms, doubling)
+READ_RETRY_START = 0.005
 MAX_HOOK_BYTES = 65536  # A pinned startup hook larger than this is refused unread.
 # The only .pth files a vetted venv may carry besides plain directory lines: name -> sha256 of the
 # exact bytes. _virtualenv.pth: virtualenv/uv `import _virtualenv`. a1_coverage.pth: coverage's
@@ -383,17 +385,35 @@ def _holder(fd: int) -> dict | None:
     identity = process_identity(int(pid))
     if identity is None or identity["start_ticks"] != ticks or identity["boot_id"] != boot:
         return None
-    verified = identity["uid"] == os.getuid() and _is_controller(identity["argv"])
+    verified = identity["uid"] == os.getuid() and _is_controller(identity)
     return {"pid": int(pid), "start_ticks": ticks, "verified": verified}
 
 
-def _is_controller(argv: list[str]) -> bool:
-    """argv is `<interpreter> [flags] <this script> start|stop ...`."""
-    script = str(Path(__file__).resolve())
-    return any(
-        value == script and following in ("start", "stop")
-        for value, following in zip(argv, argv[1:], strict=False)
-    )
+_PLAIN_FLAGS = re.compile(r"-[IBsSEOqRu]+")  # interpreter flags that take no value
+
+
+def _is_controller(identity: dict) -> bool:
+    """Is this process running `<this script> start|stop`? (recognition, not lock ownership)
+
+    Parses the interpreter's argv: flags, then the script, then the action. `-c`/`-m` and any
+    flag taking a value are refused, so a program that merely lists the script name as an
+    argument never matches. A relative script resolves against the process's own cwd.
+    """
+    argv = identity["argv"]
+    position = 1
+    while position < len(argv) and argv[position].startswith("-"):
+        if not _PLAIN_FLAGS.fullmatch(argv[position]):
+            return False
+        position += 1
+    if position + 1 >= len(argv) or argv[position + 1] not in ("start", "stop"):
+        return False
+    script = Path(argv[position])
+    try:
+        if not script.is_absolute():
+            script = Path(os.readlink(f"/proc/{identity['pid']}/cwd")) / script
+        return script.resolve() == Path(__file__).resolve()
+    except OSError:
+        return False
 
 
 def _own_holder_line() -> str:
@@ -695,15 +715,32 @@ def _probe() -> LockBusy | None:
         return exc
 
 
+def _read_settled(common: dict, root: Path) -> tuple:
+    """(journal, rows, None), or (None, None, `starting`) while a start/stop holds the lock.
+
+    A read error is only corruption if it persists with no writer: a writer that finished between
+    this read's fstat and read leaves a valid receipt behind, so retry a few times with backoff.
+    """
+    delay = READ_RETRY_START
+    for retry in range(READ_RETRIES + 1):
+        try:
+            return (*current_attempt(root), None)
+        except (OSError, ValueError):
+            busy = _probe()
+            if busy is not None:
+                return None, None, _busy(common, busy)
+            if retry == READ_RETRIES:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")
+
+
 def _recheck(common: dict, root: Path, rows: list) -> dict | None:
     """`starting` if a start/stop is running, or changed the receipt, since `rows` were read."""
-    try:
-        _, again = current_attempt(root)
-    except (OSError, ValueError):  # a torn append is only an error when no writer is mid-append
-        exc = _probe()
-        if exc is None:
-            raise
-        return _busy(common, exc)
+    _, again, mid_flight = _read_settled(common, root)
+    if mid_flight is not None:
+        return mid_flight
     exc = _probe()
     if exc is not None:
         return _busy(common, exc)
@@ -725,13 +762,9 @@ def status(root: Path, *, locked: bool = False) -> dict:
         mid_flight = _probe()
         if mid_flight is not None:
             return _busy(common, mid_flight)
-        try:  # Unlocked read: a torn row or a changed receipt is caught by `_recheck` below.
-            journal, rows = current_attempt(root)
-        except (OSError, ValueError):
-            mid_flight = _probe()
-            if mid_flight is None:
-                raise
-            return _busy(common, mid_flight)
+        journal, rows, mid_flight = _read_settled(common, root)  # caught again by `_recheck`
+        if mid_flight is not None:
+            return mid_flight
     outcome = _classify(root, common, journal, rows)
     if not locked:  # Any scan-derived verdict is stale if a start/stop began meanwhile.
         return _recheck(common, root, rows) or outcome

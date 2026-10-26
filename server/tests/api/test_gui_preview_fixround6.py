@@ -27,6 +27,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     pidfd_support_for_offline_fixtures,
     preview,
     sandbox_owners,
+    serve_argv,
     sleeper,
 )
 from test_gui_preview_fixround3 import _pth
@@ -135,9 +136,10 @@ def test_a_pinned_name_is_still_opened_safely(sandbox_owners, tmp_path, monkeypa
 # ------------------------------------ C3: a matching identity is not lock ownership
 
 
-def _spawn(argv: list[str]) -> subprocess.Popen:
+def _spawn(argv: list[str], cwd: Path | None = None) -> subprocess.Popen:
     return subprocess.Popen(  # noqa: S603 -- throwaway test child, argv is ours.
         argv,
+        cwd=cwd,
         env={"PATH": "/usr/bin:/bin"},
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -148,7 +150,7 @@ def _spawn(argv: list[str]) -> subprocess.Popen:
 @pytest.fixture
 def children():
     spawned: list[subprocess.Popen] = []
-    yield lambda argv: spawned.append(_spawn(argv)) or spawned[-1]
+    yield lambda argv, cwd=None: spawned.append(_spawn(argv, cwd)) or spawned[-1]
     for child in spawned:
         child.kill()
         child.wait()
@@ -187,14 +189,19 @@ def test_an_unrelated_holder_is_not_named_as_the_owner_in_lock_errors(
     assert "holder" not in str(raised.value).replace("holds the lock", "")
 
 
-def _start_shaped(children, action: str):
-    code = "import time; time.sleep(60)"
-    return children([sys.executable, "-c", code, preview.__file__, action])
+def _start_shaped(children, action: str, tmp_path: Path, monkeypatch):
+    """A sleeper standing in for this controller script, launched as `python script action`."""
+    script = tmp_path / "controller.py"
+    script.write_text("import time\ntime.sleep(60)\n")
+    monkeypatch.setattr(preview, "__file__", str(script))
+    return children([sys.executable, "-I", "-B", str(script), action])
 
 
 @pytest.mark.parametrize("action", ["start", "stop"])
-def test_a_real_start_shaped_holder_older_than_a_minute_is_wedged(namespace, children, action):
-    holder = _start_shaped(children, action)
+def test_a_real_start_shaped_holder_older_than_a_minute_is_wedged(
+    namespace, children, action, tmp_path, monkeypatch
+):
+    holder = _start_shaped(children, action, tmp_path, monkeypatch)
     fd = _foreign_holder(_line(holder), 120)
     try:
         result = preview.status(namespace)
@@ -205,8 +212,10 @@ def test_a_real_start_shaped_holder_older_than_a_minute_is_wedged(namespace, chi
 
 
 @pytest.mark.parametrize("action", ["status", "seed", "serve", "reset"])
-def test_a_holder_running_another_action_is_unverified(namespace, children, action):
-    holder = _start_shaped(children, action)
+def test_a_holder_running_another_action_is_unverified(
+    namespace, children, action, tmp_path, monkeypatch
+):
+    holder = _start_shaped(children, action, tmp_path, monkeypatch)
     fd = _foreign_holder(_line(holder), 120)
     try:
         result = preview.status(namespace)
@@ -215,8 +224,10 @@ def test_a_holder_running_another_action_is_unverified(namespace, children, acti
     assert result["state"] == "starting" and result["unverified_holder_pid"] == holder.pid
 
 
-def test_a_start_shaped_holder_of_another_uid_is_unverified(namespace, children, monkeypatch):
-    holder = _start_shaped(children, "start")
+def test_a_start_shaped_holder_of_another_uid_is_unverified(
+    namespace, children, tmp_path, monkeypatch
+):
+    holder = _start_shaped(children, "start", tmp_path, monkeypatch)
     real = preview.process_identity
     monkeypatch.setattr(
         preview,
@@ -456,6 +467,8 @@ SPELLINGS = [
     "/tmp/vigie-gui-preview-18745.lock",  # noqa: S108 -- only compared, never opened.
     "/tmp/./vigie-gui-preview-18745.lock",  # noqa: S108
     "/tmp//vigie-gui-preview-18745.lock",  # noqa: S108
+    "//tmp/vigie-gui-preview-18745.lock",  # noqa: S108
+    b"//tmp/vigie-gui-preview-18745.lock",  # noqa: S108
     "/tmp/x/../vigie-gui-preview-18745.lock",  # noqa: S108
     b"/tmp/vigie-gui-preview-18745.lock",  # noqa: S108
     b"/tmp//./vigie-gui-preview-18745.lock",  # noqa: S108
@@ -508,8 +521,10 @@ def test_a_holder_line_with_the_wrong_start_ticks_names_nobody(namespace):
     assert "holder_pid" not in result and "unverified_holder_pid" not in result
 
 
-def test_a_verified_holder_is_not_wedged_before_the_sixty_second_threshold(namespace, children):
-    holder = _start_shaped(children, "start")
+def test_a_verified_holder_is_not_wedged_before_the_sixty_second_threshold(
+    namespace, children, tmp_path, monkeypatch
+):
+    holder = _start_shaped(children, "start", tmp_path, monkeypatch)
     fd = _foreign_holder(_line(holder), 30)  # N20: 30 s old, threshold is 60 s
     try:
         result = preview.status(namespace)
@@ -561,3 +576,122 @@ def test_an_unpinned_startup_hook_name_is_never_opened(sandbox_owners, tmp_path,
 
     monkeypatch.setattr(preview.os, "open", spy)
     _refuses(root)
+
+
+# ------------------------------------ round 6b: holder recognition parses the interpreter argv
+
+
+def _recognised(holder) -> bool:
+    identity = preview.process_identity(holder.pid)
+    assert identity is not None
+    return preview._is_controller(identity)
+
+
+def test_a_dash_c_process_that_merely_lists_the_script_is_not_the_controller(
+    children, tmp_path, monkeypatch
+):
+    script = tmp_path / "controller.py"
+    monkeypatch.setattr(preview, "__file__", str(script))
+    holder = children(
+        [sys.executable, "-I", "-B", "-c", "import time; time.sleep(60)", str(script), "start"]
+    )
+    assert not _recognised(holder)
+
+
+def test_a_dash_m_form_is_not_the_controller(children, tmp_path, monkeypatch):
+    script = tmp_path / "controller.py"
+    monkeypatch.setattr(preview, "__file__", str(script))
+    holder = children([sys.executable, "-m", "http.server", "0", str(script), "start"])
+    assert not _recognised(holder)
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_the_absolute_script_path_is_recognised(children, tmp_path, monkeypatch, action):
+    script = tmp_path / "controller.py"
+    script.write_text("import time\ntime.sleep(60)\n")
+    monkeypatch.setattr(preview, "__file__", str(script))
+    assert _recognised(children([sys.executable, "-I", "-B", str(script), action]))
+
+
+def test_the_documented_relative_invocation_is_recognised(children, tmp_path, monkeypatch):
+    script = tmp_path / "controller.py"
+    script.write_text("import time\ntime.sleep(60)\n")
+    monkeypatch.setattr(preview, "__file__", str(script))
+    holder = children([sys.executable, "controller.py", "start"], tmp_path)
+    assert _recognised(holder)
+
+
+def test_another_script_with_the_right_action_is_not_the_controller(
+    children, tmp_path, monkeypatch
+):
+    other = tmp_path / "other.py"
+    other.write_text("import time\ntime.sleep(60)\n")
+    monkeypatch.setattr(preview, "__file__", str(tmp_path / "controller.py"))
+    holder = children([sys.executable, str(other), "start"])
+    assert not _recognised(holder)
+    holder = children([sys.executable, "other.py", "start"], tmp_path)
+    assert not _recognised(holder)
+
+
+# ------------------------------------ round 6b: a writer finishing mid-read is not corruption
+
+
+def test_a_receipt_read_racing_a_finished_writer_is_retried_not_reported(
+    namespace, listener, monkeypatch
+):
+    argv = serve_argv(namespace, listener.fileno())
+    journal = attempt(namespace, argv, str(os.fstat(listener.fileno()).st_ino), [])
+    monkeypatch.setattr(preview, "listeners", lambda: set())
+    real_read = os.read
+    armed = [True]
+
+    def racing_read(fd, count):
+        if armed[0] and threading.current_thread() is threading.main_thread():
+            with contextlib.suppress(OSError):
+                if os.readlink(f"/proc/self/fd/{fd}") == str(journal):
+                    armed[0] = False
+
+                    def writer() -> None:
+                        with preview.manager_lock():
+                            preview.event(journal, {"state": "failed-before-spawn"})
+
+                    thread = threading.Thread(target=writer)
+                    thread.start()
+                    thread.join()
+        return real_read(fd, count)
+
+    monkeypatch.setattr(preview.os, "read", racing_read)
+    assert preview.status(namespace)["state"] == "stopped"  # the valid, now-terminal receipt
+
+
+def test_a_genuinely_torn_row_with_no_writer_still_ends_as_the_retained_failure(
+    namespace, listener
+):
+    argv = serve_argv(namespace, listener.fileno())
+    journal = attempt(namespace, argv, str(os.fstat(listener.fileno()).st_ino), [])
+    with journal.open("ab") as handle:
+        handle.write(b'{"state": "spa')
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="incomplete manager receipt"):
+        preview.status(namespace)
+    assert time.monotonic() - started < 1.0  # bounded retry
+
+
+# ------------------------------------ round 6b: the guard collapses leading slashes
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "//tmp/vigie-gui-preview-18745.lock",  # noqa: S108
+        "///tmp/vigie-gui-preview-18745.lock",  # noqa: S108
+        b"//tmp/vigie-gui-preview-18745.lock",  # noqa: S108
+        b"///tmp//./vigie-gui-preview-18745.lock",  # noqa: S108
+        Path("//tmp/vigie-gui-preview-18745.lock"),  # noqa: S108
+    ],
+    ids=repr,
+)
+def test_the_guard_predicate_sees_through_leading_slashes(spelling):
+    # The predicate only: a RED run must never open the real lock.
+    guard = sys.modules["conftest"]._is_real_preview_lock
+    assert guard(spelling)

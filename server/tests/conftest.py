@@ -177,7 +177,8 @@ REAL_PREVIEW_LOCK = "/tmp/vigie-gui-preview-18745.lock"  # noqa: S108 -- the pat
 def _is_real_preview_lock(path) -> bool:
     """True for any spelling (bytes, Path, `//`, `/./`, `..`, relative to the cwd) of the lock."""
     try:
-        return os.path.normpath(os.path.abspath(os.fsdecode(path))) == REAL_PREVIEW_LOCK
+        name = os.path.normpath(os.path.abspath(os.fsdecode(path)))
+        return "/" + name.lstrip("/") == REAL_PREVIEW_LOCK  # POSIX keeps a leading `//`
     except (TypeError, ValueError):  # an int fd or other non-path: not a path spelling
         return False
 
