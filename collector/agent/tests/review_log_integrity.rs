@@ -29,11 +29,11 @@ fn leases_from(lines: &[String]) -> usize {
     let mut n = 0;
     for s in lines {
         match parse_line(s) {
-            Some(ev) => n += usize::from(a.feed(&ev).is_some()),
+            Some(ev) => n += a.feed(&ev).len(),
             None => a.break_context(),
         }
     }
-    n
+    n + a.end_poll().len() + a.end_poll().len()
 }
 
 #[test]

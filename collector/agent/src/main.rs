@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 
 use vigie_agent::builder::{build, build_with_drops, BATCH_CAP};
 use vigie_agent::config::{load_key, parse_config, wipe, Config};
-use vigie_agent::dnsmasq::{parse_line, DhcpAssembler, DnsCorrelator, LogEvent};
+use vigie_agent::dnsmasq::{DhcpAssembler, DnsCorrelator};
 use vigie_agent::dropin::{check_dropin, QuietDetector};
 use vigie_agent::ids;
 use vigie_agent::leases::parse_leases;
-use vigie_agent::model::{Health, Lease, Meta, Neighbor, Sections};
-use vigie_agent::neigh::{ip_to_mac, pairing_changed};
+use vigie_agent::model::{Health, Meta, Neighbor, Sections};
+use vigie_agent::neigh::ip_to_mac;
 use vigie_agent::procstat::{read_rss_kb, read_status, root_refusal};
 use vigie_agent::runtime::{random, random_u64, read_neighbors, wall_ms, wall_secs};
 use vigie_agent::sender::{Engine, Identity, Tick, Transport};
@@ -32,6 +32,8 @@ use vigie_agent::transport::PinnedTransport;
 use vigie_agent::urgent::Urgent;
 use vigie_agent::window::{SnapshotDelta, Window, WindowClock};
 use vigie_agent::wiring::Sources;
+
+mod log_poll;
 
 const BUILD_TS: u64 = parse_build_ts(env!("VIGIE_BUILD_TS"));
 const DEFAULT_CONFIG: &str = "/etc/vigie/collector.conf";
@@ -145,57 +147,6 @@ impl Agent {
             rss_kb: read_rss_kb(),
             spool_batches: Some(self.engine.spool.len() as u64),
             uptime_s: Some(self.started.elapsed().as_secs()),
-        }
-    }
-
-    fn poll_log(&mut self, now: u64) {
-        match self.tail.poll() {
-            Ok(lines) => {
-                for line in &lines {
-                    match parse_line(line) {
-                        Some(ev) => {
-                            self.dns.feed(&ev, now);
-                            self.on_dhcp(&ev);
-                        }
-                        // Anything unparsed sits between packet lines: no attaching across it.
-                        None => self.dhcp.break_context(),
-                    }
-                }
-            }
-            Err(e) => eprintln!("dnsmasq log: {e}"),
-        }
-        for q in self.dns.take_ready(&self.ip_to_mac) {
-            self.window.add_dns(q);
-        }
-        for (kind, n) in self
-            .dns
-            .take_counts()
-            .into_iter()
-            .chain(self.tail.take_counts())
-        {
-            self.window.note_drops(&kind, n);
-        }
-    }
-
-    fn on_dhcp(&mut self, ev: &LogEvent) {
-        if let Some(lease) = self.dhcp.feed(ev) {
-            self.on_lease(lease);
-        }
-    }
-
-    fn on_lease(&mut self, lease: Lease) {
-        let new_mac = self.urgent.on_lease(&lease.mac, started_ms(self.started));
-        // The lease states the pairing now: a table that disagrees (address moved to this MAC,
-        // or not seen yet) is stale and would bill this device's traffic to the old owner.
-        let moved = pairing_changed(&self.ip_to_mac, &lease.ip, &lease.mac);
-        self.window.add_lease(lease);
-        // A new device always refreshes (its first queries must be attributed and its neighbor
-        // entry rides along); a changed pairing refreshes at most once per `REFRESH_MIN_S`.
-        if new_mac || (moved && self.sources.refresh_due(self.mono)) {
-            self.refresh_neighbors();
-        }
-        if new_mac {
-            self.push_identity();
         }
     }
 
@@ -439,7 +390,7 @@ fn run(cfg: Config, key: Vec<u8>, args: &Args) -> ExitCode {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use vigie_agent::model::DnsQuery;
+    use vigie_agent::model::{DnsQuery, Lease};
     use vigie_agent::sender::{Headers, HttpReply, TransportError};
 
     const MAC: &str = "aa:bb:cc:dd:ee:01";
@@ -572,6 +523,11 @@ mod tests {
         assert_eq!(leases[0].opt60, None);
         std::fs::remove_file(path).ok();
     }
+
+    mod dhcp_log_tests;
+    mod dhcp_split_prop;
+    mod dhcp_split_prop2;
+    mod dhcp_split_prop3;
 
     struct Recorder(Vec<Vec<u8>>);
 

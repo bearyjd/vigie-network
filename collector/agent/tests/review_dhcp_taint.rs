@@ -13,11 +13,14 @@ fn l(rest: &str) -> String {
 
 fn feed_all(lines: &[String]) -> Vec<Lease> {
     let mut a = DhcpAssembler::default();
-    lines
+    let mut out: Vec<Lease> = lines
         .iter()
         .filter_map(|s| parse_line(s))
-        .filter_map(|ev| a.feed(&ev))
-        .collect()
+        .flat_map(|ev| a.feed(&ev))
+        .collect();
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
+    out
 }
 
 #[test]

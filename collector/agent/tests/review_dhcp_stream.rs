@@ -23,6 +23,8 @@ fn run(lines: &[String]) -> Vec<Lease> {
             None => a.break_context(),
         }
     }
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     out
 }
 
