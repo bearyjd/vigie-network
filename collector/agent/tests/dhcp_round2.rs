@@ -231,13 +231,14 @@ fn acked_transactions_do_not_evict_a_live_one_early() {
         lp(1, &format!("1 DHCPREQUEST(br-lan) 192.0.2.10 {A}")),
         opts(1, 1, "3:router"),
     ];
-    // 200 finished transactions, then 60 more open ones: only 61 are live, far below the cap.
+    // 200 finished transactions, then 60 more open ones (of another process, so they do not
+    // displace the live one's attach context): only 61 are live, far below the cap.
     for x in 1000..1200 {
-        lines.push(lp(1, &format!("{x} DHCPREQUEST(br-lan) 192.0.2.11 {B}")));
-        lines.push(lp(1, &format!("{x} DHCPACK(br-lan) 192.0.2.11 {B}")));
+        lines.push(lp(2, &format!("{x} DHCPREQUEST(br-lan) 192.0.2.11 {B}")));
+        lines.push(lp(2, &format!("{x} DHCPACK(br-lan) 192.0.2.11 {B}")));
     }
     for x in 2000..2060 {
-        lines.push(lp(1, &format!("{x} DHCPREQUEST(br-lan) 192.0.2.11 {B}")));
+        lines.push(lp(2, &format!("{x} DHCPREQUEST(br-lan) 192.0.2.11 {B}")));
     }
     lines.push(lp(1, &format!("1 DHCPACK(br-lan) 192.0.2.10 {A}")));
     let got = feed(&mut a, &lines);

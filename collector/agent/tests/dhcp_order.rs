@@ -244,6 +244,8 @@ fn foreign_boundaries_discard_the_preamble() {
     }
 }
 
+// A same-pid unparsed line is covered by `dhcp_round5` (stray lines never cost a stored
+// fingerprint) and `dhcp_round6` (r6_m2_*), so it is not repeated in this list.
 #[test]
 fn foreign_boundaries_end_the_post_ack_context() {
     let foreign = [

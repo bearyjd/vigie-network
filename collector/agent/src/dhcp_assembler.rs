@@ -32,9 +32,16 @@
 //! - STALE and TAINTED both mean "nothing collected for this serial may be attributed to its
 //!   ACK": the ACK's lease carries "fingerprint not known", no block is opened, so the window
 //!   keeps the pair it stored and is never handed a vendor-less or truncated one. An entry goes
-//!   stale when its preamble or context is dropped unfinished: ageing, the cap, a line of its own
-//!   process that does not continue it, or an unparsed line (from ANY source: the line has no
-//!   trustworthy pid). It is tainted when a second MAC (or a MAC-less verb) used the serial.
+//!   stale when its preamble is dropped unfinished, or its context is dropped after it COLLECTED
+//!   OPTIONS (older order), by: ageing, the cap, a line of its own process that does not continue
+//!   it (a marker, another REQUEST, a query, an OFFER, an options line of another serial...), or
+//!   an unparsed line (from ANY source: the line has no trustworthy pid). A context that has
+//!   collected nothing yet (the real order's REQUEST..ACK) survives an unparsed line, and a
+//!   repeated marker of the same serial before any vendor/name line just restates the preamble
+//!   (two matching ranges). Trade-off: in the older order a context broken before its first
+//!   options line ends in a vendor-only close, which the window ignores only when the stored
+//!   vendor matches. The ACK that matches a context's key consumes it without staling.
+//!   It is tainted when a second MAC (or a MAC-less verb) used the serial.
 //!   A fresh marked `DHCPREQUEST` of the SAME MAC clears stale (a complete retransmission is
 //!   published); nothing clears a taint but the ACK that consumes the entry.
 //! - Only polls that read the log to its end age anything: a poll that stopped at its byte
@@ -66,7 +73,11 @@
 //! - Same-IP supersede across pids can cost a victim's fingerprint (availability only), and a
 //!   sniffed serial can be used to poison a victim's entry (test
 //!   `attacker_cannot_poison_victim_fingerprint_with_same_xid`): availability only.
-//! - The line formats and their order are derived from a synthetic fixture, not a live capture.
+//! - The line formats and their order are derived from a synthetic fixture, not a live capture:
+//!   no live capture exists to confirm them.
+//! - TCP-DNS forked children may log under the parent's pid or under their own pid; lines logged
+//!   under a pid other than the DHCP packet's are treated as foreign (unparsed lines stale only
+//!   contexts that collected options, plus preambles), so this costs availability at worst.
 //!
 //! Lines this module deliberately does not recognise make the open preamble and context of the
 //! log stale (fingerprint lost, never leaked): a `user class:` line between vendor class and
@@ -277,9 +288,13 @@ impl DhcpAssembler {
     /// keeps the pair it stored. Held blocks are untouched (the line may be foreign): they end
     /// by their own process's next line, by inactivity, a gap or a supersede.
     pub fn break_context(&mut self) {
-        let keys: Vec<Key> = (self.ctxs.drain(..).map(|c| c.key))
-            .chain(self.pres.drain(..).map(|p| p.key))
-            .collect();
+        let keys: Vec<Key> = (self
+            .ctxs
+            .drain(..)
+            .filter(|c| c.opts_started)
+            .map(|c| c.key))
+        .chain(self.pres.drain(..).map(|p| p.key))
+        .collect();
         for k in keys {
             self.entry(&k).go_stale();
         }
@@ -358,13 +373,24 @@ impl DhcpAssembler {
     /// when the line does not directly continue it).
     fn attach_target(&mut self, key: &Key) -> Option<(&mut DhcpPartial, &mut bool)> {
         if &self.ctx.as_ref()?.key != key {
-            self.ctx = None;
+            self.drop_ctx(None);
             return None;
         }
         let c = self.ctx.as_mut()?;
         c.polls = 0;
         let p = self.partial.get_mut(key)?;
         (!p.unusable() && p.mac == c.mac).then_some((p, &mut c.opts_started))
+    }
+
+    /// Drops the attach context of the line being fed, unless it is `keep`'s. A context that
+    /// already collected options and is dropped by a line that does not continue it leaves a
+    /// possibly truncated list behind: its entry goes stale, so its ACK publishes nothing.
+    fn drop_ctx(&mut self, keep: Option<&Key>) {
+        if let Some(c) = self.ctx.take() {
+            if c.opts_started && Some(&c.key) != keep {
+                self.entry(&c.key).go_stale();
+            }
+        }
     }
 
     /// Feeds one event of the dnsmasq process without a known pid (pid 0).
@@ -402,6 +428,15 @@ impl DhcpAssembler {
         // A line that continues one is activity: it restarts that state's idle count.
         let pre = match self.pre.take() {
             Some(p) if continues_preamble(ev, pid, &p.key) => Some(Preamble { polls: 0, ..p }),
+            // A repeated marker of the same packet (two matching ranges) before any vendor or
+            // name line restates the preamble: nothing was collected, nothing is lost.
+            Some(p)
+                if p.class.is_none()
+                    && p.name.is_none()
+                    && matches!(ev, LogEvent::DhcpPacketStart { id } if same(pid, id, &p.key)) =>
+            {
+                None
+            }
             // Anything else ends the preamble unfinished: nothing is published for its entry.
             Some(p) => {
                 self.entry(&p.key).go_stale();
@@ -419,7 +454,7 @@ impl DhcpAssembler {
         let key = |id: &String| (pid, id.clone());
         match ev {
             LogEvent::DhcpPacketStart { id } => {
-                self.ctx = None;
+                self.drop_ctx(None);
                 // The marked packet restates the whole fingerprint: whatever an earlier,
                 // possibly interrupted attempt of this serial left is cleared right here.
                 if let Some(p) = self.partial.get_mut(&key(id)) {
@@ -433,6 +468,7 @@ impl DhcpAssembler {
                 });
             }
             LogEvent::DhcpRequest { id, mac, discover } => {
+                self.drop_ctx(Some(&key(id)));
                 self.on_request(&key(id), mac, *discover, pre.as_ref());
             }
             // dnsmasq may split a long list over several lines (assumed); accumulate.
@@ -477,25 +513,25 @@ impl DhcpAssembler {
             },
             // Neutral: every context survives only if it is this key's; none is created here.
             LogEvent::DhcpTags { id } => {
-                self.ctx = self
-                    .ctx
-                    .take()
-                    .filter(|c| c.key == key(id))
-                    .map(|c| Context { polls: 0, ..c });
+                if self.ctx.as_ref().is_some_and(|c| c.key != key(id)) {
+                    self.drop_ctx(None);
+                }
+                self.ctx = self.ctx.take().map(|c| Context { polls: 0, ..c });
                 self.pre = pre;
                 self.post = post;
             }
             LogEvent::DhcpBoundary { id, poison } => {
-                self.ctx = None;
+                // Same serial (DISCOVER..OFFER): the options so far are that packet's, complete.
+                self.drop_ctx(Some(&key(id)));
                 if *poison {
                     self.entry(&key(id)).taint();
                 }
             }
             LogEvent::DhcpAck { id, mac, ip, name } => {
-                self.ctx = None;
+                self.drop_ctx(Some(&key(id)));
                 out.extend(self.on_ack(&key(id), mac, ip, name.as_deref()));
             }
-            LogEvent::Query { .. } | LogEvent::Answer { .. } => self.ctx = None,
+            LogEvent::Query { .. } | LogEvent::Answer { .. } => self.drop_ctx(None),
         }
         out
     }
@@ -542,7 +578,7 @@ impl DhcpAssembler {
             p.taint();
         }
         let host = name.or(p.name.as_deref());
-        let published = !p.opt55.is_empty();
+        let published = !p.opt55.is_empty() && !p.unusable();
         let known: (&[u8], Option<&str>) = if published {
             (&p.opt55, p.class.as_deref())
         } else {
