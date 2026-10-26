@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -13,7 +13,15 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from vigie_api import effective, feeds, identity_writes, monitoring, tokens, writes
+from vigie_api import (
+    effective,
+    feeds,
+    identity_writes,
+    incident_decisions,
+    monitoring,
+    tokens,
+    writes,
+)
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
 from vigie_api.errors import ApiError, envelope, error_envelope
@@ -29,7 +37,10 @@ from vigie_api.models import (
     EventsResponse,
     HealthResponse,
     IdentityState,
+    IncidentDecisionResponse,
+    IncidentDecisionWrite,
     IncidentResponse,
+    IncidentSnoozeWrite,
     IncidentsResponse,
     MacResponse,
     PatchResponse,
@@ -208,6 +219,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         return check_auth(request, authorization)
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
+    RequestId = Annotated[
+        str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    ]
 
     @app.get(
         "/healthz", tags=["health"], summary="Liveness (unauthenticated)",
@@ -312,6 +326,67 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         if row is None:
             raise ApiError(404, "incident_not_found", "incident not found")
         return envelope(monitoring.incident_row(inv, ov, row))
+
+    incident_errors = _errors(401, 403, 404, 409, 413, 422, 429, 503)
+    incident_description = (
+        "Human review of one monitoring incident (overrides-side overlay; the pipeline's incident "
+        "state is untouched). `expected_version` is the incident's decision version (0 when it "
+        "has none); a stale value is a 409 `version_conflict`. Errors: 404 `incident_not_found`, "
+        "409 `incident_not_open` (snooze on a resolved/superseded incident), 409 `no_decision` "
+        "(clear with nothing to clear), 409 `idempotency_conflict`."
+    )
+
+    @app.post(
+        "/incidents/{incident_id}/snooze",
+        tags=["monitoring"],
+        description=incident_description + " Snooze needs an open incident and `until`.",
+        response_model=IncidentDecisionResponse,
+        responses=incident_errors,
+    )
+    def snooze_incident(
+        incident_id: DeviceId,
+        body: IncidentSnoozeWrite,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        x_request_id: RequestId = None,
+    ):
+        now = clock()
+        until = incident_decisions.parse_until(body.until, now, settings.incident_snooze_max_s)
+        return envelope(
+            incident_decisions.decide(
+                inv, ov, incident_id=incident_id, collector_id=collector_id, action="snooze",
+                body=body, until=until, principal=principal, now=now, now_iso=iso_utc(now),
+                request_id=x_request_id,
+            )  # fmt: skip
+        )
+
+    @app.post(
+        "/incidents/{incident_id}/{action}",
+        tags=["monitoring"],
+        description=incident_description + " `clear` deletes the decision (un-snooze).",
+        response_model=IncidentDecisionResponse,
+        responses=incident_errors,
+    )
+    def decide_incident(
+        incident_id: DeviceId,
+        action: Literal["acknowledge", "mark-expected", "clear"],
+        body: IncidentDecisionWrite,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        collector_id: Annotated[str, Query(min_length=1, max_length=64)],
+        x_request_id: RequestId = None,
+    ):
+        now = clock()
+        return envelope(
+            incident_decisions.decide(
+                inv, ov, incident_id=incident_id, collector_id=collector_id, action=action,
+                body=body, until=None, principal=principal, now=now, now_iso=iso_utc(now),
+                request_id=x_request_id,
+            )  # fmt: skip
+        )
 
     @app.get(
         "/devices",
@@ -466,9 +541,6 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
         return envelope(items, page={"next_cursor": nxt})
 
-    RequestId = Annotated[
-        str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
-    ]
     write_errors = _errors(401, 403, 404, 409, 410, 413, 422, 429, 503)
     pipeline_config = PipelineConfig.from_env()
     write_description = (

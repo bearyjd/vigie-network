@@ -411,3 +411,33 @@ class IncidentsResponse(_Envelope):
 
 class IncidentResponse(_Envelope):
     data: IncidentOut
+
+
+class IncidentDecisionWrite(BaseModel):
+    """Per-incident review write; the version is the incident's own decision version (0 = none)."""
+
+    model_config = ConfigDict(extra="forbid")
+    expected_version: Version
+
+
+class IncidentSnoozeWrite(IncidentDecisionWrite):
+    until: str = Field(
+        max_length=40,
+        description="RFC 3339 UTC instant (`Z` or `+00:00`, whole seconds) between now + 60 s "
+        "and now + the configured snooze cap (7 days by default).",
+    )
+
+
+class IncidentDecisionResult(BaseModel):
+    incident_id: str
+    status: Literal["acknowledged", "snoozed", "expected"] | None = Field(
+        description="Null after `clear`."
+    )
+    snooze_until: str | None
+    version: int = Field(description="The incident's decision version; 0 once cleared.")
+    decided_by: str
+    decided_at: str
+
+
+class IncidentDecisionResponse(_Envelope):
+    data: IncidentDecisionResult
