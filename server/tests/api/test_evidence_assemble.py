@@ -205,6 +205,22 @@ def test_incidents_keep_only_allowlisted_evidence_fields(env: Env):
     assert items[0]["state"] == "open" and items[0]["observed_bytes"] == 1073741824
 
 
+def test_incident_lineage_is_wrapped_as_sensitive(env: Env):
+    seed_device(env)
+    incident(env, "i1")
+    item = build(env).body["sections"]["incidents"]["items"][0]
+    assert item["lineage"] == Sensitive("lineage", "line")
+    assert item["evidence"]["lineage"] == Sensitive("lineage", "line")
+
+
+def test_signal_refs_must_look_like_service_kinds():
+    from vigie_api.evidence_determinations import _signal
+
+    good = _signal({"kind": "mdns", "service": "_airplay._tcp", "observed_at": 5})
+    bad = _signal({"kind": "mdns", "service": "x y<script>", "observed_at": 5})
+    assert good["ref"] == "_airplay._tcp" and bad["ref"] is None
+
+
 def test_incident_evidence_with_wrong_types_is_dropped_field_by_field(env: Env):
     seed_device(env)
     incident(env, "i1")
