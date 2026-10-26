@@ -39,7 +39,7 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line_pid(s) {
             Some((pid, ev)) => out.extend(a.feed_pid(pid, &ev)),
-            None => out.extend(a.break_context()),
+            None => a.break_context(),
         }
     }
     out
@@ -49,7 +49,6 @@ fn polls(a: &mut DhcpAssembler, n: usize) -> Vec<Lease> {
 }
 fn close(a: &mut DhcpAssembler, out: &mut Vec<Lease>) {
     out.extend(polls(a, 2));
-    out.extend(a.break_context());
 }
 type Fp = Vec<(Vec<u8>, Option<String>)>;
 /// (options, vendor class) of every publication of `mac` that carries a fingerprint.
@@ -221,7 +220,9 @@ fn an_interrupted_marked_retry_does_not_inherit_the_previous_attempt() {
             .all(|l| l.hostname.is_none() && l.opt60.as_deref() != Some("OLD")),
         "{out:?}"
     );
-    assert_eq!(fp(&out, A), vec![(vec![6], None)], "{out:?}");
+    // The unrecognised line between marker and request leaves the entry stale: nothing is
+    // published for it (a vendor-less list would overwrite the stored pair).
+    assert!(fp(&out, A).is_empty(), "{out:?}");
 }
 
 // ---- OPUS-F2 / F4: superseding ----
@@ -258,7 +259,7 @@ fn a_verified_ack_for_another_ip_leaves_the_block_alone() {
 
 #[test]
 fn an_unverified_ack_never_supersedes_a_block() {
-    // pid 200 ACKs MAC A / the same IP with no REQUEST of that MAC on its serial: tainted.
+    // pid 200 ACKs another MAC (B) at the same IP with no matching REQUEST on its serial: tainted.
     let mut a = DhcpAssembler::default();
     let mut lines = vec![
         range(100, 7),
@@ -267,9 +268,9 @@ fn an_unverified_ack_never_supersedes_a_block() {
         ack(100, 7, "192.0.2.10", A, "ha"),
         opts(100, 7, "1:netmask"),
     ];
-    lines.push(ack(200, 9, "192.0.2.10", A, "x"));
-    lines.push(request(200, 11, "192.0.2.10", B));
-    lines.push(ack(200, 11, "192.0.2.10", A, "y"));
+    lines.push(ack(200, 9, "192.0.2.10", B, "x"));
+    lines.push(request(200, 11, "192.0.2.10", A));
+    lines.push(ack(200, 11, "192.0.2.10", B, "y"));
     let mut out = feed(&mut a, &lines);
     close(&mut a, &mut out);
     assert_eq!(fp(&out, A), full(&[1], "vend-a"), "{out:?}");
@@ -303,7 +304,7 @@ fn a_marked_request_drops_options_logged_after_the_discover() {
 // ---- OPUS-M21: an unparsed line publishes every held block ----
 
 #[test]
-fn r4_unparsed_line_publishes_all_held_blocks() {
+fn an_unparsed_line_publishes_no_held_block_they_age_out_instead() {
     let mut a = DhcpAssembler::default();
     let mut lines = vec![
         range(100, 7),
@@ -318,7 +319,9 @@ fn r4_unparsed_line_publishes_all_held_blocks() {
         opts(200, 8, "3:router"),
     ];
     lines.push("this line is not dnsmasq".to_string());
-    let out = feed(&mut a, &lines);
+    let mut out = feed(&mut a, &lines);
+    assert!(fp(&out, A).is_empty() && fp(&out, B).is_empty(), "{out:?}");
+    close(&mut a, &mut out);
     assert_eq!(fp(&out, A), full(&[1], "va"), "{out:?}");
     assert_eq!(fp(&out, B), full(&[3], "vb"), "{out:?}");
 }

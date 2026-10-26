@@ -98,7 +98,8 @@ fn split_requested_option_lines_accumulate() {
         .filter_map(|l| parse_line(l))
         .flat_map(|e| a.feed(&e))
         .collect();
-    leases.extend(a.break_context());
+    leases.extend(a.end_poll());
+    leases.extend(a.end_poll());
     let lease = leases.pop().unwrap();
     assert_eq!(lease.opt55, vec![1, 3, 6, 15, 28]);
 }

@@ -41,7 +41,7 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line_pid(s) {
             Some((pid, ev)) => out.extend(a.feed_pid(pid, &ev)),
-            None => out.extend(a.break_context()),
+            None => a.break_context(),
         }
     }
     out
@@ -50,7 +50,8 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
 fn run(lines: &[String]) -> Vec<Lease> {
     let mut a = DhcpAssembler::default();
     let mut out = feed(&mut a, lines);
-    out.extend(a.break_context());
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     out
 }
 fn head(x: u32, mac: &str, v: &str) -> Vec<String> {
@@ -123,7 +124,8 @@ fn a_gap_in_the_middle_of_the_block_publishes_nothing() {
     got.extend(feed(&mut a, &[opts(1, "6:dns-server")]));
     got.extend(a.end_poll());
     got.extend(a.end_poll());
-    got.extend(a.break_context());
+    got.extend(a.end_poll());
+    got.extend(a.end_poll());
     assert_eq!(got.len(), 1, "only the ACK lease: {got:?}");
     assert!(no_fp(&got[0]));
 }
@@ -139,7 +141,8 @@ fn a_block_open_on_a_quiet_log_closes_after_one_more_poll() {
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].opt55, vec![1]);
     assert!(a.end_poll().is_empty(), "published once");
-    assert!(a.break_context().is_empty());
+    a.break_context();
+    assert!(a.end_poll().is_empty());
 }
 
 #[test]
@@ -331,7 +334,8 @@ fn a_vendor_only_close_does_not_shrink_a_stored_pair_of_the_same_vendor() {
     win.add_lease(Lease::new(A, "192.0.2.10", None, &[1, 3], Some("v")).unwrap());
     let mut a = DhcpAssembler::default();
     let mut got = feed(&mut a, &head(1, A, "v"));
-    got.extend(a.break_context());
+    got.extend(a.end_poll());
+    got.extend(a.end_poll());
     assert_eq!(got.len(), 2);
     for lease in got {
         win.add_lease(lease);

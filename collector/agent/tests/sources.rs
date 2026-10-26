@@ -202,7 +202,8 @@ fn dhcp_fixture_assembles_leases_with_fingerprint() {
         .filter_map(parse_line)
         .flat_map(|ev| a.feed(&ev))
         .collect();
-    leases.extend(a.break_context());
+    leases.extend(a.end_poll());
+    leases.extend(a.end_poll());
     assert_eq!(leases.len(), 7);
     let l = &leases[0];
     assert_eq!(l.mac, "c2:11:22:33:44:01");

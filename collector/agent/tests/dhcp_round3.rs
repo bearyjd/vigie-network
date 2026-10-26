@@ -44,7 +44,7 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line_pid(s) {
             Some((pid, ev)) => out.extend(a.feed_pid(pid, &ev)),
-            None => out.extend(a.break_context()),
+            None => a.break_context(),
         }
     }
     out
@@ -52,7 +52,6 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
 fn close(a: &mut DhcpAssembler, out: &mut Vec<Lease>) {
     out.extend(a.end_poll());
     out.extend(a.end_poll());
-    out.extend(a.break_context());
 }
 fn run(lines: &[String]) -> Vec<Lease> {
     let mut a = DhcpAssembler::default();
@@ -319,10 +318,19 @@ fn a_preamble_ages_out_after_two_eof_polls() {
         close(&mut a, &mut out);
         out
     };
-    assert!(run_with(true).iter().all(|l| l.opt60.is_none()));
-    assert!(run_with(false)
-        .iter()
-        .any(|l| l.opt60.as_deref() == Some("v")));
+    let set = |eof| {
+        run_with(eof)
+            .iter()
+            .map(|l| (l.opt55.clone(), l.opt60.clone()))
+            .collect::<Vec<_>>()
+    };
+    // Aged out: only the ACK's fingerprint-less lease, nothing from the unusable entry.
+    assert_eq!(set(true), vec![(vec![], None)]);
+    // Never aged (budget-stopped polls): the ACK lease, then the whole block with its vendor.
+    assert_eq!(
+        set(false),
+        vec![(vec![], None), (vec![1], Some("v".to_string()))]
+    );
 }
 
 // ---- killers for earlier surviving mutants ----
@@ -359,7 +367,6 @@ fn k09_own_new_preamble_wins_over_a_held_foreign_one() {
 #[test]
 fn k29_foreign_ack_inside_old_order_ctx_keeps_the_attach() {
     let lines = vec![
-        request(100, 7, "192.0.2.10", A),
         request(200, 9, "192.0.2.12", C),
         request(100, 7, "192.0.2.10", A),
         ack(200, 9, "192.0.2.12", C, "c"),

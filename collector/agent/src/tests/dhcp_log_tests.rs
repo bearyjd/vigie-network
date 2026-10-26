@@ -78,7 +78,7 @@ fn an_overlong_line_between_ack_and_options_leaves_the_fingerprint_empty() {
 }
 
 #[test]
-fn a_complete_block_is_published_once_by_an_unparsed_line_or_the_second_poll() {
+fn a_complete_block_is_published_once_by_the_second_poll_never_by_an_unparsed_line() {
     let (mut a, path) = log_agent("close");
     append(
         &path,
@@ -91,13 +91,16 @@ fn a_complete_block_is_published_once_by_an_unparsed_line_or_the_second_poll() {
     let closed = lease_of(&leases(&mut a), MAC_A);
     assert_eq!(closed.opt55, vec![1, 3]);
     assert_eq!(closed.opt60.as_deref(), Some("vendor-a"));
-    // A foreign line after the options finishes the block within the same poll.
+    // A foreign line after the options does not finish the block (it may sit mid-list).
     append(
         &path,
         &(packet(2, MAC_B, "vendor-b") + &opts(2, "6:dns-server")),
     );
     append(&path, "not a dnsmasq line\n");
     a.poll_log(3);
+    let held = lease_of(&leases(&mut a), MAC_B);
+    assert!(held.opt55.is_empty() && held.opt60.is_none(), "{held:?}");
+    a.poll_log(4);
     let b = lease_of(&leases(&mut a), MAC_B);
     assert_eq!(
         (b.opt55.clone(), b.opt60.as_deref()),

@@ -23,8 +23,7 @@ impl Agent {
                         }
                         // Anything unparsed sits between packet lines: no attaching across it.
                         None => {
-                            let done = self.dhcp.break_context();
-                            self.on_leases(done);
+                            self.dhcp.break_context();
                         }
                     }
                 }

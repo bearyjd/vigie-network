@@ -45,7 +45,8 @@ fn run(lines: &[String]) -> Vec<Lease> {
     let mut a = DhcpAssembler::default();
     let mut out = feed(&mut a, lines);
     // End of the stream finishes a block that is still open.
-    out.extend(a.break_context());
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     out
 }
 fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
@@ -53,7 +54,7 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line(s) {
             Some(ev) => out.extend(a.feed(&ev)),
-            None => out.extend(a.break_context()),
+            None => a.break_context(),
         }
     }
     out
@@ -247,7 +248,6 @@ fn foreign_boundaries_discard_the_preamble() {
 fn foreign_boundaries_end_the_post_ack_context() {
     let foreign = [
         dns(1),
-        l("1 some unknown line"),
         l("2 tags: br-lan"),
         opts(2, "9:x"),
         range(1),

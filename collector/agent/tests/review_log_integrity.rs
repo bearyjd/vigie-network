@@ -30,10 +30,10 @@ fn leases_from(lines: &[String]) -> usize {
     for s in lines {
         match parse_line(s) {
             Some(ev) => n += a.feed(&ev).len(),
-            None => n += a.break_context().len(),
+            None => a.break_context(),
         }
     }
-    n + a.break_context().len()
+    n + a.end_poll().len() + a.end_poll().len()
 }
 
 #[test]

@@ -18,7 +18,8 @@ fn feed_all(lines: &[String]) -> Vec<Lease> {
         .filter_map(|s| parse_line(s))
         .flat_map(|ev| a.feed(&ev))
         .collect();
-    out.extend(a.break_context());
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     out
 }
 

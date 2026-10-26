@@ -39,7 +39,7 @@ fn feed(a: &mut DhcpAssembler, lines: &[String]) -> Vec<Lease> {
     for s in lines {
         match parse_line_pid(s) {
             Some((pid, ev)) => out.extend(a.feed_pid(pid, &ev)),
-            None => out.extend(a.break_context()),
+            None => a.break_context(),
         }
     }
     out
@@ -50,7 +50,6 @@ fn run(lines: &[String]) -> Vec<Lease> {
     let mut out = feed(&mut a, lines);
     out.extend(a.end_poll());
     out.extend(a.end_poll());
-    out.extend(a.break_context());
     out
 }
 /// The option lists of the leases that carry a fingerprint.
@@ -273,7 +272,8 @@ fn a_gap_after_the_request_detaches_older_order_options() {
             lp(1, &format!("7 DHCPACK(br-lan) 192.0.2.10 {A}")),
         ],
     ));
-    out.extend(a.break_context());
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     assert!(fps(&out).is_empty(), "{out:?}");
 }
 
@@ -287,7 +287,6 @@ fn a_gap_inside_the_post_ack_block_discards_it_unpublished() {
     out.extend(feed(&mut a, &[opts(1, 7, "3:router")]));
     out.extend(a.end_poll());
     out.extend(a.end_poll());
-    out.extend(a.break_context());
     assert!(fps(&out).is_empty(), "{out:?}");
 }
 
@@ -310,6 +309,7 @@ fn a_gap_inside_the_preamble_drops_the_vendor() {
             opts(1, 7, "1:netmask"),
         ],
     ));
-    out.extend(a.break_context());
+    out.extend(a.end_poll());
+    out.extend(a.end_poll());
     assert!(out.iter().all(|l| l.opt60.is_none()), "{out:?}");
 }
