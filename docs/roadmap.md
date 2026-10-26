@@ -20,6 +20,7 @@ features remain unimplemented until their own acceptance evidence exists.
 | M1b | Local overview, device charts/history, coverage panel and incident inbox | Queued after M1a API/data contracts; necessary for the eventual monitoring MVP |
 | M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Phase 1 done: per-incident acknowledge / snooze / mark-expected / clear in the API (see [api](api.md#incidents-and-review-lifecycle)). Scoped exceptions, notifications and GUI writes are deferred; external delivery needs a configured owner-controlled destination |
 | M2 | Time-of-day patterns, destination/port novelty, essential-device absence, network-wide shifts, incident correlation and calibrated characterization | Queued after sufficient qualified history and owner-labeled evaluation |
+| M2b | Exposure and suspicious-traffic evidence: device-type known-issue notes from imported CVE data, local blocklist/reputation DNS matches, read-only provider DNS verdicts | Proposal only. Starts with device-identity quality and an offline blocklist match; every external dataset needs the source, license and false-positive review below |
 | M3 | Multiple network/VLAN scopes and optional external Zeek/Suricata metadata adapters | Queued after approved sensor placement and measured traffic visibility |
 | M4 | Drift models and optional AI explanations/classifiers | Conditional on demonstrated benefit over deterministic rules and an explicit privacy/resource review |
 
@@ -112,6 +113,56 @@ visible. Retry delivery with stable IDs and bounded backoff; test outage/restart
 Default external notifications contain a device label and incident link, not raw DNS history/destination details.
 ntfy delivery and topic ownership remain gated by D5; the local inbox works without a configured publisher.
 
+## Exposure and suspicious-traffic evidence (M2b proposal)
+
+Goal: help the owner see which devices may be exposed to known vulnerabilities and which traffic looks like it
+could be malicious, as **evidence with confidence labels**. Nothing here is a verdict. A match never blocks
+traffic, never changes a group or trust, and never merges identities; enforcement stays with Couvre-feu. This is
+a proposal: no code, dataset import, provider call or notification exists for it, and it needs the owner decisions D7-D9.
+
+Phases, each shippable and reviewed on its own:
+1. **Identity quality first.** CVE-style matching needs vendor/product (ideally version). Measure how many
+   inventory devices have a usable vendor, product or service signal (DHCP fingerprint, mDNS/service
+   characterization, OUI for non-randomized MACs) and show the unknowns honestly. Passive router-side data rarely
+   gives firmware versions, so most matches will be type-level.
+2. **Local DNS reputation match.** Match the router-local parsed DNS queries (already collected per device) against
+   an imported, versioned blocklist/reputation list. Output: an explainable incident (`detector=dns_reputation`) with
+   the device label, window, list name and version, match count, and likely benign explanations, using the existing
+   incident lifecycle (acknowledge, snooze, mark expected). No query text leaves the LAN. Bounded lists, bounded
+   scans, and a quality latch when DNS coverage is partial.
+3. **Known-issue notes.** Import an offline CVE dataset (for example NVD data and a known-exploited list) with recorded
+   source, date, license and checksum. Map a device's vendor/product signal to candidate advisories and show them as
+   "device type may be affected" notes with a confidence level, never as "vulnerable". Prefer exploited-in-the-wild
+   entries first to keep noise low. A human can mark a note expected or not applicable, with an audit entry.
+4. **Provider verdict context.** A read-only adapter for resolver logs (see NextDNS below) that adds the provider's
+   block/category verdict and roaming-device visibility as separately labelled context.
+5. **Sensor evidence (M3).** Zeek/Suricata EVE metadata for protocol-level indicators, only after sensor placement is approved.
+
+Constraints that apply to every phase:
+- Imports are manual or explicitly scheduled, versioned, checksummed and reversible; the Tower keeps working with no
+  network access. No telemetry, no cloud lookups of household data, no remote LLM.
+- Record source, license, refresh date and false-positive notes for each dataset before import (existing rule).
+- Incidents reuse the existing lifecycle and rate budgets; an alert budget and a cold-start disclosure apply.
+- Tests: fixture-replayed lists with benign and malicious domains, list-update and rollback, partial-DNS-coverage
+  abstention, duplicate/overlapping sources, and a negative suite proving a match never changes trust or groups.
+
+### Resolver role: NextDNS, AdGuard Home and Vigie
+
+Vigie's per-device DNS truth is the router-local dnsmasq log, which records which device asked. Whatever resolver
+sits upstream (NextDNS, AdGuard Home, another) only answers. Keep these roles separate:
+- **Local dnsmasq log (Vigie source).** Device attribution, coverage flags and baselines come from here.
+- **Upstream filtering resolver.** NextDNS is a cloud resolver with profiles that follow the owner away from home and
+  blocklists/threat categories; AdGuard Home is a self-hosted LAN resolver with local logs and filters that does not
+  leave home unless the owner exposes it through a VPN. Either can be dnsmasq's upstream.
+- **Provider logs as optional context.** Provider history is imported only by the read-only M2 adapter: raw events,
+  explicit provider/time coverage, pagination, deduplication and timestamped attribution. If every home device queries
+  through the router, the provider sees one client, so device names there need client-info forwarding; even then no
+  automatic identity merge and no training of the router-local baseline on cloud history (existing rule).
+- **Recommendation to settle in D8:** keep NextDNS for roaming and threat-category filtering, keep the router's
+  dnsmasq as the single home DNS entry point so Vigie attributes queries per device, and add AdGuard Home only if the
+  owner wants provider-independent local logs or a self-hosted filter. A hybrid (AdGuard Home at home, a NextDNS
+  profile on roaming devices) avoids a hard choice. This changes no Vigie code; it changes which context sources exist.
+
 ## Privacy, coverage and operating budgets
 
 Keep collection/analysis local by default; no remote LLM, reputation lookup or cloud reporting without a separate
@@ -158,6 +209,9 @@ Review each unit independently, then run the whole chain and collect deployment 
 
 D1 authoritative couvre-feu tree; D2 dnsmasq-change policy; D3 fixed-MAC policy for kid/adult devices;
 D4 server placement; D5 notification topic/ownership; D6 person IDs remain unresolved owner gates.
+Proposed new gates for M2b: D7 acceptable offline dataset import cadence (manual vs scheduled) and sources; D8 resolver strategy
+(NextDNS, AdGuard Home or hybrid) and whether provider logs may be read; D9 whether type-level known-issue notes are wanted
+or only version-exact matches.
 This roadmap does not resolve them, approve PRP-002, authorize router commands or change enforcement policy.
 A future lease-only collection mode avoids dnsmasq changes but loses fingerprint/DNS evidence; show that tradeoff
 rather than promising identical coverage. Safe fixture-driven development can proceed while field-dependent
