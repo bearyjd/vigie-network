@@ -221,6 +221,12 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         return check_auth(request, authorization)
 
     Principal = Annotated[tokens.Principal, Depends(authenticate)]
+
+    def writer(principal: Principal) -> tokens.Principal:
+        principal.require_write()  # a dependency: runs before body validation, so 403 not 422
+        return principal
+
+    Writer = Annotated[tokens.Principal, Depends(writer)]
     RequestId = Annotated[
         str | None, Header(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
     ]
@@ -352,13 +358,12 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
     def snooze_incident(
         incident_id: DeviceId,
         body: IncidentSnoozeWrite,
-        principal: Principal,
+        principal: Writer,
         inv: Inv,
         ov: Ov,
         collector_id: Annotated[str, Query(min_length=1, max_length=64)],
         x_request_id: RequestId = None,
     ):
-        principal.require_write()  # before validating `until`: a non-writer always sees 403
         now = clock()
         until = incident_decisions.parse_until(body.until)
         return envelope(
@@ -390,7 +395,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         incident_id: DeviceId,
         action: Literal["acknowledge", "mark-expected", "clear"],
         body: IncidentDecisionWrite,
-        principal: Principal,
+        principal: Writer,
         inv: Inv,
         ov: Ov,
         collector_id: Annotated[str, Query(min_length=1, max_length=64)],

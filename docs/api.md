@@ -233,7 +233,9 @@ detail) has `decision_version`: send it as `expected_version`. It stays above 0 
 - Idempotency: only an explicit `X-Request-ID` replays: the first result for an identical body, and
   `409 idempotency_conflict` for a different one. Without it every call is applied or refused on its
   `expected_version` alone, so a stale retry is always `409 version_conflict`, never a replay. The
-  incident must belong to `collector_id` (else 404) before any replay is served.
+  incident must belong to `collector_id` (else 404) before any replay is served. The receipt key
+  includes the action and incident, so reusing one request id for another action or incident is an
+  independent request, not a conflict. A non-writer token gets 403 before the body is validated.
 - Audit: `monitoring.incident.acknowledge | snooze | mark_expected | clear`, target the incident id,
   with the before/after review and the copied incident identity. `GET /events` shows these with
   `device_id: null` and the incident id in the summary.

@@ -218,7 +218,8 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
           snooze_until INTEGER,
           version INTEGER NOT NULL CHECK (version>=1),
           decided_by TEXT NOT NULL, decided_at TEXT NOT NULL, id TEXT NOT NULL,
-          CHECK ((status='snoozed') = (snooze_until IS NOT NULL))
+          CHECK ((status='snoozed') = (snooze_until IS NOT NULL)),
+          CHECK (status IS NOT NULL OR snooze_until IS NULL)
         )""",
         "CREATE INDEX idx_incident_decisions_decided ON incident_decisions(decided_at)",
         # retention scan position; one row, rewritten by every incident write

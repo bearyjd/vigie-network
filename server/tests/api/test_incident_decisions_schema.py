@@ -29,3 +29,11 @@ def test_table_enforces_status_and_snooze_pairing(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         insert(ov, "bogus", None)
     assert ov.execute("PRAGMA index_list(incident_decisions)").fetchall()
+
+
+def test_a_cleared_tombstone_cannot_carry_a_snooze(tmp_path):
+    ov = open_overrides(tmp_path / "o2.db")
+    insert(ov, None, None)
+    ov.execute("DELETE FROM incident_decisions")
+    with pytest.raises(sqlite3.IntegrityError):
+        insert(ov, None, 5)

@@ -200,3 +200,23 @@ def test_cursor_is_bound_to_the_state_filter(e):
     for other in ({}, {"state": "resolved"}):
         r = e.get("/incidents", collector_id="c1", limit=1, cursor=cursor, **other)
         assert (r.status_code, r.json()["error"]["code"]) == (400, "invalid_cursor")
+
+
+DAY = 86400
+
+
+def test_retention_window_is_exactly_120_days(e):
+    incident(e, "inc1")
+    put(e, "young", "acknowledged", decided_at=until(-119 * DAY))
+    put(e, "edge", "acknowledged", decided_at=until(-120 * DAY))
+    put(e, "old", "acknowledged", decided_at=until(-120 * DAY - 1))
+    assert post(e, "inc1", "acknowledge").status_code == 200
+    left = {d["incident_id"] for d in decisions(e)}
+    assert {"young", "edge"} <= left and "old" not in left
+
+
+def test_state_filter_applies_with_device_filter(e):
+    incident(e, "open1")
+    incident(e, "r", state="resolved", lineage="l2")
+    got = e.get("/incidents", collector_id="c1", device_id="d1", state="open").json()
+    assert [i["id"] for i in got["data"]] == ["open1"]

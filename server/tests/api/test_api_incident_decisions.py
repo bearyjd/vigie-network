@@ -74,11 +74,11 @@ def test_clear_leaves_a_tombstone_and_needs_a_decision(e):
 
 def test_two_concurrent_writers_one_wins_one_409(e):
     with ThreadPoolExecutor(2) as pool:
-        codes = sorted(
-            r.status_code
-            for r in pool.map(lambda a: post(e, "inc1", a), ["acknowledge", "mark-expected"])
-        )
-    assert codes == [200, 409]
+        results = list(pool.map(lambda a: post(e, "inc1", a), ["acknowledge", "mark-expected"]))
+    assert sorted(r.status_code for r in results) == [200, 409]
+    (loser,) = [r for r in results if r.status_code == 409]
+    assert loser.json()["error"]["code"] == "version_conflict"
+    assert loser.json()["error"]["current_version"] == 1
     assert len(decisions(e)) == 1
 
 
@@ -370,3 +370,44 @@ def test_snooze_cap_below_the_minimum_lead_is_rejected_at_startup(tmp_path):
     with pytest.raises(ValueError):
         Settings(data_dir=tmp_path, incident_snooze_max_s=60)
     assert Settings(data_dir=tmp_path, incident_snooze_max_s=120).incident_snooze_max_s == 120
+
+
+def test_stale_retry_replays_only_with_an_explicit_request_id(e):
+    rid = {"X-Request-ID": "r-ack"}
+    first = post(e, "inc1", "acknowledge", {"expected_version": 0}, headers=rid)
+    post(e, "inc1", "mark-expected", {"expected_version": 1})
+    stale = post(e, "inc1", "acknowledge", {"expected_version": 0})
+    assert stale.status_code == 409 and stale.json()["error"]["current_version"] == 2
+    replay = post(e, "inc1", "acknowledge", {"expected_version": 0}, headers=rid)
+    assert replay.status_code == 200 and replay.json() == first.json()
+    assert [d["status"] for d in decisions(e)] == ["expected"]
+
+
+def test_request_id_is_per_action_and_incident(e):
+    incident(e, "inc2", lineage="l2")
+    rid = {"X-Request-ID": "shared"}
+    assert post(e, "inc1", "acknowledge", headers=rid).status_code == 200
+    assert post(e, "inc1", "mark-expected", {"expected_version": 1}, headers=rid).status_code == 200
+    assert post(e, "inc2", "acknowledge", headers=rid).status_code == 200
+    assert [d["status"] for d in decisions(e)] == ["expected", "acknowledged"]
+
+
+@pytest.mark.parametrize("body", [{}, {"expected_version": "x"}, {"bogus": 1}])
+@pytest.mark.parametrize("action", ["acknowledge", "snooze", "mark-expected", "clear"])
+def test_non_writer_gets_403_before_body_validation(e, action, body):
+    _, token = tokens.create_token(e.ov, "rd", scope="read-only")
+    r = post(e, "inc1", action, body, headers={"Authorization": f"Bearer {token}"})
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden")
+
+
+def test_tombstone_row_is_no_review_but_keeps_its_version(e):
+    e.ov.execute(
+        "INSERT INTO incident_decisions (incident_id,collector_id,device_id,lineage,detector,"
+        "episode_start,status,snooze_until,version,decided_by,decided_at,id)"
+        " VALUES ('inc1','c1','d1','line','large_upload',1,NULL,NULL,5,'app:test','x','x')"
+    )
+    data = e.get("/incidents/inc1", collector_id="c1").json()["data"]
+    assert (data["review"], data["decision_version"], data["attention"]) == (None, 5, True)
+    no = post(e, "inc1", "clear", {"expected_version": 5})
+    assert (no.status_code, no.json()["error"]["code"]) == (409, "no_decision")
+    assert post(e, "inc1", "acknowledge", {"expected_version": 5}).json()["data"]["version"] == 6

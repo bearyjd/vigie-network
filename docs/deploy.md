@@ -137,6 +137,7 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   history is in `audit_log`. Each incident write deletes up to 100 rows whose `decided_at` is older
   than 120 days and whose incident the pipeline has already pruned (incidents live 90 days).
   `VIGIE_API_INCIDENT_SNOOZE_MAX_S` caps a snooze (default 604800 = 7 days, minimum 120).
+  `api_write_receipts` (all human-write idempotency records) has no retention and grows with writes.
   The scan position is kept in `incident_decision_prune`. Overrides schema 7 changed before any
   release: recreate an `overrides.db` migrated by an earlier branch build of it.
 - Event and hostname retention (PRP section 9, 90 days) is **not implemented**: no setting exists, so
