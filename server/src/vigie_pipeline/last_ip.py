@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from vigie_pipeline.config import ACTIVITY_MAX_REPORT_LAG_S, ACTIVITY_SKEW_S
+from vigie_pipeline.config import ACTIVITY_SKEW_S
 
 if TYPE_CHECKING:
     from vigie_pipeline.sources import MacActivity
@@ -24,17 +24,23 @@ def address_candidate(
     The raw lease/neighbour stamp is the collector's batch window end. It is a
     snapshot observation time, not a DHCP lease expiry or server receipt time.
     """
-    if received_ts is None or not (
-        received_ts - ACTIVITY_MAX_REPORT_LAG_S <= stamp <= received_ts + ACTIVITY_SKEW_S
-    ):
+    # No lower lag bound: the upsert is monotonic by stamp, so a late batch cannot
+    # win over newer data, and the delta-only collector never re-sends a pairing.
+    if received_ts is None or stamp > received_ts + ACTIVITY_SKEW_S:
         return None
     try:
-        if "%" in raw:
-            return None
         ip = ipaddress.ip_address(raw)
-    except ValueError:
+    except ValueError:  # includes scoped "fe80::1%eth0" spellings
         return None
-    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or str(ip) == "255.255.255.255":
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (
+        ip.is_unspecified
+        or ip.is_multicast
+        or ip.is_loopback
+        or ip.is_link_local
+        or (ip.version == 4 and (ip.is_reserved or ip.packed[0] == 0))  # 240/4 incl. broadcast, 0/8
+    ):
         return None
     return stamp, int(source == "lease"), str(ip), source
 

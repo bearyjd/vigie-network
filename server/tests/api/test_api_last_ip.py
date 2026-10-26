@@ -83,3 +83,22 @@ def test_page_projection_is_one_indexed_query_and_does_not_scan_unrelated_device
     assert all(v["last_observed_ip"] for v in got)
     # The selected member IDs are the returned page, not the whole inventory.
     assert "d39" not in queries[0]
+
+
+def test_equal_timestamp_lease_beats_neighbour_across_member_macs(env: Env):
+    env.device("a")
+    env.mac(MAC_A, "a")
+    env.mac(MAC_B, "a")
+    ip(env, MAC_A, "192.168.1.10", 100, "lease")
+    ip(env, MAC_B, "192.168.1.20", 100, "neigh")
+    assert env.get("/devices/a").json()["data"]["last_observed_ip"] == "192.168.1.10"
+
+
+def test_alias_alone_on_page_shows_group_address(env: Env):
+    env.device("a")
+    env.device("b", status="transient")
+    env.mac(MAC_A, "a")
+    ip(env, MAC_A, "192.168.1.10", 100)
+    env.link("b", "a")
+    got = env.get("/devices", include_aliases=1, status="transient").json()["data"]
+    assert [v["last_observed_ip"] for v in got] == ["192.168.1.10"], got
