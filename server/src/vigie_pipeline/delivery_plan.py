@@ -36,7 +36,7 @@ version, but only the SENDER CONTRACT keeps two transmissions from overlapping: 
 timeout no longer than `transmit_deadline_seconds`, a call to `may_transmit()` right before the
 network call (abort without transmitting if it is false); recording the result before the lease
 lapses is what avoids a duplicate (a late completion is harmless to the table, being fenced by
-version and `created_at`); `lease_seconds >= 2 * transmit_deadline_seconds` then guarantees a
+`(row_id, version)`); `lease_seconds >= 2 * transmit_deadline_seconds` then guarantees a
 contract-abiding sender is done before any Reclaim. Sender and planner must share one clock. A
 sender that violates its timeout can cause a duplicate (the receiver cannot detect it). The
 planner NEVER touches a live `sending` row and an announcement in flight counts as not yet sent

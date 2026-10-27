@@ -395,3 +395,39 @@ def test_a_failed_pass_names_the_delivery_and_row_to_look_at(conn):
     assert "Enqueue affected 0 rows" in message
     assert f"delivery_id={delivery_id('i1', 'open')}" in message and "row_id=" in message
     assert fetch(conn)[("i1", "open")].version == 5  # nothing else changed
+
+
+def test_a_fractional_failure_time_does_not_let_the_pull_in_shorten_the_backoff(conn):
+    """Codex: a failure at 1000.1 scheduled 1061, but updated_at was truncated to 1000, so planning
+    at 1000.2 rebuilt 1060 and a claim succeeded early. One rounded-up integer now does both."""
+    base = NOW  # 100_000_000
+    conn.execute(*sql.statement(Enqueue("i1", "open", base), base))
+    conn.execute(sql.CLAIM, sql.claim_params(fetch(conn)[("i1", "open")], base, CFG))
+    claimed = fetch(conn)[("i1", "open")]
+    statement, params = sql.failure_statement(claimed, base + 0.1, CFG)
+    assert conn.execute(statement, params).rowcount == 1
+    row = fetch(conn)[("i1", "open")]
+    assert (row.updated_at, row.next_attempt_at) == (base + 1, base + 61)  # the same rounded now
+    assert plan([inc()], {}, [row], base + 0.2, CFG) == ()  # nothing moves it earlier
+    assert conn.execute(sql.CLAIM, sql.claim_params(row, base + 60, CFG)).rowcount == 0
+    assert conn.execute(sql.CLAIM, sql.claim_params(row, base + 61, CFG)).rowcount == 1
+
+
+def test_planning_never_shortens_a_retry_deadline_whatever_the_fractions(conn):
+    for attempts in (1, 2, 3, 5):
+        for failed_at in (0.0, 0.1, 0.5, 0.9, 0.999):
+            conn.execute("DELETE FROM incident_deliveries")
+            conn.execute(*sql.statement(Enqueue("i1", "open", NOW), NOW))
+            conn.execute("UPDATE incident_deliveries SET attempts=?", (attempts - 1,))
+            row = fetch(conn)[("i1", "open")]
+            conn.execute(sql.CLAIM, sql.claim_params(row, NOW, CFG))
+            claimed = fetch(conn)[("i1", "open")]
+            conn.execute(*sql.failure_statement(claimed, NOW + failed_at, CFG))
+            stored = fetch(conn)[("i1", "open")]
+            for step in (0.0, 0.2, 0.7, 1.0, 1.9, 5.0):
+                later = NOW + failed_at + step
+                actions = plan([inc()], {}, [stored], later, CFG)
+                assert all(
+                    getattr(a, "next_attempt_at", stored.next_attempt_at) >= stored.next_attempt_at
+                    for a in actions
+                ), (attempts, failed_at, step, actions)

@@ -225,6 +225,11 @@ The planner never touches a live `sending` row (no expiry, suppress, reschedule,
 forget). Whatever changed during the send (an ack, a snooze, a resolve or a reopen) is applied on
 the next pass, once the row is `sent` or `pending` again.
 
+**Time.** `now` is rounded up to an integer once, at the boundary (`delivery_sql.tick`), and that
+one integer stamps `updated_at` and anchors every deadline (lease end, backoff, snooze), so
+`updated_at + backoff(attempts)` can never undershoot a stored deadline whatever the fractional
+clock says.
+
 **Incarnations.** A statement keyed by a row matches `row_id = :row_id AND version = :version`.
 `row_id` is AUTOINCREMENT, so SQLite never reuses one, even after a Forget: a recreated delivery
 (same `delivery_id`) is a different row, and a claim token taken from an earlier incarnation can
@@ -303,19 +308,21 @@ WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:now
 -- sender: the send succeeded (claim token: row_id and version)
 UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
 WHERE row_id=:row_id AND state='sending' AND version=:version
- 
 
 -- sender: the send failed, retry later (next_attempt_at from the claimed row)
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
 WHERE row_id=:row_id AND state='sending' AND version=:version
- 
 
 -- sender: the send failed and the budget is spent
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
 WHERE row_id=:row_id AND state='sending' AND version=:version
- 
 ```
+
+**Maintenance.** A future migration that rebuilds `incident_deliveries` by copy, drop and rename
+must carry the `sqlite_sequence` counter over (or run with no claim in flight), or `row_id`s would
+restart and an old claim token could match a new row. Restoring an older database backup while a
+sender holds a claim has the same effect: stop the senders first.
 
 **Sender checklist (unit 4b).** Acceptance test: a fake transport with a HUNG transport.
 
@@ -357,8 +364,9 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
   (a row is inserted as `suppressed`, so history exists). Suppressed rows are re-checked every
   pass, so a cleared decision (or a cleared `NULL`-status row) requeues the delivery.
 - A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
-  row is due at the verdict, but never before its cumulative backoff (`updated_at` plus the
-  backoff for its attempts) and never later: a cleared or shortened snooze pulls it in, even if it
+  row is due at the verdict, but never before its cumulative backoff (after a failure, that is
+  `attempts > 0`: `updated_at` plus the backoff for its attempts) and never later: a cleared or
+  shortened snooze pulls it in, even if it
   was parked at the old snooze end by a Reclaim, while a longer snooze pushes it out. A lapsed
   claim that is acknowledged keeps the retry deadline a Reclaim would have used, so an ack followed
   by a clear cannot skip the backoff.

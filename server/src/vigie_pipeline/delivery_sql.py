@@ -113,19 +113,16 @@ WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:now
 
 COMPLETE_SENT = """\
 UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
-WHERE row_id=:row_id AND state='sending' AND version=:version
- """
+WHERE row_id=:row_id AND state='sending' AND version=:version"""
 
 COMPLETE_RETRY = """\
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
-WHERE row_id=:row_id AND state='sending' AND version=:version
- """
+WHERE row_id=:row_id AND state='sending' AND version=:version"""
 
 COMPLETE_FAILED = """\
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
-WHERE row_id=:row_id AND state='sending' AND version=:version
- """
+WHERE row_id=:row_id AND state='sending' AND version=:version"""
 
 ALL_SQL = (
     ENQUEUE_INSERT, SUPPRESS_INSERT, SUPPRESS_UPDATE, RESCHEDULE_UPDATE, REQUEUE_UPDATE,
@@ -134,10 +131,16 @@ ALL_SQL = (
 )  # fmt: skip
 
 
+def tick(now: float) -> int:
+    """The one integer time convention: `now` is rounded UP once, here, and that integer stamps
+    `updated_at` and anchors every deadline (so `updated_at + backoff` never undershoots one)."""
+    return math.ceil(now)
+
+
 def statement(a: Action, now: float) -> tuple[str, dict]:
     """The SQL and named parameters that apply one planned action."""
     p: dict = {"id": delivery_id(a.incident_id, a.kind), "incident_id": a.incident_id}
-    p |= {"kind": a.kind, "now": int(now)}
+    p |= {"kind": a.kind, "now": tick(now)}
     if a.expected is not None:
         p |= {"state": a.expected.state, "attempts": a.expected.attempts}
         p |= {"version": a.expected.version, "row_id": a.expected.row_id}
@@ -166,7 +169,7 @@ def claim_params(row: DeliveryView, now: float, config: DeliveryConfig) -> dict:
     return {
         "row_id": row.row_id,
         "version": row.version,
-        "now": int(now),
+        "now": tick(now),
         "lease_seconds": config.lease_seconds,
         "max_attempts": config.max_attempts,
     }
@@ -174,7 +177,7 @@ def claim_params(row: DeliveryView, now: float, config: DeliveryConfig) -> dict:
 
 def completion_params(claimed: DeliveryView, now: float) -> dict:
     """Parameters of the COMPLETE_* statements: `claimed` is the row as CLAIM left it."""
-    return {"row_id": claimed.row_id, "version": claimed.version, "now": int(now)}
+    return {"row_id": claimed.row_id, "version": claimed.version, "now": tick(now)}
 
 
 def failure_statement(

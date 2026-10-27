@@ -189,7 +189,7 @@ class World:
     # ---- events -------------------------------------------------------------------------
     def ev_new(self):
         self.next_id += 1
-        detected = int(self.now) - self.rnd.randint(0, 3600)
+        detected = math.ceil(self.now) - self.rnd.randint(0, 3600)
         self.inc[f"i{self.next_id}"] = {"state": "open", "detected": detected, "present": True}
 
     def ev_transition(self):
@@ -284,12 +284,13 @@ class World:
         count = self.store.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg))
         assert count == 1, ("a due pending row must be claimable", key, d)
         claimed, life = self.rows[key], self.life.get(key, 0)
-        lease_end = int(self.now) + self.cfg.lease_seconds  # independent oracle for CLAIM
+        lease_end = math.ceil(self.now) + self.cfg.lease_seconds  # independent oracle for CLAIM
         assert (claimed.state, claimed.next_attempt_at) == ("sending", lease_end), claimed
         assert claimed.attempts == d.attempts + 1 and claimed.version == d.version + 1, claimed
         late = self.rnd.choice([0, 0, 0, self.cfg.transmit_deadline_seconds])  # a stalled sender
         allowed = may_transmit(claimed.updated_at, self.now + late, self.cfg)
-        assert allowed == (late < self.cfg.transmit_deadline_seconds), ("may_transmit", late)
+        elapsed = self.now + late - claimed.updated_at  # updated_at is the rounded-up claim time
+        assert allowed == (elapsed < self.cfg.transmit_deadline_seconds), ("may_transmit", late)
         if not allowed:
             self._observe()
             return Token(claimed, False, life)  # aborts without transmitting
@@ -427,6 +428,24 @@ class World:
             self._fire(self.zombies.pop())
             return
 
+    def ev_park_and_clear(self):
+        """A claim lapses while its incident is snoozed, so the row is parked at the snooze end;
+        then the snooze is cleared and the row must come back to its backoff-based due time."""
+        for iid, s in sorted(self.inc.items()):
+            key, row = (iid, "open"), self.rows.get((iid, "open"))
+            if not (s["present"] and s["state"] == "open" and row and key not in self.inflight):
+                continue
+            if not self._due(key, row):
+                continue
+            self.inflight[key] = self._claim(key, row)
+            self._crash(key)
+            self.reviews[iid] = ReviewView("snoozed", self.now + 7 * DAY)
+            self._advance(self.cfg.lease_seconds + 1)
+            self.ev_pass()  # the lapsed claim is parked at the snooze end
+            self.reviews.pop(iid, None)
+            self.ev_pass()  # cleared: it is pulled back in
+            return
+
     def ev_retry_flap(self):
         """A recover send fails (a retry is queued), then the incident flaps: Withdraw, Revive."""
         for key, d in sorted(self.rows.items()):
@@ -453,9 +472,12 @@ class World:
         assert count == expect, ("completion matches its own claim only", key, claimed, count)
         if count == 0:
             return
-        assert self.rows[key].updated_at == int(self.now), ("completion stamps updated_at", key)
+        assert self.rows[key].updated_at == math.ceil(self.now), (
+            "completion stamps updated_at",
+            key,
+        )
         if success and key[1] == "open":
-            self.owed_at[key[0]] = int(self.now)
+            self.owed_at[key[0]] = math.ceil(self.now)
         self._observe()
         check_transitions(before, self.rows)
 
@@ -501,9 +523,9 @@ class World:
         for a in actions:  # every planner UPDATE stamps updated_at
             row = self.rows.get((a.incident_id, a.kind))
             if a.expected is not None and not isinstance(a, Forget | Withdraw | Revive) and row:
-                assert row.updated_at == int(self.now), ("updated_at not stamped", a, row)
+                assert row.updated_at == math.ceil(self.now), ("updated_at not stamped", a, row)
             if isinstance(a, Withdraw | Revive):
-                assert self.rows[(a.incident_id, a.kind)].updated_at == int(self.now), a
+                assert self.rows[(a.incident_id, a.kind)].updated_at == math.ceil(self.now), a
         for (
             a
         ) in actions:  # a lapsed claim that is suppressed keeps the retry deadline a Reclaim has
@@ -519,7 +541,7 @@ class World:
 
     def _probe_claim_guards(self, d):
         """On scratch copies, CLAIM refuses a row that is not due, out of budget or stale."""
-        now = int(self.now)
+        now = math.ceil(self.now)
         breaks = {
             "not due": "UPDATE incident_deliveries SET next_attempt_at=:now+5",
             "out of budget": "UPDATE incident_deliveries SET attempts=:max",
@@ -541,7 +563,7 @@ class World:
                 "DELETE FROM incident_deliveries WHERE kind='recover' AND incident_id=:i",
                 {"i": a.incident_id},
             )
-            now = int(self.now)
+            now = math.ceil(self.now)
             probe.add(DeliveryView(a.incident_id, "recover", state, 1, now + 9, now, now, 0))
             assert probe.run(*sql.statement(a, self.now)) == 0, ("sibling guard", state, a)
 
@@ -623,24 +645,27 @@ class World:
             assert self.since is None or detected >= self.since, ("watermark", a)  # (j)
 
     def _check_pending_rows(self, skip=()):
-        """After a fresh pass, nothing pending contradicts the current decision."""
+        """Nothing pending contradicts the current decision. A cleared decision has no review at
+        all, so an absent review is a loud one."""
         for (iid, kind), d in self.rows.items():
             inc, review = self.inc[iid], self.reviews.get(iid)
             if kind != "open" or d.state != "pending" or not inc["present"] or (iid, kind) in skip:
                 continue
-            if inc["state"] != "open" or review is None:
+            if inc["state"] != "open":
                 continue
-            assert review.status not in QUIET, ("pending while quiet", iid, review)
-            until = review.snooze_until
-            loud = review.status is None or (review.status == "snoozed" and self.now >= until)
-            if loud and isinstance(until, int | float | type(None)):
+            until = review.snooze_until if review else None
+            numeric = isinstance(until, int | float)
+            if review is not None:
+                assert review.status not in QUIET, ("pending while quiet", iid, review)
+            cleared = review is None or (review.status is None and until is None)
+            elapsed = review is not None and review.status == "snoozed" and numeric
+            if cleared or (elapsed and self.now >= until):
                 bound = math.ceil(self.now)  # a loud row is due no later than its backoff allows
                 if d.attempts > 0:
                     bound = max(bound, math.ceil(d.updated_at) + backoff(d.attempts, self.cfg))
                 assert d.next_attempt_at <= bound, ("held back by a cleared snooze", d, review)
-            if review.status == "snoozed" and isinstance(until, int | float) and self.now < until:
-                if d.attempts == 0:
-                    assert d.next_attempt_at >= math.ceil(until), ("due before snooze", d, review)
+            elif elapsed and d.attempts == 0:
+                assert d.next_attempt_at >= math.ceil(until), ("due before snooze", d, review)
 
     def ev_pass(self):
         self._apply(self.plan())
@@ -650,6 +675,7 @@ class World:
         for _ in range(limit):
             actions = self.plan()
             if not actions:
+                self._check_pending_rows()  # at quiescence nothing is exempt from the verdict
                 return
             self._apply(actions)
         raise AssertionError(("no fixpoint", self.rows, self.inc, self.reviews))
@@ -700,7 +726,7 @@ class World:
             (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
             (self.ev_crash, 1), (self.ev_zombie, 2),
             (self.ev_violate, 1), (self.ev_zombie_race, 2), (self.ev_recreate_race, 2),
-            (self.ev_retry_flap, 2), (self.ev_clock_back, 1),
+            (self.ev_retry_flap, 2), (self.ev_park_and_clear, 2), (self.ev_clock_back, 1),
             (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]
