@@ -275,6 +275,7 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "last_error TEXT CHECK(last_error IS NULL OR length(last_error)<=200),"
         "created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer'),"
         "updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer'),"
+        "version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),"
         "CHECK(state!='pending' OR next_attempt_at IS NOT NULL),CHECK(updated_at>=created_at),"
         "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",

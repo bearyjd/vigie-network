@@ -31,6 +31,7 @@ def test_fresh_install_has_the_table_and_the_due_index(tmp_path):
         "last_error",
         "created_at",
         "updated_at",
+        "version",
     ]
     assert cols["delivery_id"][5] == 1  # primary key
     assert cols["attempts"][4] == "0"  # default
@@ -39,6 +40,14 @@ def test_fresh_install_has_the_table_and_the_due_index(tmp_path):
         for r in conn.execute("PRAGMA index_list(incident_deliveries)")
     }
     assert ["state", "next_attempt_at"] in indexes.values()
+
+
+def test_version_starts_at_zero(tmp_path):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    assert conn.execute("SELECT version FROM incident_deliveries").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE incident_deliveries SET version=NULL")
 
 
 def test_defaults_and_valid_rows(tmp_path):
@@ -101,6 +110,7 @@ def test_timestamps_are_integer_epoch_columns(tmp_path):
     "sql",
     [
         "UPDATE incident_deliveries SET attempts=-1",
+        "UPDATE incident_deliveries SET version=-1",
         "UPDATE incident_deliveries SET next_attempt_at=NULL",  # row is pending
         "UPDATE incident_deliveries SET updated_at=9",  # before created_at (10)
         "UPDATE incident_deliveries SET delivery_id='short'",
@@ -123,7 +133,9 @@ def test_a_null_or_wrong_length_delivery_id_is_refused(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM incident_deliveries").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("column", ["attempts", "next_attempt_at", "created_at", "updated_at"])
+@pytest.mark.parametrize(
+    "column", ["attempts", "next_attempt_at", "created_at", "updated_at", "version"]
+)
 def test_numeric_columns_only_hold_integers(tmp_path, column):
     conn = _fresh(tmp_path)
     conn.execute(INSERT, (A, "inc", "open", "pending"))

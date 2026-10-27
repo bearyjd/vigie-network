@@ -36,8 +36,18 @@ def inc(iid="i1", state="open", detected=NOW - 10):
     return IncidentView(id=iid, state=state, detected_at=detected)
 
 
-def dv(kind="open", state="pending", iid="i1", attempts=0, nxt=NOW - 5, created=NOW - 5, upd=None):
-    return DeliveryView(iid, kind, state, attempts, nxt, created, created if upd is None else upd)
+def dv(
+    kind="open",
+    state="pending",
+    iid="i1",
+    attempts=0,
+    nxt=NOW - 5,
+    created=NOW - 5,
+    upd=None,
+    ver=0,
+):
+    upd = created if upd is None else upd
+    return DeliveryView(iid, kind, state, attempts, nxt, created, upd, ver)
 
 
 def run(incidents, reviews=None, deliveries=(), now=NOW, cfg=CFG):
@@ -453,7 +463,9 @@ def test_bad_snooze_time_fails_closed(bad):
     assert got == (Suppress("i1", "open", U),)
 
 
-@pytest.mark.parametrize("field", ["attempts", "next_attempt_at", "created_at", "updated_at"])
+@pytest.mark.parametrize(
+    "field", ["attempts", "next_attempt_at", "created_at", "updated_at", "version"]
+)
 @pytest.mark.parametrize("bad", BAD + [-1])
 def test_pending_row_with_a_bad_number_is_expired_not_stuck(field, bad):
     if field != "attempts" and bad == -1:
@@ -474,7 +486,9 @@ def _expected_for_bad_terminal_row(state, incident_state, field, bad):
     return ()
 
 
-@pytest.mark.parametrize("field", ["attempts", "next_attempt_at", "created_at", "updated_at"])
+@pytest.mark.parametrize(
+    "field", ["attempts", "next_attempt_at", "created_at", "updated_at", "version"]
+)
 @pytest.mark.parametrize("bad", BAD)
 @pytest.mark.parametrize("state", ["sent", "failed", "suppressed", "expired"])
 @pytest.mark.parametrize("incident_state", ["open", "resolved", "superseded"])
@@ -549,15 +563,18 @@ def _scenarios():
         yield [inc(state=state)], ({"i1": review} if review else {}), ds
 
 
-def test_plan_is_idempotent_over_every_generated_state():
+def test_plan_settles_within_three_passes_over_every_generated_state():
     count = 0
     for incidents, reviews, ds in _scenarios():
-        first = plan(tuple(incidents), reviews, tuple(ds), NOW, CFG)
-        settled = apply(ds, first, NOW)
-        again = plan(tuple(incidents), reviews, settled, NOW, CFG)
-        assert again == (), (incidents, reviews, ds, first, again)
-        keys = [(a.incident_id, a.kind) for a in first]
-        assert keys == sorted(set(keys))
+        rows = tuple(ds)
+        for _ in range(4):
+            actions = plan(tuple(incidents), reviews, rows, NOW, CFG)
+            keys = [(a.incident_id, a.kind) for a in actions]
+            assert keys == sorted(set(keys))
+            if not actions:
+                break
+            rows = apply(rows, actions, NOW)
+        assert actions == (), (incidents, reviews, ds)
         count += 1
     assert count > 4000
 
@@ -611,6 +628,8 @@ def test_rows_with_an_unknown_kind_or_state_are_ignored_not_fatal():
 def test_a_pending_recover_for_an_open_incident_is_withdrawn():
     ds = [dv(state="sent"), dv("recover")]
     assert run([inc()], deliveries=ds) == (Withdraw("i1", "recover"),)
+    assert run([inc(state="superseded")], deliveries=ds) == (Withdraw("i1", "recover"),)
+    assert run([inc(state="weird")], deliveries=ds) == (Withdraw("i1", "recover"),)
     assert run([inc(state="resolved")], deliveries=ds) == ()
 
 
@@ -655,7 +674,7 @@ def test_a_stale_plan_is_skipped_not_applied_over_a_sender_outcome():
         (
             [inc()],
             None,
-            [dv("open", "suppressed", created=NOW - DAY)],
+            [dv("open", "suppressed", created=NOW - RET - 1)],
             {"Expire": ("suppressed", 0)},
         ),
         ([inc(state="resolved")], None, [dv(attempts=1)], {"Expire": ("pending", 1)}),
@@ -681,13 +700,20 @@ def test_every_action_carries_the_row_state_it_was_planned_against(
     assert {type(a).__name__ for a in got} == set(expected)
     for a in got:
         want = expected[type(a).__name__]
-        assert a.expected == (Expected(*want) if want else None)
+        assert a.expected == (Expected(*want, 0) if want else None)
         assert a.expected is None or (a.expected.state, a.expected.attempts) == want
 
 
+def test_expected_carries_the_row_version():
+    got = run([inc()], {"i1": ReviewView("acknowledged", None)}, [dv(attempts=2, ver=7)])
+    assert got[0].expected == Expected("pending", 2, 7)
+    after = after_failure(dv(attempts=1, ver=4), NOW, CFG)
+    assert after.expected == Expected("pending", 1, 4)
+
+
 def test_after_failure_actions_carry_their_expectation():
-    assert after_failure(dv(attempts=2), NOW, CFG).expected == Expected("pending", 2)
-    assert after_failure(dv(attempts=6), NOW, CFG).expected == Expected("pending", 6)
+    assert after_failure(dv(attempts=2), NOW, CFG).expected == Expected("pending", 2, 0)
+    assert after_failure(dv(attempts=6), NOW, CFG).expected == Expected("pending", 6, 0)
 
 
 # requeue target respects an existing backoff; every revival path honours the original ttl
@@ -711,11 +737,24 @@ def test_immediate_ack_clear_after_a_failure_keeps_the_backoff():
     assert (ds[0].state, ds[0].next_attempt_at, ds[0].attempts) == ("pending", NOW + 60, 1)
 
 
-def test_a_snooze_revival_also_counts_ttl_from_creation():
-    old = dv("open", "suppressed", created=NOW - DAY)
-    assert run([inc()], snooze(100), [old]) == (Expire("i1", "open", "ttl"),)
-    young = dv("open", "suppressed", created=NOW - DAY + 1)
-    assert run([inc()], snooze(100), [young]) == (Requeue("i1", "open", NOW + 100),)
+def test_a_long_ack_never_expires_a_still_open_loud_incident():
+    acked = dv("open", "suppressed", created=NOW - 25 * 3600, nxt=NOW - 25 * 3600)
+    assert run([inc()], deliveries=[acked]) == (Requeue("i1", "open", NOW),)  # ttl is 24h
+    assert run([inc()], snooze(100), [acked]) == (Requeue("i1", "open", NOW + 100),)
+    after_snooze = dv("open", "suppressed", created=NOW - 3 * DAY, nxt=NOW + 40 - 3 * DAY)
+    assert run([inc()], deliveries=[after_snooze]) == (Requeue("i1", "open", NOW),)
+    # ... and the revived row then has a fresh ttl clock (from its next_attempt_at)
+    revived = apply([acked], run([inc()], deliveries=[acked]), NOW)
+    assert run([inc()], deliveries=revived) == ()
+
+
+@pytest.mark.parametrize("state", ["pending", "suppressed"])
+def test_the_hard_lifetime_caps_every_open_row(state):
+    old = dv("open", state, created=NOW - RET - 1, nxt=NOW + 10)
+    edge = dv("open", state, created=NOW - RET, nxt=NOW + 10)
+    assert run([inc()], deliveries=[old]) == (Expire("i1", "open", "lifetime"),)
+    assert run([inc()], snooze(100), [old]) == (Expire("i1", "open", "lifetime"),)
+    assert run([inc()], deliveries=[edge]) != (Expire("i1", "open", "lifetime"),)
 
 
 # item 4: integer times
@@ -744,13 +783,6 @@ def test_requeue_past_the_attempt_budget_fails_instead():
     assert run([inc()], deliveries=[left]) == (Requeue("i1", "open", NOW),)
 
 
-def test_requeue_after_the_original_ttl_expires_instead():
-    old = dv(state="suppressed", created=NOW - DAY)
-    assert run([inc()], deliveries=[old]) == (Expire("i1", "open", "ttl"),)
-    almost = dv(state="suppressed", created=NOW - DAY + 1)
-    assert run([inc()], deliveries=[almost]) == (Requeue("i1", "open", NOW),)
-
-
 def _cycle(fail_each_time, step, rounds):
     """ack/clear alternately; optionally every delivery attempt fails. Returns (rows, trace)."""
     ds, t, ack, clear = (), NOW, {"i1": ReviewView("acknowledged", None)}, {}
@@ -775,10 +807,59 @@ def test_ack_clear_cycles_never_exceed_the_attempt_budget():
     assert ds[0].state == "failed" and ds[0].attempts == CFG.max_attempts
 
 
-def test_ack_clear_cycles_still_hit_the_ttl_on_schedule():
-    ds, seen, _ = _cycle(False, 5 * 3600, 12)
-    assert ds[0].state == "expired"
-    assert ds[0].created_at == NOW + 5 * 3600
-    assert ds[0].updated_at - ds[0].created_at >= DAY  # never expired early
-    assert ds[0].updated_at - ds[0].created_at < DAY + 2 * 5 * 3600
+def test_ack_clear_cycles_end_at_the_lifetime_cap_not_before():
+    step = 20 * 3600  # shorter than the ttl, so only the lifetime cap can end the cycle
+    ds, seen, _ = _cycle(False, step, 40)
+    assert ds[0].state == "expired" and ds[0].created_at == NOW + step
+    life = ds[0].updated_at - ds[0].created_at
+    assert RET < life <= RET + 2 * step  # never early, and on the first revival after the cap
     assert {r.created_at for r in seen} == {ds[0].created_at}
+
+
+# item 3: a Forget of an open row never deletes it from under a pending recover
+def test_forget_of_an_open_row_carries_the_sibling_recover_precondition():
+    old = NOW - RET - 1
+    got = run([inc(state="superseded")], deliveries=[dv(state="sent", created=old)])
+    assert got == (Forget("i1", "open"),) and got[0].sibling_recover == "absent_or_terminal"
+    got = run([inc(state="superseded")], deliveries=[dv("recover", "sent", created=old)])
+    assert got == (Forget("i1", "recover"),) and got[0].sibling_recover is None
+    orphan = run([], deliveries=[dv(state="sent", created=old)])
+    assert orphan[0].sibling_recover == "absent_or_terminal"
+
+
+@pytest.mark.parametrize("incident", [[], [inc(state="superseded")]])
+def test_a_pending_recover_holds_back_the_forget_of_its_open_row(incident):
+    old = NOW - RET - 1
+    ds = [dv(state="sent", created=old), dv("recover", created=NOW - 5, nxt=NOW)]
+    got = run(incident, deliveries=ds)
+    assert not [a for a in got if isinstance(a, Forget)]
+
+
+def test_the_apply_model_refuses_a_forget_when_a_recover_is_pending_meanwhile():
+    old = NOW - RET - 1
+    plan_ = run([inc(state="superseded")], deliveries=[dv(state="sent", created=old)])
+    pending_recover = dv("recover", created=NOW - 5, nxt=NOW)
+    rows = {("i1", "open"): dv(state="sent", created=old), ("i1", "recover"): pending_recover}
+    out, skipped = apply_cas(rows, plan_, NOW)
+    assert skipped == list(plan_) and ("i1", "open") in out
+    assert apply_cas({("i1", "open"): rows[("i1", "open")]}, plan_, NOW)[0] == {}
+
+
+# item 2: versions make a stale action miss a different incarnation of the row
+def test_a_stale_action_cannot_hit_a_different_incarnation_of_a_row():
+    ack = {"i1": ReviewView("acknowledged", None)}
+    stale = run([inc()], ack, [dv(attempts=1, ver=3)])
+    reborn = dv(attempts=1, ver=5)  # same state and attempts, different incarnation
+    out, skipped = apply_cas({("i1", "open"): reborn}, stale, NOW)
+    assert skipped == list(stale) and out[("i1", "open")] == reborn
+    out, skipped = apply_cas({("i1", "open"): dv(attempts=1, ver=3)}, stale, NOW)
+    assert not skipped and out[("i1", "open")].version == 4  # every change bumps the version
+    inserted = apply_cas({}, run([inc()]), NOW)[0]
+    assert inserted[("i1", "open")].version == 0
+
+
+def test_bad_version_fails_closed():
+    d = dataclasses.replace(dv(), version="x")  # type: ignore[arg-type]
+    assert run([inc()], deliveries=[d]) == (Expire("i1", "open", "unrecognised_state"),)
+    s = dataclasses.replace(dv(state="suppressed"), version=None)  # type: ignore[arg-type]
+    assert run([inc()], deliveries=[s]) == ()

@@ -168,58 +168,67 @@ it on never announces old open incidents.
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
 `recover`; `UNIQUE(incident_id, kind)`), `state` `pending`, `sent`, `failed`, `suppressed` or
 `expired`, integer epoch-second `created_at`, `updated_at` and `next_attempt_at` (required while
-pending), `attempts >= 0`, and `last_error` capped at 200 characters. `delivery_id` is the first
-32 hex chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
-incident link only.
+pending), `attempts >= 0`, a `version` that every change increments, and `last_error` capped at
+200 characters. `delivery_id` is the first 32 hex chars of `sha256(incident_id + "\n" + kind)`.
+External payloads carry a device label and an incident link only.
 
-`vigie_pipeline.delivery_plan.plan()` turns incidents, decisions and rows into actions (no I/O,
-`now` injected; a non-finite `now` raises `ValueError`; action times are integer seconds).
-`incidents` must be the complete current set. Unit 4b must read the incidents and run the planner
-in the same read transaction and skip the pass if the incident read fails: a pending row whose
-incident is missing from a partial list is expired as `incident_missing`. An incident id that is
-pruned and later reappears is treated as new.
+**Concurrency contract (the primary defence).** Unit 4b reads the complete incident set and the
+delivery rows, runs `plan()` and applies every action inside one `BEGIN IMMEDIATE` transaction on
+the pipeline database; it skips the pass if the incident read fails (a partial list would expire
+pending rows as `incident_missing`). The sender records each result with its own conditional
+`UPDATE ... WHERE delivery_id=? AND state='pending' AND version=?` (bumping `version`) and never
+changes rows outside that lock. A plan can then only be stale relative to the sender's in-flight
+send, never relative to another planner.
+
+Every action also carries the row it was planned against (`expected`: none for an insert, else
+state, attempts and version) as an assertion. Each action is one conditional statement that bumps
+`version`; 0 affected rows is a bug, so log it and abort the pass (the transaction rolls back):
+
+- `Enqueue`, and `Suppress` of an incident with no row (inserts a `suppressed` row): `INSERT OR
+  IGNORE`.
+- `Suppress`, `Reschedule`: `UPDATE ... WHERE delivery_id=? AND state='pending' AND attempts=? AND
+  version=?` (a suppress keeps `next_attempt_at`, so a backoff survives). `Requeue`: the same with
+  `state='suppressed'`.
+- `Expire` and `Fail`: `UPDATE ...` with the planned state, `pending`, or `suppressed` for a
+  revival that fails or expires.
+- `Withdraw` (a pending recover) and `Forget` (a terminal row): `DELETE ... WHERE delivery_id=? AND
+  state=? AND attempts=? AND version=?`. A `Forget` of an `open` row adds
+  `AND NOT EXISTS (SELECT 1 FROM incident_deliveries r WHERE r.incident_id=? AND r.kind='recover'
+  AND r.state='pending')`.
+
+Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-finite `now` raises
+`ValueError`, action times are integer seconds):
 
 - A loud open incident gets one `open` delivery. Acknowledged or expected incidents are suppressed
-  (a row is inserted as `suppressed`, so ttl and budget history exist). Suppressed rows are
-  re-checked every pass, so a cleared decision (or a cleared `NULL`-status row) requeues the
-  delivery. A requeue keeps `attempts` and `created_at`: an attempted row waits out its backoff,
-  past `max_attempts` it fails, and past the original 24 hour ttl (from `created_at`, on every
-  path) it expires, so ack/clear cycles cannot extend the retry budget.
+  (a row is inserted as `suppressed`, so history exists). Suppressed rows are re-checked every
+  pass, so a cleared decision (or a cleared `NULL`-status row) requeues the delivery.
 - A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
   row that has not been attempted tracks the current verdict exactly, earlier or later. A row that
   already failed keeps its retry backoff and is only pushed later by a longer snooze.
+- An un-ack never silently drops an announcement. A pending row expires 24 hours after
+  `max(created_at, next_attempt_at)`; a requeue sets `next_attempt_at` to its target, so an ack
+  that lasted longer than the ttl does not expire a still-open loud incident. Spam is bounded by
+  the attempt budget (a requeue keeps `attempts`; past `max_attempts` the row fails) and by a hard
+  lifetime: a row more than 30 days past `created_at` expires as `lifetime` and is never revived,
+  so an acknowledgement older than that never notifies after it is cleared. Failures back off 60 s
+  doubling to 1 h, six attempts.
 - An incident that closes before its `open` delivery went out expires it and gets no `recover`.
   Exactly one `recover` is created, only for a `resolved` incident whose `open` was `sent`, on the
   first pass after resolution however old the open row is. A pending `recover` for an incident that
-  is open again is withdrawn (the row is deleted), so the next resolution enqueues a fresh one; a
-  recover that was already sent is not repeated. Known limit: superseded incidents, and incidents
-  that stay open because the device went silent (`monitoring_unavailable` covers silence), get no
-  recovery notice.
-- A pending row expires 24 hours after `max(created_at, next_attempt_at)` (a long snooze is not
-  expired early); failures back off 60 s doubling to 1 h, six attempts.
+  is no longer `resolved` (open again, or superseded) is withdrawn (deleted), so the next resolution enqueues a fresh one; a recover that
+  was already sent is not repeated. Known limit: superseded incidents, and incidents that stay open
+  because the device went silent (`monitoring_unavailable` covers silence), get no recovery notice.
 - Retention: terminal rows of a closed incident are forgotten once `updated_at` is more than 30
   days old, but an open row stays until its recover row is terminal, and rows of a still-open
   incident are kept so an old incident never re-announces. Terminal rows of an incident missing
-  from the list follow the same 30 day rule; pending ones expire first.
+  from the list follow the same 30 day rule; pending ones expire first. An incident id that is
+  pruned and later reappears after its delivery rows have been forgotten is treated as new, and so
+  is a closed incident that reopens after its rows were forgotten (real incidents get a new id).
 - Watermark: an incident detected before `eligible_since` that has no delivery rows is ignored
   completely. An incident that already has any row is managed normally, so raising the watermark
   never drops an owed recover or forgets state, and lowering it only admits incidents that were
-  never announced. Reopening a closed incident after its rows were forgotten starts a new life
-  (it is announced again); real incidents never reopen, a new id is used.
+  never announced.
 - Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
-
-Every action carries the row state it was planned against (`expected`: none for an insert, else
-state and attempts). The applier runs each action as one conditional statement and treats 0
-affected rows as a stale plan to re-plan next pass, never an error:
-
-- `Enqueue`, and `Suppress` of an incident with no row: `INSERT OR IGNORE`.
-- `Suppress`, `Reschedule`: `UPDATE ... WHERE delivery_id=? AND state='pending' AND attempts=?`
-  (a suppress keeps `next_attempt_at`, so a backoff survives).
-- `Requeue`: the same with `state='suppressed'`.
-- `Expire` and `Fail`: `UPDATE ... AND state=? AND attempts=?`, where the state is `pending`, or
-  `suppressed` for a revival that fails or expires.
-- `Withdraw` (a pending recover) and `Forget` (a terminal row): `DELETE ... AND state=? AND
-  attempts=?`.
 
 ## Retention and verification limits
 
