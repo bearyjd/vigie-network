@@ -89,24 +89,33 @@ MACs cannot immediately redefine an old reference.
 
 `vigie_pipeline/baselines_tod.py` is a pure module (no I/O, clock or database) that is NOT used by
 the engine yet: monitoring still runs `pooled-median-v1`, and no schema, migration or environment
-variable changed. It models time of day without an hour-of-week table:
+variable changed.
 
-- **Cohorts.** `(is_weekend, hour_of_day)`, 48 in all, read from the sample's epoch hour in UTC.
-  Local time and DST are deferred: a DST change never moves a sample between cohorts, it only means
-  the cohort hour is not the household's wall-clock hour.
-- **Maturity.** A cohort needs at least 20 valid samples (`min_samples_per_cohort`) AND 7 distinct
-  UTC days (`min_days_per_cohort`); below either floor it ABSTAINS with `immature_samples` or
-  `immature_days`. Hourly samples give one sample per day per cohort, so the day floor only binds
-  when configured above the sample floor. A weekend cohort needs 20 weekend days (about ten weeks).
+- **Cohorts.** `(is_weekend, hour_of_day // bucket_hours)` read from the sample's epoch hour in
+  UTC. `bucket_hours` divides 24 (1, 2, 3, 4, 6, 8, 12 or 24; default 4), so adjacent hours pool and
+  there are `2 * 24 / bucket_hours` cohorts. Local time and DST are deferred: a DST change never
+  moves a sample between cohorts, it only means the bucket is not the household's wall-clock hour.
+- **Maturity.** A cohort needs at least 20 valid samples AND 7 distinct UTC days, else it ABSTAINS
+  (`immature_samples`, then `immature_days`). With four-hour buckets a weekday cohort matures after
+  about 7 weekdays of history and a weekend cohort after about 4 weekends (8 weekend days).
 - **Valid samples.** Ineligible (missing) hours are skipped, never counted as zero. Suspicious hours
-  and hours at or above the fixed large-upload line are excluded as contamination.
+  and hours at or above the fixed large-upload line are excluded as contamination. At most 4368
+  samples (26 weeks) are accepted; hours and byte counts must be exact integers.
 - **Threshold.** Twice the cohort median is kept exactly; the line is
   `max(minimum_bytes, median * multiplier)`, the same constants as `pooled-median-v1`.
-- **Detection.** Two consecutive eligible hours, each strictly above the line of its OWN mature
-  cohort. An immature current cohort yields no candidate and an explicit abstain reason, so a
-  nightly backup that is high every night in its hour is learned, not flagged.
-- **Versioning.** `TodConfig.version` hashes the algorithm id and every parameter; the result is
-  deterministic for any input order and backfilled history fits by its own cohort.
+- **The caller freezes the baseline.** `fit_tod(samples, config, trained_until)` learns only from
+  hours up to `trained_until` and records it, plus each cohort's last trained hour. `findings_tod`
+  scores an hour only if it is strictly after both; otherwise it abstains with
+  `leaks_evaluated_hours`. The engine wiring unit will choose and persist `trained_until`; appending
+  later history never redefines normality, so slow drift is judged against the frozen window.
+- **Detection.** The fixed large-upload candidate is always evaluated first, even in cold start or
+  with an immature cohort. The learned deviation needs TWO consecutive eligible hours, each strictly
+  above the line of its OWN mature cohort. An immature current cohort abstains with its reason; an
+  immature previous cohort abstains with `previous_<reason>`. A nightly backup that is high every
+  night is learned, not flagged.
+- **Versioning.** `TodConfig.version` hashes the algorithm id and every parameter, including
+  `bucket_hours`. Results are deterministic for any input order, and backfilled history fits by its
+  own cohort.
 
 ## Bounded read API
 

@@ -76,19 +76,25 @@ def fit_reference(samples, config: BaselineConfig):
     return None
 
 
+def large_upload_finding(current: Sample, large_upload_bytes: int):
+    "The fixed cold-start detector, shared with the time-of-day module. Caller checks eligibility."
+    if current.bytes_up < large_upload_bytes:
+        return None
+    return {
+        "detector": "large_upload",
+        "observed_bytes": current.bytes_up,
+        "threshold_bytes": large_upload_bytes,
+        "reason_code": "large_upload_threshold",
+    }
+
+
 def findings(current: Sample | None, previous: Sample | None, reference, config: BaselineConfig):
     if current is None or not current.eligible:
         return []
     out = []
-    if current.bytes_up >= config.large_upload_bytes:
-        out.append(
-            {
-                "detector": "large_upload",
-                "observed_bytes": current.bytes_up,
-                "threshold_bytes": config.large_upload_bytes,
-                "reason_code": "large_upload_threshold",
-            }
-        )
+    large = large_upload_finding(current, config.large_upload_bytes)
+    if large is not None:
+        out.append(large)
     if reference is not None and current.hour > reference["trained_until"]:
         threshold = max(config.minimum_bytes, reference["median_twice"] * config.multiplier // 2)
         if (
