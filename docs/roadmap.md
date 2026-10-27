@@ -21,6 +21,7 @@ features remain unimplemented until their own acceptance evidence exists.
 | M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Phase 1 done: per-incident acknowledge / snooze / mark-expected / clear in the API (see [api](api.md#incidents-and-review-lifecycle)). Scoped exceptions, notifications and GUI writes are deferred; external delivery needs a configured owner-controlled destination |
 | M2 | Time-of-day patterns, destination/port novelty, essential-device absence, network-wide shifts, incident correlation and calibrated characterization | Queued after sufficient qualified history and owner-labeled evaluation |
 | M2b | Exposure and suspicious-traffic evidence: device-type known-issue notes from imported CVE data, local blocklist/reputation DNS matches, read-only provider DNS verdicts | Proposal only. Starts with device-identity quality and an offline blocklist match; every external dataset needs the source, license and false-positive review below |
+| M2c — endpoint connection events (design proposal) | Observe-only evidence from an endpoint firewall (Snitchwatch/OpenSnitch) compared with router conntrack | Design doc only: [docs/prp/003-endpoint-events.md](prp/003-endpoint-events.md); nothing built; K1-K4 confirmed; E0 feasibility measurement next |
 | M3 | Multiple network/VLAN scopes and optional external Zeek/Suricata metadata adapters | Queued after approved sensor placement and measured traffic visibility |
 | M4 | Drift models and optional AI explanations/classifiers | Conditional on demonstrated benefit over deterministic rules and an explicit privacy/resource review |
 
@@ -269,6 +270,7 @@ accept, KEV and URLhaus first); D8 resolver strategy (decided: keep NextDNS upst
 dnsmasq as the single home entry point, provider logs read-only context); D9 known-issue notes (decided: type-level,
 KEV only, product-level signal required, device detail only). See "Device evidence pack" above.
 This roadmap does not resolve them, approve PRP-002, authorize router commands or change enforcement policy.
+Endpoint connection events (M2c) are a separate design-only proposal in [PRP-003](prp/003-endpoint-events.md); it is not PRP-002.
 A future lease-only collection mode avoids dnsmasq changes but loses fingerprint/DNS evidence; show that tradeoff
 rather than promising identical coverage. Safe fixture-driven development can proceed while field-dependent
 acceptance waits. UI framework, external sensor placement, final alert budget and retention beyond current
