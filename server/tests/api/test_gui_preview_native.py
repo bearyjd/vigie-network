@@ -30,7 +30,7 @@ def _native_has_pidfd() -> bool:
         probe = subprocess.run(  # noqa: S603 -- fixed native interpreter, fixed snippet.
             [NATIVE, "-I", "-c", "import os, signal; os.pidfd_open; signal.pidfd_send_signal"],
             capture_output=True,
-            timeout=20,
+            timeout=120,  # runs at collection time: a saturated host must not abort the whole run
         )
     except OSError:
         return False

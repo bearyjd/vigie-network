@@ -26,6 +26,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     real_stop_signals,
     sandbox_owners,
     serve_argv,
+    settled_identity,
     sleeper,
 )
 
@@ -150,13 +151,14 @@ def test_main_installs_both_sigterm_and_sighup_handlers(namespace, monkeypatch, 
 # ---------------------------------------------------------------- M1 non-UTF-8 argv
 
 
+@pytest.mark.timeout(120)  # the scan reads every /proc cmdline on the host
 def test_non_utf8_argv_of_any_process_does_not_break_the_orphan_scan(namespace, listener, sleeper):
     junk = subprocess.Popen(  # noqa: S603 -- throwaway child with deliberately invalid argv.
         [os.fsencode(sys.executable), b"-c", b"import time; time.sleep(60)", b"\xff\xfe"],
         stdin=subprocess.DEVNULL,
     )
     try:
-        identity = preview.process_identity(junk.pid)
+        identity = settled_identity(junk)
         assert identity is not None and identity["argv"][-1] == "\udcff\udcfe"
         child, argv, _, inode = live(namespace, listener, sleeper)
         attempt(namespace, argv, inode, [])  # prepared-only, the scan reads every /proc cmdline
@@ -175,6 +177,7 @@ def test_non_utf8_argv_does_not_break_a_prepared_only_receipt_with_no_listener(
         stdin=subprocess.DEVNULL,
     )
     try:
+        settled_identity(junk)  # the scan must see the invalid argv, not pytest's pre-exec copy
         attempt(namespace, serve_argv(namespace, 7), "999999", [])
         monkeypatch.setattr(preview, "listeners", lambda: set())
         assert preview.status(namespace)["state"] == "stopped"

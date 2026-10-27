@@ -28,6 +28,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     preview,
     sandbox_owners,
     serve_argv,
+    settled_identity,
     sleeper,
 )
 from test_gui_preview_fixround3 import _pth
@@ -157,8 +158,7 @@ def children():
 
 
 def _line(child) -> str:
-    identity = preview.process_identity(child.pid)
-    assert identity is not None
+    identity = settled_identity(child)
     return f"{child.pid} {identity['start_ticks']} {identity['boot_id']}\n"
 
 
@@ -228,6 +228,7 @@ def test_a_start_shaped_holder_of_another_uid_is_unverified(
     namespace, children, tmp_path, monkeypatch
 ):
     holder = _start_shaped(children, "start", tmp_path, monkeypatch)
+    settled_identity(holder)  # settle before the mock below: it expands the real identity
     real = preview.process_identity
     monkeypatch.setattr(
         preview,
@@ -582,8 +583,7 @@ def test_an_unpinned_startup_hook_name_is_never_opened(sandbox_owners, tmp_path,
 
 
 def _recognised(holder) -> bool:
-    identity = preview.process_identity(holder.pid)
-    assert identity is not None
+    identity = settled_identity(holder)
     return preview._is_controller(identity)
 
 
@@ -601,7 +601,10 @@ def test_a_dash_c_process_that_merely_lists_the_script_is_not_the_controller(
 def test_a_dash_m_form_is_not_the_controller(children, tmp_path, monkeypatch):
     script = tmp_path / "controller.py"
     monkeypatch.setattr(preview, "__file__", str(script))
-    holder = children([sys.executable, "-m", "http.server", "0", str(script), "start"])
+    (tmp_path / "sleeper_mod.py").write_text(
+        "import time\ntime.sleep(60)\n"
+    )  # stays alive, unlike http.server
+    holder = children([sys.executable, "-m", "sleeper_mod", "0", str(script), "start"], tmp_path)
     assert not _recognised(holder)
 
 
