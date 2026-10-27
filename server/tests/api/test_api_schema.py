@@ -156,6 +156,12 @@ def test_accepted_status_needs_an_accept_record(tmp_path: Path) -> None:
     ):  # fmt: skip
         with pytest.raises(sqlite3.IntegrityError):
             _import(conn, f"x{n}", sha=f"{n}" * 64, **extra)
+    with pytest.raises(sqlite3.IntegrityError):  # an empty accept record is no record
+        _import(conn, "e1", sha="e" * 64, status="accepted", accepted_by="", accepted_at="t")
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "e2", sha="f" * 64, status="accepted", accepted_by="u", accepted_at="")
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "e3", sha="d" * 64, accepted_by="")
     _import(conn, "ok", status="accepted", accepted_by="u", accepted_at="t")
     _import(conn, "st", sha="b" * 64, accepted_by="u")  # staged rows may carry a stray value
 

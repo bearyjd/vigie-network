@@ -1,10 +1,11 @@
 """Pure parsers for the offline known-issue datasets (CISA KEV JSON, URLhaus CSV).
 
 No I/O, no network, no clock. Structure is strict: a file that is not the expected shape, has a
-wrong column count, an oversized field or a control character anywhere raises ValueError naming
-the row, so a staged import is never a silently partial parse. Host problems in single URLhaus
-rows (odd scheme, bad port, lookalike characters) skip just that row; skips are counted and too
-many reject the file. Every cap is checked before the structure it protects is built. URLhaus
+wrong column count, an oversized or control-character field (any column but the URL) raises
+ValueError naming the line. Problems in a single URLhaus row's URL (odd scheme, bad port,
+lookalike characters, oversized) skip just that row; skips are counted, and a majority of
+skipped rows rejects the file. Caps are enforced before the structure they protect is built:
+KEV from raw byte counts, URLhaus by iterating lazily and bounding each physical line. URLhaus
 rows are reduced to the lower-cased host and the threat label; the path, query, port and
 credentials of a listed URL are dropped here and never reach the database.
 """
@@ -21,19 +22,22 @@ from datetime import date
 from typing import Any
 from urllib.parse import urlsplit
 
-KEV_MAX_INPUT = 16 * 1024 * 1024
-KEV_MAX_ENTRIES = 100_000
+KEV_MAX_INPUT = 8 * 1024 * 1024  # the real catalog is ~1.3 MB
+KEV_MAX_ENTRIES = 20_000  # ... and ~1.5k entries
 URLHAUS_MAX_INPUT = 64 * 1024 * 1024
 URLHAUS_MAX_ENTRIES = 250_000  # ~2.5 s of inserts inside one write transaction
 MAX_FIELD_LEN = 512
-SKIP_FLOOR = 100
-SKIP_FRACTION = 0.01
-_BRACE_SLACK = 16  # braces outside the entry objects: the catalog itself, a stray few
+MAX_LINE_LEN = 16 * 1024  # one physical CSV line; real URLhaus rows are a few hundred bytes
+SKIP_MAX_FRACTION = 0.5  # more skipped than this means the file is not the expected format
+_SCAN_SLACK = 16  # structure outside the entries: the catalog itself, a stray few
+_BRACKETS_PER_ENTRY = 3  # real KEV: one object and one cwes array per entry
+_COMMAS_PER_ENTRY = 64  # real KEV: ~15
 
 _CVE = re.compile(r"CVE-[0-9]{4}-(?:[1-9][0-9]{4,18}|[0-9]{4})", re.ASCII)
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 _DNS = re.compile(r"(?:[a-z0-9-]{1,63}\.)*[a-z0-9-]{1,63}", re.ASCII)
-_IPV4_LIKE = re.compile(r"[0-9.]+", re.ASCII)
+# a host whose last label is numeric (or 0x..) is an address; only strict dotted quads are kept
+_IPV4_LIKE = re.compile(r"(?:.*\.)?(?:[0-9]+|0x[0-9a-f]*)", re.ASCII)
 _KEV_FIELDS = ("cveID", "vendorProject", "product", "dateAdded")
 _URLHAUS_COLUMNS = 9
 _URL_COL, _THREAT_COL = 2, 5
@@ -86,10 +90,18 @@ def _kev_entry(item: Any, index: int) -> Entry:
     return Entry(payload["cveID"], payload)
 
 
+def _prescan_kev(data: bytes) -> None:
+    """Bound the number of items from raw byte counts, so no object is built to count them."""
+    structure = data.count(b"{") + data.count(b"[")
+    if structure > _BRACKETS_PER_ENTRY * KEV_MAX_ENTRIES + _SCAN_SLACK:
+        raise _too_many(KEV_MAX_ENTRIES)
+    if data.count(b",") > _COMMAS_PER_ENTRY * KEV_MAX_ENTRIES + _SCAN_SLACK:
+        raise _too_many(KEV_MAX_ENTRIES)
+
+
 def parse_kev(data: bytes) -> list[Entry]:
     _check_size(data, KEV_MAX_INPUT)
-    if data.count(b"{") > KEV_MAX_ENTRIES + _BRACE_SLACK:  # before json builds anything
-        raise _too_many(KEV_MAX_ENTRIES)
+    _prescan_kev(data)  # before json builds anything
     try:
         doc = json.loads(data)
     except (ValueError, RecursionError) as exc:  # UnicodeDecodeError is a ValueError
@@ -109,7 +121,10 @@ def parse_kev(data: bytes) -> list[Entry]:
 def _ip_key(host: str, bracketed: bool) -> str | None:
     try:
         if bracketed:
-            return None if "%" in host else str(ipaddress.IPv6Address(host))
+            if "%" in host:
+                return None
+            address = ipaddress.IPv6Address(host)
+            return str(address.ipv4_mapped or address)
         return str(ipaddress.IPv4Address(host)) if _IPV4_LIKE.fullmatch(host) else None
     except ValueError:
         return None
@@ -128,10 +143,9 @@ def _urlhaus_host(url: str) -> str | None:
     if split.scheme not in _SCHEMES or not split.netloc.isascii() or not split.hostname:
         return None
     bracketed = "[" in split.netloc
-    host = split.hostname.lower()
+    host = split.hostname.lower().removesuffix(".")  # evil.com. and evil.com are one host
     if bracketed or _IPV4_LIKE.fullmatch(host):
         return _ip_key(host, bracketed)
-    host = host.removesuffix(".")  # evil.com. and evil.com are one host
     ok = len(host) <= _MAX_HOST_LEN and _DNS.fullmatch(host) and not host.startswith("-")
     return host if ok else None
 
@@ -139,9 +153,13 @@ def _urlhaus_host(url: str) -> str | None:
 def _urlhaus_row(row: list[str], where: str) -> Entry | None:
     if len(row) != _URLHAUS_COLUMNS:
         raise ValueError(f"{where}: expected {_URLHAUS_COLUMNS} columns, got {len(row)}")
-    for column in row:
-        _field(column, where)
-    host = _urlhaus_host(row[_URL_COL])
+    for index, column in enumerate(row):
+        if index != _URL_COL:
+            _field(column, where)
+    url = row[_URL_COL]  # a bad URL column is a bad host: that row is skipped, not the file
+    host = None
+    if len(url) <= MAX_FIELD_LEN and url.isprintable():
+        host = _urlhaus_host(url)
     return None if host is None else Entry(host, {"host": host, "threat": row[_THREAT_COL]})
 
 
@@ -152,10 +170,18 @@ def _decode(data: bytes) -> str:
         raise ValueError("URLhaus CSV is not valid UTF-8") from None
 
 
+def _lines(text: str):
+    """Physical lines, each bounded before csv.reader tokenizes it (a 1M-comma line)."""
+    for number, line in enumerate(io.StringIO(text, newline=""), start=1):
+        if len(line) > MAX_LINE_LEN:
+            raise ValueError(f"line {number}: line longer than {MAX_LINE_LEN} characters")
+        yield line
+
+
 def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
     """Entries (first row per host wins) and the number of rows skipped for an unusable host."""
     _check_size(data, URLHAUS_MAX_INPUT)
-    reader = csv.reader(io.StringIO(_decode(data), newline=""))
+    reader = csv.reader(_lines(_decode(data)), strict=True)
     seen: dict[str, Entry] = {}
     rows = skipped = 0
     try:
@@ -172,8 +198,8 @@ def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
                 seen.setdefault(entry.key, entry)
     except csv.Error as exc:
         raise ValueError(f"line {reader.line_num}: URLhaus CSV is not valid: {exc}") from None
-    if skipped > max(SKIP_FLOOR, rows * SKIP_FRACTION):
-        raise ValueError(f"too many rows skipped for an unusable host ({skipped} of {rows})")
     if not seen:
         raise ValueError("URLhaus CSV has no usable entries")
+    if skipped > rows * SKIP_MAX_FRACTION:
+        raise ValueError(f"too many rows skipped for an unusable host ({skipped} of {rows})")
     return list(seen.values()), skipped

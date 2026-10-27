@@ -130,12 +130,10 @@ def test_audit_failure_rolls_back_the_import_and_entries(ov):
 
 def test_skipped_count_is_recorded_without_contents(ov):
     stage(ov, "urlhaus", (FIX / "urlhaus_hosts.csv").read_bytes())
-    assert ov.execute("SELECT entry_count, skipped_count FROM dataset_imports").fetchone()[:] == (
-        4,
-        7,
-    )
+    counts = ov.execute("SELECT entry_count, skipped_count FROM dataset_imports").fetchone()
+    assert tuple(counts) == (7, 7)
     detail = json.loads(ov.execute("SELECT detail FROM audit_log").fetchone()[0])
-    assert (detail["entry_count"], detail["skipped_count"]) == (4, 7)
+    assert (detail["entry_count"], detail["skipped_count"]) == (7, 7)
     assert "ftp" not in json.dumps(detail) and "secret" not in json.dumps(detail)
 
 

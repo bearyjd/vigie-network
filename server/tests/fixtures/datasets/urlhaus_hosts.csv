@@ -1,4 +1,4 @@
-# synthetic host edge cases: 4 hosts kept, 7 rows skipped, 1 duplicate
+# synthetic host edge cases: 7 hosts kept, 7 rows skipped, 1 duplicate
 "1","2024-01-01 00:00:01","http://Evil.com./x","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/1/","r"
 "2","2024-01-01 00:00:01","http://EVIL.com/y","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/2/","r"
 "3","2024-01-01 00:00:01","http://[2001:DB8:0:0::1]:8080/p","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/3/","r"
@@ -11,3 +11,6 @@
 "10","2024-01-01 00:00:01","http://a.test:99999/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/10/","r"
 "11","2024-01-01 00:00:01","http://192.0.2.7:81/z","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/11/","r"
 "12","2024-01-01 00:00:01","http://192.000.2.7/z","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/12/","r"
+"13","2024-01-01 00:00:01","http://good1.example.org/p","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/13/","r"
+"14","2024-01-01 00:00:01","http://good2.example.org/p","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/14/","r"
+"15","2024-01-01 00:00:01","http://good3.example.org/p","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/15/","r"

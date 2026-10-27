@@ -27,18 +27,37 @@ simply another staged import.
 
 ## Parser privacy and safety rules (`vigie_api/dataset_parse.py`, pure, no I/O)
 
-- Caps are checked before the structure they protect is built. KEV: 16 MiB, 100,000 entries
-  (a brace pre-scan rejects before `json.loads`). URLhaus: 64 MiB, 250,000 rows, counted while
-  iterating and stopped at the cap. 512 characters per field; control characters are rejected
-  in every field.
+- **Caps, per source.** KEV: 8 MiB and 20,000 entries (the real catalog is ~1.3 MB and ~1.5k
+  entries). Before `json.loads` runs, raw byte counts bound the structure: `{` plus `[` at most
+  3 per allowed entry and `,` at most 64 per allowed entry, so lists of `0`, `[]` or `{}`
+  cannot amplify. Giant strings and deeply nested arrays are bounded by the input cap and by
+  Python's recursion limit (a clean rejection), not by the counts. URLhaus: 64 MiB and 250,000
+  rows, counted while a lazy CSV reader iterates and stopped at the cap, with each physical
+  line bounded to 16 KiB before it is tokenized. 512 characters per field.
+- **Memory.** Decoding and tokenizing a URLhaus file peaks at roughly 5x the input size (about
+  320 MiB for a file at the cap). Run staging on a host with that headroom.
 - KEV (CISA JSON): only `cveID`, `vendorProject`, `product`, `dateAdded` are kept. The CVE id is
   ASCII with no leading zeros beyond four digits; the date must be a real date. Duplicates are
   malformed.
-- URLhaus (CSV, read with a real CSV reader, so a newline inside a quoted URL is rejected, not
-  split): only the lower-cased **host** and the threat label are kept. Path, query, port and
-  credentials are discarded before anything is stored. Only http/https URLs count. The host
-  must be ASCII (Kelvin-sign and other lookalikes fail), a trailing dot is dropped, IPv4/IPv6
-  literals are normalised (IPv6 stored without brackets), and the port must be valid.
-  Duplicate hosts keep the first row.
-- A row whose host, scheme or port is unusable is **skipped and counted**; the import is
-  rejected if more than max(100, 1% of data rows) are skipped.
+- URLhaus (CSV, strict quoting, so a newline in a quoted field stays in that field): only the
+  lower-cased **host** and the threat label are kept. Path, query, port and credentials are
+  discarded before anything is stored. Only http/https URLs count. The host must be ASCII
+  (Kelvin-sign and other lookalikes fail), one trailing dot is dropped, IPv6 literals are
+  normalised and stored without brackets, and an IPv4-mapped IPv6 literal is stored as the
+  plain IPv4 address. The port must be valid. Duplicate hosts keep the first row.
+- **Deliberately skipped address forms.** A host whose last label is numeric or `0x..` is an
+  address and is kept only as a strict dotted quad. Browser-ambiguous forms (`0x7f.0.0.1`,
+  `127.1`, `010.0.0.1`, `2130706433`) are skipped, never guessed. The later matcher unit must
+  treat them the same way.
+- **Skip vs reject.** A bad URL column (oversized, non-printable) or an unusable host, scheme
+  or port skips that row only; it is counted in `skipped_count` (import row and audit detail)
+  for the later accept step to show. The file is rejected only when more than half of its data
+  rows are skipped (not the expected format). Any other column that is oversized, has control
+  characters or the wrong column count, bad quoting, or a physical line over 16 KiB rejects the
+  whole file.
+
+## Staging capacity
+
+At most 5 imports per source may be in `staged` status. There is no accept/reject yet (unit
+3b), so until it lands a source is permanently full after five stagings. That is intended;
+there is no workaround.

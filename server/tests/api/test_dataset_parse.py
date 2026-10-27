@@ -107,7 +107,10 @@ def test_urlhaus_dedupes_by_host_first_wins():
 
 def test_host_edge_cases_keep_normalised_hosts_and_skip_the_rest():
     entries, skipped = parse_urlhaus((FIX / "urlhaus_hosts.csv").read_bytes())
-    assert keys(entries) == ["evil.com", "2001:db8::1", "userinfo.example.org", "192.0.2.7"]
+    assert keys(entries) == [
+        "evil.com", "2001:db8::1", "userinfo.example.org", "192.0.2.7",
+        "good1.example.org", "good2.example.org", "good3.example.org",
+    ]  # fmt: skip
     assert skipped == 7
     assert "pw" not in json.dumps([e.payload for e in entries])
 
@@ -134,6 +137,15 @@ def test_unicode_lookalike_host_is_skipped_not_stored():
         "http://-a.test/",
         "http://a..test/",
         "http://999.1.1.1/",
+        "http://0x7f.0.0.1/",  # ambiguous browser forms are skipped on purpose
+        "http://127.1/",
+        "http://010.0.0.1/",
+        "http://2130706433/",
+        "http://1.2.3.4.5/",
+        "http://a.test/\x07",  # a bad URL column skips the row, it does not reject the file
+        "http://a.test/\u00a0x",
+        "http://a.test/\n",
+        "http://" + "a" * 600 + ".test/",
         "not a url",
         "http:///nohost",
     ],
@@ -149,35 +161,44 @@ def test_only_unusable_rows_means_no_import():
         parse_urlhaus(urlhaus_row("ftp://a.test/"))
 
 
-def test_trailing_dot_and_ipv6_normalisation():
-    raw = urlhaus_row("http://Evil.COM./a") + urlhaus_row("http://[2001:DB8::0:1]/")
-    entries, _ = parse_urlhaus(raw)
-    assert keys(entries) == ["evil.com", "2001:db8::1"]
+def test_trailing_dot_and_ip_normalisation():
+    urls = [
+        "http://Evil.COM./a", "http://[2001:DB8::0:1]/", "http://1.2.3.4./",
+        "http://[::ffff:1.2.3.4]/", "http://[::FFFF:102:304]:80/", "http://[::ffff:5.6.7.8]/",
+    ]  # fmt: skip
+    entries, _ = parse_urlhaus(b"".join(urlhaus_row(u) for u in urls))
+    assert keys(entries) == ["evil.com", "2001:db8::1", "1.2.3.4", "5.6.7.8"]
 
 
-def test_skip_budget_is_the_larger_of_floor_and_one_percent(monkeypatch):
-    monkeypatch.setattr(dataset_parse, "SKIP_FLOOR", 0)
-    good = b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(198))
-    bad = urlhaus_row("ftp://x.test/")
-    assert parse_urlhaus(good + bad * 2)[1] == 2  # 2 of 200 rows is exactly 1%
+def test_skip_policy_rejects_only_a_majority_of_skipped_rows():
+    good, bad = urlhaus_row("http://ok.test/"), urlhaus_row("ftp://x.test/")
+    assert parse_urlhaus(good + bad)[1] == 1  # exactly half is still staged
+    assert (
+        parse_urlhaus(
+            good * 1
+            + bad * 1
+            + b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(200))
+            + bad * 150
+        )[1]
+        == 151
+    )
     with pytest.raises(ValueError, match="skipped"):
-        parse_urlhaus(good + bad * 3)
-    monkeypatch.setattr(dataset_parse, "SKIP_FLOOR", 3)
-    assert parse_urlhaus(good + bad * 3)[1] == 3
+        parse_urlhaus(good + bad * 2)
+
+
+def test_a_few_hundred_crafted_rows_cannot_block_an_update():
+    good = b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(1000))
+    assert parse_urlhaus(good + urlhaus_row("ftp://x.test/") * 300)[1] == 300
 
 
 @pytest.mark.parametrize(
     "raw",
     [
         b'"1","d","http://a.test/","online"\n',  # wrong column count
-        urlhaus_row("http://a.test/\x07"),
         urlhaus_row("http://a.test/", "bad\x00threat"),
         urlhaus_row("http://a.test/", "x" * 513),
-        urlhaus_row("http://" + "a" * 600 + ".test/"),
         b'"1","d","http://a.test/","o","l","t","\x07","l","r"\n',  # control char, any column
         b'"1","d","http://a.test/","o","l","t","","l","r\x00"\n',
-        b'"1","d","http://a.\ntest/x","o","l","t","","l","r"\n',  # embedded newline in the URL
-        b'"1","d","http://a.test/\n","o","l","t","","l","r"\n',
         b"\xff\xfe",
         b"",
         b"# only comments\n\n",
@@ -190,8 +211,8 @@ def test_urlhaus_structural_problems_reject_the_whole_file(raw):
 
 def test_embedded_newline_is_not_read_as_a_shorter_host():
     raw = b'"1","d","http://a.\ntest/x","o","l","t","","l","r"\n'
-    with pytest.raises(ValueError, match="non-printable"):
-        parse_urlhaus(urlhaus_row("http://ok.test/") + raw)
+    entries, skipped = parse_urlhaus(urlhaus_row("http://ok.test/") + raw)
+    assert keys(entries) == ["ok.test"] and skipped == 1  # skipped, not stored as a.test
 
 
 def test_comments_and_blank_rows_are_skipped_after_csv_parsing():
@@ -230,7 +251,7 @@ def test_urlhaus_entry_cap_stops_iterating_at_cap_plus_one(monkeypatch):
     monkeypatch.setattr(dataset_parse, "URLHAUS_MAX_ENTRIES", 3)
     real = dataset_parse.csv.reader
     CountingReader.pulled = 0
-    monkeypatch.setattr(dataset_parse.csv, "reader", lambda f: CountingReader(real(f)))
+    monkeypatch.setattr(dataset_parse.csv, "reader", lambda f, **kw: CountingReader(real(f, **kw)))
     raw = b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(500))
     with pytest.raises(ValueError, match="too many"):
         parse_urlhaus(raw)
@@ -254,8 +275,8 @@ def test_urlhaus_input_cap_boundary(monkeypatch):
 
 
 def test_kev_limits_are_smaller_than_urlhaus_limits():
-    assert dataset_parse.KEV_MAX_INPUT == 16 * 1024 * 1024
-    assert dataset_parse.KEV_MAX_ENTRIES == 100_000
+    assert dataset_parse.KEV_MAX_INPUT == 8 * 1024 * 1024
+    assert dataset_parse.KEV_MAX_ENTRIES == 20_000
     assert dataset_parse.URLHAUS_MAX_INPUT == 64 * 1024 * 1024
     assert dataset_parse.URLHAUS_MAX_ENTRIES == 250_000
 
@@ -277,6 +298,39 @@ def test_kev_entry_cap_boundary(monkeypatch):
         parse_kev(raw)
 
 
+def test_kev_prescan_counts_arrays_too(monkeypatch):
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_ENTRIES", 2)
+
+    def boom(*_a, **_k):
+        raise AssertionError("json.loads must not run")
+
+    monkeypatch.setattr(dataset_parse.json, "loads", boom)
+    raw = b'{"vulnerabilities":[' + b"[]," * 40 + b"[]]}"
+    with pytest.raises(ValueError, match="too many"):
+        parse_kev(raw)
+
+
+@pytest.mark.parametrize("item", [b"0", b"[]", b"{}", b'"x"', b"null"])
+def test_kev_prescan_bounds_every_item_shape(monkeypatch, item):
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_ENTRIES", 2)
+
+    def boom(*_a, **_k):
+        raise AssertionError("json.loads must not run")
+
+    monkeypatch.setattr(dataset_parse.json, "loads", boom)
+    raw = b'{"vulnerabilities":[' + (item + b",") * 400 + item + b"]}"
+    with pytest.raises(ValueError, match="too many"):
+        parse_kev(raw)
+
+
+def test_a_realistic_kev_catalog_passes_the_prescan(monkeypatch):
+    entry = {"cveID": "CVE-2021-%04d", "vendorProject": "A", "product": "B",
+             "dateAdded": "2021-01-01", "cwes": ["CWE-1", "CWE-2"]}  # fmt: skip
+    items = [{**entry, "cveID": entry["cveID"] % n} for n in range(1, 51)]
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_ENTRIES", 50)
+    assert len(parse_kev(json.dumps({"vulnerabilities": items}).encode())) == 50
+
+
 def test_kev_brace_prescan_rejects_before_json_is_built(monkeypatch):
     monkeypatch.setattr(dataset_parse, "KEV_MAX_ENTRIES", 2)
 
@@ -294,8 +348,48 @@ def test_field_length_cap(monkeypatch):
     parse_urlhaus(urlhaus_row("http://a.test/", "x" * 20))  # at the cap is fine
     with pytest.raises(ValueError, match="field"):
         parse_urlhaus(urlhaus_row("http://a.test/", "x" * 21))
-    with pytest.raises(ValueError, match="field"):
-        parse_urlhaus(urlhaus_row("http://a.test/" + "p" * 20))
+    entries, skipped = parse_urlhaus(
+        urlhaus_row("http://ok.test/") + urlhaus_row("http://a.te/" + "p" * 20)
+    )
+    assert keys(entries) == ["ok.test"] and skipped == 1  # the URL column skips, not rejects
     monkeypatch.setattr(dataset_parse, "MAX_FIELD_LEN", 5)
     with pytest.raises(ValueError, match="field"):
         parse_kev((FIX / "kev_small.json").read_bytes())
+
+
+def test_a_giant_physical_line_is_rejected_before_it_becomes_a_row(monkeypatch):
+    real = dataset_parse.csv.reader
+    CountingReader.pulled = 0
+    monkeypatch.setattr(dataset_parse.csv, "reader", lambda f, **kw: CountingReader(real(f, **kw)))
+    raw = urlhaus_row("http://ok.test/") + b"," * 1_000_000 + b"\n"
+    with pytest.raises(ValueError, match="line 2: line longer"):
+        parse_urlhaus(raw)
+    assert CountingReader.pulled == 1  # the comma line never reached the tokenizer
+
+
+def test_line_cap_boundary_and_legal_long_urls(monkeypatch):
+    long_url = "http://ok.test/" + "p" * 400
+    assert keys(parse_urlhaus(urlhaus_row(long_url))[0]) == ["ok.test"]
+    row = urlhaus_row("http://ok.test/")
+    monkeypatch.setattr(dataset_parse, "MAX_LINE_LEN", len(row))
+    parse_urlhaus(row)
+    with pytest.raises(ValueError, match="line longer"):
+        parse_urlhaus(row.replace(b"\n", b" \n"))
+
+
+def test_quoted_multiline_fields_still_parse_as_one_row():
+    raw = b'"1","d","http://ok.test/","o","l","t","line one\nline two","l","r"\n'
+    with pytest.raises(ValueError, match="non-printable"):  # structural, but read as ONE row
+        parse_urlhaus(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'"1","d","http://a.test/","o","l","t","","l","unterminated\n',
+        b'"1","d","http://a.test/","o","l","t","","l","r"x\n',
+    ],
+)
+def test_malformed_quoting_is_rejected_strictly(raw):
+    with pytest.raises(ValueError, match="line"):
+        parse_urlhaus(raw)

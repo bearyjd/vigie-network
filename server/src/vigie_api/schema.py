@@ -239,7 +239,8 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
           skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count>=0),
           status TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged','accepted','rejected')),
           created_at TEXT NOT NULL, created_by TEXT NOT NULL,
-          accepted_by TEXT, accepted_at TEXT,
+          accepted_by TEXT CHECK (accepted_by IS NULL OR length(accepted_by)>0),
+          accepted_at TEXT CHECK (accepted_at IS NULL OR length(accepted_at)>0),
           CHECK (status!='accepted' OR (accepted_by IS NOT NULL AND accepted_at IS NOT NULL))
         )""",
         "CREATE UNIQUE INDEX idx_dataset_imports_source_sha ON dataset_imports(source, sha256)",
