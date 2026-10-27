@@ -176,6 +176,11 @@ WRITE_PATHS = {
         ("_audit", "INSERT", "audit_log"),
     ],
     "evidence_writes.py": [("record_export", "INSERT", "audit_log")],
+    "dataset_writes.py": [
+        ("stage", "INSERT", "dataset_imports"),
+        ("stage", "INSERT", "dataset_entries_staging"),
+        ("stage", "INSERT", "audit_log"),
+    ],
     "identity_writes.py": [
         ("atomic", "INSERT", "audit_log"),
         ("atomic", "INSERT", "api_write_receipts"),
@@ -198,6 +203,8 @@ IRRELEVANT_WRITE_TABLES = {
     "audit_log": "audit history never changes attach authorization",
     "api_write_receipts": "idempotency receipt only",
     "identity_merges": "undo history; live identity is in links/rules/decisions",
+    "dataset_imports": "staged threat data; nothing reads it for attach authorization",
+    "dataset_entries_staging": "staged threat data; nothing reads it for attach authorization",
 }
 TRIGGERED_WRITE_TABLES = {
     "device_overrides",

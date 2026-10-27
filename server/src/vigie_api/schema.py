@@ -226,6 +226,34 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE TABLE incident_decision_prune (decided_at TEXT NOT NULL,"
         " incident_id TEXT NOT NULL)",
     ),
+    (
+        # Offline known-issue datasets (KEV, URLhaus) staged for a later human accept. Staging only:
+        # nothing reads these tables yet. The unique index makes re-importing identical bytes of
+        # one source a no-op the writer can refuse; entries hold no more than the parsers keep.
+        """CREATE TABLE dataset_imports (
+          id TEXT PRIMARY KEY,
+          source TEXT NOT NULL CHECK (source IN ('kev','urlhaus')),
+          version TEXT NOT NULL CHECK (length(trim(version, ' '||char(9,10,11,12,13,160)))>0),
+          licence TEXT NOT NULL CHECK (length(trim(licence, ' '||char(9,10,11,12,13,160)))>0),
+          sha256 TEXT NOT NULL CHECK (length(sha256)=64),
+          entry_count INTEGER NOT NULL CHECK (entry_count>=0),
+          skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count>=0),
+          status TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged','accepted','rejected')),
+          created_at TEXT NOT NULL CHECK (length(trim(created_at, ' '||char(9,10,11,12,13,160)))>0),
+          created_by TEXT NOT NULL CHECK (length(trim(created_by, ' '||char(9,10,11,12,13,160)))>0),
+          accepted_by TEXT CHECK (accepted_by IS NULL OR
+            length(trim(accepted_by, ' '||char(9,10,11,12,13,160)))>0),
+          accepted_at TEXT CHECK (accepted_at IS NULL OR
+            length(trim(accepted_at, ' '||char(9,10,11,12,13,160)))>0),
+          CHECK (status!='accepted' OR (accepted_by IS NOT NULL AND accepted_at IS NOT NULL))
+        )""",
+        "CREATE UNIQUE INDEX idx_dataset_imports_source_sha ON dataset_imports(source, sha256)",
+        """CREATE TABLE dataset_entries_staging (
+          import_id TEXT NOT NULL REFERENCES dataset_imports(id),
+          key TEXT NOT NULL, payload TEXT NOT NULL,
+          PRIMARY KEY (import_id, key)
+        ) WITHOUT ROWID""",
+    ),
 )
 
 

@@ -1,0 +1,4 @@
+{"vulnerabilities": [
+  {"cveID": "CVE-2021-0001", "vendorProject": "A", "product": "B", "dateAdded": "2021-11-03"},
+  {"cveID": "CVE-2021-0002; DROP TABLE x", "vendorProject": "A", "product": "B", "dateAdded": "2021-11-03"}
+]}

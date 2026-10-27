@@ -1,0 +1,8 @@
+################################################################
+# abuse.ch URLhaus Database Dump (synthetic test fixture)
+# id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,reporter
+################################################################
+"1","2024-01-01 00:00:01","http://Evil.Example.com/path/to/mal.exe?token=SECRET-QUERY-CANARY","online","2024-01-02","malware_download","exe","https://urlhaus.abuse.ch/url/1/","rep1"
+"2","2024-01-01 00:00:02","http://user:SECRET-PW-CANARY@creds.example.net:8080/a/b","online","2024-01-02","malware_download","elf","https://urlhaus.abuse.ch/url/2/","rep2"
+"3","2024-01-01 00:00:03","http://EVIL.example.com/other","offline","2024-01-02","botnet_cc","","https://urlhaus.abuse.ch/url/3/","rep1"
+"4","2024-01-01 00:00:04","http://192.0.2.7/x.sh","online","2024-01-02","malware_download","sh","https://urlhaus.abuse.ch/url/4/","rep3"
