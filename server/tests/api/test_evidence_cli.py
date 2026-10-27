@@ -55,6 +55,21 @@ def test_export_writes_a_private_file_and_audits_as_cli_local(e, tmp_path):
     assert "cli-canary-host" not in json.dumps(row)
 
 
+def test_cli_salt_comes_from_fresh_entropy(e, tmp_path, monkeypatch):
+    seen = []
+    real = evidence_cli.evidence_export.build_export
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["rng"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_cli.evidence_export, "build_export", spy)
+    assert run(e, tmp_path / "a.json") == 0
+    (rng,) = seen
+    first, second = rng(16), rng(16)
+    assert first != second and first != bytes(16) and second != bytes(16)
+
+
 def test_markdown_format_and_minimal_level(e, tmp_path):
     out = tmp_path / "pack.md"
     assert run(e, out, "--format", "markdown", "--redaction", "minimal") == 0
