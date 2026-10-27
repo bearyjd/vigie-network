@@ -59,6 +59,7 @@ LOG_WEDGED_EVERY = 20  # a wedged transport is logged on the first run and every
 # claim that spawned it (already completed as a failure) could have used it.
 _ABANDONED: set[threading.Thread] = set()
 _ABANDONED_LOCK = threading.Lock()
+_IN_FLIGHT = 0  # reserved publishes (claimed or about to be) that are not abandoned yet
 _wedged_runs = 0
 _ROW = "row_id,incident_id,kind,state,attempts,next_attempt_at,created_at,updated_at,version"
 
@@ -152,20 +153,53 @@ def abandoned_count() -> int:
         return len(_ABANDONED)
 
 
-def _wedged(limit: int) -> bool:
-    """True when `limit` abandoned publishes are still running: do not claim, do not publish."""
-    global _wedged_runs
-    running = abandoned_count()
-    if running < limit:
-        return False
-    if _wedged_runs % LOG_WEDGED_EVERY == 0:
-        detail = f"delivery transport wedged: {running} abandoned publishes still running"
+class _Slot:
+    """One unit of publish capacity. Held until released, or converted into an abandoned worker."""
+
+    held = True
+
+
+def _reserve(limit: int) -> _Slot | None:
+    """Atomically take capacity BEFORE the CLAIM: in-flight plus still-running abandoned publishes
+    never exceed `limit` (so it also bounds concurrent publishes across the process). None when
+    full: the caller ends its drain without claiming anything."""
+    global _IN_FLIGHT, _wedged_runs
+    with _ABANDONED_LOCK:
+        _ABANDONED.difference_update([t for t in _ABANDONED if not t.is_alive()])
+        running, active = len(_ABANDONED), _IN_FLIGHT
+        if running + active < limit:
+            _IN_FLIGHT += 1
+            return _Slot()
+        noisy = _wedged_runs % LOG_WEDGED_EVERY == 0
+        _wedged_runs += 1
+    if noisy:
+        detail = (
+            f"delivery transport wedged: {running} abandoned publishes still running, "
+            f"{active} in flight"
+        )
         log(logger, logging.ERROR, "delivery_transport_wedged", abandoned=running, detail=detail)
-    _wedged_runs += 1
-    return True
+    return None
 
 
-def _publish(publisher: Publisher, message: Message, seconds: float) -> str:
+def _release(slot: _Slot) -> None:
+    global _IN_FLIGHT
+    with _ABANDONED_LOCK:
+        if slot.held:
+            slot.held = False
+            _IN_FLIGHT -= 1
+
+
+def _abandon(slot: _Slot, worker: threading.Thread) -> None:
+    """The deadline expired: the reservation becomes an abandoned entry in one locked step."""
+    global _IN_FLIGHT
+    with _ABANDONED_LOCK:
+        _ABANDONED.add(worker)
+        if slot.held:
+            slot.held = False
+            _IN_FLIGHT -= 1
+
+
+def _publish(publisher: Publisher, message: Message, seconds: float, slot: _Slot) -> str:
     """'sent', 'failed' or 'timeout'. The publisher runs in a daemon thread that is abandoned at
     the deadline: a hard wall timeout that does not depend on the transport honouring one."""
     outcome: list[BaseException | None] = []
@@ -181,8 +215,7 @@ def _publish(publisher: Publisher, message: Message, seconds: float) -> str:
     worker.start()
     worker.join(seconds)
     if worker.is_alive() or not outcome:
-        with _ABANDONED_LOCK:
-            _ABANDONED.add(worker)
+        _abandon(slot, worker)
         log(logger, logging.ERROR, "delivery_publish_timeout", delivery_id=message.delivery_id)
         return "timeout"
     if outcome[0] is not None:
@@ -202,7 +235,7 @@ def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> bool:
         return inv.execute(sql, params).rowcount == 1
 
 
-def _send_one(inv, ro, publisher, row: DeliveryView, config, clock) -> str:
+def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot) -> str:
     taken = _claim(inv, row, config, clock)
     if taken is None:
         return "skipped"
@@ -214,7 +247,7 @@ def _send_one(inv, ro, publisher, row: DeliveryView, config, clock) -> str:
     elif not may_transmit(stamp, clock(), config):
         outcome = "aborted"
     else:
-        outcome = _publish(publisher, message, config.transmit_deadline_seconds)
+        outcome = _publish(publisher, message, config.transmit_deadline_seconds, slot)
     if not _complete(inv, claimed, outcome == "sent", config, clock):
         log(logger, logging.WARNING, "delivery_completion_lost", row_id=claimed.row_id)
         return "lost"
@@ -249,9 +282,13 @@ def run_delivery(
             return RunReport(skipped="decisions_unavailable")
         counts: Counter[str] = Counter()
         for row in _due(inv, now, config, max_per_run):
-            if _wedged(max_abandoned):
-                break  # checked BEFORE the claim, so a dead transport burns no attempts
-            outcome = _send_one(inv, ro, publisher, row, config, clock)
+            slot = _reserve(max_abandoned)
+            if slot is None:
+                break  # reserved BEFORE the claim, so a dead transport burns no attempts
+            try:
+                outcome = _send_one(inv, ro, publisher, row, config, clock, slot)
+            finally:
+                _release(slot)
             counts[outcome] += 1
             if outcome == "timeout":
                 break  # the transport is wedged: do not strand more worker threads this run

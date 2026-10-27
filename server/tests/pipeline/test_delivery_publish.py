@@ -226,45 +226,53 @@ def test_short_writes_are_completed(tmp_path, monkeypatch):
     assert [r["delivery_id"] for r in _all_lines_parse(path)] == [f"{3:032d}"]
 
 
+def _fixed(i):
+    """Records of identical size whatever `i` is (0..9999)."""
+    return Message(f"{i:032d}", "open", "title", "body", f"/ui/#incident={i:04d}")
+
+
+def _fixed_len(tmp_path):
+    probe = tmp_path / "probe.jsonl"
+    FilePublisher(probe).publish(_fixed(0), timeout_seconds=1)
+    return probe.stat().st_size
+
+
 def _line_len():
     return len(json.dumps({"delivery_id": f"{0:032d}", "kind": "open", "title": "title",
         "body": "body é", "link": "/ui/#incident=0"}, separators=(",", ":"))) + 1  # fmt: skip
 
 
+ROOM = 5  # records the limit admits
+
+
+def _attempt(path, limit, i):
+    try:
+        FilePublisher(Path(path), max_bytes=limit).publish(_fixed(i), timeout_seconds=1)
+        return True
+    except PublishError as exc:
+        assert "full" in str(exc)
+        return False
+
+
 def test_concurrent_publishers_cannot_exceed_the_limit(tmp_path):
     path = tmp_path / "out.jsonl"
-    n = _line_len()
-    limit = n * 5 + n // 2  # room for exactly five lines
-    ok, full = [], []
-
-    def work(base):
-        pub = FilePublisher(path, max_bytes=limit)
-        for i in range(5):
-            try:
-                pub.publish(_msg(base * 10 + i), timeout_seconds=1)
-                ok.append(1)
-            except PublishError:
-                full.append(1)
-
-    threads = [threading.Thread(target=work, args=(b,)) for b in range(6)]
+    limit = _fixed_len(tmp_path) * ROOM
+    results = []
+    threads = [
+        threading.Thread(target=lambda i=i: results.append(_attempt(path, limit, i)))
+        for i in range(ROOM + 3)
+    ]
     for t in threads:
         t.start()
     for t in threads:
         t.join(30)
-    assert len(ok) == 5 and path.stat().st_size <= limit
-    assert len(_all_lines_parse(path)) == 5
+    assert results.count(True) == ROOM and results.count(False) == 3
+    assert path.stat().st_size == limit
+    assert len(_all_lines_parse(path)) == ROOM
 
 
-def _proc_work(path, limit, base, queue):
-    pub = FilePublisher(Path(path), max_bytes=limit)
-    done = 0
-    for i in range(5):
-        try:
-            pub.publish(_msg(base * 10 + i), timeout_seconds=1)
-            done += 1
-        except PublishError:
-            pass
-    queue.put(done)
+def _proc_work(path, limit, i, queue):
+    queue.put(_attempt(path, limit, i))
 
 
 def test_separate_processes_serialize_on_the_file(tmp_path):
@@ -272,16 +280,19 @@ def test_separate_processes_serialize_on_the_file(tmp_path):
 
     ctx = multiprocessing.get_context("fork")
     path = tmp_path / "out.jsonl"
-    limit = _line_len() * 7 + 3
+    limit = _fixed_len(tmp_path) * ROOM
     queue = ctx.Queue()
-    procs = [ctx.Process(target=_proc_work, args=(str(path), limit, b, queue)) for b in range(4)]
+    procs = [
+        ctx.Process(target=_proc_work, args=(str(path), limit, i, queue)) for i in range(ROOM + 3)
+    ]
     for p in procs:
         p.start()
-    total = sum(queue.get(timeout=60) for _ in procs)
+    results = [queue.get(timeout=60) for _ in procs]
     for p in procs:
         p.join(30)
-    assert total == 7 and path.stat().st_size <= limit
-    assert len(_all_lines_parse(path)) == 7
+    assert results.count(True) == ROOM and results.count(False) == 3
+    assert path.stat().st_size == limit
+    assert len(_all_lines_parse(path)) == ROOM
 
 
 def test_check_and_write_are_one_critical_section(tmp_path, monkeypatch):

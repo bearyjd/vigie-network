@@ -27,11 +27,13 @@ def _no_abandoned_workers():
     """The registry of abandoned publishes is process-wide: every test starts and ends clean."""
     delivery_runner._ABANDONED.clear()
     delivery_runner._wedged_runs = 0
+    delivery_runner._IN_FLIGHT = 0
     yield
     for gate in _GATES:
         gate.set()
     _GATES.clear()
     _wait_idle()
+    assert delivery_runner._IN_FLIGHT == 0  # no test may leak a reservation
 
 
 @pytest.fixture
@@ -337,3 +339,109 @@ def test_late_worker_result_never_touches_rows(world):
     gates[0].set()  # the hung publish now "succeeds", long after its claim was failed
     _wait_idle()
     assert world.rows() == before and world.states() == {"open": "pending"}
+
+
+def test_concurrent_drains_cannot_both_start_a_worker(world, tmp_path, monkeypatch):
+    """Both drains reach the capacity check together: exactly one may proceed, and the loser must
+    not even CLAIM (reserve-then-claim), so its row keeps attempts == 0."""
+    from vigie_pipeline.overrides import open_overrides_ro
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    world.incident("a")
+    world.incident("b")
+    gates, pub = _hang_forever(1)
+    barrier = threading.Barrier(2)
+    seen: set[int] = set()
+    real = delivery_runner._reserve
+
+    def meet(*args):
+        ident = threading.get_ident()
+        if ident not in seen:
+            seen.add(ident)
+            try:
+                barrier.wait(10)
+            except threading.BrokenBarrierError:
+                pass
+        return real(*args)
+
+    monkeypatch.setattr(delivery_runner, "_reserve", meet)
+    errors = []
+
+    def drain():
+        inv = open_pipeline_inventory(tmp_path / "inventory.db")
+        ro = open_overrides_ro(tmp_path / "overrides.db")
+        try:
+            run_delivery(inv, ro, pub, dconf(), Clock(), max_abandoned=1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            inv.close()
+            ro.close()
+
+    threads = [threading.Thread(target=drain) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert not errors and len(pub.attempted) == 1
+    assert sorted(r["attempts"] for r in world.rows()) == [0, 1]
+    assert delivery_runner.abandoned_count() == 1 and delivery_runner._IN_FLIGHT == 0
+
+
+def test_in_flight_bounds_concurrent_publishes_even_without_abandonment(world):
+    world.incident()
+    slot = delivery_runner._reserve(1)
+    assert slot is not None
+    pub = FakePublisher()
+    report = go(world, pub, Clock(), max_abandoned=1)
+    assert pub.attempted == [] and report.claimed == 0
+    assert world.rows()[0]["attempts"] == 0
+    delivery_runner._release(slot)
+    assert go(world, pub, Clock(T0 + 1), max_abandoned=1).sent == 1
+
+
+def test_reservation_released_when_the_claim_is_lost(world, monkeypatch):
+    world.incident()
+    go(world, FakePublisher(script=[PublishError("x")]), Clock())
+    (row,) = world.rows()
+    stale = delivery_runner.DeliveryView(**{**_view(row), "version": row["version"] - 1})
+    monkeypatch.setattr(delivery_runner, "_due", lambda *a, **k: [stale])
+    go(world, FakePublisher(), Clock(T0 + 600))
+    assert delivery_runner._IN_FLIGHT == 0
+
+
+def test_reservation_released_on_may_transmit_abort(world):
+    world.incident()
+    reads = []
+
+    def clock():
+        reads.append(1)
+        return T0 if len(reads) <= 2 else T0 + 5
+
+    assert go(world, FakePublisher(), clock).aborted == 1
+    assert delivery_runner._IN_FLIGHT == 0
+
+
+def test_reservation_released_when_the_run_raises(world, monkeypatch):
+    world.incident()
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(delivery_runner, "_message", boom)
+    with pytest.raises(RuntimeError):
+        go(world, FakePublisher(), Clock())
+    assert delivery_runner._IN_FLIGHT == 0
+
+
+def test_reservation_released_when_the_worker_cannot_start(world, monkeypatch):
+    world.incident()
+
+    def no_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_start)
+    with pytest.raises(RuntimeError):
+        go(world, FakePublisher(), Clock())
+    monkeypatch.undo()
+    assert delivery_runner._IN_FLIGHT == 0 and delivery_runner.abandoned_count() == 0
