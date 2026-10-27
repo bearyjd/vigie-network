@@ -268,3 +268,38 @@ def test_markdown_nonce_differs_per_salt(e):
     na = re.search(r"BEGIN UNTRUSTED DEVICE DATA (\w+)", render_markdown(a).decode())[1]
     nb = re.search(r"BEGIN UNTRUSTED DEVICE DATA (\w+)", render_markdown(b).decode())[1]
     assert na != nb
+
+
+def test_unavailable_records_beyond_the_cap_are_counted(e):
+    e.inv.execute("DELETE FROM monitoring_unavailable")
+    for n in range(55):
+        e.inv.execute(
+            "INSERT INTO monitoring_unavailable VALUES (?,?,'no_lineage',?)",
+            (f"coll-{n:02}", DEV, int(NOW)),
+        )
+    sec = redact(pack(e), "full", bytes(32)).body["sections"]["coverage_gaps"]
+    assert (sec["status"], sec["omitted_count"]) == ("truncated", 5)
+
+
+def test_fixed_vocabulary_fields_reject_values_that_merely_look_like_ids():
+    from vigie_api.evidence_assemble import _identity_item
+    from vigie_api.evidence_determinations import allowlisted_evidence
+
+    row = {"is_randomized": 0}
+    mac = {"mac": MAC, "link_source": "alice-laptop", "link_rule_id": None, "first_seen": None,
+           "last_seen": None, "current": True}  # fmt: skip
+    assert _identity_item(mac, row)["link_source"] is None
+    assert "reason_code" not in allowlisted_evidence({"reason_code": "alice-laptop"})
+    assert allowlisted_evidence({"reason_code": "large_upload_threshold"})["reason_code"]
+
+
+def test_incident_detector_and_state_reject_free_values():
+    from vigie_api.evidence_determinations import _incident_item
+
+    plain = ("episode_start", "last_hour", "detected_at", "observed_bytes", "threshold_bytes")
+    row = dict.fromkeys(plain, None) | {"baseline_id": None}
+    row |= {"id": "i", "collector_id": "c", "lineage": "l", "detector": "alice-laptop",
+            "state": "aa:bb:cc:00:00:01", "current_lineage": True, "evidence": {}, "review": None,
+            "decision_version": 0, "attention": False}  # fmt: skip
+    item = _incident_item(row)
+    assert item["detector"] is None and item["state"] is None
