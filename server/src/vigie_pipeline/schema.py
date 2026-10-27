@@ -260,6 +260,31 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "CREATE TABLE mac_last_ip (mac TEXT PRIMARY KEY,ip TEXT NOT NULL,"
         "observed_at INTEGER NOT NULL,source TEXT NOT NULL CHECK(source IN ('lease','neigh')))",
     ),
+    (
+        # Outbox for incident notifications (see vigie_pipeline.delivery_plan). Times are integer
+        # epoch seconds. No FK to monitoring_incidents: incidents are pruned by retention while
+        # deliveries age out on their own. delivery_id is deterministic: sha256 of
+        # f"{incident_id}\n{kind}", first 32 hex. row_id is the INCARNATION token: AUTOINCREMENT
+        # never reuses an id, so a recreated delivery is a different row whatever the clock says.
+        "CREATE TABLE incident_deliveries ("
+        "row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "delivery_id TEXT NOT NULL UNIQUE CHECK(length(delivery_id)=32),"
+        "incident_id TEXT NOT NULL,"
+        "kind TEXT NOT NULL CHECK(kind IN ('open','recover')),"
+        "state TEXT NOT NULL CHECK(state IN "
+        "('pending','sending','sent','failed','suppressed','expired','withdrawn')),"
+        "attempts INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempts)='integer' AND attempts>=0),"
+        "next_attempt_at INTEGER CHECK(next_attempt_at IS NULL OR "
+        "typeof(next_attempt_at)='integer'),"
+        "last_error TEXT CHECK(last_error IS NULL OR length(last_error)<=200),"
+        "created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer'),"
+        "updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer'),"
+        "version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),"
+        "CHECK(state NOT IN ('pending','sending') OR next_attempt_at IS NOT NULL),"
+        "CHECK(state!='withdrawn' OR kind='recover'),"
+        "UNIQUE(incident_id,kind))",
+        "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",
+    ),
 )
 
 PIPELINE_TABLES = (

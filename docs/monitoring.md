@@ -155,6 +155,252 @@ API withholds expired or stale-lineage hints, without waiting for the next pipel
 bounded20-device refresh processes new/expired hints and round-robin work. No raw hostname, vendor
 class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numeric probability.
 
+### Incident delivery (planned)
+
+Nothing is sent yet: this lands the outbox schema and a pure planner only. Delivery is off by
+default and the local inbox works without any publisher. The topic and ownership are still open
+(D5), so no code names a topic or calls a network service. When it is built, the pipeline (not the
+API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
+delivery is disabled the planner does not run, so nothing is created and nothing expires; enabling
+it records `eligible_since`, and incidents detected before that instant are ignored so switching
+it on never announces old open incidents.
+
+Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
+`recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and
+`next_attempt_at` (required while `pending` or `sending`), `attempts >= 0`, a `version` (a plain
+counter: 0 at creation, +1 per change) and `last_error` capped at 200 characters. `row_id` is an
+`INTEGER PRIMARY KEY AUTOINCREMENT`, the incarnation token; `delivery_id` (unique) is the first 32
+hex chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
+incident link only. States:
+
+| state | meaning |
+| --- | --- |
+| `pending` | waiting for `next_attempt_at`, then for a sender to claim it |
+| `sending` | claimed: a sender holds a lease until `next_attempt_at`; the planner leaves it alone |
+| `sent`, `failed`, `expired` | terminal |
+| `suppressed` | held back by an acknowledged/expected decision; re-checked every pass |
+| `withdrawn` | a `recover` taken back because its incident is not resolved; revived by the next resolution |
+
+**Contract.** Unit 4b reads the complete incident set and the delivery rows, runs `plan()` and
+applies every action inside one `BEGIN IMMEDIATE` transaction; it skips the pass if the incident
+read fails (a partial list would expire pending rows as `incident_missing`). Each action is exactly
+one of the statements below (`vigie_pipeline.delivery_sql`; the tests run them against a table built
+by the production migration, and another test keeps this block identical to the code) and carries
+the row it was planned against (`expected`: state, attempts, version, row_id) as an assertion. Every UPDATE
+sets `updated_at=:now` and `version=version+1`. Each statement must affect exactly one row;
+anything else is a planner bug, so roll the whole pass back (`delivery_sql.apply_actions` raises
+`PassError` naming `delivery_id` and `row_id`). To investigate, run `SELECT * FROM
+incident_deliveries WHERE delivery_id = '<id from the message>'`; a corrupt row may be removed by
+hand with `DELETE FROM incident_deliveries WHERE row_id = <row_id>` (the next pass then plans the
+incident afresh, so an open that was already sent may be announced again).
+
+**Sender contract (a lease).** The sender works in short separate transactions: CLAIM a due
+`pending` row (the only way to transmit; attempts are counted at claim, and a transmit aborted by
+`may_transmit` still uses one); transmit outside any transaction; then COMPLETE with the claim token `(row_id, version)` (`sent`;
+back to `pending` with a backoff, or `failed` past `max_attempts`, via
+`delivery_sql.failure_statement`). The database allows only one live CLAIM per delivery
+(`sending`, lease end in `next_attempt_at`) and fences every write by `row_id` and `version`, but
+it cannot see a network call. Overlapping transmissions are prevented by the sender contract:
+
+- a hard timeout covering connect, send and response, no longer than `transmit_deadline_seconds`
+  (default 30);
+- call `may_transmit(claimed_at, now, config)` right before the network call and abort without
+  transmitting (recording a failed attempt) if it is false, i.e. `deadline` seconds or more after
+  the claim;
+
+Recording the result before the lease lapses is what avoids a duplicate send; a completion that
+arrives later is harmless to the table, because it is fenced by `row_id` and `version`.
+
+`lease_seconds` (default 300, at least 60) must be at least twice the deadline, so a sender that
+honours the contract has finished transmitting before the earliest possible Reclaim, and the next
+claim can only follow later. The lease is half-open, `[claim, claim + lease)`: at `next_attempt_at
+== now` it has lapsed, the planner's Reclaim wins, and a completion arriving in that same second
+finds a new version and is lost. Sender and planner must read one clock (the same pipeline process
+or host) for the lease timing: clock skew between hosts, or a forward clock jump, can break the
+no-overlap guarantee. Incarnation fencing does not depend on the clock at all. Residual: a
+sender that violates its timeout (a hung network call) can cause a duplicate that the receiver
+cannot detect; publisher idempotency keys are a later concern (4c).
+
+The planner never touches a live `sending` row (no expiry, suppress, reschedule, withdraw or
+forget). Whatever changed during the send (an ack, a snooze, a resolve or a reopen) is applied on
+the next pass, once the row is `sent` or `pending` again.
+
+**Time.** Compare with floor, stamp with ceil: we never act early and never promise early. The
+shell derives two integers from `now` (`delivery_types.tick_floor` and `tick_ceil`, re-exported by
+`delivery_sql`). Every eligibility test (CLAIM's `next_attempt_at <= :due_now`, a lapsed lease,
+`may_transmit`) uses the floor; `updated_at` and every new deadline (lease end, backoff, snooze) use
+the ceil, so `updated_at + backoff(attempts)` can never undershoot a stored deadline.
+
+**Incarnations.** A statement keyed by a row matches `row_id = :row_id AND version = :version`.
+`row_id` is AUTOINCREMENT, so SQLite never reuses one, even after a Forget: a recreated delivery
+(same `delivery_id`) is a different row, and a claim token taken from an earlier incarnation can
+never complete it, whatever the clock, the retention or the number of updates. `version` is a plain
+counter with no ceiling. Backoffs are whole seconds (`backoff_base_seconds` and
+`backoff_cap_seconds` must be integers) and every computed time is rounded up, so no statement ever
+binds a fractional time.
+
+```sql
+-- planner: Enqueue (version 0; SQLite assigns a fresh row_id)
+INSERT OR IGNORE INTO incident_deliveries
+  (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
+   version)
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, 0)
+
+-- planner: Suppress, incident without a row
+INSERT OR IGNORE INTO incident_deliveries
+  (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
+   version)
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, 0)
+
+-- planner: Suppress (pending, or a lapsed sending open, which keeps its retry deadline)
+UPDATE incident_deliveries SET state='suppressed',
+  next_attempt_at=COALESCE(:next_attempt_at, next_attempt_at), updated_at=:now,
+  version=version+1
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Reschedule
+UPDATE incident_deliveries SET next_attempt_at=:next_attempt_at, updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state='pending' AND attempts=:attempts AND version=:version
+
+-- planner: Requeue (suppressed -> pending)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
+  version=version+1
+WHERE row_id=:row_id AND state='suppressed' AND attempts=:attempts AND version=:version
+
+-- planner: Revive (withdrawn -> pending; attempts and created_at are kept)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
+  version=version+1
+WHERE row_id=:row_id AND state='withdrawn' AND attempts=:attempts AND version=:version
+
+-- planner: Expire (state is pending, suppressed, withdrawn or sending)
+UPDATE incident_deliveries SET state='expired', updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Fail (pending, suppressed, withdrawn or sending)
+UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Withdraw (a recover, pending or lapsed sending, whose incident is not resolved)
+UPDATE incident_deliveries SET state='withdrawn', updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Forget a recover row (or any row without the sibling guard)
+DELETE FROM incident_deliveries
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Forget an open row (refuses while a recover is pending or sending)
+DELETE FROM incident_deliveries
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
+  AND NOT EXISTS (SELECT 1 FROM incident_deliveries r
+                  WHERE r.incident_id=:incident_id AND r.kind='recover'
+                    AND r.state IN ('pending', 'sending'))
+
+-- planner: Reclaim a lapsed sending row that is still deliverable
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at, updated_at=:now,
+  version=version+1
+WHERE row_id=:row_id AND state='sending' AND attempts=:attempts AND version=:version
+
+-- sender: claim a due pending row (the only way to transmit); the lease end is next_attempt_at
+UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
+  next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:due_now
+  AND attempts<:max_attempts AND version=:version
+
+-- sender: the send succeeded (claim token: row_id and version)
+UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state='sending' AND version=:version
+
+-- sender: the send failed, retry later (next_attempt_at from the claimed row)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
+  updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state='sending' AND version=:version
+
+-- sender: the send failed and the budget is spent
+UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
+WHERE row_id=:row_id AND state='sending' AND version=:version
+```
+
+**Maintenance.** A future migration that rebuilds `incident_deliveries` by copy, drop and rename
+must carry the `sqlite_sequence` counter over (or run with no claim in flight), or `row_id`s would
+restart and an old claim token could match a new row. Restoring an older database backup while a
+sender holds a claim has the same effect: stop the senders first.
+
+**Sender checklist (unit 4b).** Acceptance test: a fake transport with a HUNG transport.
+
+1. One planner pass = one `BEGIN IMMEDIATE` transaction; read `now` AFTER the transaction has begun
+   (so a CLAIM committed in the gap cannot leave the pass with stale time), then read the COMPLETE
+   incident set and all rows, `plan()`, and apply the actions with `delivery_sql.apply_actions`;
+   on `PassError` roll the whole pass back.
+2. CLAIM (`delivery_sql.CLAIM` with `claim_params`) in its own short transaction; it must affect 1
+   row. Re-read the row: its `(row_id, version)` is the claim token.
+3. Call `may_transmit(claimed_at, now, config)` with `claimed_at` = the CLAIM's `:now`, which is the
+   row's `updated_at`; abort without transmitting, and record a failure, if it is false.
+4. Transmit outside any transaction with a hard timeout covering connect, send and response, at
+   most `transmit_deadline_seconds`.
+5. Record the result in a short transaction: `COMPLETE_SENT`, or `failure_statement(claimed, now,
+   config)`, both with `completion_params` (the claim token).
+6. Sender and planner read one clock (same process or host) for the lease timing.
+
+If the sender crashes after transmitting, the row stays `sending` until the lease lapses. The
+planner then judges the lapsed claim by the normal rules first: it expires it if its lifetime ended,
+its incident is missing, or (for an `open`) its incident has since resolved or been superseded, and
+withdraws a `recover` whose incident is no longer resolved. It fails it past the budget. An `open`
+then meets the current decision as a pending row would: acknowledged or expected is suppressed, a
+snooze moves it back to `pending` no earlier than the snooze end; only otherwise it Reclaims it
+(back to `pending` after a backoff, `attempts` not counted again). A lapsed
+lease means we cannot know whether the transmit happened. Delivery is therefore at least once, and
+the cancellation rules deliberately favour a lost announcement over a stale one: a crash after a
+successful send can cause one retransmission per reclaim (bounded by `max_attempts` for the whole
+life of the delivery), and an `open` that did go out but whose claim lapsed and whose incident then
+resolved (or was acknowledged) is expired or suppressed, so that user sees the open and never gets a
+recover for it. We do not send a recovery for an announcement we cannot prove was delivered. Another
+accepted window, bounded by one send duration: a `recover` claimed before its incident reopened is
+delivered, so the user may see one stale recovery notice. A pending row already at `max_attempts`
+is failed by the planner rather than left for the ttl, because CLAIM refuses it.
+
+Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-finite `now` raises
+`ValueError`, action times are integer seconds):
+
+- A loud open incident gets one `open` delivery. Acknowledged or expected incidents are suppressed
+  (a row is inserted as `suppressed`, so history exists). Suppressed rows are re-checked every
+  pass, so a cleared decision (or a cleared `NULL`-status row) requeues the delivery.
+- A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
+  row is due at the verdict, but never before its cumulative backoff (after a failure, that is
+  `attempts > 0`: `updated_at` plus the backoff for its attempts) and never later: a cleared or
+  shortened snooze pulls it in, even if it
+  was parked at the old snooze end by a Reclaim, while a longer snooze pushes it out. A lapsed
+  claim that is acknowledged keeps the retry deadline a Reclaim would have used, so an ack followed
+  by a clear cannot skip the backoff.
+- An un-ack never silently drops an announcement. A pending row expires 24 hours after
+  `max(created_at, next_attempt_at)`; a requeue sets `next_attempt_at` to its target, so an ack
+  that lasted longer than the ttl does not expire a still-open loud incident. Spam is bounded by
+  the attempt budget (a requeue keeps `attempts`; past `max_attempts` the row fails) and by a hard
+  lifetime: a row more than 30 days past `created_at` expires as `lifetime` and is never revived,
+  so an acknowledgement older than that never notifies after it is cleared. Failures back off 60 s
+  doubling to 1 h, six attempts.
+- An incident that closes before its `open` delivery went out expires it and gets no `recover`.
+  Exactly one `recover` is created, only for a `resolved` incident whose `open` was `sent`, on the
+  first pass after resolution however old the open row is. A pending `recover` for an incident that
+  is no longer `resolved` (open again, or superseded) is withdrawn, and the next resolution revives
+  that row, keeping its attempts and `created_at` (the retry budget and the lifetime are cumulative);
+  a recover that was already sent is not repeated. Accepted windows are listed with the SQL above.
+  Known limit: superseded
+  incidents, and incidents that stay open because the device went silent
+  (`monitoring_unavailable` covers silence), get no recovery notice.
+- Retention is all or nothing. An incident's rows are forgotten together, in one pass (one
+  transaction), and only when the incident is closed or missing, no recover is owed, and every row
+  is terminal (`withdrawn` counts) and more than 30 days past `updated_at`. Rows of a still-open
+  incident are never forgotten, so an old incident never re-announces, and a row is never forgotten
+  alone: a half-forgotten incident would announce again when it reopens. Pending rows of a missing
+  incident expire first. An incident id that is pruned and later reappears after all its delivery
+  rows have been forgotten is treated as new, and so is a closed incident that reopens after its
+  rows were forgotten (real incidents get a new id).
+- Watermark: an incident detected before `eligible_since` that has no delivery rows is ignored
+  completely. An incident that already has any row is managed normally, so raising the watermark
+  never drops an owed recover or forgets state, and lowering it only admits incidents that were
+  never announced.
+- Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
