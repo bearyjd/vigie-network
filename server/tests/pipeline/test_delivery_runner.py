@@ -233,3 +233,32 @@ def test_hostile_fields_never_reach_the_message(world):
     for needle in ("203.0.113.9", "evil.example.com", "aa:bb:cc", "192.168", "10.0.0.5", "999999"):
         assert needle not in text
     assert not any(ord(c) < 32 for c in text) and len(text) < 600
+
+
+def test_now_is_read_after_begin_immediate_and_claim_is_short(world):
+    world.incident()
+    seen = []
+
+    def clock():
+        seen.append(world.inv.in_transaction)
+        return T0
+
+    go(world, FakePublisher(), clock)
+    # plan pass, claim, may_transmit, complete: the publish happens between claim and complete
+    assert seen == [True, True, False, True]
+
+
+def test_lost_claim_race_transmits_nothing(world, monkeypatch):
+    world.incident()
+    go(world, FakePublisher(script=[PublishError("x")]), Clock())
+    (row,) = world.rows()
+    stale = delivery_runner.DeliveryView(**{**_view(row), "version": row["version"] - 1})
+    monkeypatch.setattr(delivery_runner, "_due", lambda *a, **k: [stale])
+    pub = FakePublisher()
+    report = go(world, pub, Clock(T0 + 600))
+    assert pub.attempted == [] and report.claimed == 0
+
+
+def _view(row):
+    keys = "row_id incident_id kind state attempts next_attempt_at created_at updated_at version"
+    return {k: row[k] for k in keys.split()}

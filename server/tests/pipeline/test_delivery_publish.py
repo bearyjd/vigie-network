@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -160,3 +161,15 @@ def test_file_publisher_concurrent_appends_stay_whole_lines(tmp_path):
     assert not errors
     rows = [json.loads(line) for line in path.read_bytes().splitlines()]
     assert len(rows) == 150 and len({r["delivery_id"] for r in rows}) == 150
+
+
+def test_file_publisher_refuses_a_device_node(tmp_path):
+    with pytest.raises(PublishError, match="regular"):
+        FilePublisher(Path("/dev/null")).publish(_msg(), timeout_seconds=1)
+
+
+def test_file_publisher_fsyncs_every_message(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    FilePublisher(tmp_path / "out.jsonl").publish(_msg(), timeout_seconds=1)
+    assert len(calls) == 1

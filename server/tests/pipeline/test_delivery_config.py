@@ -45,7 +45,7 @@ def test_off_values(value):
 @pytest.mark.parametrize("value", ["ture", "2", "enabled", "y"])
 def test_garbage_is_a_startup_error_not_a_silent_off(value):
     with pytest.raises(ValueError, match="VIGIE_DELIVERY_ENABLED"):
-        cfg(VIGIE_DELIVERY_ENABLED=value)
+        cfg(VIGIE_DELIVERY_ENABLED=value, VIGIE_DELIVERY_FILE="/nonexistent/o")
 
 
 def test_enabled_requires_file():

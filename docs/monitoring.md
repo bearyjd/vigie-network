@@ -155,15 +155,60 @@ API withholds expired or stale-lineage hints, without waiting for the next pipel
 bounded20-device refresh processes new/expired hints and round-robin work. No raw hostname, vendor
 class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numeric probability.
 
-### Incident delivery (planned)
+### Incident delivery
 
-Nothing is sent yet: this lands the outbox schema and a pure planner only. Delivery is off by
-default and the local inbox works without any publisher. The topic and ownership are still open
-(D5), so no code names a topic or calls a network service. When it is built, the pipeline (not the
-API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
-delivery is disabled the planner does not run, so nothing is created and nothing expires; enabling
-it records `eligible_since`, and incidents detected before that instant are ignored so switching
-it on never announces old open incidents.
+Delivery is **off by default** and the local inbox works without any publisher. The pipeline (not
+the API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
+delivery is disabled the runner is not called, so nothing is created and nothing expires. The
+real network adapter (topic, ownership: D5) is a later unit; no code here names a topic or opens a
+socket.
+
+**What is wired (unit 4b).** After `analyze_monitoring`, when `VIGIE_DELIVERY_ENABLED` is set,
+each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_delivery`:
+
+1. *Planner pass*: one `BEGIN IMMEDIATE`; `now` is read after it; the complete incident set, all
+   delivery rows and the decisions are read; `plan()` runs and every action is applied through
+   `delivery_sql`. A statement that does not affect exactly one row rolls the whole pass back
+   (`PassError`, logged as `delivery_stage_failed`; the rest of the pipeline pass is unaffected).
+   If `overrides.db` is absent, unreadable or locked the whole run is skipped (nothing is planned
+   and nothing is sent; `delivery_decisions_unavailable` is logged once per run).
+2. *Drain*: up to `VIGIE_DELIVERY_MAX_PER_RUN` due `pending` rows, oldest first. Per row: CLAIM in
+   its own short transaction, `may_transmit` right before the publisher (past the deadline: no
+   transmit, a failed attempt is recorded), the publish OUTSIDE any transaction under a hard wall
+   timeout of `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` enforced by the runner (a daemon worker thread
+   abandoned at the deadline), then COMPLETE with the claim token. A hung publisher ends the drain
+   for that run, so a pass is delayed by at most one deadline plus the normal drain work.
+3. *Watermark*: the first enabled run stores `pipeline_meta.delivery_eligible_since` (the floor of
+   `now`) with `INSERT OR IGNORE`; later runs, and disable/enable cycles, never move it.
+   Incidents detected before it are never announced.
+
+A runner exception is caught and logged (first occurrence and every 20th), never raised into the
+pass. A message holds the device label (the `device_overrides.name`, else the device id) and a
+relative link `/ui/#incident=<id>`, nothing else: the label is scrubbed of anything that looks
+like an IP, MAC, domain or byte count, stripped of control characters and cut to 64 characters.
+
+**Settings** (all in `deploy/.env.example`; invalid values stop the pipeline at startup):
+`VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
+other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
+`_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20).
+
+**FilePublisher format.** The only publisher today appends one JSON object per line to
+`VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
+created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a symlink, FIFO or
+device is refused), each message is one `write` followed by `fsync`, and a message that would push
+the file past 10 MiB is refused (the delivery then fails and retries; rotate or truncate the
+file). In compose the file lives on the `vigie-delivery` volume (`/delivery/messages.jsonl`).
+
+**Enabling safely.** Set `VIGIE_DELIVERY_FILE=/delivery/messages.jsonl`, then
+`VIGIE_DELIVERY_ENABLED=1`, restart the pipeline and watch the file. Only incidents detected after
+the first enabled pass are announced. To stop, set `VIGIE_DELIVERY_ENABLED=0`: pending rows then
+wait (nothing expires) until it is switched back on.
+
+**Residual windows.** A publisher that ignores its deadline can still finish after the runner
+abandoned it, which may produce a duplicate (the row is retried); a completion that arrives after
+its lease lapsed is lost by design; the runner and the planner must share one clock; a daemon
+worker abandoned on a hang lives until its call returns.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
 `recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and
