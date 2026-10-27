@@ -155,6 +155,29 @@ API withholds expired or stale-lineage hints, without waiting for the next pipel
 bounded20-device refresh processes new/expired hints and round-robin work. No raw hostname, vendor
 class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numeric probability.
 
+### Incident delivery (planned)
+
+Nothing is sent yet: this lands the outbox schema and a pure planner only. Delivery is off by
+default, the local inbox works without any publisher, and the topic and ownership are still
+open (D5), so no code names a topic or calls a network service.
+
+Pipeline schema v11 adds `incident_deliveries` (one row per incident and kind; `kind` is `open` or
+`recover`, `state` is `pending`, `sent`, `failed`, `suppressed` or `expired`). `UNIQUE(incident_id,
+kind)` makes enqueueing idempotent; `delivery_id` is the first 32 hex chars of
+`sha256(incident_id + "\n" + kind)`; `last_error` is capped at 200 characters. External payloads
+will carry a device label and an incident link only.
+
+`vigie_pipeline.delivery_plan.plan()` turns incidents, human decisions and existing rows into
+actions (no I/O, `now` injected):
+
+- A loud open incident gets one `open` delivery; acknowledged or expected incidents are suppressed.
+- A snooze defers the delivery to `snooze_until` (strictly before is quiet, as in the inbox) and is
+  re-checked every pass.
+- An incident that closes before its `open` delivery went out expires it and never gets a `recover`;
+  only an announced (`sent`) incident gets exactly one `recover`, a separate kind.
+- Pending rows older than 24 hours expire; failures back off 60 s doubling to 1 h, six attempts max.
+- Unknown incident states or decision statuses fail closed (suppressed as `unrecognised_state`).
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
