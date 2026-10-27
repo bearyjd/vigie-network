@@ -98,3 +98,32 @@ def test_inventory_uri_mode_ro_blocks_write_even_with_query_only_off(tmp_path: P
 def test_inventory_missing_is_not_created(tmp_path: Path) -> None:
     assert open_inventory_ro(tmp_path / "inventory.db") is None
     assert not (tmp_path / "inventory.db").exists()
+
+
+def test_overrides_schema_is_at_version_8(tmp_path: Path) -> None:
+    from vigie_api.schema import OVERRIDES_MIGRATIONS
+
+    conn = open_overrides(tmp_path / "o.db")
+    assert len(OVERRIDES_MIGRATIONS) == 8
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
+def test_dataset_staging_tables_enforce_their_checks(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    conn.execute("PRAGMA foreign_keys=ON")
+    insert = (
+        "INSERT INTO dataset_imports"
+        " (id,source,version,licence,sha256,entry_count,{}created_at,created_by)"
+    )
+    ok = ("i1", "kev", "v", "l", "h", 1, "t", "u")
+    conn.execute(insert.format("") + " VALUES (?,?,?,?,?,?,?,?)", ok)
+    assert conn.execute("SELECT status FROM dataset_imports").fetchone()[0] == "staged"
+    with pytest.raises(sqlite3.IntegrityError):  # unknown source
+        conn.execute(insert.format("") + " VALUES (?,?,?,?,?,?,?,?)", ("i2", "x", *ok[2:]))
+    with pytest.raises(sqlite3.IntegrityError):  # unknown status
+        conn.execute(insert.format("status,") + " VALUES ('i3','kev','v','l','h',1,'bad','t','u')")
+    with pytest.raises(sqlite3.IntegrityError):  # entries need their import
+        conn.execute("INSERT INTO dataset_entries_staging VALUES ('nope','k','{}')")
+    with pytest.raises(sqlite3.IntegrityError):  # one row per (import, key)
+        conn.execute("INSERT INTO dataset_entries_staging VALUES ('i1','k','{}')")
+        conn.execute("INSERT INTO dataset_entries_staging VALUES ('i1','k','{}')")
