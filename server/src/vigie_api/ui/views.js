@@ -44,13 +44,26 @@ export function pager(page, count, next, onPage) { return node('div', {class: 'p
 function validateHours(data) { if (!data || !Array.isArray(data.hours) || data.hours.length > 200 || data.hours.some(h => !h || !Number.isInteger(h.hour) || h.hour < 0 || h.hour % 3600 || !['missing', 'partial', 'eligible', 'open'].includes(h.state) || !Array.isArray(h.reasons) || h.reasons.some(r => typeof r !== 'string'))) throw new Error('Malformed monitoring response'); }
 function metric(label, value, note, tone = '') { return node('div', {class: 'metric'}, node('span', {class: 'label'}, label), node('strong', {}, value instanceof Node ? value : text(value)), node('small', {}, note), tone ? badge(tone, tone === 'Current' ? 'good' : 'warn') : null); }
 function hourLegend() { return node('div', {class: 'legend'}, ['eligible', 'partial', 'missing', 'open'].map(s => node('span', {}, node('i', {class: `swatch ${s}`, 'aria-hidden': 'true'}), s === 'eligible' ? 'Qualified' : s[0].toUpperCase() + s.slice(1)))); }
+const fresh = age => age !== null && age >= 0 && age <= 120;
+/* One honest line for the banner above every view; only complete, current, fully qualified evidence is 'ok'. */
+export function coverageStatus(snapshot, now = Date.now()) {
+  if (snapshot?.phase === 'loading') return {tone: 'loading', text: 'Checking · checking coverage'};
+  const data = snapshot?.data; const c = data?.collector;
+  try { if (snapshot?.phase !== 'ready' || !c || typeof c !== 'object') throw new Error(); validateHours(data); }
+  catch { return {tone: 'error', text: 'Unavailable · coverage unavailable, so nothing can be concluded'}; }
+  if (!data.hours.length) return {tone: 'unknown', text: 'Unknown · no coverage data yet'};
+  const windowAge = finite(c.latest_window_end) ? now / 1000 - c.latest_window_end : null;
+  const gaps = data.hours.filter(h => h.state === 'partial' || h.state === 'missing').length; const gone = Array.isArray(c.monitoring_unavailable) ? c.monitoring_unavailable : [];
+  const reasons = [!(fresh(secondsAgo(c.latest_observation_received_at, now)) && fresh(windowAge)) ? 'source observation stale or missing' : null, gaps ? `${gaps} hour${gaps === 1 ? '' : 's'} partial or missing` : null, gone.length ? `monitoring unavailable for ${text(gone[0]?.device_id)} · ${text(gone[0]?.reason)}${gone.length > 1 ? ` and ${gone.length - 1} more` : ''}` : null].filter(Boolean);
+  if (reasons.length) return {tone: 'degraded', text: `Warning · ${reasons[0]} (${reasons.length} issue${reasons.length === 1 ? '' : 's'})`};
+  return {tone: 'ok', text: 'OK · displayed hours qualified and the source is current'};
+}
 export function coverageView(data) {
   validateHours(data); const c = data.collector; if (!c || typeof c !== 'object') throw new Error('Malformed coverage response');
   if (!data.hours.length) return empty('Coverage unavailable', 'No hourly coverage was returned. There is no basis for a quality conclusion.');
   const currentAge = secondsAgo(c.latest_observation_received_at); const dnsAge = secondsAgo(c.latest_dns_observation_received_at);
   const windowAge = finite(c.latest_window_end) ? Date.now() / 1000 - c.latest_window_end : null;
   const dnsWindowAge = finite(c.latest_dns_observation_window_end) ? Date.now() / 1000 - c.latest_dns_observation_window_end : null;
-  const fresh = age => age !== null && age >= 0 && age <= 120;
   const oldest = (received, windowEnd) => Math.min(Date.parse(received) / 1000, windowEnd);
   const proc = processingState(c); const count = value => Number.isInteger(value) && value >= 0 ? String(value) : 'Unknown';
   const strip = node('div', {class: 'health-strip'}, metric('Observation', liveValue(fresh(currentAge) && fresh(windowAge), oldest(c.latest_observation_received_at, c.latest_window_end)), `Received ${utc(c.latest_observation_received_at)}`), metric('Parsed DNS', liveValue(fresh(dnsAge) && fresh(dnsWindowAge), oldest(c.latest_dns_observation_received_at, c.latest_dns_observation_window_end)), `Received ${utc(c.latest_dns_observation_received_at)}`), metric('Source flags', c.source_flags_latest === 0 ? '0 · None reported' : c.source_flags_latest === null || c.source_flags_latest === undefined ? 'Unknown' : String(c.source_flags_latest), c.source_flags_latest === 8 ? 'Multicast discovery unavailable' : 'Latest observation only; history remains below'), metric('Processing', badge(proc.label, proc.tone), `${count(c.backlog_batches)} pending${c.backlog_capped ? ' (capped)' : ''} · oldest ${proc.age === null ? 'unknown' : `${Math.round(proc.age)}s`}`));
@@ -90,10 +103,37 @@ export function activityView(data) {
   return node('div', {}, node('div', {class: 'section-head'}, node('h2', {}, 'Traffic over time'), badge(states[b.state] || 'Unknown reference state', b.state === 'mature' ? 'good' : '')), node('code', {class: 'identity-id'}, data.device_id), node('div', {class: 'callout'}, b.state === 'mature' ? `Qualified reference available · median upload ${bytes(b.median_upload_bytes)} per hour.` : 'A mature reference is not available for this identity and source. Observed traffic remains visible while the reference learns or rebuilds.'), facts([['Qualified hours', finite(b.sample_hours) ? String(b.sample_hours) : 'Unavailable'], ['Distinct dates', finite(b.distinct_days) ? String(b.distinct_days) : 'Unavailable'], ['Training since', utc(b.training_since)], ['Algorithm', text(b.algorithm)]]), activityChart(data), node('div', {class: 'chart-meta'}, node('span', {}, 'Paired bars · hourly totals'), node('span', {}, 'Partial/open hours are faint · missing hours remain gaps')), node('div', {class: 'legend'}, node('span', {}, node('i', {class: 'swatch upload', 'aria-hidden': 'true'}), 'Upload'), node('span', {}, node('i', {class: 'swatch download', 'aria-hidden': 'true'}), 'Download'), node('span', {}, 'Dashed area: unavailable observations')), node('details', {}, node('summary', {}, 'Hourly observations and quality'), node('div', {class: 'scroll-details'}, table(['Hour · UTC', 'Quality', 'Upload', 'Download', 'DNS', 'Reasons'], rows))), node('p', {class: 'table-note'}, 'Observed totals can be incomplete when coverage is partial. Missing data is never drawn as zero traffic.'));
 }
 const detector = value => ({large_upload: 'Large upload', upload_deviation: 'Upload above reference'}[value] || text(value));
-export function incidentsView(data, onSelect) {
-  if (!Array.isArray(data) || data.length > 25 || data.some(d => !d || typeof d.id !== 'string')) throw new Error('Malformed incidents response');
-  if (!data.length) return empty('No incidents on this page', 'This does not establish healthy coverage or normal device behavior. Review the coverage view for missing evidence.');
-  return table(['Observation', 'Inventory identity', 'State', 'Observed / threshold', 'Detected · UTC'], data.map(d => node('tr', {}, node('td', {}, node('button', {class: 'identity-button', type: 'button', 'data-focus-key': `incident:${d.id}`, onclick: () => onSelect(d.id)}, node('span', {class: 'identity-name'}, detector(d.detector)), node('code', {class: 'identity-id'}, d.id))), node('td', {}, node('code', {class: 'mono'}, d.device_id), node('span', {class: 'subline'}, d.current_lineage ? 'Current identity lineage' : 'Historical identity lineage')), node('td', {}, badge(d.state, d.state === 'open' ? 'warn' : '')), node('td', {}, `${bytes(d.observed_bytes)} / ${bytes(d.threshold_bytes)}`), node('td', {}, utc(d.detected_at)))));
+const INBOX_CAP = 25; const FILTERS = [['all', 'All'], ['attention', 'Needs attention'], ['quiet', 'Quiet']];
+const QUIET_LABELS = {acknowledged: 'acknowledged', expected: 'expected'};
+/* Decision label and whether a human is still needed. Unrecognised data fails loud: it needs attention. */
+function triage(d, now) {
+  const unknown = {label: 'unknown decision', attention: true}; const r = d.review; const open = d.state === 'open';
+  if (d.attention !== undefined && typeof d.attention !== 'boolean') return unknown;
+  const pick = (label, derived, forced = false) => ({label, attention: typeof d.attention === 'boolean' ? d.attention || forced : derived});
+  if (r === null || r === undefined) return pick(open ? 'needs review' : 'no decision', open);
+  if (typeof r !== 'object' || Array.isArray(r)) return unknown;
+  if (Object.hasOwn(QUIET_LABELS, r.status)) return pick(QUIET_LABELS[r.status], false);
+  const until = r.status === 'snoozed' && typeof r.snooze_until === 'string' ? Date.parse(r.snooze_until) : NaN;
+  if (!Number.isFinite(until)) return unknown;
+  return now < until ? pick(`snoozed until ${utc(r.snooze_until)}`, false) : pick('snooze expired · needs review', open, open);
+}
+const detectedMs = d => { const t = typeof d.detected_at === 'number' ? d.detected_at * 1000 : Date.parse(d.detected_at); return Number.isFinite(t) ? t : -Infinity; };
+function filterBar(active, counts, onFilter) {
+  return node('div', {class: 'filter-bar', role: 'group', 'aria-label': 'Filter incidents (changes this view only)'}, FILTERS.map(([name, label]) => node('button', {type: 'button', 'data-focus-key': `filter:${name}`, 'aria-pressed': String(name === active), onclick: () => onFilter(name)}, `${label} (${counts[name]})`)));
+}
+/* Read-only inbox: needs-attention first, then newest; sorts a copy and never writes a decision. */
+export function incidentsView(data, onSelect, {filter = 'all', onFilter = () => {}, now = Date.now()} = {}) {
+  if (!Array.isArray(data) || data.length > 100 || data.some(d => !d || typeof d.id !== 'string')) throw new Error('Malformed incidents response');
+  if (!data.length) return empty('No incidents recorded for this scope', 'Absence of incidents is not proof of health: this does not establish healthy coverage or normal device behavior. Check the coverage banner and the Overview.');
+  const active = FILTERS.some(([name]) => name === filter) ? filter : 'all';
+  const rows = data.map(d => ({d, ...triage(d, now)})).sort((a, b) => Number(b.attention) - Number(a.attention) || detectedMs(b.d) - detectedMs(a.d));
+  const counts = {all: rows.length, attention: rows.filter(r => r.attention).length, quiet: rows.filter(r => !r.attention).length};
+  const shown = rows.filter(r => active === 'all' || (active === 'attention') === r.attention);
+  const bar = filterBar(active, counts, onFilter);
+  if (!shown.length) return node('div', {}, bar, empty('No incidents match this filter', `${rows.length} incidents on this page are hidden by the filter. Choose All to see them.`));
+  const note = shown.length > INBOX_CAP ? node('p', {class: 'table-note'}, `Showing ${INBOX_CAP} of ${shown.length} incidents on this page`) : null;
+  const row = ({d, label, attention}) => node('tr', {}, node('td', {}, node('button', {class: 'identity-button', type: 'button', 'data-focus-key': `incident:${d.id}`, onclick: () => onSelect(d.id)}, node('span', {class: 'identity-name'}, detector(d.detector)), node('code', {class: 'identity-id'}, d.id))), node('td', {}, node('code', {class: 'mono'}, d.device_id), node('span', {class: 'subline'}, d.current_lineage ? 'Current identity lineage' : 'Historical identity lineage')), node('td', {}, badge(d.state, d.state === 'open' ? 'warn' : '')), node('td', {}, badge(label, attention ? 'warn' : '')), node('td', {}, `${bytes(d.observed_bytes)} / ${bytes(d.threshold_bytes)}`), node('td', {}, utc(d.detected_at)));
+  return node('div', {}, bar, note, table(['Observation', 'Inventory identity', 'State', 'Decision', 'Observed / threshold', 'Detected · UTC'], shown.slice(0, INBOX_CAP).map(row)));
 }
 export function incidentView(d, onActivity) {
   if (!d || !d.evidence || typeof d.id !== 'string') throw new Error('Malformed incident response'); const e = d.evidence;

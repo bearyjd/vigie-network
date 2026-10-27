@@ -1,6 +1,7 @@
 // Offline behaviour contracts for ui/app.js against a minimal fake DOM; no browser, no network, no port.
 // Run: node tools/gui/app_contracts.mjs
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 
 class FakeNode {}
 class FakeText extends FakeNode { constructor(data) { super(); this.data = data; this.parent = null; } }
@@ -24,19 +25,22 @@ class FakeElement extends FakeNode {
   querySelectorAll(selector) { const found = []; for (const c of this.children) if (c instanceof FakeElement) { if (c.matches(selector)) found.push(c); found.push(...c.querySelectorAll(selector)); } return found; }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
 }
-const ids = ['preview-banner', 'connect-collector', 'content', 'notice', 'connect-panel', 'workspace', 'disconnect', 'connection-state', 'view-title', 'scope-label', 'refresh', 'refresh-status', 'token', 'connect-form', 'collector', 'scope-form', 'range'];
+const ids = ['preview-banner', 'connect-collector', 'content', 'notice', 'connect-panel', 'workspace', 'disconnect', 'connection-state', 'view-title', 'scope-label', 'refresh', 'refresh-status', 'token', 'connect-form', 'collector', 'scope-form', 'range', 'coverage-banner'];
 const elements = Object.fromEntries(ids.map(id => [id, new FakeElement('div')]));
 for (const id of ['content', 'notice']) elements[id].parent = null;
 elements.refresh.tag = 'button';
 const body = new FakeElement('body');
+const navButtons = ['overview', 'inventory', 'activity', 'incidents'].map(view => Object.assign(new FakeElement('button'), {dataset: {view}}));
 const documentListeners = {};
 globalThis.Node = FakeNode;
 globalThis.document = {
   hidden: false, activeElement: body,
   getElementById: id => elements[id], createElement: tag => new FakeElement(tag), createTextNode: data => new FakeText(String(data)),
-  querySelectorAll: () => [], querySelector: () => null, addEventListener: (type, listener) => { (documentListeners[type] ||= []).push(listener); },
+  querySelectorAll: selector => selector === 'nav button[data-view]' ? navButtons : [], querySelector: () => null, addEventListener: (type, listener) => { (documentListeners[type] ||= []).push(listener); },
 };
-globalThis.location = {origin: 'http://127.0.0.1:1', search: ''};
+let storageTouched = false;  // the inbox filter lives in the URL hash only
+for (const name of ['localStorage', 'sessionStorage']) Object.defineProperty(globalThis, name, {get() { storageTouched = true; throw new Error(`${name} is off limits`); }});
+globalThis.location = {origin: 'http://127.0.0.1:1', search: '', hash: ''};
 const windowListeners = {};
 globalThis.window = {addEventListener: (type, listener) => { (windowListeners[type] ||= []).push(listener); }};
 const realNow = Date.now; let clock = Date.parse('2026-10-25T12:00:00Z'); Date.now = () => clock;
@@ -44,12 +48,13 @@ let intervalTick = null; globalThis.setInterval = callback => { intervalTick = c
 globalThis.setTimeout = () => 1; globalThis.clearTimeout = () => {};
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
+let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
 let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
   const from = Number(url.searchParams.get('from_hour')); const to = Number(url.searchParams.get('to_hour'));
-  const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
+  const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: i === 0 ? hourState : 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
   const now = clock / 1000; const stamp = new Date(clock - lag * 1000).toISOString();
-  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: [], monitoring_unavailable_capped: false};
+  const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: unavailable, monitoring_unavailable_capped: false};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
 let gate = null;  // when set, responses wait for it: a slow manual refresh
@@ -58,6 +63,8 @@ globalThis.fetch = async url => {
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
+  if (target.pathname === '/coverage' && coverageDown) return new Response('{}', {status: 503});
+  if (target.pathname === '/incidents') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: incidents}));
   return new Response(JSON.stringify(coverageBody(target)));
 };
 
@@ -207,5 +214,101 @@ body.focus();
   content.replaceChildren = render; extras = () => []; body.focus(); refresh.fire('click'); await flush(); body.focus();
 }
 
+// Unit 6: persistent coverage banner (driven by the coverage data, never green from silence or failure).
+const views = await import('../../server/src/vigie_api/ui/views.js');
+const banner = elements['coverage-banner'];
+const bannerText = () => banner.textContent; const tone = () => banner.getAttribute('data-tone');
+const reload = async () => { refresh.fire('click'); await flush(); };
+mode = 'ok'; lag = 0; windowLag = null; await reload();
+assert.match(bannerText(), /^OK/); assert.equal(tone(), 'ok');
+elements.collector.value = 'c1'; elements.range.value = '24'; gate = new Promise(resolve => { release = resolve; });
+elements['scope-form'].fire('submit'); await flush();
+assert.match(bannerText(), /^Checking/); assert.equal(tone(), 'loading'); assert.doesNotMatch(bannerText(), /^OK/);
+release(); gate = null; await flush(); assert.equal(tone(), 'ok');
+mode = '503'; await reload();
+assert.match(bannerText(), /^Unavailable.*coverage unavailable/); assert.equal(tone(), 'error', 'a failed fetch is never green');
+mode = 'ok'; lag = 200; await reload();
+assert.match(bannerText(), /^Warning.*stale.*\(1 issue\)/); assert.equal(tone(), 'degraded'); lag = 0;
+for (const state of ['partial', 'missing']) { hourState = state; await reload(); assert.match(bannerText(), new RegExp(`^Warning.*${state}`)); assert.equal(tone(), 'degraded'); }
+hourState = 'open'; await reload(); assert.equal(tone(), 'ok', 'an open hour is still accumulating, not degraded');
+hourState = 'partial'; lag = 200; await reload(); assert.match(bannerText(), /\(2 issues\)/); assert.match(bannerText(), /stale/, 'the first reason leads'); hourState = 'eligible'; lag = 0;
+unavailable = [{device_id: '<img src=x onerror=alert(1)>', reason: '</script>'}]; await reload();
+assert.match(bannerText(), /^Warning/); assert.ok(bannerText().includes('<img src=x onerror=alert(1)>') && bannerText().includes('</script>'), 'API strings render verbatim');
+assert.ok(banner.children.every(child => child instanceof FakeText), 'the banner holds text only'); unavailable = [];
+await reload(); assert.equal(tone(), 'ok'); clock += 121000; intervalTick();
+assert.equal(tone(), 'degraded', 'an ok banner turns degraded when the observation ages'); await reload();
+const empty = views.coverageStatus({phase: 'ready', data: {collector: {}, hours: []}}, clock);
+assert.equal(empty.tone, 'unknown'); assert.match(empty.text, /^Unknown.*no coverage data yet/); assert.doesNotMatch(empty.text, /OK/);
+for (const bad of [undefined, null, {phase: 'ready'}, {phase: 'ready', data: {hours: 3}}, {phase: 'mystery'}]) assert.notEqual(views.coverageStatus(bad, clock).tone, 'ok', `garbage ${JSON.stringify(bad)} is never ok`);
+
+// The banner sits above every view: other views fetch the same coverage endpoint.
+const view = name => navButtons.find(b => b.dataset.view === name).fire('click');
+incidents = []; view('incidents'); await flush(); assert.equal(tone(), 'ok');
+hourState = 'partial'; await reload(); assert.equal(tone(), 'degraded', 'the incidents view shows coverage degradation');
+coverageDown = true; await reload(); assert.equal(tone(), 'error', 'a coverage failure on another view is not hidden'); assert.equal(notice.hidden, true, 'the incident list itself still rendered');
+coverageDown = false; hourState = 'eligible';
+
+// Unit 6: incident inbox.
+const inc = (id, over = {}) => Object.freeze({id, device_id: 'dev-1', detector: 'large_upload', state: 'open', detected_at: 1000, observed_bytes: 5, threshold_bytes: 4, current_lineage: true, review: null, attention: true, ...over});
+const rowsOf = el => el.querySelectorAll('tr').slice(1);
+const idsOf = el => rowsOf(el).map(r => r.querySelector('code').textContent);
+const decisions = el => rowsOf(el).map(r => r.querySelectorAll('td')[3].textContent);
+const NOW = Date.parse('2026-10-25T12:00:00Z'); const at = delta => new Date(NOW + delta).toISOString();
+const opts = (filter = 'all', onFilter = () => {}) => ({filter, onFilter, now: NOW});
+const noop = () => {}; const render = (data, o = opts()) => views.incidentsView(data, noop, o);
+const mixed = Object.freeze([
+  inc('a', {attention: false, state: 'open', review: {status: 'acknowledged'}, detected_at: 500}), inc('b', {detected_at: 100}), inc('c', {detected_at: 300}),
+  inc('d', {attention: undefined, detected_at: 200}), inc('e', {attention: undefined, state: 'resolved', detected_at: 400}), inc('f', {attention: 'yes', detected_at: 50}),
+  inc('g', {attention: false, review: {status: 'weird'}, detected_at: 600}), inc('h', {detected_at: 300}), inc('i', {detected_at: 300})]);
+assert.deepEqual(idsOf(render(mixed)), ['g', 'c', 'h', 'i', 'd', 'b', 'f', 'a', 'e'], 'attention first, newest first, stable ties, garbage fails loud');
+assert.deepEqual(mixed.map(d => d.id), ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'], 'the API payload is never reordered');
+assert.deepEqual(idsOf(render(mixed, opts('attention'))), ['g', 'c', 'h', 'i', 'd', 'b', 'f']);
+assert.deepEqual(idsOf(render(mixed, opts('quiet'))), ['a', 'e']);
+assert.deepEqual(idsOf(render(mixed, opts('bogus'))), idsOf(render(mixed)), 'an unknown filter means all');
+const text = el => el.textContent;
+const one = (d) => decisions(render([d]))[0];
+assert.equal(one(inc('x', {attention: false, review: {status: 'acknowledged'}})), 'acknowledged');
+assert.equal(one(inc('x', {attention: false, review: {status: 'expected'}})), 'expected');
+assert.equal(one(inc('x', {attention: false, review: {status: 'snoozed', snooze_until: at(3600000)}})), 'snoozed until 2026-10-25 13:00:00 UTC');
+assert.equal(one(inc('x', {attention: false, review: {status: 'snoozed', snooze_until: at(1000)}})), 'snoozed until 2026-10-25 12:00:01 UTC', 'still covered one second before');
+assert.match(one(inc('x', {attention: false, review: {status: 'snoozed', snooze_until: at(0)}})), /snooze expired.*needs review/, 'the snooze ends AT snooze_until');
+assert.match(one(inc('x', {attention: false, review: {status: 'snoozed', snooze_until: at(-3600000)}})), /snooze expired.*needs review/);
+assert.deepEqual(idsOf(render([inc('q', {attention: false, detected_at: 1, review: {status: 'snoozed', snooze_until: at(-1)}}), inc('r', {attention: false, detected_at: 9, review: {status: 'acknowledged'}})])), ['q', 'r'], 'an expired snooze sorts as needing attention');
+assert.equal(one(inc('x')), 'needs review'); assert.equal(one(inc('x', {attention: false, state: 'resolved'})), 'no decision');
+for (const review of ['lol', 7, [], {status: 'bogus'}, {}, {status: 'snoozed', snooze_until: 'garbage'}, {status: 'snoozed'}]) assert.equal(one(inc('x', {review, attention: false})), 'unknown decision', `review ${JSON.stringify(review)}`);
+assert.equal(one(inc('x', {attention: null})), 'unknown decision', 'null attention is garbage, not quiet');
+const old = inc('o', {attention: undefined, review: {status: 'expected'}}); assert.equal(one(old), 'expected'); assert.equal(rowsOf(render([old, inc('p', {attention: undefined, detected_at: 0})])).length, 2);
+assert.deepEqual(idsOf(render([old, inc('p', {attention: undefined, detected_at: 0})])), ['p', 'o'], 'older payloads without attention still sort by decision');
+// filter buttons: read-only view state
+const bar = render(mixed, opts('quiet', name => picked.push(name))); const picked = [];
+const filterButtons = bar.querySelectorAll('button').filter(b => (b.getAttribute('data-focus-key') || '').startsWith('filter:'));
+assert.deepEqual(filterButtons.map(b => b.getAttribute('aria-pressed')), ['false', 'false', 'true']); assert.match(filterButtons[1].textContent, /Needs attention \(7\)/);
+filterButtons[1].fire('click'); assert.deepEqual(picked, ['attention']);
+// truncation and empty state
+const many = Array.from({length: 30}, (_, i) => inc(`m${i}`, {detected_at: i}));
+assert.equal(rowsOf(render(many)).length, 25); assert.match(text(render(many)), /Showing 25 of 30/); assert.deepEqual(idsOf(render(many)).slice(0, 2), ['m29', 'm28']);
+assert.doesNotMatch(text(render(many.slice(0, 25))), /Showing/);
+const none = render([]); assert.match(text(none), /No incidents recorded for this scope/); assert.match(text(none), /absence of incidents is not proof of health/i);
+assert.equal(none.querySelectorAll('span').filter(s => /good/.test(s.getAttribute('class') || '')).length, 0, 'an empty inbox shows no success badge');
+assert.match(text(render(mixed.slice(0, 1), opts('attention'))), /No incidents match this filter/);
+// XSS: hostile strings are inert text; only the expected tags exist
+const hostile = render([inc('<img src=x onerror=alert(1)>', {detector: '</script><script>alert(1)</script>', device_id: '<img onerror=alert(2)>', review: {status: '<b onmouseover=x>'}})]);
+const tags = new Set(); (function walk(el) { tags.add(el.tag); el.children.forEach(c => c instanceof FakeElement && walk(c)); })(hostile);
+assert.deepEqual([...tags].filter(t => !['div', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'button', 'span', 'code', 'p'].includes(t)), [], 'no element beyond the expected tags');
+for (const needle of ['<img src=x onerror=alert(1)>', '</script><script>alert(1)</script>', '<img onerror=alert(2)>']) assert.ok(text(hostile).includes(needle), `verbatim ${needle}`);
+// App wiring: hash round trip, no storage.
+incidents = mixed.map(d => ({...d})); location.hash = ''; view('incidents'); await flush();
+assert.equal(rowsOf(content).length, 9); const pick = name => content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === `filter:${name}`);
+pick('attention').fire('click'); assert.equal(location.hash, '#filter=attention'); for (const l of windowListeners.hashchange || []) l(); await flush();
+assert.equal(rowsOf(content).length, 7, 'the hash drives the filter');
+location.hash = '#filter=quiet'; for (const l of windowListeners.hashchange || []) l(); await flush(); assert.deepEqual(idsOf(content), ['a', 'e']);
+location.hash = '#filter=<img onerror=1>'; for (const l of windowListeners.hashchange || []) l(); await flush(); assert.equal(rowsOf(content).length, 9, 'a garbage hash means all'); location.hash = '';
+assert.equal(storageTouched, false, 'no browser storage');
+// Static guard on the shipped sources.
+const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${name}`, import.meta.url), 'utf8');
+for (const name of ['views.js', 'app.js']) { const code = source(name); assert.doesNotMatch(code, /innerHTML|outerHTML|insertAdjacentHTML|\beval\s*\(|new Function|document\.write|localStorage|sessionStorage|indexedDB/, `${name} stays inert`); assert.doesNotMatch(code, /\bfetch\s*\(|XMLHttpRequest|sendBeacon/, `${name} never fetches directly`); }
+assert.deepEqual([...source('client.js').matchAll(/method:\s*'(\w+)'/g)].map(m => m[1]), ['GET'], 'the only HTTP verb is GET');
+const page = source('index.html'); assert.match(page, /<div id="coverage-banner"[^>]*role="status"[^>]*aria-live="polite"/); assert.doesNotMatch(page, /<form[^>]*method=|<textarea/i);
+
 Date.now = realNow;
-console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts.');
+console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts; coverage banner states; read-only incident inbox ordering, decisions, filter, truncation and inert-text contracts.');

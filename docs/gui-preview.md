@@ -74,6 +74,31 @@ On the container workspace, prefix the command with `host-spawn /usr/bin/env` an
 
 For another isolated instance after stopping the existing preview, create a NEW direct `/tmp/vigie-gui-preview-*` directory with the script's `seed` action, then `serve`. Only loopback port `18745` is supported. Seed refuses existing directories; serve/start reuse only privately owned synthetic files and refuse symlinked/shared databases or a non-synthetic manifest. The seed command prints a safe manifest and token filepath, never the token.
 
+## Coverage banner and incident inbox
+
+A status banner (`role="status"`, `aria-live="polite"`) sits above every view. It reads the same
+`/coverage` data as the Overview, so the other views fetch that endpoint too; a failure there never
+fails the view itself. Each state starts with a text prefix, so colour is never the only cue:
+
+- `Checking` while the first fetch is in flight.
+- `Unavailable` when the fetch failed or the response is malformed. It is never green.
+- `Unknown` when no coverage rows exist yet. Silence is not health.
+- `Warning` when the source observation is stale, any hour is partial or missing, or the collector
+  reports unavailable monitoring scopes. It names the first reason and the issue count.
+- `OK` only when rows exist, the source is current and every displayed hour is qualified. The age
+  check reruns every few seconds, so an `OK` banner turns `Warning` as the observation ages.
+
+The Incidents view is a local inbox that needs no notification publisher. Incidents the API marks
+`attention` come first, newest first, with ties kept in API order; payloads without `attention` fall
+back to the incident state. The Decision column shows `acknowledged`, `expected`,
+`snoozed until <UTC>`, `snooze expired · needs review`, `needs review` or `no decision`. Unrecognised
+`review` or `attention` values show `unknown decision` and sort as needing attention. The All / Needs
+attention / Quiet filter changes only the view and is kept in the URL hash (`#filter=attention`),
+never in browser storage. Lists show at most 25 rows with `Showing 25 of N`, and an empty list says
+absence of incidents is not proof of health. The GUI is intentionally read-only: it has no
+acknowledge, snooze or expected controls and issues only GET requests; decisions are made through
+the authenticated API.
+
 ## Verification and future delivery
 
 Backend tests cover public shell versus protected JSON, read-only CLI issuance and HTTP `403` write rejection, old token flags, exact assets/GET+HEAD, traversal/symlink refusal, security headers on UI redirects/errors, installed-wheel assets and isolated seed/auth/pagination/activity/incident responses. The browser review exercises real API journeys, text-only untrusted rendering, storage/network boundaries, stale requests and failure states. UI results do not prove device classification accuracy, mature baselines or completion of the real 48-hour soak.
