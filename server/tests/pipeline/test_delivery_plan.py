@@ -1426,3 +1426,20 @@ def test_a_reclaimed_open_parked_at_a_snooze_is_pulled_in_when_the_snooze_change
     assert store.run(sql.CLAIM, sql.claim_params(row, want - 1, CFG)) == 0
     assert store.run(sql.CLAIM, sql.claim_params(row, want, CFG)) == 1
     assert _pass(store, "open", review, t) == []  # and a second pass changes nothing
+
+
+# round 12: compare with floor, stamp with ceil
+def test_a_lease_lapses_at_its_end_never_a_fraction_before():
+    row = sending(nxt=NOW + 1)
+    for later in (0.1, 0.5, 0.999999):
+        assert run([inc()], deliveries=[row], now=NOW + later) == (), later
+    for later in (1, 1.1, 1.9):
+        assert [type(a) for a in run([inc()], deliveries=[row], now=NOW + later)] == [Reclaim]
+
+
+def test_may_transmit_counts_whole_seconds_since_the_claim():
+    deadline = CFG.transmit_deadline_seconds
+    assert may_transmit(NOW, NOW + deadline - 0.1, CFG)  # still inside the last second
+    assert not may_transmit(NOW, NOW + deadline, CFG)
+    assert not may_transmit(NOW, NOW + deadline + 0.9, CFG)
+    assert may_transmit(NOW + 1, NOW + 0.5, CFG)  # a claim stamped (rounded up) just ahead of now

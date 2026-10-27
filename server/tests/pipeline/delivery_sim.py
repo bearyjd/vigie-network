@@ -266,23 +266,30 @@ class World:
     def ev_sender(self):
         """Claim, transmit and record in one step (a fast send)."""
         for key, d in sorted(self.rows.items()):
-            if key not in self.inflight and self._due(key, d) and self.rnd.random() > 0.3:
-                self._finish(key, self._claim(key, d))
+            if d.state == "pending" and key not in self.inflight and self.rnd.random() > 0.3:
+                token = self._claim(key, d)  # the SQL decides; the oracle checks it
+                if token is not None:
+                    self._finish(key, token)
 
     def _due(self, key, d):
-        if d.state != "pending" or d.next_attempt_at > self.now:
-            return False
-        if key[1] == "recover":  # a recover is only ever sent for an announced open
-            opened = self.rows.get((key[0], "open"))
-            assert opened is not None and opened.state == "sent", ("recover w/o open", key)
-        return True
+        """Independent oracle for CLAIM eligibility: compare with floor, never early."""
+        return (
+            d.state == "pending"
+            and d.next_attempt_at <= math.floor(self.now)
+            and d.attempts < self.cfg.max_attempts
+        )
 
     def _claim(self, key, d, success=None):
         """CLAIM (short transaction), then transmit outside any transaction. Every transmission
         is counted independently of the persisted attempts."""
         self._probe_claim_guards(d)
         count = self.store.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg))
-        assert count == 1, ("a due pending row must be claimable", key, d)
+        assert count == int(self._due(key, d)), ("CLAIM must match eligibility", self.now, d, count)
+        if count == 0:
+            return None  # refused: not due yet (never claimed early), or out of budget
+        if key[1] == "recover":  # a recover is only ever sent for an announced open
+            opened = self.rows.get((key[0], "open"))
+            assert opened is not None and opened.state == "sent", ("recover w/o open", key)
         claimed, life = self.rows[key], self.life.get(key, 0)
         lease_end = math.ceil(self.now) + self.cfg.lease_seconds  # independent oracle for CLAIM
         assert (claimed.state, claimed.next_attempt_at) == ("sending", lease_end), claimed
@@ -316,8 +323,25 @@ class World:
 
     def ev_claim(self):
         for key, d in sorted(self.rows.items()):
-            if key not in self.inflight and self._due(key, d) and self.rnd.random() < 0.5:
-                self.inflight[key] = self._claim(key, d)
+            if d.state == "pending" and key not in self.inflight and self.rnd.random() < 0.5:
+                token = self._claim(key, d)
+                if token is not None:
+                    self.inflight[key] = token
+
+    def ev_edge_claim(self):
+        """Claim around a stored deadline: refused a fraction of a second early, accepted at it."""
+        for key, d in sorted(self.rows.items()):
+            if d.state != "pending" or key in self.inflight or d.attempts >= self.cfg.max_attempts:
+                continue
+            if d.next_attempt_at <= self.now + 0.2:
+                continue
+            self._advance(d.next_attempt_at - 0.1 - self.now)
+            assert self._claim(key, self.rows[key]) is None, "claimed before the deadline"
+            self._advance(d.next_attempt_at - self.now)  # exactly the stored deadline
+            token = self._claim(key, self.rows[key])
+            assert token is not None, "refused at the deadline"
+            self.inflight[key] = token
+            return
 
     def ev_overtake(self):
         """An ack lands while an open is in flight and is cleared again before the next send."""
@@ -426,6 +450,20 @@ class World:
             if fresh is not None and self._due(key, fresh) and key not in self.inflight:
                 self.inflight[key] = self._claim(key, fresh)
             self._fire(self.zombies.pop())
+            return
+
+    def ev_edge_lease(self):
+        """Walk a live claim to a fraction of a second before its lease end (hands off), crash the
+        sender, then to exactly the lease end (now it has lapsed and may be reclaimed)."""
+        for key, token in sorted(self.inflight.items()):
+            end = token.claimed.next_attempt_at
+            if end - 0.1 <= self.now:
+                continue
+            self._advance(end - 0.1 - self.now)
+            self.ev_pass()
+            self._crash(key)
+            self._advance(end - self.now)
+            self.ev_pass()
             return
 
     def ev_park_and_clear(self):
@@ -541,9 +579,10 @@ class World:
 
     def _probe_claim_guards(self, d):
         """On scratch copies, CLAIM refuses a row that is not due, out of budget or stale."""
-        now = math.ceil(self.now)
+        now, floor = math.ceil(self.now), math.floor(self.now)
         breaks = {
             "not due": "UPDATE incident_deliveries SET next_attempt_at=:now+5",
+            "not due by a fraction": "UPDATE incident_deliveries SET next_attempt_at=:floor+1",
             "out of budget": "UPDATE incident_deliveries SET attempts=:max",
             "stale": "UPDATE incident_deliveries SET version=version+1",
             "already sending": "UPDATE incident_deliveries SET state='sending'",
@@ -551,7 +590,8 @@ class World:
         }
         for label, update in breaks.items():
             probe = Store(self.rows.values())
-            args = {"now": now, "max": self.cfg.max_attempts, "kind": d.kind, "i": d.incident_id}
+            args = {"now": now, "floor": floor, "max": self.cfg.max_attempts}
+            args |= {"kind": d.kind, "i": d.incident_id}
             probe.run(update + " WHERE kind=:kind AND incident_id=:i", args)
             assert probe.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg)) == 0, label
 
@@ -726,7 +766,9 @@ class World:
             (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
             (self.ev_crash, 1), (self.ev_zombie, 2),
             (self.ev_violate, 1), (self.ev_zombie_race, 2), (self.ev_recreate_race, 2),
-            (self.ev_retry_flap, 2), (self.ev_park_and_clear, 2), (self.ev_clock_back, 1),
+            (self.ev_retry_flap, 2), (self.ev_park_and_clear, 2), (self.ev_edge_claim, 2),
+            (self.ev_edge_lease, 2),
+            (self.ev_clock_back, 1),
             (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]

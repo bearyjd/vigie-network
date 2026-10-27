@@ -86,6 +86,8 @@ from vigie_pipeline.delivery_types import (  # noqa: F401 - re-exported
     Revive,
     Suppress,
     Withdraw,
+    tick_ceil,
+    tick_floor,
 )
 from vigie_pipeline.delivery_types import is_number as _num
 
@@ -111,7 +113,7 @@ def may_transmit(claimed_at: float, now: float, config: DeliveryConfig) -> bool:
     time and lasted at most `transmit_deadline_seconds` (the sender's hard timeout)."""
     if not (_num(claimed_at) and _num(now)):
         return False
-    return now - claimed_at < config.transmit_deadline_seconds
+    return tick_floor(now) - claimed_at < config.transmit_deadline_seconds
 
 
 def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | None]:
@@ -133,7 +135,7 @@ def _retarget(
     """A pending open against the verdict's time `target` (`now` when loud). The row is due at the
     verdict, but never before its cumulative backoff, and never later than that: a cleared or
     shortened snooze pulls it in. A snooze that ends later pushes it out."""
-    floor = math.ceil(now)
+    floor = tick_ceil(now)
     if d.attempts > 0:
         floor = max(floor, math.ceil(d.updated_at) + backoff(d.attempts, config))
     want = max(target, floor)
@@ -176,7 +178,7 @@ def _open_action(
     if state in CLOSED_STATES:
         return Expire(iid, "open", "resolved_before_send", _exp(d)) if pending else None
     kind, detail = _verdict(review, now) if state == "open" else ("unknown", None)
-    target = math.ceil(detail) if kind == "until" else math.ceil(now)
+    target = math.ceil(detail) if kind == "until" else tick_ceil(now)
     if d is not None and d.state == "suppressed":
         return _revive(d, target, now, config, Requeue) if kind in ("loud", "until") else None
     if kind in ("unknown", "quiet"):
@@ -225,7 +227,7 @@ def _lease_action(
     earlier than its end); only otherwise is it reclaimed."""
     if not _row_ok(d):
         return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
-    if d.next_attempt_at > now:
+    if d.next_attempt_at > tick_floor(now):  # a lease lapses at its end, never before
         return None
     if _lifetime_over(d, now, config):
         return Expire(iid, d.kind, "lifetime", _exp(d))
@@ -237,7 +239,7 @@ def _lease_action(
         return Withdraw(iid, d.kind, _exp(d))
     if d.attempts >= config.max_attempts:
         return Fail(iid, d.kind, "max_attempts", _exp(d))
-    due = math.ceil(now) + backoff(d.attempts, config)
+    due = tick_ceil(now) + backoff(d.attempts, config)
     if d.kind == "open":
         verdict, detail = _verdict(review, now) if state == "open" else ("unknown", None)
         if verdict in ("quiet", "unknown"):
@@ -282,9 +284,9 @@ def _recover_action(
     if opened is None or opened.state != "sent":
         return None
     if recover is None:
-        return Enqueue(iid, "recover", math.ceil(now))
+        return Enqueue(iid, "recover", tick_ceil(now))
     if recover.state == "withdrawn":
-        return _revive(recover, math.ceil(now), now, config, Revive)
+        return _revive(recover, tick_ceil(now), now, config, Revive)
     return None
 
 

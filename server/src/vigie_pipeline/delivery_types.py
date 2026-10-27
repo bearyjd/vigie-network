@@ -16,6 +16,19 @@ CLOSED_STATES = frozenset({"resolved", "superseded"})
 UNRECOGNISED = "unrecognised_state"
 
 
+def tick_floor(now: float) -> int:
+    """Compare with floor, stamp with ceil: we never act early and never promise early. Every
+    ELIGIBILITY test (is a deadline reached, has a lease lapsed, is a send still in time) uses this
+    integer."""
+    return math.floor(now)
+
+
+def tick_ceil(now: float) -> int:
+    """The integer that stamps `updated_at` and anchors every new deadline (lease end, backoff,
+    snooze), so `updated_at + backoff` never undershoots a stored deadline."""
+    return math.ceil(now)
+
+
 def is_number(value: object) -> bool:
     """A real finite number: not a bool, not NaN/inf, not too large for a float."""
     if isinstance(value, bool) or not isinstance(value, int | float):

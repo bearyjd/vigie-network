@@ -44,6 +44,7 @@ from vigie_pipeline.delivery_plan import (
     backoff,
     delivery_id,
 )
+from vigie_pipeline.delivery_types import tick_ceil, tick_floor
 
 ENQUEUE_INSERT = """\
 INSERT OR IGNORE INTO incident_deliveries
@@ -108,7 +109,7 @@ WHERE row_id=:row_id AND state='sending' AND attempts=:attempts AND version=:ver
 CLAIM = """\
 UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
   next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
-WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:now
+WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:due_now
   AND attempts<:max_attempts AND version=:version"""
 
 COMPLETE_SENT = """\
@@ -131,16 +132,10 @@ ALL_SQL = (
 )  # fmt: skip
 
 
-def tick(now: float) -> int:
-    """The one integer time convention: `now` is rounded UP once, here, and that integer stamps
-    `updated_at` and anchors every deadline (so `updated_at + backoff` never undershoots one)."""
-    return math.ceil(now)
-
-
 def statement(a: Action, now: float) -> tuple[str, dict]:
     """The SQL and named parameters that apply one planned action."""
     p: dict = {"id": delivery_id(a.incident_id, a.kind), "incident_id": a.incident_id}
-    p |= {"kind": a.kind, "now": tick(now)}
+    p |= {"kind": a.kind, "now": tick_ceil(now)}
     if a.expected is not None:
         p |= {"state": a.expected.state, "attempts": a.expected.attempts}
         p |= {"version": a.expected.version, "row_id": a.expected.row_id}
@@ -169,7 +164,8 @@ def claim_params(row: DeliveryView, now: float, config: DeliveryConfig) -> dict:
     return {
         "row_id": row.row_id,
         "version": row.version,
-        "now": tick(now),
+        "now": tick_ceil(now),
+        "due_now": tick_floor(now),
         "lease_seconds": config.lease_seconds,
         "max_attempts": config.max_attempts,
     }
@@ -177,7 +173,7 @@ def claim_params(row: DeliveryView, now: float, config: DeliveryConfig) -> dict:
 
 def completion_params(claimed: DeliveryView, now: float) -> dict:
     """Parameters of the COMPLETE_* statements: `claimed` is the row as CLAIM left it."""
-    return {"row_id": claimed.row_id, "version": claimed.version, "now": tick(now)}
+    return {"row_id": claimed.row_id, "version": claimed.version, "now": tick_ceil(now)}
 
 
 def failure_statement(
@@ -188,7 +184,7 @@ def failure_statement(
     params = completion_params(claimed, now)
     if claimed.attempts >= config.max_attempts:
         return COMPLETE_FAILED, params
-    due = math.ceil(now) + backoff(claimed.attempts, config)
+    due = tick_ceil(now) + backoff(claimed.attempts, config)
     return COMPLETE_RETRY, params | {"next_attempt_at": due}
 
 

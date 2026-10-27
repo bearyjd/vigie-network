@@ -431,3 +431,22 @@ def test_planning_never_shortens_a_retry_deadline_whatever_the_fractions(conn):
                     getattr(a, "next_attempt_at", stored.next_attempt_at) >= stored.next_attempt_at
                     for a in actions
                 ), (attempts, failed_at, step, actions)
+
+
+@pytest.mark.parametrize(
+    "offset,claims", [(-1.0, 0), (-0.1, 0), (-1e-9, 0), (0, 1), (0.1, 1), (0.999, 1)]
+)
+def test_claim_is_never_early_and_works_at_the_stored_deadline(conn, offset, claims):
+    deadline = 1061  # small numbers keep 1e-9 representable
+    stored = row(nxt=deadline, created=900)
+    load(conn, [stored])
+    params = sql.claim_params(stored, deadline + offset, CFG)
+    assert params["due_now"] == deadline + (-1 if offset < 0 else 0)  # compare with floor
+    assert conn.execute(sql.CLAIM, params).rowcount == claims
+    if claims:  # stamped with ceil: the lease end never promises early
+        assert fetch(conn)[("i1", "open")].next_attempt_at == params["now"] + CFG.lease_seconds
+
+
+def test_stamp_with_ceil_compare_with_floor():
+    assert (sql.tick_ceil(1060.1), sql.tick_floor(1060.1)) == (1061, 1060)
+    assert (sql.tick_ceil(1060.0), sql.tick_floor(1060.0)) == (1060, 1060)

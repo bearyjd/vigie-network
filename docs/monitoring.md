@@ -225,10 +225,11 @@ The planner never touches a live `sending` row (no expiry, suppress, reschedule,
 forget). Whatever changed during the send (an ack, a snooze, a resolve or a reopen) is applied on
 the next pass, once the row is `sent` or `pending` again.
 
-**Time.** `now` is rounded up to an integer once, at the boundary (`delivery_sql.tick`), and that
-one integer stamps `updated_at` and anchors every deadline (lease end, backoff, snooze), so
-`updated_at + backoff(attempts)` can never undershoot a stored deadline whatever the fractional
-clock says.
+**Time.** Compare with floor, stamp with ceil: we never act early and never promise early. The
+shell derives two integers from `now` (`delivery_types.tick_floor` and `tick_ceil`, re-exported by
+`delivery_sql`). Every eligibility test (CLAIM's `next_attempt_at <= :due_now`, a lapsed lease,
+`may_transmit`) uses the floor; `updated_at` and every new deadline (lease end, backoff, snooze) use
+the ceil, so `updated_at + backoff(attempts)` can never undershoot a stored deadline.
 
 **Incarnations.** A statement keyed by a row matches `row_id = :row_id AND version = :version`.
 `row_id` is AUTOINCREMENT, so SQLite never reuses one, even after a Forget: a recreated delivery
@@ -302,7 +303,7 @@ WHERE row_id=:row_id AND state='sending' AND attempts=:attempts AND version=:ver
 -- sender: claim a due pending row (the only way to transmit); the lease end is next_attempt_at
 UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
   next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
-WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:now
+WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:due_now
   AND attempts<:max_attempts AND version=:version
 
 -- sender: the send succeeded (claim token: row_id and version)
