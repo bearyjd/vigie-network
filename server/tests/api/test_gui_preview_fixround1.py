@@ -131,6 +131,7 @@ def settled_identity(proc, argv=None):
     pid = getattr(proc, "pid", proc)
     if argv is None:
         assert hasattr(proc, "args"), "settled_identity needs a Popen or an explicit argv"
+        assert not isinstance(proc.args, (str, bytes)), "a shell-string Popen has no argv list"
         argv = [os.fsdecode(arg) for arg in proc.args]
     deadline = time.monotonic() + 5
     while True:

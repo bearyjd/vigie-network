@@ -177,6 +177,7 @@ def test_non_utf8_argv_does_not_break_a_prepared_only_receipt_with_no_listener(
         stdin=subprocess.DEVNULL,
     )
     try:
+        settled_identity(junk)  # the scan must see the invalid argv, not pytest's pre-exec copy
         attempt(namespace, serve_argv(namespace, 7), "999999", [])
         monkeypatch.setattr(preview, "listeners", lambda: set())
         assert preview.status(namespace)["state"] == "stopped"

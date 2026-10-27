@@ -601,7 +601,10 @@ def test_a_dash_c_process_that_merely_lists_the_script_is_not_the_controller(
 def test_a_dash_m_form_is_not_the_controller(children, tmp_path, monkeypatch):
     script = tmp_path / "controller.py"
     monkeypatch.setattr(preview, "__file__", str(script))
-    holder = children([sys.executable, "-m", "http.server", "0", str(script), "start"])
+    (tmp_path / "sleeper_mod.py").write_text(
+        "import time\ntime.sleep(60)\n"
+    )  # stays alive, unlike http.server
+    holder = children([sys.executable, "-m", "sleeper_mod", "0", str(script), "start"], tmp_path)
     assert not _recognised(holder)
 
 
