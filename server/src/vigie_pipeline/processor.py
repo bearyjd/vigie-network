@@ -20,6 +20,7 @@ from vigie_pipeline.characterization_store import (
     save_services,
 )
 from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
@@ -73,6 +74,7 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
                 BaselineConfig(large_upload_bytes=config.monitoring_large_upload_bytes),
                 clock,
             )
+            run_delivery_stage(inv, overrides, config, live or (lambda: clock))
             refresh_characterization(inv, overrides, clock)
         prune_monitoring(inv, clock)
     finally:

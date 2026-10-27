@@ -130,10 +130,21 @@ services:
       VIGIE_STITCH_THRESHOLD: ${VIGIE_STITCH_THRESHOLD:-0.8}
       VIGIE_OVERLAP_GRACE_S: ${VIGIE_OVERLAP_GRACE_S:-600}
       VIGIE_ACTIVITY_GAP_S: ${VIGIE_ACTIVITY_GAP_S:-300}
+      VIGIE_DELIVERY_ENABLED: ${VIGIE_DELIVERY_ENABLED:-0}
+      VIGIE_DELIVERY_FILE: ${VIGIE_DELIVERY_FILE:-}
+      VIGIE_DELIVERY_LEASE_S: ${VIGIE_DELIVERY_LEASE_S:-300}
+      VIGIE_DELIVERY_TRANSMIT_DEADLINE_S: ${VIGIE_DELIVERY_TRANSMIT_DEADLINE_S:-30}
+      VIGIE_DELIVERY_MAX_ATTEMPTS: ${VIGIE_DELIVERY_MAX_ATTEMPTS:-6}
+      VIGIE_DELIVERY_BACKOFF_BASE_S: ${VIGIE_DELIVERY_BACKOFF_BASE_S:-60}
+      VIGIE_DELIVERY_BACKOFF_CAP_S: ${VIGIE_DELIVERY_BACKOFF_CAP_S:-3600}
+      VIGIE_DELIVERY_TTL_S: ${VIGIE_DELIVERY_TTL_S:-86400}
+      VIGIE_DELIVERY_RETENTION_S: ${VIGIE_DELIVERY_RETENTION_S:-2592000}
+      VIGIE_DELIVERY_MAX_PER_RUN: ${VIGIE_DELIVERY_MAX_PER_RUN:-20}
     volumes:
       - vigie-raw:/raw:ro
       - vigie-inv:/inv:rw
       - vigie-overrides:/overrides:ro
+      - vigie-delivery:/delivery:rw  # only used when VIGIE_DELIVERY_FILE=/delivery/...
     healthcheck:
       # Heartbeat: the loop touches the file after every SUCCESSFUL pass; unhealthy once the last
       # one is older than 3 x VIGIE_PIPELINE_INTERVAL_S (a failing or wedged loop goes unhealthy).
@@ -193,6 +204,7 @@ volumes:
   vigie-raw: {}
   vigie-inv: {}
   vigie-overrides: {}
+  vigie-delivery: {}
 
 # External podman secrets, created with `podman secret create` (gen-certs.sh and
 # provision-collector.sh do it). External, not `file:`, because podman-compose only honours

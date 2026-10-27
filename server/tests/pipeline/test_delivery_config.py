@@ -19,7 +19,7 @@ NAMES = (
 
 
 def cfg(**env):
-    return PipelineConfig.from_env({"VIGIE_DATA_DIR": "/tmp/x", **env})
+    return PipelineConfig.from_env({"VIGIE_DATA_DIR": "/nonexistent/x", **env})
 
 
 def test_default_is_off_with_documented_knobs():
@@ -34,7 +34,7 @@ def test_default_is_off_with_documented_knobs():
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", " Yes "])
 def test_enable_values(value):
-    assert cfg(VIGIE_DELIVERY_ENABLED=value, VIGIE_DELIVERY_FILE="/tmp/o").delivery.enabled
+    assert cfg(VIGIE_DELIVERY_ENABLED=value, VIGIE_DELIVERY_FILE="/nonexistent/o").delivery.enabled
 
 
 @pytest.mark.parametrize("value", ["", "0", "false", "no", "off"])
@@ -56,8 +56,8 @@ def test_enabled_requires_file():
 
 
 def test_file_alone_does_not_enable():
-    d = cfg(VIGIE_DELIVERY_FILE="/tmp/o").delivery
-    assert d.enabled is False and d.file == Path("/tmp/o")
+    d = cfg(VIGIE_DELIVERY_FILE="/nonexistent/o").delivery
+    assert d.enabled is False and d.file == Path("/nonexistent/o")
 
 
 @pytest.mark.parametrize(
