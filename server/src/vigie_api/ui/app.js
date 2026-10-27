@@ -124,10 +124,10 @@ async function load(clear = false, focus = null, automatic = false) {
       content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident, {filter: inboxFilter(), onFilter: setInboxFilter}), pager(state.page, inboxRows(list.data, inboxFilter()).length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
     }
     if (generation !== state.generation || !state.connected) return;
-    if (automatic && interacting()) return;
     const snapshot = coverage ?? await banner;  // settle first: an obsolete load must not touch shared state
     if (generation !== state.generation || !state.connected) return;
     state.coverage = snapshot;
+    if (automatic && interacting()) return;  // checked after the LAST await: the user may have started using the content meanwhile
     const held = focusedInContent();
     state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice(); restoreContentFocus(held);
     if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});

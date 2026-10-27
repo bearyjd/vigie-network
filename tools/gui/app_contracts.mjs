@@ -469,6 +469,24 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   view('overview'); await flush(); assert.equal(tone(), 'ok', 'the fresh overview owns the banner');
   releaseStale(); await flush(); intervalTick(); assert.equal(tone(), 'ok', 'the obsolete response must not flip the banner'); assert.match(bannerText(), /^OK/);
 }
+// Round 4: an automatic refresh that is still waiting on coverage must not replace content the user has since started using.
+{
+  incidents = [inc('r1'), inc('r2')]; location.hash = ''; view('incidents'); await flush(); await reload(); assert.equal(tone(), 'ok'); body.focus();
+  const startAutomatic = async hold => { await tick(30000); return hold; };
+  let releaseCoverage; holdCoverage = {promise: new Promise(resolve => { releaseCoverage = resolve; })};
+  await startAutomatic(); await flush();  // the list answered, coverage is still pending
+  const probe = content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'filter:all'); probe.focus(); content.fire('focusin');
+  const firstChild = content.children[0]; const probeText = probe.textContent; const contentText = content.textContent; const sent = requests.length;
+  releaseCoverage(); await flush();
+  assert.equal(content.children[0], firstChild, 'the original content node survives'); assert.equal(content.textContent, contentText); assert.equal(document.activeElement, probe); assert.equal(probe.textContent, probeText);
+  assert.equal(tone(), 'error', 'the banner still takes the late coverage result'); assert.equal(requests.length, sent, 'no extra request'); assert.equal(refreshTimers(), 1, 'exactly one refresh timer'); assert.equal(dueTimers()[0][1].ms, 30000);
+  // the same holds when the list request itself fails after the user focused a control
+  body.focus(); await reload(); body.focus(); gate = new Promise(resolve => { release = resolve; }); incidentsDown = true; await tick(30000);
+  const probe2 = content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'filter:all'); probe2.focus(); content.fire('focusin'); const child2 = content.children[0];
+  release(); gate = null; await flush();
+  assert.equal(content.children[0], child2, 'a failed automatic refresh leaves the focused content alone'); assert.equal(document.activeElement, probe2); assert.equal(notice.hidden, false); assert.equal(refreshTimers(), 1);
+  incidentsDown = false; body.focus(); content.fire('focusout'); await reload();
+}
 // L2: schedule() called while a timer is still registered (the interacting branch re-arms without load()'s own clear) leaves ONE live timer.
 {
   await reload(); const [[, timer]] = dueTimers(); body.focus(); const probe = content.querySelector('[data-focus-key]') || content.querySelector('[aria-label]'); probe.focus(); content.fire('focusin');
