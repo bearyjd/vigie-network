@@ -118,7 +118,7 @@ ntfy delivery and topic ownership remain gated by D5; the local inbox works with
 Goal: help the owner see which devices may be exposed to known vulnerabilities and which traffic looks like it
 could be malicious, as **evidence with confidence labels**. Nothing here is a verdict. A match never blocks
 traffic, never changes a group or trust, and never merges identities; enforcement stays with Couvre-feu. This is
-a proposal: apart from the dataset-free device evidence pack below (phase 1, implemented), no dataset import, provider call or notification exists for it, and the rest needs owner confirmation of D7 (D8 and D9 are decided).
+a proposal: apart from the dataset-free device evidence pack below (phase 1, implemented), no dataset import, provider call or notification exists for it, and the rest is gated by per-dataset source, license and false-positive review (D7, D8 and D9 are decided).
 
 Phases, each shippable and reviewed on its own:
 1. **Identity quality first.** CVE-style matching needs vendor/product (ideally version). Measure how many
@@ -183,9 +183,10 @@ Owner decisions recorded 2026-10-26:
   incidents, never in notifications. A human can mark a note "not applicable", with an audit entry.
 - **D8 = keep NextDNS upstream.** The router's dnsmasq stays the single home DNS entry point, so Vigie attributes
   queries per device; NextDNS stays the upstream and roaming filter; provider logs are read-only context only.
-- **D7 = RECOMMENDED, awaiting owner confirmation.** A scheduled fetch of KEV and URLhaus into a staging area, a
-  human accept step, and versioned, reversible imports; KEV and URLhaus first. Nothing is fetched until the owner
-  confirms.
+- **D7 = confirmed by the owner, 2026-10-26.** A scheduled fetch of KEV and URLhaus into a staging area, a human
+  accept step, and versioned, reversible imports; KEV and URLhaus first. Confirmation approves the plan, not an
+  implementation: no fetch, import or dataset exists yet, and each dataset still needs its source, version, license
+  and false-positive review before import.
 
 ### Resolver role: NextDNS, AdGuard Home and Vigie
 
@@ -263,8 +264,8 @@ Review each unit independently, then run the whole chain and collect deployment 
 
 D1 authoritative couvre-feu tree; D2 dnsmasq-change policy; D3 fixed-MAC policy for kid/adult devices;
 D4 server placement; D5 notification topic/ownership; D6 person IDs remain unresolved owner gates.
-New gates for M2b: D7 offline dataset import cadence and sources (recommended: scheduled fetch into staging with human
-accept, KEV and URLhaus first; awaiting owner confirmation); D8 resolver strategy (decided: keep NextDNS upstream, router
+New gates for M2b: D7 offline dataset import cadence and sources (decided: scheduled fetch into staging with human
+accept, KEV and URLhaus first); D8 resolver strategy (decided: keep NextDNS upstream, router
 dnsmasq as the single home entry point, provider logs read-only context); D9 known-issue notes (decided: type-level,
 KEV only, product-level signal required, device detail only). See "Device evidence pack" above.
 This roadmap does not resolve them, approve PRP-002, authorize router commands or change enforcement policy.
