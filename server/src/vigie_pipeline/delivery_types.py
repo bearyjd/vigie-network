@@ -61,6 +61,7 @@ class DeliveryConfig:
     pending_ttl_seconds: int = 86400
     retention_seconds: int = 30 * 86400
     lease_seconds: int = 300
+    transmit_deadline_seconds: int = 30
     eligible_since: float | None = None
 
     def __post_init__(self) -> None:
@@ -70,11 +71,18 @@ class DeliveryConfig:
             self.pending_ttl_seconds,
             self.retention_seconds,
             self.lease_seconds,
+            self.transmit_deadline_seconds,
         )
         if not all(is_number(v) and v > 0 for v in durations):
             raise ValueError("durations must be finite numbers > 0")
-        if isinstance(self.lease_seconds, bool) or not isinstance(self.lease_seconds, int):
-            raise ValueError("lease_seconds must be an integer")
+        for name in ("lease_seconds", "transmit_deadline_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if self.lease_seconds < 60:
+            raise ValueError("lease_seconds must be at least 60")
+        if self.transmit_deadline_seconds * 2 > self.lease_seconds:
+            raise ValueError("a lease must cover twice the transmit deadline")
         if not is_number(self.max_attempts) or self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if self.backoff_cap_seconds < self.backoff_base_seconds:

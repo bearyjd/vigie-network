@@ -6,6 +6,7 @@ import dataclasses
 import math
 import random
 import sqlite3
+from typing import NamedTuple
 
 from vigie_pipeline import delivery_sql as sql
 from vigie_pipeline import schema
@@ -23,9 +24,9 @@ from vigie_pipeline.delivery_plan import (
     Revive,
     Suppress,
     Withdraw,
-    after_failure,
     backoff,
     delivery_id,
+    may_transmit,
     plan,
 )
 
@@ -33,7 +34,7 @@ DAY = 86400
 QUIET = ("acknowledged", "expected")
 ALLOWED = {
     "pending": {"pending", "sending", "suppressed", "expired", "withdrawn"},
-    "sending": {"sending", "sent", "pending", "failed", "expired"},
+    "sending": {"sending", "sent", "pending", "failed", "expired", "withdrawn"},
     "withdrawn": {"withdrawn", "pending", "expired", "failed"},
     "suppressed": {"suppressed", "pending", "failed", "expired"},
     "sent": {"sent"},
@@ -48,6 +49,14 @@ EDGE = DeliveryConfig(
     backoff_base_seconds=60,
     backoff_cap_seconds=60,
 )
+
+
+class Token(NamedTuple):
+    """What a sender holds after CLAIM: the claimed row, the outcome, and the row's life."""
+
+    claimed: DeliveryView
+    success: bool
+    life: int
 
 
 class PassAborted(AssertionError):
@@ -145,7 +154,8 @@ class World:
         self.cfg = cfg or DeliveryConfig()
         self.now, self.since, self.next_id = 1_000_000, None, 0
         self.inc, self.reviews, self.store = {}, {}, Store()
-        self.opened, self.owed_at, self.inflight, self.zombies = set(), {}, {}, {}
+        self.opened, self.owed_at, self.inflight, self.zombies = set(), {}, {}, []
+        self.life, self.tx_end, self.hung, self.violations = {}, {}, set(), {}
         self.transmissions, self.successes, self.crashes = {}, {}, {}
         self.seen = set()
 
@@ -221,19 +231,22 @@ class World:
     def ev_time(self):
         ttl, ret = self.cfg.pending_ttl_seconds, self.cfg.retention_seconds
         steps = [0, 1, 59, 60, ttl - 1, ttl, ttl + 1, ret - 1, ret, ret + 1, DAY]
-        self.now += self.rnd.choice(steps) + self.rnd.choice([0, 0, 0.5, 0.999])
-        self._lapse_leases()
+        self._advance(self.rnd.choice(steps) + self.rnd.choice([0, 0, 0.5, 0.999]))
 
-    def _lapse_leases(self):
-        for key in sorted(self.inflight):  # a sender that outlives its lease is a crashed sender
-            if self.inflight[key][0].next_attempt_at <= self.now:
-                self._crash(key)
+    def _advance(self, delta):
+        """Time passes. A contract-abiding sender records its result before its lease lapses, so
+        it does so before the clock crosses the lease end (crash and violation are explicit
+        events, never inferred)."""
+        for key in sorted(self.inflight):
+            if self.inflight[key].claimed.next_attempt_at <= self.now + delta:
+                self._finish(key, self.inflight.pop(key))
+        self.now += delta
 
     def ev_sender(self):
         """Claim, transmit and record in one step (a fast send)."""
         for key, d in sorted(self.rows.items()):
             if key not in self.inflight and self._due(key, d) and self.rnd.random() > 0.3:
-                self._finish(key, *self._claim(key, d))
+                self._finish(key, self._claim(key, d))
 
     def _due(self, key, d):
         if d.state != "pending" or d.next_attempt_at > self.now:
@@ -244,21 +257,35 @@ class World:
         return True
 
     def _claim(self, key, d, success=None):
-        """CLAIM (short transaction), then transmit outside any transaction. Every claim is one
-        transmission, counted independently of the persisted attempts."""
-        if self.rnd.random() < 0.3:
-            self._probe_claim_guards(d)
+        """CLAIM (short transaction), then transmit outside any transaction. Every transmission
+        is counted independently of the persisted attempts."""
+        self._probe_claim_guards(d)
         count = self.store.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg))
         assert count == 1, ("a due pending row must be claimable", key, d)
+        claimed, life = self.rows[key], self.life.get(key, 0)
+        lease_end = int(self.now) + self.cfg.lease_seconds  # independent oracle for CLAIM
+        assert (claimed.state, claimed.next_attempt_at) == ("sending", lease_end), claimed
+        assert claimed.attempts == d.attempts + 1 and claimed.version == d.version + 1, claimed
+        late = self.rnd.choice([0, 0, 0, self.cfg.transmit_deadline_seconds])  # a stalled sender
+        allowed = may_transmit(claimed.updated_at, self.now + late, self.cfg)
+        assert allowed == (late < self.cfg.transmit_deadline_seconds), ("may_transmit", late)
+        if not allowed:
+            self._observe()
+            return Token(claimed, False, life)  # aborts without transmitting
+        # the sender contract (hard timeout) keeps a transmission inside the deadline
+        end = self.tx_end.get(key, 0)
+        assert end <= self.now or key in self.hung, ("two transmissions overlap", key, end)
+        self.tx_end[key] = self.now + self.rnd.randint(1, self.cfg.transmit_deadline_seconds - 1)
         self.transmissions[key] = self.transmissions.get(key, 0) + 1
         assert self.transmissions[key] <= self.cfg.max_attempts, ("transmissions", key)
         success = self.rnd.random() < 0.6 if success is None else success
         if success:
             self.successes[key] = self.successes.get(key, 0) + 1
-            # a second delivery is only possible after a crash lost the first completion
-            assert self.successes[key] <= 1 + self.crashes.get(key, 0), ("delivered twice", key)
+            # a second delivery needs an explicit crash or deadline violation first
+            allowed = 1 + self.crashes.get(key, 0) + self.violations.get(key, 0)
+            assert self.successes[key] <= allowed, ("delivered twice", key)
         self._observe()
-        return self.rows[key], success
+        return Token(claimed, success, life)
 
     def ev_claim(self):
         for key, d in sorted(self.rows.items()):
@@ -275,7 +302,7 @@ class World:
         self.reviews[key[0]] = ReviewView("acknowledged", None)
         self.ev_pass()
         if key in self.inflight:
-            self._finish(key, *self.inflight.pop(key))
+            self._finish(key, self.inflight.pop(key))
         self.reviews.pop(key[0]) if was is None else self.reviews.update({key[0]: was})
         self.ev_pass()
         self.ev_sender()
@@ -283,7 +310,7 @@ class World:
     def ev_complete(self):
         for key in sorted(self.inflight):
             if self.rnd.random() < 0.6:
-                self._finish(key, *self.inflight.pop(key))
+                self._finish(key, self.inflight.pop(key))
 
     def ev_crash(self):
         """The sender dies between transmitting and recording the result."""
@@ -291,38 +318,85 @@ class World:
             self._crash(self.rnd.choice(sorted(self.inflight)))
 
     def _crash(self, key):
-        claimed, success = self.inflight.pop(key)
-        self.zombies[key] = (claimed, success)  # it may still try to record its result later
-        if success:
+        token = self.inflight.pop(key)
+        self.tx_end[key] = min(self.tx_end.get(key, 0), self.now)  # a dead sender stops sending
+        if token.success:
             self.crashes[key] = self.crashes.get(key, 0) + 1
 
+    def ev_violate(self):
+        """The sender violates its transmit deadline: it hangs, its send may still be going out
+        when the lease lapses, and it records the result late."""
+        if self.inflight:
+            self._violate(self.rnd.choice(sorted(self.inflight)))
+
+    def _violate(self, key):
+        token = self.inflight.pop(key)
+        self.hung.add(key)
+        self.tx_end[key] = self.now + 10 * self.cfg.lease_seconds
+        self.zombies.append(token)
+        if token.success:
+            self.violations[key] = self.violations.get(key, 0) + 1
+
+    def _fire(self, token):
+        """A late completion carries its own claim token: it lands only on that incarnation."""
+        key = (token.claimed.incident_id, token.claimed.kind)
+        row = self.rows.get(key)
+        same = (
+            row is not None
+            and self.life.get(key, 0) == token.life
+            and row.state == "sending"
+            and row.version == token.claimed.version
+        )
+        self._finish(key, token, expect=1 if same else 0)
+
+    def ev_zombie(self):
+        if self.zombies:
+            self._fire(self.zombies.pop(self.rnd.randrange(len(self.zombies))))
+
     def ev_zombie_race(self):
-        """A sender dies mid-send, its lease lapses, the row is reclaimed and claimed again, and
-        only then does the dead sender's late completion arrive: it must not land."""
+        """A hung sender's lease lapses, the row is reclaimed and claimed again, and only then
+        does the hung sender record its result: it must not land on the new claim."""
         for key, d in sorted(self.rows.items()):
             if key in self.inflight or not self._due(key, d):
                 continue
-            self._crash_after(key, d)
-            self.now += self.cfg.lease_seconds + 1
-            self._lapse_leases()
-            self.ev_pass()  # Reclaim
+            self.inflight[key] = self._claim(key, d)
+            self._violate(key)
+            self._advance(self.cfg.lease_seconds + 1)
+            self.ev_pass()  # Reclaim, or a cancellation
             row = self.rows.get(key)
             if row is not None and row.state == "pending":
-                self.now = max(self.now, row.next_attempt_at)
-                self._lapse_leases()
+                self._advance(max(0, row.next_attempt_at - self.now))
                 self.ev_pass()
-                row = self.rows[key]
-                if self._due(key, row) and key not in self.inflight:
+                row = self.rows.get(key)
+                if row is not None and self._due(key, row) and key not in self.inflight:
                     self.inflight[key] = self._claim(key, row)
-            claimed, success = self.zombies.pop(key)
-            row = self.rows.get(key)
-            same = row is not None and row.state == "sending" and row.version == claimed.version
-            self._finish(key, claimed, success, expect=1 if same else 0)
+            self._fire(self.zombies.pop())
             return
 
-    def _crash_after(self, key, d):
-        self.inflight[key] = self._claim(key, d)
-        self._crash(key)
+    def ev_recreate_race(self):
+        """A hung sender's row is cancelled, forgotten and created afresh; its late completion
+        carries a version the new row must never share."""
+        for iid, s in sorted(self.inc.items()):
+            key = (iid, "open")
+            row = self.rows.get(key)
+            if not (s["present"] and s["state"] == "open" and row and key not in self.inflight):
+                continue
+            if not self._due(key, row):
+                continue
+            self.inflight[key] = self._claim(key, row)
+            self._violate(key)
+            self._advance(self.cfg.lease_seconds + 1)
+            s["state"] = "resolved"
+            self.ev_pass()  # the lapsed claim is cancelled
+            self._advance(self.cfg.retention_seconds + 1)
+            self.ev_pass()  # and forgotten
+            s["state"], _ = "open", self.reviews.pop(iid, None)
+            self.ev_pass()  # a new row, a new life
+            fresh = self.rows.get(key)
+            if fresh is not None and self._due(key, fresh) and key not in self.inflight:
+                self.inflight[key] = self._claim(key, fresh)
+            self._fire(self.zombies.pop())
+            return
 
     def ev_retry_flap(self):
         """A recover send fails (a retry is queued), then the incident flaps: Withdraw, Revive."""
@@ -332,35 +406,21 @@ class World:
                 continue
             if not (s["present"] and s["state"] == "resolved"):
                 continue
-            claimed, _ = self._claim(key, d, success=False)
-            self._finish(key, claimed, False)
+            self._finish(key, self._claim(key, d, success=False))
             s["state"] = "open"
             self.ev_pass()
             s["state"] = "resolved"
             self.ev_pass()
             return
 
-    def ev_zombie(self):
-        """A sender whose lease lapsed records its result late: it lands only on its own claim."""
-        if self.zombies:
-            key = self.rnd.choice(sorted(self.zombies))
-            claimed, success = self.zombies.pop(key)
-            row = self.rows.get(key)
-            same = row is not None and row.state == "sending" and row.version == claimed.version
-            self._finish(key, claimed, success, expect=1 if same else 0)
-
-    def _finish(self, key, claimed, success, expect=1):
+    def _finish(self, key, token, expect=1):
         """Record the outcome with a short transaction, version-checked against the claim."""
+        claimed, success = token.claimed, token.success
         before, params = dict(self.rows), sql.completion_params(claimed, self.now)
         if success:
             count = self.store.run(sql.COMPLETE_SENT, params)
         else:
-            act = after_failure(claimed, self.now, self._cfg())
-            if isinstance(act, Fail):
-                count = self.store.run(sql.COMPLETE_FAILED, params)
-            else:
-                retry = params | {"next_attempt_at": act.next_attempt_at}
-                count = self.store.run(sql.COMPLETE_RETRY, retry)
+            count = self.store.run(*sql.failure_statement(claimed, self.now, self._cfg()))
         assert count == expect, ("completion matches its own claim only", key, claimed, count)
         if count == 0:
             return
@@ -394,9 +454,13 @@ class World:
         self.store.apply_pass(actions, self.now, self.cfg.retention_seconds)
         self.seen |= {type(a).__name__ for a in actions}
         for a in actions:
+            if a.expected is None:  # an INSERT: the row starts a new life
+                key = (a.incident_id, a.kind)
+                self.life[key] = self.life.get(key, 0) + 1
+        for a in actions:
             key = (a.incident_id, a.kind)
             if isinstance(a, Forget):  # a forgotten row ends its life: history starts over
-                for book in (self.transmissions, self.successes, self.crashes, self.zombies):
+                for book in (self.transmissions, self.successes, self.crashes, self.violations):
                     book.pop(key, None)
                 if a.kind == "open":
                     self.opened.discard(a.incident_id)
@@ -468,7 +532,7 @@ class World:
         inc = self.inc[a.incident_id]
         if row is not None and row.state == "sending":
             assert row.next_attempt_at <= self.now, ("action on a live lease", a, row)
-            assert isinstance(a, Reclaim | Fail | Expire), ("action on a sending row", a, row)
+            assert isinstance(a, Reclaim | Fail | Expire | Withdraw), ("on a sending row", a, row)
         if a.expected is None:
             assert row is None and isinstance(a, Enqueue | Suppress), (a, row)
         else:
@@ -487,6 +551,10 @@ class World:
                 done = ("sent", "failed", "suppressed", "expired")
                 assert row.state != "sent" or (rec is not None and rec.state in done), (a, rec)
         if isinstance(a, Reclaim):
+            assert inc["present"] and self.now - row.created_at <= self.cfg.retention_seconds, a
+            closed = inc["state"] in ("resolved", "superseded")
+            assert not (a.kind == "open" and closed), ("reclaim of a cancelled open", a)
+            assert not (a.kind == "recover" and inc["state"] != "resolved"), ("reclaim", a)
             backoff_at = math.ceil(self.now) + backoff(row.attempts, self.cfg)
             assert a.next_attempt_at == backoff_at, ("reclaim waits out a backoff", a, row)
         if isinstance(a, Revive):
@@ -495,7 +563,7 @@ class World:
             assert inc["state"] == "resolved" and row.state == "withdrawn", ("revive", a, row)
             assert opened is not None and opened.state == "sent", ("revive w/o sent open", a)
         if isinstance(a, Withdraw):
-            assert row.state == "pending" and inc["state"] != "resolved", ("withdraw", a, row)
+            assert row.state in ("pending", "sending") and inc["state"] != "resolved", (a, row)
         if isinstance(a, Requeue):
             assert self.now - row.created_at <= self.cfg.retention_seconds, ("lifetime", a, row)
             if row.attempts > 0 and row.next_attempt_at is not None:
@@ -575,7 +643,8 @@ class World:
             (self.ev_watermark, 3), (self.ev_time, 4), (self.ev_sender, 2),
             (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
             (self.ev_crash, 1), (self.ev_zombie, 2),
-            (self.ev_zombie_race, 2), (self.ev_retry_flap, 2),
+            (self.ev_violate, 1), (self.ev_zombie_race, 2), (self.ev_recreate_race, 2),
+            (self.ev_retry_flap, 2),
             (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]

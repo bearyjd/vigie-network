@@ -73,6 +73,22 @@ SCENARIOS = {
     "Fail": ([inc()], {}, [row(state="suppressed", attempts=CFG.max_attempts)]),
     "Withdraw": ([inc()], {}, [row(state="sent"), row("recover", ver=1)]),
     "Revive": ([inc("resolved")], {}, [row(state="sent"), row("recover", "withdrawn", ver=2)]),  # noqa: E501
+    "Expire sending": (
+        [inc("resolved")],
+        {},
+        [row(state="sending", attempts=1, nxt=NOW - 1, ver=3)],
+    ),
+    "Fail sending": (
+        [inc()],
+        {},
+        [row(state="sending", attempts=CFG.max_attempts, nxt=NOW - 1, ver=3)],
+    ),
+    "Fail pending": ([inc()], {}, [row(attempts=CFG.max_attempts, nxt=NOW + 9, ver=1)]),
+    "Withdraw sending": (
+        [inc()],
+        {},
+        [row(state="sent"), row("recover", "sending", attempts=1, nxt=NOW - 1, ver=2)],
+    ),
     "Reclaim": ([inc()], {}, [row(state="sending", attempts=2, nxt=NOW - 1, ver=3)]),
     "Forget": ([inc("superseded")], {}, [row(state="sent", created=OLD), row("recover", "sent", created=OLD)]),  # noqa: E501
 }  # fmt: skip
@@ -204,3 +220,23 @@ def test_the_docs_quote_every_statement_verbatim():
     for statement in sql.ALL_SQL:
         assert " ".join(statement.split()) in section, statement
     assert isinstance(sqlite3.sqlite_version, str)
+
+
+def test_a_new_row_starts_at_the_epoch_second_so_versions_never_repeat(conn):
+    from vigie_pipeline.delivery_plan import Enqueue, Suppress
+
+    for action in (Enqueue("i1", "open", NOW), Suppress("i1", "recover", "acknowledged")):
+        assert conn.execute(*sql.statement(action, NOW)).rowcount == 1
+    assert {d.version for d in fetch(conn).values()} == {NOW}
+    claim = sql.claim_params(fetch(conn)[("i1", "open")], NOW, CFG)
+    assert conn.execute(sql.CLAIM, claim).rowcount == 1
+    assert fetch(conn)[("i1", "open")].version == NOW + 1
+
+
+def test_failure_statements_apply_to_a_claimed_row(conn):
+    load(conn, [row(nxt=NOW - 1)])
+    conn.execute(sql.CLAIM, sql.claim_params(row(nxt=NOW - 1), NOW, CFG))
+    claimed = fetch(conn)[("i1", "open")]
+    statement, params = sql.failure_statement(claimed, NOW + 1, CFG)
+    assert statement == sql.COMPLETE_RETRY and conn.execute(statement, params).rowcount == 1
+    assert fetch(conn)[("i1", "open")].next_attempt_at == NOW + 1 + 60

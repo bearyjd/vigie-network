@@ -18,7 +18,7 @@ def test_the_simulation_exercises_every_action_and_crashes():
         world = World(seed, [None, TIGHT, EDGE][seed % 3])
         world.run()
         seen |= world.seen
-        crashed += sum(world.crashes.values())
+        crashed += sum(world.crashes.values()) + sum(world.violations.values())
     # Fail is a defensive revival path: a consistent sender already fails rows at the budget
     every = {
         "Enqueue",
@@ -31,4 +31,4 @@ def test_the_simulation_exercises_every_action_and_crashes():
         "Revive",
     }
     assert seen >= every
-    assert crashed > 5  # sender crashes happen and the planner reclaims the lapsed leases
+    assert crashed > 5  # senders crash or violate their deadline; the planner reclaims the leases

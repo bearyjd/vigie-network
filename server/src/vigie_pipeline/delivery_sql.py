@@ -18,6 +18,8 @@ bounded by `max_attempts` overall).
 
 from __future__ import annotations
 
+import math
+
 from vigie_pipeline.delivery_plan import (
     Action,
     DeliveryConfig,
@@ -32,6 +34,7 @@ from vigie_pipeline.delivery_plan import (
     Revive,
     Suppress,
     Withdraw,
+    backoff,
     delivery_id,
 )
 
@@ -39,13 +42,13 @@ ENQUEUE_INSERT = """\
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, 0)"""
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now)"""
 
 SUPPRESS_INSERT = """\
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, 0)"""
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now)"""
 
 SUPPRESS_UPDATE = """\
 UPDATE incident_deliveries SET state='suppressed', updated_at=:now, version=version+1
@@ -75,7 +78,7 @@ WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:versi
 
 WITHDRAW_UPDATE = """\
 UPDATE incident_deliveries SET state='withdrawn', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version"""
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version"""
 
 FORGET_DELETE = """\
 DELETE FROM incident_deliveries
@@ -162,3 +165,15 @@ def completion_params(claimed: DeliveryView, now: float) -> dict:
         "version": claimed.version,
         "now": int(now),
     }
+
+
+def failure_statement(
+    claimed: DeliveryView, now: float, config: DeliveryConfig
+) -> tuple[str, dict]:
+    """The sender's completion for a failed send: retry later, or give up past the budget.
+    `claimed.attempts` already counts the attempt that just failed."""
+    params = completion_params(claimed, now)
+    if claimed.attempts >= config.max_attempts:
+        return COMPLETE_FAILED, params
+    due = math.ceil(now) + backoff(claimed.attempts, config)
+    return COMPLETE_RETRY, params | {"next_attempt_at": due}

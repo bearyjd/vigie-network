@@ -29,15 +29,22 @@ that read fails) AND the delivery rows, runs `plan()` and applies every action i
 `BEGIN IMMEDIATE` transaction, using the statements in `vigie_pipeline.delivery_sql`.
 
 SENDER LEASE. The sender CLAIMs a due `pending` row (the only way to transmit: it moves the row to
-`sending`, counts the attempt and puts the lease end in `next_attempt_at`), transmits outside any
-transaction, then COMPLETEs with the claimed version. The database allows one live claim per
-delivery_id. The planner NEVER touches a live `sending` row (no action of any kind) and an
-announcement in flight counts as not yet sent (no recover until `sent`; no Forget while any row of
-the incident is `sending` or `pending`). Once the lease lapsed the sender is presumed crashed:
-Reclaim (back to `pending` after a backoff; `attempts` already counted) or Fail past the budget.
-Delivery is at least once: a crash after a successful send can cause one retransmission per
-reclaim, bounded by `max_attempts`. Accepted window: a recover claimed before its incident
-reopened is delivered (one stale recovery notice).
+`sending`, counts the attempt and puts the lease end in `next_attempt_at`; the lease is half-open,
+at `next_attempt_at == now` it has lapsed), transmits outside any transaction, then COMPLETEs with
+the claimed version. The database allows one live claim per delivery_id and fences every write by
+version, but only the SENDER CONTRACT keeps two transmissions from overlapping: a hard network
+timeout no longer than `transmit_deadline_seconds`, a call to `may_transmit()` right before the
+network call (abort without transmitting if it is false), and no completion after the lease end;
+`lease_seconds >= 2 * transmit_deadline_seconds` then guarantees a contract-abiding sender is done
+before any Reclaim. Sender and planner must share one clock. A sender that violates its timeout can
+cause a duplicate (the receiver cannot detect it). The planner NEVER touches a live `sending` row
+and an announcement in flight counts as not yet sent (no recover until `sent`; no Forget while any
+row of the incident is `sending` or `pending`). A lapsed lease means we cannot know whether the
+send happened, so the normal cancellation rules run first (lifetime, missing incident, a resolved
+or superseded incident for an open, a non-resolved incident for a recover); only otherwise Reclaim
+(back to `pending` after a backoff; `attempts` already counted) or Fail past the budget. Delivery
+is at least once, and a cancelled announcement is never retransmitted. A new row starts at
+`version = :now` so its versions exceed any version of a forgotten row with the same delivery_id.
 
 `expected` is an assertion: None means the row must not exist (INSERT OR IGNORE), otherwise
 Expected(state, attempts, version) of the row planned against. Each action is one conditional
@@ -97,12 +104,13 @@ def backoff(attempts: int, config: DeliveryConfig) -> int:
     return min(config.backoff_base_seconds * doubling, config.backoff_cap_seconds)
 
 
-def after_failure(delivery: DeliveryView, now: float, config: DeliveryConfig) -> Action:
-    """`delivery.attempts` already counts the attempt that just failed."""
-    if delivery.attempts >= config.max_attempts:
-        return Fail(delivery.incident_id, delivery.kind, "max_attempts", _exp(delivery))
-    due = math.ceil(now) + backoff(delivery.attempts, config)
-    return Reschedule(delivery.incident_id, delivery.kind, due, _exp(delivery))
+def may_transmit(claimed_at: float, now: float, config: DeliveryConfig) -> bool:
+    """The sender asks this right before the network call. Past the deadline it must abort without
+    transmitting (and record a failed attempt): the lease then still covers a send that started in
+    time and lasted at most `transmit_deadline_seconds` (the sender's hard timeout)."""
+    if not (_num(claimed_at) and _num(now)):
+        return False
+    return now - claimed_at < config.transmit_deadline_seconds
 
 
 def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | None]:
@@ -194,13 +202,25 @@ def _forget_all(
     return [Forget(iid, d.kind, _exp(d), sibling if d.kind == "open" else None) for d in rows]
 
 
-def _lease_action(iid: str, d: DeliveryView, now: float, config: DeliveryConfig) -> Action | None:
-    """A `sending` row belongs to its sender: hands off while the lease is live. Once it lapsed the
-    sender is presumed crashed: back to pending after a backoff, or failed past the budget."""
+def _lease_action(
+    iid: str, d: DeliveryView, state: object, now: float, config: DeliveryConfig, missing=False
+) -> Action | None:
+    """A `sending` row belongs to its sender: hands off while the lease is live ([claim, claim +
+    lease): at `next_attempt_at == now` it has lapsed). Once it lapsed we cannot know whether the
+    send happened, so the normal cancellation rules run first (a lapsed claim counts as unsent:
+    it is never retransmitted for a cancelled announcement); only otherwise is it reclaimed."""
     if not _row_ok(d):
         return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
     if d.next_attempt_at > now:
         return None
+    if _lifetime_over(d, now, config):
+        return Expire(iid, d.kind, "lifetime", _exp(d))
+    if missing:
+        return Expire(iid, d.kind, "incident_missing", _exp(d))
+    if d.kind == "open" and state in CLOSED_STATES:
+        return Expire(iid, d.kind, "resolved_before_send", _exp(d))
+    if d.kind == "recover" and state != "resolved":
+        return Withdraw(iid, d.kind, _exp(d))
     if d.attempts >= config.max_attempts:
         return Fail(iid, d.kind, "max_attempts", _exp(d))
     return Reclaim(iid, d.kind, math.ceil(now) + backoff(d.attempts, config), _exp(d))
@@ -211,13 +231,15 @@ def _row_action(
 ) -> Action | None:
     """Pending and sending rows; the others are inert until a verdict or a Forget touches them."""
     if d.state == "sending":
-        return _lease_action(iid, d, now, config)
+        return _lease_action(iid, d, state, now, config)
     if d.state != "pending":
         return None
     if not _row_ok(d):
         return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
     if d.kind == "recover" and state != "resolved":
         return Withdraw(iid, d.kind, _exp(d))
+    if d.attempts >= config.max_attempts:  # CLAIM refuses it, so do not wait for the ttl
+        return Fail(iid, d.kind, "max_attempts", _exp(d))
     if _lifetime_over(d, now, config):
         return Expire(iid, d.kind, "lifetime", _exp(d))
     if now - max(d.created_at, d.next_attempt_at) >= config.pending_ttl_seconds:
@@ -252,7 +274,7 @@ def _plan_incident(
         live = [
             Expire(iid, k, "incident_missing", _exp(d))
             if d.state == "pending"
-            else _lease_action(iid, d, now, config)
+            else _lease_action(iid, d, None, now, config, missing=True)
             for k, d in rows
             if d.state in ("pending", "sending")
         ]
