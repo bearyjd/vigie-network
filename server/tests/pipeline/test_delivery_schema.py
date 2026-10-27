@@ -7,9 +7,10 @@ import pytest
 from vigie_pipeline import schema
 from vigie_pipeline.schema import apply_pipeline_migrations, open_pipeline_inventory
 
+A, B, C = "a" * 32, "b" * 32, "c" * 32
 INSERT = (
-    "INSERT INTO incident_deliveries (delivery_id, incident_id, kind, state, created_at,"
-    " updated_at) VALUES (?, ?, ?, ?, 't', 't')"
+    "INSERT INTO incident_deliveries (delivery_id, incident_id, kind, state, next_attempt_at,"
+    " created_at, updated_at) VALUES (?, ?, ?, ?, 5, 10, 10)"
 )
 
 
@@ -42,9 +43,9 @@ def test_fresh_install_has_the_table_and_the_due_index(tmp_path):
 
 def test_defaults_and_valid_rows(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute(INSERT, ("a", "inc", "open", "pending"))
-    row = conn.execute("SELECT attempts, next_attempt_at, last_error FROM incident_deliveries")
-    assert tuple(row.fetchone()) == (0, None, None)
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    row = conn.execute("SELECT attempts, last_error FROM incident_deliveries")
+    assert tuple(row.fetchone()) == (0, None)
 
 
 @pytest.mark.parametrize(
@@ -53,31 +54,31 @@ def test_defaults_and_valid_rows(tmp_path):
 def test_kind_and_state_are_checked(tmp_path, kind, state):
     conn = _fresh(tmp_path)
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(INSERT, ("a", "inc", kind, state))
+        conn.execute(INSERT, (A, "inc", kind, state))
 
 
 @pytest.mark.parametrize("state", ["pending", "sent", "failed", "suppressed", "expired"])
 def test_every_documented_state_is_accepted(tmp_path, state):
-    _fresh(tmp_path).execute(INSERT, ("a", "inc", "recover", state))
+    _fresh(tmp_path).execute(INSERT, (A, "inc", "recover", state))
 
 
 def test_incident_and_kind_are_unique_but_kinds_coexist(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute(INSERT, ("a", "inc", "open", "pending"))
-    conn.execute(INSERT, ("b", "inc", "recover", "pending"))
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    conn.execute(INSERT, (B, "inc", "recover", "pending"))
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(INSERT, ("c", "inc", "open", "sent"))
+        conn.execute(INSERT, (C, "inc", "open", "sent"))
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(INSERT, ("a", "other", "open", "pending"))  # delivery_id is the key
+        conn.execute(INSERT, (A, "other", "open", "pending"))  # delivery_id is the key
 
 
 def test_last_error_is_length_bounded(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute(INSERT, ("a", "inc", "open", "failed"))
-    upd = "UPDATE incident_deliveries SET last_error=? WHERE delivery_id='a'"
-    conn.execute(upd, ("x" * 200,))
+    conn.execute(INSERT, (A, "inc", "open", "failed"))
+    upd = "UPDATE incident_deliveries SET last_error=? WHERE delivery_id=?"
+    conn.execute(upd, ("x" * 200, A))
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(upd, ("x" * 201,))
+        conn.execute(upd, ("x" * 201, A))
 
 
 def test_not_null_columns_are_enforced(tmp_path):
@@ -85,8 +86,39 @@ def test_not_null_columns_are_enforced(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO incident_deliveries (delivery_id, incident_id, kind, state)"
-            " VALUES ('a','i','open','pending')"
+            " VALUES (?,'i','open','sent')",
+            (A,),
         )
+
+
+def test_timestamps_are_integer_epoch_columns(tmp_path):
+    conn = _fresh(tmp_path)
+    types = {r[1]: r[2] for r in conn.execute("PRAGMA table_info(incident_deliveries)")}
+    assert {types[c] for c in ("created_at", "updated_at", "next_attempt_at")} == {"INTEGER"}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE incident_deliveries SET attempts=-1",
+        "UPDATE incident_deliveries SET next_attempt_at=NULL",  # row is pending
+        "UPDATE incident_deliveries SET updated_at=9",  # before created_at (10)
+        "UPDATE incident_deliveries SET delivery_id='short'",
+        "UPDATE incident_deliveries SET delivery_id='" + "a" * 33 + "'",
+    ],
+)
+def test_row_checks(tmp_path, sql):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql)
+
+
+def test_only_pending_rows_need_a_next_attempt(tmp_path):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "sent"))
+    conn.execute("UPDATE incident_deliveries SET next_attempt_at=NULL")
+    conn.execute("UPDATE incident_deliveries SET updated_at=10, attempts=0")
 
 
 def _v10(path, monkeypatch):
@@ -120,7 +152,7 @@ def test_upgrade_from_v10_keeps_rows_and_adds_the_table(tmp_path, monkeypatch):
 
 def test_rerunning_the_migration_is_idempotent_and_keeps_deliveries(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute(INSERT, ("a", "inc", "open", "sent"))
+    conn.execute(INSERT, (A, "inc", "open", "sent"))
     assert apply_pipeline_migrations(conn) == 11
     assert apply_pipeline_migrations(conn) == 11
     assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 11

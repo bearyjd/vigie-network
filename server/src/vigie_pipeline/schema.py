@@ -261,16 +261,19 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "observed_at INTEGER NOT NULL,source TEXT NOT NULL CHECK(source IN ('lease','neigh')))",
     ),
     (
-        # Outbox for incident notifications (see vigie_pipeline.delivery_plan). No FK to
-        # monitoring_incidents: incidents are pruned by retention, deliveries expire on their own.
-        # delivery_id = sha256(f"{incident_id}\n{kind}") hex, first 32 chars.
-        "CREATE TABLE incident_deliveries (delivery_id TEXT PRIMARY KEY,"
+        # Outbox for incident notifications (see vigie_pipeline.delivery_plan). Times are integer
+        # epoch seconds. No FK to monitoring_incidents: incidents are pruned by retention while
+        # deliveries age out on their own. delivery_id = sha256(f"{incident_id}\n{kind}") hex[:32].
+        "CREATE TABLE incident_deliveries ("
+        "delivery_id TEXT PRIMARY KEY CHECK(length(delivery_id)=32),"
         "incident_id TEXT NOT NULL,"
         "kind TEXT NOT NULL CHECK(kind IN ('open','recover')),"
         "state TEXT NOT NULL CHECK(state IN ('pending','sent','failed','suppressed','expired')),"
-        "attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TEXT,"
+        "attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),next_attempt_at INTEGER,"
         "last_error TEXT CHECK(last_error IS NULL OR length(last_error)<=200),"
-        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(incident_id,kind))",
+        "created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,"
+        "CHECK(state!='pending' OR next_attempt_at IS NOT NULL),CHECK(updated_at>=created_at),"
+        "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",
     ),
 )

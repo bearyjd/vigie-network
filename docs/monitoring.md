@@ -158,25 +158,41 @@ class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numer
 ### Incident delivery (planned)
 
 Nothing is sent yet: this lands the outbox schema and a pure planner only. Delivery is off by
-default, the local inbox works without any publisher, and the topic and ownership are still
-open (D5), so no code names a topic or calls a network service.
+default and the local inbox works without any publisher. The topic and ownership are still open
+(D5), so no code names a topic or calls a network service. When it is built, the pipeline (not the
+API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
+delivery is disabled the planner does not run, so nothing is created and nothing expires; enabling
+it records `eligible_since`, and incidents detected before that instant are ignored so switching
+it on never announces old open incidents.
 
-Pipeline schema v11 adds `incident_deliveries` (one row per incident and kind; `kind` is `open` or
-`recover`, `state` is `pending`, `sent`, `failed`, `suppressed` or `expired`). `UNIQUE(incident_id,
-kind)` makes enqueueing idempotent; `delivery_id` is the first 32 hex chars of
-`sha256(incident_id + "\n" + kind)`; `last_error` is capped at 200 characters. External payloads
-will carry a device label and an incident link only.
+Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
+`recover`; `UNIQUE(incident_id, kind)`), `state` `pending`, `sent`, `failed`, `suppressed` or
+`expired`, integer epoch-second `created_at`, `updated_at` and `next_attempt_at` (required while
+pending), `attempts >= 0`, and `last_error` capped at 200 characters. `delivery_id` is the first
+32 hex chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
+incident link only.
 
-`vigie_pipeline.delivery_plan.plan()` turns incidents, human decisions and existing rows into
-actions (no I/O, `now` injected):
+`vigie_pipeline.delivery_plan.plan()` turns incidents, decisions and rows into actions (no I/O,
+`now` injected; a non-finite `now` raises `ValueError`):
 
-- A loud open incident gets one `open` delivery; acknowledged or expected incidents are suppressed.
-- A snooze defers the delivery to `snooze_until` (strictly before is quiet, as in the inbox) and is
-  re-checked every pass.
-- An incident that closes before its `open` delivery went out expires it and never gets a `recover`;
-  only an announced (`sent`) incident gets exactly one `recover`, a separate kind.
-- Pending rows older than 24 hours expire; failures back off 60 s doubling to 1 h, six attempts max.
-- Unknown incident states or decision statuses fail closed (suppressed as `unrecognised_state`).
+- A loud open incident gets one `open` delivery. Acknowledged or expected incidents are suppressed;
+  suppressed rows are re-checked every pass, so a cleared decision (or a cleared `NULL`-status
+  row) requeues the delivery with attempts reset.
+- A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
+  row that has not been attempted tracks the current verdict exactly, earlier or later. A row that
+  already failed keeps its retry backoff and is only pushed later by a longer snooze.
+- An incident that closes before its `open` delivery went out expires it and gets no `recover`.
+  Only a `resolved` incident whose `open` was `sent` gets exactly one `recover`. Known limit:
+  superseded incidents, and incidents that stay open because the device went silent
+  (`monitoring_unavailable` covers silence), get no recovery notice.
+- Pending rows older than 24 hours expire; failures back off 60 s doubling to 1 h, six attempts.
+- Terminal rows of closed or missing incidents are forgotten after 30 days; rows of open incidents
+  are kept so an old incident never re-announces.
+- Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
+
+Applying Expire, Fail, Reschedule, Requeue and Suppress must be a conditional update
+(`WHERE state='pending'`, or `'suppressed'` for Requeue) so a plan made before an in-flight send
+cannot overwrite the sender's outcome.
 
 ## Retention and verification limits
 
