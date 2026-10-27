@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from delivery_sim import EDGE, TIGHT, World
+from delivery_sim import EDGE, TIGHT, Tx, World
 
 CONFIGS = {"default": None, "tight": TIGHT, "edge": EDGE}
 
@@ -32,3 +32,22 @@ def test_the_simulation_exercises_every_action_and_crashes():
     }
     assert seen >= every
     assert crashed > 5  # senders crash or violate their deadline; the planner reclaims the leases
+
+
+def test_a_normal_overlap_after_a_violation_still_fails_the_oracle():
+    world = World(0)
+    world.now = 1_000
+    key = ("i1", "open")
+    hung = Tx(end=5_000)
+    hung.hung = True
+    world.sends[key] = [hung]
+    world.check_overlap(key)  # overlapping only the hung send is the allowed violation
+    world.sends[key].append(Tx(end=1_020))  # a second, ordinary send in progress
+    with pytest.raises(AssertionError, match="overlap"):
+        world.check_overlap(key)
+    hung.end = 900  # once the hung send has finished its exemption is gone
+    world.sends[key] = [hung, Tx(end=1_020)]
+    with pytest.raises(AssertionError, match="overlap"):
+        world.check_overlap(key)
+    world.sends[key] = [hung]
+    world.check_overlap(key)

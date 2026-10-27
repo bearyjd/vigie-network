@@ -7,13 +7,16 @@ docs/monitoring.md quotes every constant (a test keeps them identical). Every UP
 row: anything else is a planner bug, so roll the whole pass back (one `BEGIN IMMEDIATE`).
 
 SENDER PROTOCOL (a lease). CLAIM, in a short `BEGIN IMMEDIATE` transaction, is the only way to
-transmit: it moves one `pending` row to `sending`, counts the attempt and sets the lease end in
+transmit: it moves one `pending` row to `sending`, counts the attempt (a transmit that
+`may_transmit` aborts still uses one) and sets the lease end in
 `next_attempt_at`, so the database allows at most one live claim per delivery_id. The transmission
 happens outside any transaction. The completion statements, again short transactions, are always
-version-checked against the claimed version; the planner never touches a live `sending` row, so a
-completion always matches unless the lease lapsed first. A crash after a successful send leaves the
-row `sending`; the planner then Reclaims it (at-least-once: one retransmission per reclaim,
-bounded by `max_attempts` overall).
+checked against the claimed version and `created_at` (a recreated row has a later `created_at`, so
+an old claim can never complete a new incarnation); the planner never touches a live `sending` row,
+so a completion always matches unless the lease lapsed first. A crash after a successful send leaves
+the row `sending`; once the lease lapsed the planner evaluates the claim by the normal cancellation
+rules first and Reclaims it only if it is still deliverable (at-least-once: one retransmission per
+reclaim, bounded by `max_attempts` overall).
 """
 
 from __future__ import annotations
@@ -42,17 +45,17 @@ ENQUEUE_INSERT = """\
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now)"""
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now * 1048576)"""
 
 SUPPRESS_INSERT = """\
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now)"""
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now * 1048576)"""
 
 SUPPRESS_UPDATE = """\
 UPDATE incident_deliveries SET state='suppressed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version"""
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version"""
 
 RESCHEDULE_UPDATE = """\
 UPDATE incident_deliveries SET next_attempt_at=:next_attempt_at, updated_at=:now, version=version+1
@@ -104,16 +107,19 @@ WHERE delivery_id=:id AND state='pending' AND next_attempt_at<=:now
 
 COMPLETE_SENT = """\
 UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version"""
+WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at"""
 
 COMPLETE_RETRY = """\
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version"""
+WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at"""
 
 COMPLETE_FAILED = """\
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version"""
+WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at"""
 
 ALL_SQL = (
     ENQUEUE_INSERT, SUPPRESS_INSERT, SUPPRESS_UPDATE, RESCHEDULE_UPDATE, REQUEUE_UPDATE,
@@ -130,17 +136,17 @@ def statement(a: Action, now: float) -> tuple[str, dict]:
         p |= {"state": a.expected.state, "attempts": a.expected.attempts}
         p["version"] = a.expected.version
     if isinstance(a, Enqueue):
-        return ENQUEUE_INSERT, p | {"not_before": a.not_before}
+        return ENQUEUE_INSERT, p | {"not_before": math.ceil(a.not_before)}
     if isinstance(a, Suppress):
         return (SUPPRESS_INSERT if a.expected is None else SUPPRESS_UPDATE), p
     if isinstance(a, Requeue):
-        return REQUEUE_UPDATE, p | {"not_before": a.not_before}
+        return REQUEUE_UPDATE, p | {"not_before": math.ceil(a.not_before)}
     if isinstance(a, Revive):
-        return REVIVE_UPDATE, p | {"not_before": a.not_before}
+        return REVIVE_UPDATE, p | {"not_before": math.ceil(a.not_before)}
     if isinstance(a, Reschedule):
-        return RESCHEDULE_UPDATE, p | {"next_attempt_at": a.next_attempt_at}
+        return RESCHEDULE_UPDATE, p | {"next_attempt_at": math.ceil(a.next_attempt_at)}
     if isinstance(a, Reclaim):
-        return RECLAIM_UPDATE, p | {"next_attempt_at": a.next_attempt_at}
+        return RECLAIM_UPDATE, p | {"next_attempt_at": math.ceil(a.next_attempt_at)}
     if isinstance(a, Forget):
         return (FORGET_OPEN_DELETE if a.sibling_recover else FORGET_DELETE), p
     table = {Expire: EXPIRE_UPDATE, Fail: FAIL_UPDATE, Withdraw: WITHDRAW_UPDATE}
@@ -163,6 +169,7 @@ def completion_params(claimed: DeliveryView, now: float) -> dict:
     return {
         "id": delivery_id(claimed.incident_id, claimed.kind),
         "version": claimed.version,
+        "created_at": claimed.created_at,
         "now": int(now),
     }
 

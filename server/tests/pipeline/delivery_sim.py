@@ -34,7 +34,7 @@ DAY = 86400
 QUIET = ("acknowledged", "expected")
 ALLOWED = {
     "pending": {"pending", "sending", "suppressed", "expired", "withdrawn"},
-    "sending": {"sending", "sent", "pending", "failed", "expired", "withdrawn"},
+    "sending": {"sending", "sent", "pending", "failed", "expired", "withdrawn", "suppressed"},
     "withdrawn": {"withdrawn", "pending", "expired", "failed"},
     "suppressed": {"suppressed", "pending", "failed", "expired"},
     "sent": {"sent"},
@@ -51,12 +51,20 @@ EDGE = DeliveryConfig(
 )
 
 
+class Tx:
+    """One transmission: when it ends, and whether it is a deadline violation (a hung send)."""
+
+    def __init__(self, end):
+        self.end, self.hung = end, False
+
+
 class Token(NamedTuple):
-    """What a sender holds after CLAIM: the claimed row, the outcome, and the row's life."""
+    """What a sender holds after CLAIM: the claimed row, the outcome, the row's life, its send."""
 
     claimed: DeliveryView
     success: bool
     life: int
+    tx: Tx | None = None
 
 
 class PassAborted(AssertionError):
@@ -152,10 +160,10 @@ class World:
     def __init__(self, seed: int, cfg: DeliveryConfig | None = None):
         self.rnd = random.Random(seed)  # noqa: S311 - deterministic test data
         self.cfg = cfg or DeliveryConfig()
-        self.now, self.since, self.next_id = 1_000_000, None, 0
+        self.now, self.since, self.next_id = 100_000_000, None, 0
         self.inc, self.reviews, self.store = {}, {}, Store()
         self.opened, self.owed_at, self.inflight, self.zombies = set(), {}, {}, []
-        self.life, self.tx_end, self.hung, self.violations = {}, {}, set(), {}
+        self.life, self.sends, self.violations = {}, {}, {}
         self.transmissions, self.successes, self.crashes = {}, {}, {}
         self.seen = set()
 
@@ -273,9 +281,9 @@ class World:
             self._observe()
             return Token(claimed, False, life)  # aborts without transmitting
         # the sender contract (hard timeout) keeps a transmission inside the deadline
-        end = self.tx_end.get(key, 0)
-        assert end <= self.now or key in self.hung, ("two transmissions overlap", key, end)
-        self.tx_end[key] = self.now + self.rnd.randint(1, self.cfg.transmit_deadline_seconds - 1)
+        self.check_overlap(key)
+        tx = Tx(self.now + self.rnd.randint(1, self.cfg.transmit_deadline_seconds - 1))
+        self.sends.setdefault(key, []).append(tx)
         self.transmissions[key] = self.transmissions.get(key, 0) + 1
         assert self.transmissions[key] <= self.cfg.max_attempts, ("transmissions", key)
         success = self.rnd.random() < 0.6 if success is None else success
@@ -285,7 +293,12 @@ class World:
             allowed = 1 + self.crashes.get(key, 0) + self.violations.get(key, 0)
             assert self.successes[key] <= allowed, ("delivered twice", key)
         self._observe()
-        return Token(claimed, success, life)
+        return Token(claimed, success, life, tx)
+
+    def check_overlap(self, key):
+        """A new transmission may only overlap a send that is individually a deadline violation."""
+        live = [t for t in self.sends.get(key, []) if t.end > self.now]
+        assert all(t.hung for t in live), ("two transmissions overlap", key, live)
 
     def ev_claim(self):
         for key, d in sorted(self.rows.items()):
@@ -319,7 +332,8 @@ class World:
 
     def _crash(self, key):
         token = self.inflight.pop(key)
-        self.tx_end[key] = min(self.tx_end.get(key, 0), self.now)  # a dead sender stops sending
+        if token.tx is not None:
+            token.tx.end = min(token.tx.end, self.now)  # a dead sender stops sending
         if token.success:
             self.crashes[key] = self.crashes.get(key, 0) + 1
 
@@ -331,8 +345,8 @@ class World:
 
     def _violate(self, key):
         token = self.inflight.pop(key)
-        self.hung.add(key)
-        self.tx_end[key] = self.now + 10 * self.cfg.lease_seconds
+        if token.tx is not None:
+            token.tx.hung, token.tx.end = True, self.now + 10 * self.cfg.lease_seconds
         self.zombies.append(token)
         if token.success:
             self.violations[key] = self.violations.get(key, 0) + 1
@@ -348,6 +362,8 @@ class World:
             and row.version == token.claimed.version
         )
         self._finish(key, token, expect=1 if same else 0)
+        if token.tx is not None:
+            token.tx.end = min(token.tx.end, self.now)  # the hung sender is done: exemption over
 
     def ev_zombie(self):
         if self.zombies:
@@ -525,20 +541,28 @@ class World:
         assert review.status not in QUIET, ("scheduled while quiet", a, review)
         until = review.snooze_until
         if review.status == "snoozed" and isinstance(until, int | float) and self.now < until:
-            assert a.not_before >= math.ceil(until), ("before snooze ends", a, review)
+            due = getattr(a, "not_before", None) or a.next_attempt_at
+            assert due >= math.ceil(until), ("before snooze ends", a, review)
 
     def _check_action(self, a):
         row = self.rows.get((a.incident_id, a.kind))
         inc = self.inc[a.incident_id]
         if row is not None and row.state == "sending":
             assert row.next_attempt_at <= self.now, ("action on a live lease", a, row)
-            assert isinstance(a, Reclaim | Fail | Expire | Withdraw), ("on a sending row", a, row)
+            assert isinstance(a, Reclaim | Fail | Expire | Withdraw | Suppress), (
+                "on a sending row",
+                a,
+                row,
+            )
+            if isinstance(a, Suppress):  # only an open that is still wanted meets the decision
+                alive = inc["present"] and inc["state"] == "open"
+                assert alive and self.now - row.created_at <= self.cfg.retention_seconds, (a, row)
         if a.expected is None:
             assert row is None and isinstance(a, Enqueue | Suppress), (a, row)
         else:
             exp = (a.expected.state, a.expected.attempts, a.expected.version)
             assert row is not None and (row.state, row.attempts, row.version) == exp, (a, row)
-        if isinstance(a, Enqueue | Requeue) and a.kind == "open":
+        if isinstance(a, Enqueue | Requeue | Reclaim) and a.kind == "open":
             self._verdict_ok(a)
         if isinstance(a, Enqueue) and a.kind == "recover":
             opened = self.rows.get((a.incident_id, "open"))
@@ -556,7 +580,7 @@ class World:
             assert not (a.kind == "open" and closed), ("reclaim of a cancelled open", a)
             assert not (a.kind == "recover" and inc["state"] != "resolved"), ("reclaim", a)
             backoff_at = math.ceil(self.now) + backoff(row.attempts, self.cfg)
-            assert a.next_attempt_at == backoff_at, ("reclaim waits out a backoff", a, row)
+            assert a.next_attempt_at >= backoff_at, ("reclaim waits out a backoff", a, row)
         if isinstance(a, Revive):
             assert a.not_before >= row.next_attempt_at, ("revive before its backoff", a, row)
             opened = self.rows.get((a.incident_id, "open"))

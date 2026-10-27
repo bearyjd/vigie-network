@@ -79,6 +79,11 @@ class DeliveryConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"{name} must be an integer")
+        for name in ("backoff_base_seconds", "backoff_cap_seconds"):
+            if type(getattr(self, name)) is not int:  # a computed time must stay an integer
+                raise ValueError(f"{name} must be an integer")
+        if self.retention_seconds < 60:
+            raise ValueError("retention_seconds must be at least 60")
         if self.lease_seconds < 60:
             raise ValueError("lease_seconds must be at least 60")
         if self.transmit_deadline_seconds * 2 > self.lease_seconds:
@@ -181,8 +186,9 @@ class Revive:
 
 @dataclass(frozen=True)
 class Reclaim:
-    """A `sending` row whose lease lapsed (the sender crashed): back to pending after a backoff.
-    The claim already counted the attempt, so `attempts` is not incremented again."""
+    """A `sending` row whose lease lapsed and that is still deliverable (the normal cancellation
+    rules ran first): back to pending after a backoff. The claim already counted the attempt, so
+    `attempts` is not incremented again."""
 
     incident_id: str
     kind: str

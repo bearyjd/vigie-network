@@ -34,17 +34,20 @@ at `next_attempt_at == now` it has lapsed), transmits outside any transaction, t
 the claimed version. The database allows one live claim per delivery_id and fences every write by
 version, but only the SENDER CONTRACT keeps two transmissions from overlapping: a hard network
 timeout no longer than `transmit_deadline_seconds`, a call to `may_transmit()` right before the
-network call (abort without transmitting if it is false), and no completion after the lease end;
-`lease_seconds >= 2 * transmit_deadline_seconds` then guarantees a contract-abiding sender is done
-before any Reclaim. Sender and planner must share one clock. A sender that violates its timeout can
-cause a duplicate (the receiver cannot detect it). The planner NEVER touches a live `sending` row
-and an announcement in flight counts as not yet sent (no recover until `sent`; no Forget while any
-row of the incident is `sending` or `pending`). A lapsed lease means we cannot know whether the
-send happened, so the normal cancellation rules run first (lifetime, missing incident, a resolved
-or superseded incident for an open, a non-resolved incident for a recover); only otherwise Reclaim
-(back to `pending` after a backoff; `attempts` already counted) or Fail past the budget. Delivery
-is at least once, and a cancelled announcement is never retransmitted. A new row starts at
-`version = :now` so its versions exceed any version of a forgotten row with the same delivery_id.
+network call (abort without transmitting if it is false); recording the result before the lease
+lapses is what avoids a duplicate (a late completion is harmless to the table, being fenced by
+version and `created_at`); `lease_seconds >= 2 * transmit_deadline_seconds` then guarantees a
+contract-abiding sender is done before any Reclaim. Sender and planner must share one clock. A
+sender that violates its timeout can cause a duplicate (the receiver cannot detect it). The
+planner NEVER touches a live `sending` row and an announcement in flight counts as not yet sent
+(no recover until `sent`; no Forget while any row of the incident is `sending` or `pending`). A
+lapsed lease means we cannot know whether the send happened, so the normal cancellation rules run
+first (lifetime, missing incident, a resolved or superseded incident for an open, a non-resolved
+incident for a recover); only otherwise Reclaim (back to `pending` after a backoff; `attempts`
+already counted) or Fail past the budget. Delivery is at least once, and a cancelled announcement
+is never retransmitted. A new row starts at `version = created_at << 20`, so its versions exceed
+any version of a forgotten row with the same delivery_id (see docs/monitoring.md), and completions
+also check `created_at`.
 
 `expected` is an assertion: None means the row must not exist (INSERT OR IGNORE), otherwise
 Expected(state, attempts, version) of the row planned against. Each action is one conditional
@@ -84,7 +87,6 @@ from vigie_pipeline.delivery_types import (  # noqa: F401 - re-exported
     Revive,
     Suppress,
     Withdraw,
-    is_number,
 )
 from vigie_pipeline.delivery_types import is_number as _num
 
@@ -203,12 +205,20 @@ def _forget_all(
 
 
 def _lease_action(
-    iid: str, d: DeliveryView, state: object, now: float, config: DeliveryConfig, missing=False
+    iid: str,
+    d: DeliveryView,
+    state: object,
+    review: ReviewView | None,
+    now: float,
+    config: DeliveryConfig,
+    missing: bool = False,
 ) -> Action | None:
     """A `sending` row belongs to its sender: hands off while the lease is live ([claim, claim +
     lease): at `next_attempt_at == now` it has lapsed). Once it lapsed we cannot know whether the
     send happened, so the normal cancellation rules run first (a lapsed claim counts as unsent:
-    it is never retransmitted for a cancelled announcement); only otherwise is it reclaimed."""
+    it is never retransmitted for a cancelled announcement); an open then meets the current
+    decision exactly as a pending row would (ack/expected: Suppress; a snooze: back to pending no
+    earlier than its end); only otherwise is it reclaimed."""
     if not _row_ok(d):
         return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
     if d.next_attempt_at > now:
@@ -223,15 +233,28 @@ def _lease_action(
         return Withdraw(iid, d.kind, _exp(d))
     if d.attempts >= config.max_attempts:
         return Fail(iid, d.kind, "max_attempts", _exp(d))
-    return Reclaim(iid, d.kind, math.ceil(now) + backoff(d.attempts, config), _exp(d))
+    due = math.ceil(now) + backoff(d.attempts, config)
+    if d.kind == "open":
+        verdict, detail = _verdict(review, now) if state == "open" else ("unknown", None)
+        if verdict in ("quiet", "unknown"):
+            reason = UNRECOGNISED if verdict == "unknown" else str(detail)
+            return Suppress(iid, "open", reason, _exp(d))
+        if verdict == "until":
+            due = max(due, math.ceil(detail))
+    return Reclaim(iid, d.kind, due, _exp(d))
 
 
 def _row_action(
-    iid: str, d: DeliveryView, state: object, now: float, config: DeliveryConfig
+    iid: str,
+    d: DeliveryView,
+    state: object,
+    review: ReviewView | None,
+    now: float,
+    config: DeliveryConfig,
 ) -> Action | None:
     """Pending and sending rows; the others are inert until a verdict or a Forget touches them."""
     if d.state == "sending":
-        return _lease_action(iid, d, state, now, config)
+        return _lease_action(iid, d, state, review, now, config)
     if d.state != "pending":
         return None
     if not _row_ok(d):
@@ -274,14 +297,14 @@ def _plan_incident(
         live = [
             Expire(iid, k, "incident_missing", _exp(d))
             if d.state == "pending"
-            else _lease_action(iid, d, None, now, config, missing=True)
+            else _lease_action(iid, d, None, None, now, config, missing=True)
             for k, d in rows
             if d.state in ("pending", "sending")
         ]
         live = [a for a in live if a]
         return live or _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
-    rows = (_row_action(iid, d, state, now, config) for _, d in sorted(ds.items()))
+    rows = (_row_action(iid, d, state, review, now, config) for _, d in sorted(ds.items()))
     actions = [a for a in rows if a]
     if "open" not in {a.kind for a in actions}:
         opened = _open_action(iid, state, review, ds.get("open"), now, config)
@@ -308,8 +331,13 @@ def plan(
     """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind)."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
+    held = list(deliveries)
+    if any(_num(d.updated_at) and d.updated_at > now for d in held):
+        # row versions assume a monotonic clock (see delivery_sql); refuse to plan on a clock that
+        # is behind what the table already holds
+        raise ValueError("now is earlier than a stored updated_at: the clock stepped back")
     grouped: dict[str, dict[str, DeliveryView]] = {}
-    for d in deliveries:
+    for d in held:
         if d.kind in KINDS and d.state in STATES:
             grouped.setdefault(d.incident_id, {})[d.kind] = d
     by_incident: dict[str, IncidentView] = {}

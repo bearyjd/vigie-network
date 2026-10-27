@@ -279,6 +279,7 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),"
         "CHECK(state NOT IN ('pending','sending') OR next_attempt_at IS NOT NULL),"
         "CHECK(updated_at>=created_at),"
+        "CHECK(version<(created_at+1)*1048576),"
         "CHECK(state!='withdrawn' OR kind='recover'),"
         "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",

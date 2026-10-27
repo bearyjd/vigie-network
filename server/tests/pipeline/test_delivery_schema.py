@@ -210,3 +210,12 @@ def test_a_newer_schema_is_still_refused(tmp_path):
     conn.execute("INSERT INTO pipeline_schema (version) VALUES (12)")
     with pytest.raises(RuntimeError, match="newer"):
         apply_pipeline_migrations(conn)
+
+
+def test_version_stays_inside_the_creation_second_window(tmp_path):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "pending"))  # created_at 10
+    top = (10 + 1) * (1 << 20) - 1
+    conn.execute("UPDATE incident_deliveries SET version=?", (top,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE incident_deliveries SET version=?", (top + 1,))

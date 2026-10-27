@@ -190,8 +190,8 @@ sets `updated_at=:now` and `version=version+1`. Each statement must affect exact
 anything else is a planner bug, so log it and roll the whole pass back.
 
 **Sender contract (a lease).** The sender works in short separate transactions: CLAIM a due
-`pending` row (the only way to transmit; it counts the attempt, so the budget counts actual
-transmissions); transmit outside any transaction; then COMPLETE with the claimed version (`sent`;
+`pending` row (the only way to transmit; attempts are counted at claim, and a transmit aborted by
+`may_transmit` still uses one); transmit outside any transaction; then COMPLETE with the claimed version and `created_at` (`sent`;
 back to `pending` with a backoff, or `failed` past `max_attempts`, via
 `delivery_sql.failure_statement`). The database allows only one live CLAIM per `delivery_id`
 (`sending`, lease end in `next_attempt_at`) and fences every write by `version`, but it cannot see a
@@ -202,7 +202,9 @@ network call. Overlapping transmissions are prevented by the sender contract:
 - call `may_transmit(claimed_at, now, config)` right before the network call and abort without
   transmitting (recording a failed attempt) if it is false, i.e. `deadline` seconds or more after
   the claim;
-- attempt no completion after the lease end.
+
+Recording the result before the lease lapses is what avoids a duplicate send; a completion that
+arrives later is harmless to the table, because it is fenced by `version` and `created_at`.
 
 `lease_seconds` (default 300, at least 60) must be at least twice the deadline, so a sender that
 honours the contract has finished transmitting before the earliest possible Reclaim, and the next
@@ -217,28 +219,37 @@ The planner never touches a live `sending` row (no expiry, suppress, reschedule,
 forget). Whatever changed during the send (an ack, a snooze, a resolve or a reopen) is applied on
 the next pass, once the row is `sent` or `pending` again.
 
-**Versions.** A new row starts at `version = :now` (the epoch second of its creation) and every
-change adds 1. Forgetting happens more than `retention_seconds` (30 days) after the row's last
-update, and a row sees far fewer than that many updates in its life, so the next row with the same
-deterministic `delivery_id` starts above any version the deleted one reached. A late completion
-from the old incarnation can therefore never match the new row.
+**Versions.** A new row starts at `version = created_at * 2**20` and every change adds 1; a CHECK
+(`version < (created_at + 1) * 2**20`) fails loudly if a row ever takes 2**20 updates, which the
+planner and sender (bounded by `max_attempts` and the row's lifetime) never approach. Every version
+of a row therefore lies in `[created_at << 20, (created_at + 1) << 20)`. A row with the same
+deterministic `delivery_id` is only recreated more than `retention_seconds` after the old row's last
+update (30 days by default, configurable, never less than 60 s), so `new_created_at >= old_created_at + 1`, and
+`old_version < (old_created_at + 1) << 20 <= new_created_at << 20 = new initial version`. A late
+completion from the old incarnation can therefore never match the new row; as belt and braces every
+COMPLETE statement also requires `created_at` to equal the claimed row's, and a recreated row's is
+at least a second later. This needs a monotonic
+clock: `plan()` raises if `now` is earlier than any stored `updated_at`, and the drain must stop
+rather than run on a clock that stepped back. Backoffs are whole seconds (`backoff_base_seconds`
+and `backoff_cap_seconds` must be integers) and every computed time is rounded up, so no statement
+ever binds a fractional time.
 
 ```sql
--- planner: Enqueue (a new row's version is the epoch second, see below)
+-- planner: Enqueue (a new row's version is its creation second times 2**20)
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now)
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now * 1048576)
 
 -- planner: Suppress, incident without a row
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now)
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now * 1048576)
 
--- planner: Suppress, pending row
+-- planner: Suppress (pending, or a lapsed sending open)
 UPDATE incident_deliveries SET state='suppressed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Reschedule
 UPDATE incident_deliveries SET next_attempt_at=:next_attempt_at, updated_at=:now, version=version+1
@@ -277,7 +288,7 @@ WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:versi
                   WHERE r.incident_id=:incident_id AND r.kind='recover'
                     AND r.state IN ('pending', 'sending'))
 
--- planner: Reclaim a sending row whose lease lapsed (the sender crashed)
+-- planner: Reclaim a lapsed sending row that is still deliverable
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at, updated_at=:now,
   version=version+1
 WHERE delivery_id=:id AND state='sending' AND attempts=:attempts AND version=:version
@@ -288,25 +299,45 @@ UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
 WHERE delivery_id=:id AND state='pending' AND next_attempt_at<=:now
   AND attempts<:max_attempts AND version=:version
 
--- sender: the send succeeded (version = the claimed version)
+-- sender: the send succeeded (claimed version and created_at)
 UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
 WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at
 
 -- sender: the send failed, retry later (next_attempt_at from the claimed row)
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
 WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at
 
 -- sender: the send failed and the budget is spent
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
 WHERE delivery_id=:id AND state='sending' AND version=:version
+  AND created_at=:created_at
 ```
+
+**Sender checklist (unit 4b).** Acceptance test: a fake transport with a HUNG transport.
+
+1. One planner pass = one `BEGIN IMMEDIATE` transaction over the COMPLETE incident set and all
+   rows; apply `delivery_sql.statement(action, now)` for each action and roll the whole pass back
+   unless every statement affects exactly 1 row.
+2. CLAIM (`delivery_sql.CLAIM` with `claim_params`) in its own short transaction; it must affect 1
+   row.
+3. Call `may_transmit(claimed_at, now, config)` with `claimed_at` = the CLAIM's `:now`, which is the
+   row's `updated_at`; abort without transmitting, and record a failure, if it is false.
+4. Transmit outside any transaction with a hard timeout covering connect, send and response, at
+   most `transmit_deadline_seconds`.
+5. Record the result in a short transaction: `COMPLETE_SENT`, or `failure_statement(claimed, now,
+   config)`, both with `completion_params` (the claimed version and `created_at`).
+6. Sender and planner read one clock (same process or host).
 
 If the sender crashes after transmitting, the row stays `sending` until the lease lapses. The
 planner then judges the lapsed claim by the normal rules first: it expires it if its lifetime ended,
 its incident is missing, or (for an `open`) its incident has since resolved or been superseded, and
-withdraws a `recover` whose incident is no longer resolved; only otherwise it Reclaims it (back to
-`pending` after a backoff, `attempts` not counted again), or fails it past the budget. A lapsed
+withdraws a `recover` whose incident is no longer resolved. It fails it past the budget. An `open`
+then meets the current decision as a pending row would: acknowledged or expected is suppressed, a
+snooze moves it back to `pending` no earlier than the snooze end; only otherwise it Reclaims it
+(back to `pending` after a backoff, `attempts` not counted again). A lapsed
 lease means we cannot know whether the transmit happened. Delivery is therefore at least once, and
 the cancellation rules deliberately favour a lost announcement over a stale one: a crash after a
 successful send can cause one retransmission per reclaim (bounded by `max_attempts` for the whole
