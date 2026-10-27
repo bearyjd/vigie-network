@@ -232,6 +232,19 @@ def test_config_version_depends_on_algorithm_and_every_parameter():
         {"minimum_bytes": 0},
         {"large_upload_bytes": 0},
         {"min_samples_per_cohort": 10_001},
+        {"multiplier": True},
+        {"multiplier": 101},
+        {"min_days_per_cohort": 3651},
+        {"multiplier": 1.5},
+        {"multiplier": math.nan},
+        {"multiplier": math.inf},
+        {"min_days_per_cohort": 2.5},
+        {"min_samples_per_cohort": True},
+        {"min_samples_per_cohort": 20.0},
+        {"minimum_bytes": 1.5},
+        {"large_upload_bytes": math.inf},
+        {"large_upload_bytes": True},
+        {"multiplier": "4"},
     ],
 )
 def test_config_bounds(kw):
@@ -444,6 +457,16 @@ def test_unusable_previous_hour_is_not_an_abstain():
         assert out.candidates == () and out.abstain_reason is None
 
 
+def test_non_adjacent_previous_hour_inside_the_window_is_not_a_leak():
+    ref = fit(history())
+    c = at(MONDAY + 15, 3, 130 * MIB)
+    old = Sample(ref.trained_until - 10 * 3600, 130 * MIB, True)
+    out = findings_tod(c, old, ref, SMALL)
+    assert out.candidates == () and out.abstain_reason is None
+    adjacent = Sample(c.hour - 3600, 130 * MIB, True)
+    assert len(findings_tod(c, adjacent, ref, SMALL).candidates) == 1
+
+
 def test_abstain_reasons_for_unusable_current_or_mismatched_reference():
     ref = fit(history())
     c = at(MONDAY + 15, 3, 130 * MIB)
@@ -521,21 +544,27 @@ def test_cohort_provenance_must_also_precede_the_scored_hours(which):
     assert len(findings_tod(c, p, ref, SMALL).candidates) == 1
 
 
-def test_gradual_drift_is_caught_only_by_a_frozen_baseline():
+def test_gradual_ramp_is_caught_only_by_a_frozen_baseline():
     cfg = TodConfig(20, 7, bucket_hours=1)
     clean_days = span_days(20)
-    attack_days = span_days(20, clean_days[-1] + 1)
+    ramp_days = span_days(60, clean_days[-1] + 1)
+    score_day = span_days(1, ramp_days[-1] + 1)[0]
+
+    def ramp(i):  # 30 MiB creeping to 200 MiB over sixty weekdays
+        return 30 * MIB + 170 * MIB * (i + 1) // 60
+
     clean = [s for h in (2, 3) for s in series(clean_days, h, 30 * MIB)]
-    attack = [s for h in (2, 3) for s in series(attack_days, h, 200 * MIB)]
+    drift = [at(d, h, ramp(i)) for i, d in enumerate(ramp_days) for h in (2, 3)]
+    p, c = at(score_day, 2, 200 * MIB), at(score_day, 3, 200 * MIB)
     frozen = fit_tod(clean, cfg, clean[-1].hour)
-    day = attack_days[0]
-    p, c = at(day, 2, 200 * MIB), at(day, 3, 200 * MIB)
     (cand,) = findings_tod(c, p, frozen, cfg).candidates
     assert (cand.cohort, cand.threshold_bytes) == ((False, 3), 120 * MIB)
-    # a baseline that keeps learning the attack either leaks or normalises it
-    refit = fit_tod(clean + attack, cfg, attack[-1].hour)
-    assert cohort(refit, False, 3).median_twice == 230 * MIB  # threshold 460 MiB
-    assert findings_tod(c, p, refit, cfg).abstain_reason == "leaks_evaluated_hours"
+    # both cutoffs precede the scored pair; only the one that kept learning the ramp goes blind
+    refit = fit_tod(clean + drift, cfg, drift[-1].hour)
+    assert refit.trained_until < p.hour
+    out = findings_tod(c, p, refit, cfg)
+    assert out.candidates == () and out.abstain_reason is None
+    assert cohort(refit, False, 3).median_twice * cfg.multiplier // 2 > 200 * MIB
 
 
 def test_freeze_the_same_reference_scores_identically_after_future_history_appears():
@@ -593,7 +622,7 @@ def test_large_upload_boundary_leak_mismatch_and_eligibility():
     in_training = at(MONDAY, 3, 2000 * MIB)  # inside the frozen window: still a fixed-line hit
     out = findings_tod(in_training, None, ref, SMALL)
     assert [x.detector for x in out.candidates] == ["large_upload"]
-    assert out.abstain_reason == "leaks_evaluated_hours" or out.abstain_reason is None
+    assert out.abstain_reason == "leaks_evaluated_hours"
     other = dataclasses.replace(SMALL, multiplier=5)
     assert len(findings_tod(at_line, None, ref, other).candidates) == 1
     ineligible = dataclasses.replace(at_line, eligible=False)
@@ -631,26 +660,40 @@ def test_utc_cohorts_ignore_local_dst_shift():
     assert [cohort_key(first, 1), cohort_key(second, 1)] == [(True, 5), (True, 6)]
 
 
-def test_samples_built_like_the_engine_cross_a_cohort_boundary():
-    "Mirror monitoring_engine.samples_for: epoch-second hours, one row per hour."
-    now = (MONDAY + 28) * 86400 + 1234  # a Monday 00:20 pass
-    top = now // 3600 * 3600
+def engine_rows():
+    "Mirror monitoring_engine.samples_for: epoch-second hours, one row per hour, Monday 00:20 pass."
+    top = ((MONDAY + 28) * 86400 + 1234) // 3600 * 3600
     rows = [  # (hour, bytes_up, qualified_seconds, reasons)
         (top - n * 3600, (30 if n > 48 else 140) * MIB, 3600, "[]") for n in range(24 * 21, 0, -1)
     ]
     rows = [r for r in rows if r[0] % 86400 // 3600 in (22, 23, 0, 1)]
     samples = [Sample(h, b, q >= 3420 and not json.loads(r or "[]"), False) for h, b, q, r in rows]
-    cfg = TodConfig(10, 3, bucket_hours=4)
-    train_end = top - 49 * 3600
+    return top, samples
+
+
+def test_engine_shaped_samples_detect_and_cross_a_cohort_boundary():
+    top, samples = engine_rows()
+    cfg = TodConfig(8, 4, bucket_hours=4)
+    train_end = top - 49 * 3600  # Friday 23:00: the weekend burst is not yet learned
     ref = fit_tod(samples, cfg, train_end)
     current = next(s for s in samples if s.hour == top - 3600)  # Sunday 23:00
     previous = next(s for s in samples if s.hour == top - 7200)  # Sunday 22:00
     assert cohort_key(current.hour, 4) == cohort_key(previous.hour, 4) == (True, 5)
-    assert current.hour > train_end
-    nxt = Sample(top, 140 * MIB, True)  # Monday 00:00: weekday bucket 0
-    cross = findings_tod(nxt, current, ref, cfg)
+    (hit,) = findings_tod(current, previous, ref, cfg).candidates
+    assert (hit.detector, hit.cohort, hit.observed_bytes) == (
+        "upload_deviation",
+        (True, 5),
+        140 * MIB,
+    )
+    assert hit.threshold_bytes == 120 * MIB
+    # Monday 00:00 is a weekday bucket: Sunday 23:00 is judged against the weekend cohort
+    nxt = Sample(top, 140 * MIB, True)
     assert cohort_key(nxt.hour, 4) == (False, 0)
-    assert cross.candidates == () and cross.abstain_reason is not None
+    (cross,) = findings_tod(nxt, current, ref, cfg).candidates
+    assert (cross.cohort, cross.threshold_bytes) == ((False, 0), 120 * MIB)
+    strict = TodConfig(8, 5, bucket_hours=4)  # only four weekend days exist: weekend immature
+    out = findings_tod(nxt, current, fit_tod(samples, strict, train_end), strict)
+    assert out.candidates == () and out.abstain_reason == "previous_immature_days"
 
 
 def mature_keys(ref):

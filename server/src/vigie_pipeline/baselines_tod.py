@@ -38,12 +38,15 @@ class TodConfig:
     bucket_hours: int = 4
 
     def __post_init__(self):
+        bounds = (
+            (self.min_samples_per_cohort, 1, 10_000),
+            (self.min_days_per_cohort, 1, 3650),
+            (self.minimum_bytes, 1, 2**50),
+            (self.multiplier, 1, 100),
+            (self.large_upload_bytes, 1, 2**50),
+        )
         if not (
-            1 <= self.min_samples_per_cohort <= 10_000
-            and 1 <= self.min_days_per_cohort <= 3650
-            and 1 <= self.minimum_bytes <= 2**50
-            and 1 <= self.multiplier <= 100
-            and 1 <= self.large_upload_bytes <= 2**50
+            all(type(v) is int and lo <= v <= hi for v, lo, hi in bounds)
             and type(self.bucket_hours) is int
             and self.bucket_hours in BUCKET_HOURS
         ):
@@ -202,15 +205,15 @@ def _deviation_reason(current, previous, reference, config, out):
     "Append a deviation candidate to `out` when warranted; return the abstain reason, if any."
     if reference.config_version != config.version:
         return "config_mismatch"
+    if previous is not None and (not previous.eligible or previous.hour != current.hour - 3600):
+        previous = None  # not a consecutive pair: it can neither fire nor leak
     if current.hour <= reference.trained_until or (
         previous is not None and previous.hour <= reference.trained_until
     ):
         return "leaks_evaluated_hours"
     now_fit, reason = _scorable(current, reference, config)
-    if now_fit is None:
+    if now_fit is None or previous is None:
         return reason
-    if previous is None or not previous.eligible or previous.hour != current.hour - 3600:
-        return None
     before_fit, reason = _scorable(previous, reference, config)
     if before_fit is None:
         return reason if reason == "leaks_evaluated_hours" else f"previous_{reason}"

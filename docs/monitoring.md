@@ -97,7 +97,7 @@ variable changed.
   moves a sample between cohorts, it only means the bucket is not the household's wall-clock hour.
 - **Maturity.** A cohort needs at least 20 valid samples AND 7 distinct UTC days, else it ABSTAINS
   (`immature_samples`, then `immature_days`). With four-hour buckets a weekday cohort matures after
-  about 7 weekdays of history and a weekend cohort after about 4 weekends (8 weekend days).
+  about 7 weekdays of history and a weekend cohort after about 7 weekend days (the fourth Saturday).
 - **Valid samples.** Ineligible (missing) hours are skipped, never counted as zero. Suspicious hours
   and hours at or above the fixed large-upload line are excluded as contamination. At most 4368
   samples (26 weeks) are accepted; hours and byte counts must be exact integers.
@@ -113,6 +113,11 @@ variable changed.
   above the line of its OWN mature cohort. An immature current cohort abstains with its reason; an
   immature previous cohort abstains with `previous_<reason>`. A nightly backup that is high every
   night is learned, not flagged.
+- **Known blind band.** A baseline poisoned by sustained high traffic before `trained_until` can
+  raise a cohort threshold up to `multiplier` times its median-twice, so sustained exfiltration just
+  under the fixed large-upload line (1 GiB/h) may not yield an `upload_deviation` candidate. The
+  fixed detector remains the backstop; the engine wiring unit must freeze `trained_until` before
+  suspected incidents and may cap the threshold. This is the same limit as `pooled-median-v1`.
 - **Versioning.** `TodConfig.version` hashes the algorithm id and every parameter, including
   `bucket_hours`. Results are deterministic for any input order, and backfilled history fits by its
   own cohort.
