@@ -1,0 +1,13 @@
+# synthetic host edge cases: 4 hosts kept, 7 rows skipped, 1 duplicate
+"1","2024-01-01 00:00:01","http://Evil.com./x","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/1/","r"
+"2","2024-01-01 00:00:01","http://EVIL.com/y","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/2/","r"
+"3","2024-01-01 00:00:01","http://[2001:DB8:0:0::1]:8080/p","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/3/","r"
+"4","2024-01-01 00:00:01","http://[fe80::1%25eth0]/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/4/","r"
+"5","2024-01-01 00:00:01","ftp://ftp.example.com/x","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/5/","r"
+"6","2024-01-01 00:00:01","http://secret:token/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/6/","r"
+"7","2024-01-01 00:00:01","http://user:pw@userinfo.example.org/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/7/","r"
+"8","2024-01-01 00:00:01","http://Kelvin.test/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/8/","r"
+"9","2024-01-01 00:00:01","http://[v1.fe]/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/9/","r"
+"10","2024-01-01 00:00:01","http://a.test:99999/","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/10/","r"
+"11","2024-01-01 00:00:01","http://192.0.2.7:81/z","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/11/","r"
+"12","2024-01-01 00:00:01","http://192.000.2.7/z","online","2024-01-02","malware_download","","https://urlhaus.abuse.ch/url/12/","r"

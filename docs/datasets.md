@@ -9,26 +9,36 @@ python -m vigie_api dataset stage --source kev|urlhaus --file PATH --version V -
 python -m vigie_api dataset list [--data-dir D]
 ```
 
-`stage` reads the file bounded (64 MiB, regular files only, symlinks refused), parses it
-strictly (any malformed row rejects the whole file, exit 2), and writes in ONE transaction an
-import row, its entries and one `dataset.stage` audit row (source, version, sha256, entry count;
-never entry contents) as principal `cli:local`. Staging the same bytes twice for one source is
-refused (exit 1, `dataset_already_staged`). A new version is simply another staged import.
+`stage` reads the file bounded (per-source input cap, regular files only, no symlinks, no
+controlling tty), parses it strictly and writes in ONE transaction an import row, its entries
+and one `dataset.stage` audit row (source, version, sha256, entry and skipped counts; never
+entry contents) as principal `cli:local`. A structurally bad file is rejected whole (exit 2).
+Staging the same bytes twice for one source is refused (exit 1, `dataset_already_staged`), and
+so is a sixth still-`staged` import of one source (`dataset_staging_full`). A new version is
+simply another staged import.
 
 ## Tables (overrides.db, migration 8)
 
 - `dataset_imports`: id, source (`kev`|`urlhaus`), version, licence, sha256 of the raw bytes,
-  entry_count, status (`staged`|`accepted`|`rejected`, default `staged`), created_at/by.
-  Unique on (source, sha256). The version and licence are recorded so provenance is never lost.
+  entry_count, skipped_count, status (`staged`|`accepted`|`rejected`, default `staged`),
+  created_at/by, and accepted_by/at. A row cannot be `accepted` without an accept record.
+  Unique on (source, sha256). Version and licence are recorded so provenance is never lost.
 - `dataset_entries_staging`: (import_id, key, payload JSON), one row per key.
 
 ## Parser privacy and safety rules (`vigie_api/dataset_parse.py`, pure, no I/O)
 
-- KEV (CISA JSON): only `cveID`, `vendorProject`, `product`, `dateAdded` are kept; descriptions
-  and notes are dropped. Duplicate CVE ids are malformed.
-- URLhaus (CSV): only the lower-cased **host** and the threat label are kept. Path, query, port
-  and credentials of a listed URL are discarded before anything is stored. Hosts are restricted
-  to `[a-z0-9.:-]`, so unicode lookalikes and backslash tricks are rejected. Duplicate hosts
-  keep the first row.
-- Caps for both: 64 MiB input, 2,000,000 entries, 512 characters per field; non-printable
-  characters are rejected.
+- Caps are checked before the structure they protect is built. KEV: 16 MiB, 100,000 entries
+  (a brace pre-scan rejects before `json.loads`). URLhaus: 64 MiB, 250,000 rows, counted while
+  iterating and stopped at the cap. 512 characters per field; control characters are rejected
+  in every field.
+- KEV (CISA JSON): only `cveID`, `vendorProject`, `product`, `dateAdded` are kept. The CVE id is
+  ASCII with no leading zeros beyond four digits; the date must be a real date. Duplicates are
+  malformed.
+- URLhaus (CSV, read with a real CSV reader, so a newline inside a quoted URL is rejected, not
+  split): only the lower-cased **host** and the threat label are kept. Path, query, port and
+  credentials are discarded before anything is stored. Only http/https URLs count. The host
+  must be ASCII (Kelvin-sign and other lookalikes fail), a trailing dot is dropped, IPv4/IPv6
+  literals are normalised (IPv6 stored without brackets), and the port must be valid.
+  Duplicate hosts keep the first row.
+- A row whose host, scheme or port is unusable is **skipped and counted**; the import is
+  rejected if more than max(100, 1% of data rows) are skipped.

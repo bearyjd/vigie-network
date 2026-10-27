@@ -17,8 +17,9 @@ from vigie_api import dataset_parse
 from vigie_api.errors import ApiError
 
 AUDIT_ACTION = "dataset.stage"
-PARSERS: dict[str, Callable[[bytes], list[dataset_parse.Entry]]] = {
-    "kev": dataset_parse.parse_kev,
+MAX_STAGED = 5  # unaccepted imports per source; bounds what a stream of new files can store
+PARSERS: dict[str, Callable[[bytes], tuple[list[dataset_parse.Entry], int]]] = {
+    "kev": lambda data: (dataset_parse.parse_kev(data), 0),
     "urlhaus": dataset_parse.parse_urlhaus,
 }
 
@@ -38,6 +39,20 @@ def _compact(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _guard(ov: sqlite3.Connection, source: str, sha256: str) -> None:
+    if ov.execute(
+        "SELECT 1 FROM dataset_imports WHERE source=? AND sha256=?", (source, sha256)
+    ).fetchone():
+        raise ApiError(409, "dataset_already_staged", "this exact file is already staged")
+    (staged,) = ov.execute(
+        "SELECT COUNT(*) FROM dataset_imports WHERE source=? AND status='staged'", (source,)
+    ).fetchone()
+    if staged >= MAX_STAGED:
+        raise ApiError(
+            409, "dataset_staging_full", f"{MAX_STAGED} imports of {source} are already staged"
+        )
+
+
 def stage(
     ov: sqlite3.Connection,
     source: str,
@@ -52,24 +67,34 @@ def stage(
     if parser is None:
         raise _invalid(f"unknown source {source!r}")
     version, licence = _label("version", version), _label("licence", licence)
+    principal, now_iso = _label("principal", principal), _label("now_iso", now_iso)
     try:
-        entries = parser(data)
+        entries, skipped = parser(data)
     except ValueError as exc:
         raise _invalid(str(exc)) from None
     sha256 = hashlib.sha256(data).hexdigest()
     import_id = id_factory()
-    detail = {"source": source, "version": version, "sha256": sha256, "entry_count": len(entries)}
+    detail = {
+        "source": source, "version": version, "sha256": sha256,
+        "entry_count": len(entries), "skipped_count": skipped,
+    }  # fmt: skip
     ov.execute("BEGIN IMMEDIATE")
     try:
-        if ov.execute(
-            "SELECT 1 FROM dataset_imports WHERE source=? AND sha256=?", (source, sha256)
-        ).fetchone():
-            raise ApiError(409, "dataset_already_staged", "this exact file is already staged")
+        _guard(ov, source, sha256)
         ov.execute(
-            "INSERT INTO dataset_imports"
-            " (id,source,version,licence,sha256,entry_count,created_at,created_by)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (import_id, source, version, licence, sha256, len(entries), now_iso, principal),
+            "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,"
+            "skipped_count,created_at,created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                import_id,
+                source,
+                version,
+                licence,
+                sha256,
+                len(entries),
+                skipped,
+                now_iso,
+                principal,
+            ),
         )
         ov.executemany(
             "INSERT INTO dataset_entries_staging (import_id,key,payload) VALUES (?,?,?)",

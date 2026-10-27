@@ -108,20 +108,29 @@ def test_overrides_schema_is_at_version_8(tmp_path: Path) -> None:
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
+SHA = "a" * 64
+IMPORT_SQL = (
+    "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,created_at,"
+    "created_by{}) VALUES (?,?,'v','l',?,?,'t','u'{})"
+)
+
+
+def _import(conn, id_="i1", source="kev", sha=SHA, count=1, **extra):
+    names = "".join(f",{k}" for k in extra)
+    marks = ",?" * len(extra)
+    conn.execute(IMPORT_SQL.format(names, marks), (id_, source, sha, count, *extra.values()))
+
+
 def test_dataset_staging_tables_enforce_their_checks(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "o.db")
     conn.execute("PRAGMA foreign_keys=ON")
-    insert = (
-        "INSERT INTO dataset_imports"
-        " (id,source,version,licence,sha256,entry_count,{}created_at,created_by)"
-    )
-    ok = ("i1", "kev", "v", "l", "h", 1, "t", "u")
-    conn.execute(insert.format("") + " VALUES (?,?,?,?,?,?,?,?)", ok)
-    assert conn.execute("SELECT status FROM dataset_imports").fetchone()[0] == "staged"
+    _import(conn)
+    row = conn.execute("SELECT status, skipped_count, accepted_by FROM dataset_imports").fetchone()
+    assert tuple(row) == ("staged", 0, None)
     with pytest.raises(sqlite3.IntegrityError):  # unknown source
-        conn.execute(insert.format("") + " VALUES (?,?,?,?,?,?,?,?)", ("i2", "x", *ok[2:]))
+        _import(conn, "i2", source="x")
     with pytest.raises(sqlite3.IntegrityError):  # unknown status
-        conn.execute(insert.format("status,") + " VALUES ('i3','kev','v','l','h',1,'bad','t','u')")
+        _import(conn, "i3", status="bad")
     with pytest.raises(sqlite3.IntegrityError):  # entries need their import
         conn.execute("INSERT INTO dataset_entries_staging VALUES ('nope','k','{}')")
     with pytest.raises(sqlite3.IntegrityError):  # one row per (import, key)
@@ -129,13 +138,31 @@ def test_dataset_staging_tables_enforce_their_checks(tmp_path: Path) -> None:
         conn.execute("INSERT INTO dataset_entries_staging VALUES ('i1','k','{}')")
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [{"skipped_count": -1}, {"sha": "abc"}, {"sha": "a" * 65}, {"count": -1}],
+)
+def test_dataset_import_numeric_and_hash_checks(tmp_path: Path, extra) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, **{k: v for k, v in extra.items()})
+
+
+def test_accepted_status_needs_an_accept_record(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    for n, extra in enumerate(
+        [{"status": "accepted"}, {"status": "accepted", "accepted_by": "u"},
+         {"status": "accepted", "accepted_at": "t"}]
+    ):  # fmt: skip
+        with pytest.raises(sqlite3.IntegrityError):
+            _import(conn, f"x{n}", sha=f"{n}" * 64, **extra)
+    _import(conn, "ok", status="accepted", accepted_by="u", accepted_at="t")
+    _import(conn, "st", sha="b" * 64, accepted_by="u")  # staged rows may carry a stray value
+
+
 def test_dataset_import_is_unique_per_source_and_hash(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "o.db")
-    sql = (
-        "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,created_at,"
-        "created_by) VALUES (?,?,'v','l','h',1,'t','u')"
-    )
-    conn.execute(sql, ("a", "kev"))
-    conn.execute(sql, ("b", "urlhaus"))  # same hash under another source is fine
+    _import(conn, "a")
+    _import(conn, "b", source="urlhaus")  # same hash under another source is fine
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(sql, ("c", "kev"))
+        _import(conn, "c")

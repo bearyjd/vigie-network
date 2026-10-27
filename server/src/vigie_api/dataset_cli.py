@@ -1,6 +1,6 @@
 """`vigie-api dataset stage|list`: stage an offline known-issue dataset, as principal cli:local.
 
-The file is read bounded (never more than the parser's input cap), through O_NOFOLLOW and only
+The file is read bounded (never more than the source's input cap), through O_NOFOLLOW and only
 if it is a regular file. Nothing is fetched or applied: staging writes the import, its entries
 and one audit row, and `list` shows what is staged.
 """
@@ -45,13 +45,14 @@ def _fail(message: str, code: int) -> int:
     return code
 
 
-def _read_bounded(path: Path) -> bytes:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK  # NONBLOCK: a FIFO must not hang open
+def _read_bounded(path: Path, limit: int) -> bytes:
+    # NONBLOCK: a FIFO must not hang open; NOCTTY: a tty must not become our controlling tty
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     fd = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("not a regular file")
-        limit, chunks, total = dataset_parse.MAX_INPUT_BYTES, [], 0
+        chunks, total = [], 0
         while chunk := os.read(fd, min(CHUNK, limit + 1 - total)):
             total += len(chunk)
             if total > limit:
@@ -65,7 +66,7 @@ def _read_bounded(path: Path) -> bytes:
 def _stage(ov, args) -> int:
     path = Path(args.file)
     try:
-        data = _read_bounded(path)
+        data = _read_bounded(path, dataset_parse.input_limit(args.source))
     except OSError as exc:
         return _fail(f"cannot read {path}: {exc.strerror or exc}", 2)
     try:

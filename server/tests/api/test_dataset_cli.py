@@ -81,14 +81,14 @@ def test_non_regular_files_are_refused(tmp_path, capsys):
 
 
 def test_oversized_file_is_refused_before_parsing(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(dataset_parse, "MAX_INPUT_BYTES", 10)
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_INPUT", 10)
     assert run(tmp_path, *stage_args(KEV)) == 2
     assert "too large" in capsys.readouterr().err
     assert rows(tmp_path, "SELECT COUNT(*) FROM dataset_imports") == [(0,)]
 
 
 def test_the_read_is_bounded_not_slurped(tmp_path, monkeypatch):
-    monkeypatch.setattr(dataset_parse, "MAX_INPUT_BYTES", 10)
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_INPUT", 10)
     sizes = []
     real = os.read
     monkeypatch.setattr(dataset_cli.os, "read", lambda fd, n: sizes.append(n) or real(fd, n))
@@ -105,3 +105,25 @@ def test_unknown_source_is_an_argument_error(tmp_path):
 def test_blank_version_is_rejected_with_exit_2(tmp_path, capsys):
     assert run(tmp_path, *stage_args(KEV, version=" ")) == 2
     assert "dataset_invalid" in capsys.readouterr().err
+
+
+def test_each_source_is_read_with_its_own_cap(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(dataset_parse, "KEV_MAX_INPUT", 10)
+    assert run(tmp_path, *stage_args(FIX / "urlhaus_small.csv", source="urlhaus")) == 0
+    assert run(tmp_path, *stage_args(KEV)) == 2
+    monkeypatch.setattr(dataset_parse, "URLHAUS_MAX_INPUT", 10)
+    assert run(tmp_path, *stage_args(FIX / "urlhaus_hosts.csv", source="urlhaus")) == 2
+    assert capsys.readouterr().err.count("too large") == 2
+
+
+def test_the_file_is_opened_without_a_controlling_tty_and_close_on_exec(tmp_path, monkeypatch):
+    flags = []
+    real = os.open
+    monkeypatch.setattr(
+        dataset_cli.os,
+        "open",
+        lambda p, f, *a: (flags.append(f) if str(p) == str(KEV) else 0, real(p, f, *a))[1],
+    )
+    assert run(tmp_path, *stage_args(KEV)) == 0
+    needed = os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
+    assert len(flags) == 1 and flags[0] & needed == needed

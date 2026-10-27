@@ -233,10 +233,14 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         """CREATE TABLE dataset_imports (
           id TEXT PRIMARY KEY,
           source TEXT NOT NULL CHECK (source IN ('kev','urlhaus')),
-          version TEXT NOT NULL, licence TEXT NOT NULL, sha256 TEXT NOT NULL,
-          entry_count INTEGER NOT NULL,
+          version TEXT NOT NULL, licence TEXT NOT NULL,
+          sha256 TEXT NOT NULL CHECK (length(sha256)=64),
+          entry_count INTEGER NOT NULL CHECK (entry_count>=0),
+          skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count>=0),
           status TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged','accepted','rejected')),
-          created_at TEXT NOT NULL, created_by TEXT NOT NULL
+          created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+          accepted_by TEXT, accepted_at TEXT,
+          CHECK (status!='accepted' OR (accepted_by IS NOT NULL AND accepted_at IS NOT NULL))
         )""",
         "CREATE UNIQUE INDEX idx_dataset_imports_source_sha ON dataset_imports(source, sha256)",
         """CREATE TABLE dataset_entries_staging (
