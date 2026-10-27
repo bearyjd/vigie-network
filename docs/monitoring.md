@@ -190,14 +190,16 @@ each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_deli
 A runner exception is caught and logged (first occurrence and every 20th), never raised into the
 pass. A message holds the device label (the `device_overrides.name`, else the device id) and a
 relative link `/ui/#incident=<id>`, nothing else: the label goes through a
-fail-safe check. After NFKC normalisation the text is squashed to its letters and digits (so no
-separator or invisible character can hide anything) and the label is SUSPECT if that holds 12 or
-more hex digits (a MAC), 8 or more digits, or if the text has an `@`, `://`, an IPv4/IPv6 address
-or a hostname. A suspect label is replaced by the stable alias `Device <4 hex of sha256(device
-id)>`, never partly redacted. Otherwise only letters of any script, ASCII digits and ` '’-_.&`
-are kept, whitespace is collapsed and the result is cut to 64 characters (an empty result also
-becomes the alias). Over-redaction is intentional: labels are written by the admin and this is a
-defence-in-depth net for a future network publisher.
+STRICT ACCEPTOR (`delivery_publish.scrub_label`). After NFKC and whitespace collapsing it is sent
+verbatim only if all hold: 1 to 48 characters; only letters of any script, spaces, `'`, `’`, the
+ASCII hyphen and ASCII digits; at most 3 digits; fewer than 12 hex-looking letters/digits once
+squashed (no MAC, however separated); no word of 20 or more characters. Otherwise the message
+carries the stable alias `Device <4 letters>` derived from a hash of the device id. Nothing is ever
+cleaned, dropped or partly redacted, so dots, colons, slashes, `@`, invisible characters and other
+separators (hence hostnames, addresses, emails, URLs, serials) are impossible by construction, and
+the function is idempotent. This over-redacts on purpose: a name with a dot, an underscore, an
+emoji, more than 3 digits or other punctuation shows as an alias, and the owner sees the real
+name by following the link.
 
 **Settings** (all in `deploy/.env.example`; invalid values stop the pipeline at startup):
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any

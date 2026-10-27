@@ -2,10 +2,10 @@
 
 PRIVACY. A message holds a device LABEL and an incident link and nothing else: never a
 destination, IP, MAC, domain or byte count. `build_message` takes an allowlist of inputs (delivery
-id, kind, incident id, label, device id). A label that could hold an address, MAC, domain or
-mailbox is replaced by a stable alias (see `scrub_label`); all lengths are bounded. There is no
-network publisher here: `FakePublisher` records (tests) and `FilePublisher` appends JSON lines to
-a local file.
+id, kind, incident id, label, device id). A label is accepted verbatim only if it passes the
+strict acceptor in `scrub_label`, otherwise a stable alias is sent; all lengths are bounded.
+There is no network publisher here: `FakePublisher` records (tests) and `FilePublisher` appends
+JSON lines to a local file.
 """
 
 from __future__ import annotations
@@ -23,18 +23,17 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 
-MAX_LABEL = 64
-PRE_CUT = 256  # no regex ever sees more than this: their cost is superlinear on hostile input
+MAX_LABEL = 48
+MAX_DIGITS = 3
+MAX_WORD = 20  # a word this long is an opaque token, not a name
+MAX_HEX_LETTERS = 12  # squashed hex-looking characters this many or more could be a MAC
+RAW_CUT = 4096  # bound the work on a hostile label
 MAX_LINK = 200
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
-_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\u2024": ".", "\ufe52": "."})
-_KEEP = frozenset(" '\u2019-_.&0123456789")
-# Suspect-label detectors. Separators are never enumerated: the hex and digit rules run on the
-# text squashed down to its letters and digits, so any punctuation or invisible character between
-# the octets is irrelevant.
-_HOSTNAME = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b", re.IGNORECASE)
-_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-_IPV6 = re.compile(r"(?<![0-9a-z])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-z])", re.IGNORECASE)
+_PUNCT = frozenset(" '\u2019-")
+_DIGITS = frozenset("0123456789")
+_HEX = frozenset("0123456789abcdef")
+_WORD_BREAKS = re.compile("[ '\u2019-]")
 TITLES = {"open": "Vigie: check {label}", "recover": "Vigie: {label} is back to normal"}
 BODIES = {
     "open": "{label}: unusual activity detected. Review it here: {link}",
@@ -60,38 +59,37 @@ class Publisher(Protocol):
         """Deliver or raise PublishError. The runner enforces a hard wall timeout on top."""
 
 
-def _suspect(text: str) -> bool:
-    """Conservative on purpose: anything that could be a MAC, address, domain or mailbox."""
-    squashed = "".join(c for c in text if c.isalnum()).lower()
-    return (
-        len(re.sub("[^0-9a-f]", "", squashed)) >= 12
-        or sum(c.isdigit() for c in squashed) >= 8
-        or "@" in text
-        or "://" in text
-        or _HOSTNAME.search(text) is not None
-        or _IPV4.search(text) is not None
-        or _IPV6.search(text) is not None
-    )
-
-
 def alias(device_id: object) -> str:
-    return "Device " + hashlib.sha256(str(device_id).encode()).hexdigest()[:4]
+    """`Device <4 letters>` from the hash of the device id: stable, letters only (so the acceptor
+    below accepts it unchanged)."""
+    digest = hashlib.sha256(str(device_id).encode()).digest()
+    return "Device " + "".join(chr(ord("a") + b % 26) for b in digest[:4])
+
+
+def _acceptable(text: str) -> bool:
+    if not 1 <= len(text) <= MAX_LABEL:
+        return False
+    if not all(c.isalpha() or c in _PUNCT or c in _DIGITS for c in text):
+        return False
+    if sum(c in _DIGITS for c in text) > MAX_DIGITS:
+        return False
+    if sum(c.lower() in _HEX for c in text if c.isalnum()) >= MAX_HEX_LETTERS:
+        return False
+    return all(len(word) < MAX_WORD for word in _WORD_BREAKS.split(text))
 
 
 def scrub_label(raw: object, device_id: object = "") -> str:
-    """FAIL SAFE. A suspect label is replaced by a stable alias derived from the device id, never
-    redacted in part. Over-redaction is intentional: labels are admin-written, and this is a
-    defence-in-depth net for a future network publisher. Otherwise only letters of any script,
-    ASCII digits and ` '’-_.&` are kept, whitespace is collapsed and the result is cut."""
-    head = "" if raw is None else str(raw)[:PRE_CUT]
-    text = unicodedata.normalize("NFKC", head).translate(_DOTS)[:PRE_CUT]
-    if _suspect(text):
-        return alias(device_id)
-    kept = "".join(c for c in text if c.isalpha() or c in _KEEP)
-    clean = " ".join(kept.split())[:MAX_LABEL].strip()
-    if not clean or _suspect(clean):  # dropping characters may have joined a hostname
-        return alias(device_id)
-    return clean
+    """STRICT ACCEPTOR. The label (NFKC, whitespace collapsed) is used verbatim only if every
+    character is a letter of any script, a space, an apostrophe, an ASCII hyphen or an ASCII digit
+    and it is short, has at most 3 digits, does not look like a MAC once squashed and holds no
+    opaque long word. Anything else becomes the stable alias of the device: text is never cleaned
+    or partly redacted, so dots, colons, slashes, `@`, separators, hostnames, addresses, serials
+    and invisible tricks cannot get through, and the function is idempotent by construction.
+    Over-redaction is intended: a name with a dot, an underscore, an emoji, more than 3 digits or
+    other punctuation shows as an alias; the owner sees the real name by following the link."""
+    head = "" if raw is None else str(raw)[:RAW_CUT]
+    text = " ".join(unicodedata.normalize("NFKC", head).split())
+    return text if _acceptable(text) else alias(device_id)
 
 
 def incident_link(incident_id: object) -> str:
