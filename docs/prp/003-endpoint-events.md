@@ -11,7 +11,9 @@ Labelling: every statement about the peer project (Snitchwatch, OpenSnitch v1.8.
 
 ## 1. Goal and non-goals
 
-**Goal.** An external check of an endpoint firewall. The router sees every packet from the host but not the program or the decision; the endpoint firewall knows the program and the decision but only for what it intercepts. Comparing the two shows traffic the endpoint guard did not report, and a guard that has gone quiet. Secondary: per-program attribution on the device page.
+**Goal.** A second, independent view of what an endpoint firewall reports. The router sees every packet from the host but not the program or the decision; the endpoint firewall knows the program and the decision but only for what it intercepts. Comparing the two shows traffic the endpoint guard did not report, and a guard that has gone quiet. Secondary: per-program attribution on the device page.
+
+**What this detects and what it does not.** PRP-003 detects a dead or bypassed guard, a non-root program the guard misses, and pipeline loss. It does NOT detect a root-compromised endpoint, which can fabricate or suppress events at will. A host can also trip the suppressors on purpose (one bad frame per hour, a foreign `src_ip`, skewed time). Pre-auth counters (`tls_fail`, `conn_limit`, `unknown_cert`) are per peer address and never charged to a host.
 
 **Non-goals.** Vigie stays observe-only: no enforcement, nothing sent back to the endpoint, no raw packet or payload capture. Endpoint data never feeds stitching, type inference, baselines or merges (same rule as section 8). It never clears or suppresses a router-side detector.
 
@@ -34,18 +36,19 @@ A **new dedicated `endpoint-ingest` container** receives the TLS syslog stream i
 
 | Property | Value |
 |---|---|
-| Hardening | same `x-hardening` anchor as the other services (`deploy/compose.yaml:34-44`: uid 10001, read-only, `cap_drop: [ALL]`, no-new-privileges); the anchor's `mem_limit: 512m` / `cpus: 1.0` (lines 44-45) are overridden to `mem_limit: 128m`, `cpus: 0.25` |
-| Runtime | Python asyncio + stdlib `ssl` |
-| Port | `${VIGIE_LAN_ADDR}:6514`, bound like ingest (`deploy/compose.yaml:103-106`, `VIGIE_LAN_ADDR` has no default) |
-| Storage | own volume `vigie-endpoint`; own server certificate (new `gen-certs.sh --role endpoint`, keeping the ingest/API certificate separation stated at `deploy/gen-certs.sh:2-3`) |
-| Mounts | NEITHER `vigie-inv` nor `vigie-overrides`; the pipeline mounts `vigie-endpoint` read-only |
+| Hardening | same `x-hardening` anchor as the other services (`deploy/compose.yaml:34-45`: uid 10001, read-only, `cap_drop: [ALL]`, no-new-privileges); the anchor's `mem_limit: 512m` / `cpus: 1.0` (lines 44-45) are overridden to `mem_limit: 128m`, `cpus: 0.25` |
+| Runtime | Python asyncio + stdlib `ssl`; `num_tickets=0` so the SPKI pin check runs on every full handshake. Stdlib `ssl` cannot extract an SPKI from DER and `cryptography` is not a server dependency: **dependency decision for E2** is either to add `cryptography` (pinned in `deploy/build-constraints.txt`) or to compute the pin from the peer's DER with a small vetted parser; undecided |
+| Port | `${VIGIE_LAN_ADDR}:6514`, bound like ingest (`deploy/compose.yaml:103-106`, `VIGIE_LAN_ADDR` has no default). The per-peer limits need the real source address, which depends on the rootless network mode (`docs/deploy.md:239-241`, `deploy/.env.example:13`): **pasta is required** (slirp4netns may rewrite it); the listener checks `podman info --format '{{.Host.RootlessNetworkCmd}}'`-equivalent evidence at startup (refuses per-peer limiting it cannot trust, logged and counted) and a test covers it |
+| Storage | own volume `vigie-endpoint`; own self-signed server certificate (new `gen-certs.sh --role endpoint`, keeping the ingest/API certificate separation stated at `deploy/gen-certs.sh:2-3`) |
+| Mounts | NEITHER `vigie-inv` nor `vigie-overrides`; the pipeline mounts `vigie-endpoint` read-only (`:ro`). The API does not mount it |
+| Read-only WAL mechanics | A WAL database nobody has open loses its `-wal`/`-shm` files and a `:ro` reader cannot recreate them (`server/src/vigie_ingest/keeper.py:3-7`, `docs/deploy.md:73-80`). So the listener holds a Keeper connection on every endpoint shard and on its registry database, released before retention deletes a shard. The pipeline opens with `mode=ro` plus `query_only`. A missing Keeper fails closed and is counted as a listener gap, which suppresses both endpoint detectors |
 
 **Why not the alternatives.**
 
 | Option | Verdict | Reason |
 |---|---|---|
 | Dedicated listener (recommended) | Chosen | Own writer and own volume; identity comes from the client certificate; no coupling to batch limits |
-| Tower-side relay into signed batches | Rejected | Ingest runs a single worker and holds an exclusive `flock` on the raw directory (`deploy/compose.yaml:78-80` `--workers 1`; `server/src/vigie_ingest/lock.py:19-28`; PRP-001 section 4, line 100), so a second writer cannot share `/raw`. A relay still needs the same TLS listener, adds a second key on the same host and no new trust boundary, and couples endpoint traffic to batch limits (`api/batch.schema.json:363` `maxItems` 5000 for `conntrack`; body cap 512 KB, `server/src/vigie_ingest/config.py:9`). A relay on the endpoint breaks the peer contract (rsyslog `omfwd` only) |
+| Tower-side relay into signed batches | Rejected | Ingest runs a single worker and holds an exclusive `flock` on the raw directory (`deploy/compose.yaml:79-80` `--workers 1`; `server/src/vigie_ingest/lock.py:19-28`; PRP-001 section 4, line 100), so a second writer cannot share `/raw`. A relay still needs the same TLS listener, adds a second key on the same host and no new trust boundary, and couples endpoint traffic to batch limits (`api/batch.schema.json:363` `maxItems` 5000 for `conntrack`; body cap 512 KB, `server/src/vigie_ingest/config.py:9`). A relay on the endpoint breaks the peer contract (rsyslog `omfwd` only) |
 | rsyslog `imtcp` on the Tower (steelman) | Rejected | Battle-tested framing, but it gives no per-message client-certificate identity (`host_id` would be whatever the sender claims), identity would need one port per host, and the files it writes are one more parser to harden |
 
 **Framing.** The peer sends NO syslog header, so the frame body must be exactly one JSON object; any PRI or header is rejected and counted (`header_present`).
@@ -56,8 +59,9 @@ Boundaries: (1) LAN to listener (before auth, then after mTLS); (2) listener to 
 
 | STRIDE | Threat | Mitigation |
 |---|---|---|
-| S | Host claims another `host_id` | mTLS mandatory; client certificate SPKI must be in the registry; payload `host_id` must equal the host bound to that certificate, else reject and count `host_id_mismatch`; the source IP is never used for identity |
-| S | Compromised host fabricates events to hide traffic | Endpoint events NEVER clear or suppress router detectors (DoH, volume); "no incident" is not shown as "clean" |
+| S | Host claims another `host_id` | mTLS mandatory; the client certificate must carry EKU `clientAuth` and the listener requires it; identity is the SPKI pin only (CN is informational); the SPKI must be in the registry; payload `host_id` must equal the host bound to that certificate, else reject and count `host_id_mismatch`; the source IP is never used for identity |
+| S | Compromised host fabricates events to hide traffic | Endpoint events NEVER clear or suppress router detectors (DoH, volume); "no incident" is not shown as "clean". A root-compromised endpoint is out of scope (section 1) |
+| D | A host trips the suppressors on purpose (one bad frame per hour, foreign `src_ip`, skewed time) | Accepted and stated: suppression only withholds the endpoint-derived incidents, never router detectors; each suppression reason is shown as a status so it is visible. Pre-auth counters are per peer address and never charged to a host |
 | T | Framing smuggling, partial frames | Octet count 1-5 digits, no leading zero, <= 8192, then exactly one space; any violation closes the connection; a frame must complete within 10 s of its first byte |
 | R | Who sent what | Store per event the certificate SPKI id, server receive time and connection id |
 | I | `process_path`/`dst_host` leak through incidents, notifications or packs | Never stored in incidents or notifications; packs use new Sensitive kinds (section 8); raw retention 7 d |
@@ -73,9 +77,9 @@ Boundaries: (1) LAN to listener (before auth, then after mTLS); (2) listener to 
 - Any C0/C1 control, bidi-override or NUL character rejects the event. This is safe: a missing event becomes suspicion on the router side, never a clearance.
 - `"<nil>"` in `Action`/`Rule` is stored as `decided_by='default'`, `action=NULL` (verdict unknown); the event still counts as "reported".
 
-**Time.** Join windows use the server receive time. The endpoint `time` and the skew are stored. If |skew| > 5 min (the bound used in PRP-001 section 4), the event is marked `late` and joined using the endpoint time corrected by the host's median live skew, and only if it is no older than `VIGIE_MAX_SPOOL_AGE_S` (`server/src/vigie_ingest/config.py:72`, default 86400). Future-dated events are rejected (`future_ts`).
+**Time.** Join windows use the server receive time. The endpoint `time` and the skew are stored. If |skew| > 5 min (the bound used in PRP-001 section 4), the event is marked `late` and joined using the endpoint time corrected by the host's median live skew, and only if it is no older than `VIGIE_MAX_SPOOL_AGE_S` (`server/src/vigie_ingest/config.py:72`, default 86400). Only events MORE than 5 min ahead of server receive time are rejected (`future_ts`); anything smaller is stored with its skew, so a 1 s fast clock loses nothing.
 
-**Dedup.** Key `(host, time, proto, src_ip, src_port, dst_ip, dst_port)` in a bounded LRU of 50k entries / 10 min. TLS prevents network replay; rsyslog may resend after a reconnect.
+**Dedup.** Key `(host, time, proto, src_ip, src_port, dst_ip, dst_port)` enforced by a UNIQUE index per shard with `INSERT OR IGNORE`, so it survives restarts and rsyslog disk-queue resends. A small in-memory LRU (50k entries / 10 min) is only a cache in front of it. TLS prevents network replay; rsyslog may resend after a reconnect.
 
 ## 4. Data model and provenance
 
@@ -100,12 +104,17 @@ Every derived row carries `source_kind='endpoint'` beside the router kinds. Endp
 
 **Authentication is held by the listener.** `endpoint_hosts(host_id, spki1, spki2, revoked)` lives in the listener's own database, written by a new `provision-endpoint.sh HOST_ID` that mirrors `deploy/provision-collector.sh` and `server/src/vigie_ingest/admin.py`.
 
-`gen-certs.sh` produces only self-signed server certificates today (`deploy/gen-certs.sh:128`, `openssl req -x509`), so it needs a new `--role endpoint-ca`: a private P-256 CA issuing client certificates with `CN=host_id`, valid 397 days. Two SPKI pins per host allow rotation; revocation is the registry flag (no CRL). The peer's rsyslog verifies the server against the CA file and the permitted peer name, which must be in the server certificate's SAN.
+`gen-certs.sh` produces only self-signed server certificates today (`deploy/gen-certs.sh:128`, `openssl req -x509`), so it needs a new `--role endpoint-ca`: a private P-256 CA that issues client certificates with `CN=host_id`, EKU `clientAuth`, valid 397 days.
+
+- **CA key custody.** The CA key is never mounted into any container; it stays on the host (mode 0600) and is used only by `provision-endpoint.sh`.
+- **Name separation.** The listener's server certificate is NOT issued by the client CA: the peer pins the server certificate itself. `provision-endpoint.sh` refuses a `host_id` equal to any server SAN, because rsyslog can fall back to the CN when there is no SAN and its `CheckExtendedKeyUsage` is off by default (per rsyslog documentation, not verified by Vigie).
+- **Rotation and revocation.** Two SPKI pins per host allow rotation; revocation is the registry flag (no CRL). Revocation must also close live connections, because rsyslog connections live for days: `provision-endpoint.sh` writes the live registry through `podman-compose run --rm --no-deps` like `deploy/provision-collector.sh:25` (`VIGIE_ADMIN_CMD`), followed by a reload that drops the revoked host's connections.
+- The peer's rsyslog verifies the server against the pinned file and the permitted peer name, which must be in the server certificate's SAN.
 
 **Binding to a device (human-owned).** `endpoint_host_bindings(host_id, device_id, state proposed|approved|revoked, version)` in `overrides.db`, written ONLY by the API.
 
-- The pipeline proposes a binding only after 24 h in which the event `src_ip`, mapped through `raw_neigh`/`raw_lease` (`server/src/vigie_ingest/db.py:20`), lands on MACs of a single device.
-- The binding targets the `device_id`, never an IP, so a DHCP change has no effect. It covers every MAC of that device (`observations.device_id`) and follows stitching aliases (`merged_into`, `server/src/vigie_api/effective.py:130`).
+- The pipeline proposes a binding only after 24 h in which the event `src_ip`, mapped through `raw_neigh`/`raw_lease` (`server/src/vigie_ingest/db.py:20`), lands on MACs of a single device AND the TLS peer address (not attacker-supplied) maps to the same device; a mismatch between the two is a status, not a proposal.
+- `src_ip` is attacker-supplied text, hence the second check. The binding targets the `device_id`, never an IP, so a DHCP change has no effect. It covers every MAC of that device (`observations.device_id`) and follows stitching aliases (`merged_into`, `server/src/vigie_api/effective.py:130`).
 - If the device is retired the binding is suspended.
 - Per hour, if `src_ip` maps to a MAC outside the bound device set: `binding_mismatch`, shown as a status (not an incident), and detectors are suppressed for that hour.
 
@@ -139,7 +148,7 @@ So the finest possible join key is **(device, dst_ip, dst_port, proto, window)**
 
 ## 7. Incidents
 
-Hourly, because `monitoring_incidents` uses `last_hour` and has `observed_bytes`/`threshold_bytes` `NOT NULL` (`server/src/vigie_pipeline/schema.py:228-233`). Either store counts in those columns with `detector` naming the unit, or migrate the schema.
+Hourly, because `monitoring_incidents` uses `last_hour` and has `observed_bytes`/`threshold_bytes` `NOT NULL` (`server/src/vigie_pipeline/schema.py:228-233`). The table also has `collector_id` and `lineage` `NOT NULL` and a unique open-incident index on `(collector_id, device_id, lineage, detector)` (`server/src/vigie_pipeline/schema.py:228-235`). Proposal for endpoint incidents: `collector_id='endpoint:<host_id>'`, an explicit `lineage` value `'endpoint'`, counts stored in `observed_bytes`/`threshold_bytes` with `detector` naming the unit; the alternative is a schema migration, to be decided and committed to in E3.
 
 | Incident | Fires when | Suppressed when |
 |---|---|---|
@@ -148,15 +157,17 @@ Hourly, because `monitoring_incidents` uses `last_hour` and has `observed_bytes`
 
 Starting thresholds are calibrated in shadow mode against a false-alert budget set in advance (roadmap M2b).
 
-**Wording.** "Likely unreported traffic: the router saw N connections from <device> to M destinations that its endpoint guard did not report between HH:00 and HH:59. Possible causes: dropped events, VMs or containers sharing the connection, or a program the guard does not see." It never says malware or bypass as a fact. If the guarded host is the Tower itself, container egress shows up as the pasta/slirp process: add a fixture.
+**Wording.** "Likely unreported traffic: the router saw N destination keys from <device> to M destinations that its endpoint guard did not report between HH:00 and HH:59. Possible causes: dropped events, VMs or containers sharing the connection, or a program the guard does not see." It never says malware or bypass as a fact. The match is key-level, not connection-level: router `flows` is a max of live flows (`collector/agent/src/ctfold.rs:9-12`), matching is per key, and shared or CDN destinations are invisible. If the guarded host is the Tower itself, container egress shows up as the pasta/slirp process: add a fixture.
 
 ## 8. Retention, privacy, limits
 
 **Retention.** Raw shards: `VIGIE_ENDPOINT_RETENTION_DAYS`, default 7, hard max 30, `secure_delete` like raw shards (`docs/deploy.md:128` for the existing setting; `server/src/vigie_ingest/db.py:138`). `endpoint_hourly` holds counts only, 90 d.
 
+**Backups and exports.** `vigie-endpoint` is excluded from backups (same as raw shards, PRP-001 section 9) and follows the 7-day policy. Exported evidence packs outlive the 7-day raw retention; that is why `process_path` appears only at full level.
+
 **Privacy.** `process_path`, `dst_host`, `user_id` and `rule` are never in incidents, notifications or `search_queries`. Evidence packs (`feat/evidence-pack`, PR #23, not on `main` at the time of writing) need new Sensitive kinds with their own pseudonym namespaces (`proc`, `dsthost`; uid and rule omitted). Do not reuse `host`, or LAN hostnames and remote domains become linkable inside one pack. In `server/src/vigie_api/evidence_redact.py` on that branch (`_PSEUDONYM` at line 33, `_INDEXED` at line 44) a new kind falls through: raw at full level, omitted at pseudonymized/minimal unless added to `_PSEUDONYM` or `_INDEXED`. Add `proc`/`dsthost` to `_PSEUDONYM`; leave uid/rule omitted.
 
-**API (read-only).** New scope `endpoint:read` (off by default) for event detail. A per-host health view (connected, last event, counters, skew, binding state) needs no special scope. Binding approval goes through the existing human-write path.
+**API (read-only).** Decision: **event detail is dropped from the API for now (E2)**; only the pipeline mounts `vigie-endpoint` and `endpoint_hourly` holds counts only, so the API has no data source for it. Revisit later; if added, the API would mount `vigie-endpoint:ro` and the Keeper rule of section 2 applies. The scope name `endpoint:read` is reserved; "off by default" means no existing token scope (including `app`, see `docs/api.md:184`) implies it and it is granted only when a token is explicitly minted with it. A per-host health view (connected, last event, counters, skew, binding state) needs no special scope. Binding approval goes through the existing human-write path.
 
 **Limits.**
 
@@ -182,6 +193,10 @@ Starting thresholds are calibrated in shadow mode against a false-alert budget s
 | TLS | no client cert, wrong CA, unregistered SPKI, revoked cert, TLS 1.2 client, `host_id` spoofing |
 | JSON | duplicate `process_path`, 10^5-digit int, NaN, nested object, extra `process_args`, `"<nil>"`, bidi/ANSI/NUL characters, 1 MB `dst_host`, skew +-10 min, rsyslog resend dedup |
 | Isolation | the listener cannot open inventory or overrides; the pipeline opens endpoint shards read-only |
+| Read-only mount | E2: a real `:ro` bind mount test mirroring `server/tests/test_ro_mount_wal.py` (reader works while the Keeper runs; a missing Keeper fails closed and suppresses the detectors) |
+| Network mode | startup check for pasta vs slirp; per-peer limits keyed on the real address |
+| Identity | `clientAuth` EKU required; `host_id` equal to a server SAN refused; revocation drops a live connection |
+| Dedup | restart and disk-queue resend produce no duplicate rows (UNIQUE index) |
 | Join fixtures | long-lived flow, VPN, container NAT, IPv6 privacy address, DHCP change, laptop away then back with a late burst, coverage gap, drop counter > 0 must suppress |
 | Adversarial | a fabricated event stream cannot clear router detectors; process paths never appear in notifications or pseudonymized/minimal packs; Markdown injection through `process_path` stays fenced |
 
@@ -197,6 +212,16 @@ Starting thresholds are calibrated in shadow mode against a false-alert budget s
 | E5 | Likely unreported traffic, only after the shadow false-alert budget is met |
 
 Each phase gets a review log in the PRP-001 section 15/17 format.
+
+**Exit gates.**
+
+| Phase | Gate |
+|---|---|
+| E0 | Numeric go/no-go on a clean desktop: `other` byte share < 10% and key match ratio >= 0.9, else stop and rethink. The exported JSON log is obtained from the peer's `opensnitchd` remote logger output on that desktop (per the peer spec, not verified by Vigie), copied by the owner, never from a live service |
+| E1 | `ConntrackSummary` has `additionalProperties: false` (`api/batch.schema.json:4`), so an old server rejects collectors that send `new_flows`: the SERVER deploys first. Add an old/new compatibility test |
+| E2 | Full fuzz corpus, isolation and read-only-mount tests pass; an Opus security review and a Codex review are logged |
+| E3, E5 | A stated numeric false-alert budget before enabling. None exists in the roadmap or PRP-001 (`docs/roadmap.md:146-147` only says one must be set), so the owner sets it |
+| Ops | Alarms 30 days before client or server certificate expiry (a 397-day expiry would otherwise fire guard-quiet on every host at once) |
 
 ## 11. Owner decisions
 
@@ -214,16 +239,29 @@ All four were confirmed by the owner on 2026-10-26; the recommendation text is k
 | Risk | Mitigation / note |
 |---|---|
 | New attack surface on the Tower: a network listener | Dedicated container, no inventory/overrides mounts, mTLS required, TLS 1.3 only, strict parser, hard limits, counters, 128 MB / 0.25 CPU cap, LAN-address bind and host firewall to the endpoint addresses |
-| Fabricated-event trust | Events never clear router detectors; absence of an incident is not shown as clean |
+| Fabricated-event trust | Events never clear router detectors; absence of an incident is not shown as clean. A root-compromised endpoint can fabricate or suppress events at will and is NOT detected; a host can trip the suppressors on purpose. Pre-auth counters are per peer address and never charged to a host |
 | Operational burden of client-certificate issuance | `provision-endpoint.sh`, 397-day certificates, two SPKI pins for rotation; one desktop first |
 | Endpoint asleep vs guard quiet | Presence from router lease/neighbour; TLS connected vs silent recorded; setup-problem status instead of incident |
 | Accuracy of the join | No source port on the router side; E0 measures it first; shadow mode and a false-alert budget before any incident is shown |
 
-## 13. Review log
+## 13. Implementation blockers
 
-Not yet run. Slots to be filled in the PRP-001 section 15/17 format.
+| Phase | Blocked on |
+|---|---|
+| E1 | The deploy-order gate (server before collector) |
+| E2 | Section 2 Keeper/read-only mechanics (item 1), CA key custody and name separation (section 5), the compromised-host statement (sections 1, 12), the SPKI dependency decision (section 2), and live-connection revocation (section 5) |
+| E5 | A stated false-alert budget AND an E0 result showing key-level matching is useful: CDN keys, NAT'd containers and kernel WireGuard may leave a structural unmatched rate that the 0.9 gate hides or keeps firing on |
+
+## 14. Open questions
+
+- Does the peer's rsyslog (GnuTLS/OpenSSL) accept a self-signed `CA:FALSE` server certificate as the pinned CA (`deploy/gen-certs.sh:127-132`)? Unverified.
+- Does it negotiate TLS 1.3 with mutual TLS? Unverified; the listener is TLS 1.3 only.
+- Is the guard-quiet threshold ">= 20 flows" a per-window gauge sum or a count? `flows` is a max across samples, so the unit must be fixed in E0.
+
+## 15. Review log
 
 | Round | Reviewer | Findings and dispositions |
 |---|---|---|
+| 1 | Opus critic | Verdict REVISE, 5 MAJOR: read-only WAL mechanics, API event-detail data source, CA custody and naming, compromised-host honesty, incident schema fit. All addressed in this revision (sections 1, 2, 5, 7, 8, 12), plus SHOULD-FIX items on future time, wording, network mode, binding, dedup, SPKI dependency, revocation, citations and exit gates |
 | 1 | Opus security review | to be filled when the review runs |
 | 1 | Codex review | to be filled when the review runs |

@@ -244,8 +244,8 @@ D4 server placement; D5 notification topic/ownership; D6 person IDs remain unres
 Proposed new gates for M2b: D7 acceptable offline dataset import cadence (manual vs scheduled) and sources; D8 resolver strategy
 (NextDNS, AdGuard Home or hybrid) and whether provider logs may be read; D9 whether type-level known-issue notes are wanted
 or only version-exact matches.
-Endpoint connection events (M2c) are a separate design-only proposal in [PRP-003](prp/003-endpoint-events.md); it is not PRP-002.
 This roadmap does not resolve them, approve PRP-002, authorize router commands or change enforcement policy.
+Endpoint connection events (M2c) are a separate design-only proposal in [PRP-003](prp/003-endpoint-events.md); it is not PRP-002.
 A future lease-only collection mode avoids dnsmasq changes but loses fingerprint/DNS evidence; show that tradeoff
 rather than promising identical coverage. Safe fixture-driven development can proceed while field-dependent
 acceptance waits. UI framework, external sensor placement, final alert budget and retention beyond current
