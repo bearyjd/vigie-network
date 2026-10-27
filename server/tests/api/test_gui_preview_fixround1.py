@@ -49,6 +49,11 @@ def namespace(tmp_path, monkeypatch):
     root = tmp_path / "synthetic"
     preview.seed(root)
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
+    with (
+        socket.socket() as probe
+    ):  # never the real port: a live preview on this host must not leak in
+        probe.bind(("127.0.0.1", 0))
+        monkeypatch.setattr(preview, "PORT", probe.getsockname()[1])
     return root
 
 
@@ -118,12 +123,26 @@ def attempt(root, argv, inode, states, identity=None, **extra):
     return journal
 
 
+def settled_identity(pid, argv=None):
+    """process_identity once /proc shows the child's argv (it is empty for a moment around exec,
+    worst under load); `argv` additionally waits for that exact value."""
+    deadline = time.monotonic() + 5
+    while True:
+        identity = preview.process_identity(pid)
+        done = (
+            identity is not None and identity["argv"] and (argv is None or identity["argv"] == argv)
+        )
+        if done or time.monotonic() > deadline:
+            return identity
+        time.sleep(0.01)
+
+
 def live(root, listener, sleeper, *, hold=True):
     """A real throwaway child with the exact fixed argv; optionally owning the listener."""
     fd = listener.fileno()
     argv = serve_argv(root, fd)
     child = sleeper(argv, pass_fds=(fd,) if hold else ())
-    identity = preview.process_identity(child.pid)
+    identity = settled_identity(child.pid, argv)
     assert identity is not None and identity["argv"] == argv
     return child, argv, identity, str(os.fstat(fd).st_ino)
 
@@ -478,7 +497,7 @@ def test_health_with_non_object_json_is_unhealthy_not_an_exception(monkeypatch):
 def test_process_identity_reads_real_proc_start_ticks_uid_argv_and_boot(sleeper, tmp_path):
     before = time.time()
     child = sleeper([sys.executable, "-c", "import time; time.sleep(60)"])
-    identity = preview.process_identity(child.pid)
+    identity = settled_identity(child.pid)
     after = time.time()
     raw = Path(f"/proc/{child.pid}/stat").read_text()
     parsed = re.match(r"^\d+ \(.*\) (.*)$", raw, re.S)

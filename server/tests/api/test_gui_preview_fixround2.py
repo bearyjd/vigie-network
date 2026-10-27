@@ -26,6 +26,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     real_stop_signals,
     sandbox_owners,
     serve_argv,
+    settled_identity,
     sleeper,
 )
 
@@ -156,7 +157,7 @@ def test_non_utf8_argv_of_any_process_does_not_break_the_orphan_scan(namespace, 
         stdin=subprocess.DEVNULL,
     )
     try:
-        identity = preview.process_identity(junk.pid)
+        identity = settled_identity(junk.pid)
         assert identity is not None and identity["argv"][-1] == "\udcff\udcfe"
         child, argv, _, inode = live(namespace, listener, sleeper)
         attempt(namespace, argv, inode, [])  # prepared-only, the scan reads every /proc cmdline

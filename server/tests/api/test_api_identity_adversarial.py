@@ -28,6 +28,9 @@ def test_merge_blocks_fully_contained_activity_in_either_component(env, short_de
     assert env.ov.execute("SELECT count(*) FROM audit_log").fetchone()[0] == 0
 
 
+# 10k seeded rows per case: the check is a deterministic step count, so only the 20 s default
+# timeout is load-sensitive.
+@pytest.mark.timeout(120)
 @pytest.mark.parametrize("action", ["create", "revoke", "undo", "clear", "label"])
 def test_identity_write_lock_work_ignores_unrelated_links(env, action):
     suggestion(

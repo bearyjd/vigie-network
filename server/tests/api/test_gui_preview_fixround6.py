@@ -28,6 +28,7 @@ from test_gui_preview_fixround1 import (  # noqa: F401 -- shared fixtures, same 
     preview,
     sandbox_owners,
     serve_argv,
+    settled_identity,
     sleeper,
 )
 from test_gui_preview_fixround3 import _pth
@@ -157,7 +158,7 @@ def children():
 
 
 def _line(child) -> str:
-    identity = preview.process_identity(child.pid)
+    identity = settled_identity(child.pid)
     assert identity is not None
     return f"{child.pid} {identity['start_ticks']} {identity['boot_id']}\n"
 
@@ -582,7 +583,7 @@ def test_an_unpinned_startup_hook_name_is_never_opened(sandbox_owners, tmp_path,
 
 
 def _recognised(holder) -> bool:
-    identity = preview.process_identity(holder.pid)
+    identity = settled_identity(holder.pid)
     assert identity is not None
     return preview._is_controller(identity)
 

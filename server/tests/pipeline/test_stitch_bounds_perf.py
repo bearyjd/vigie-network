@@ -49,6 +49,10 @@ from vigie_pipeline.stitch_db import (
 )
 from vigie_pipeline.stitch_types import Veto
 
+# Tables of up to 500k rows are built per test; the VM-step assertions are deterministic, so only
+# the 20 s default timeout is load-sensitive.
+pytestmark = pytest.mark.timeout(180)
+
 # ---- floods ------------------------------------------------------------------------------------
 
 
