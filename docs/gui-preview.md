@@ -83,18 +83,31 @@ fails the view itself. Each state starts with a text prefix, so colour is never 
 - `Checking` while the first fetch is in flight.
 - `Unavailable` when the fetch failed or the response is malformed. It is never green.
 - `Unknown` when no coverage rows exist yet. Silence is not health.
-- `Warning` when the source observation is stale, any hour is partial or missing, or the collector
-  reports unavailable monitoring scopes. It names the first reason and the issue count.
-- `OK` only when rows exist, the source is current and every displayed hour is qualified. The age
-  check reruns every few seconds, so an `OK` banner turns `Warning` as the observation ages.
+- `Warning` when the evidence is old or incomplete. It names the first reason and the issue count.
+  Reasons: the source or parsed-DNS observation is stale (older than 120 s) or missing; any hour is
+  partial or missing; no hour is qualified yet (all open, so the baseline is still accumulating);
+  `monitoring_unavailable` is not a list or is capped; the summary is capped or its cap is unknown;
+  processing is `Stalled` (oldest pending batch over 180 s) or `Unknown`; or the collector reports
+  unavailable monitoring scopes. Errors on the side of Warning: a missing flag is a gap, not a pass.
+  A fresh pending batch (`Awaiting processing`) is normal flow and does not warn.
+- `OK` only when none of the above applies, e.g. `OK · coverage current; 23 qualified hours, 1
+  accumulating`. Open hours are shown as accumulating and never count as qualified. The age check
+  reruns every few seconds, so an `OK` banner turns `Warning` as the observation ages. Changing
+  view, selecting or paging keeps the previous banner text until a new snapshot arrives; only the
+  first load and a collector or range change show `Checking`.
+- API strings are shown only when they are text or finite numbers; anything else reads
+  `Unavailable`, and a banner that cannot be computed reads `Unavailable`, never its old state.
 
 The Incidents view is a local inbox that needs no notification publisher. Incidents the API marks
 `attention` come first, newest first, with ties kept in API order; payloads without `attention` fall
 back to the incident state. The Decision column shows `acknowledged`, `expected`,
-`snoozed until <UTC>`, `snooze expired · needs review`, `needs review` or `no decision`. Unrecognised
+`snoozed until <UTC>`, `snooze expired · needs attention`, `needs review` or `no decision`; a
+decision the API still flags gets ` · needs attention` appended, so the label and the filter always agree. Unrecognised
 `review` or `attention` values show `unknown decision` and sort as needing attention. The All / Needs
 attention / Quiet filter changes only the view and is kept in the URL hash (`#filter=attention`),
-never in browser storage. Lists show at most 25 rows with `Showing 25 of N`, and an empty list says
+never in browser storage. The API returns at most 25 incidents per page and a longer list is rejected as malformed rather
+than truncated; the pager counts the rows the filter leaves, and a filter that hides rows says
+`Showing X of N incidents on this page`. An empty list says
 absence of incidents is not proof of health. The GUI is intentionally read-only: it has no
 acknowledge, snooze or expected controls and issues only GET requests; decisions are made through
 the authenticated API.

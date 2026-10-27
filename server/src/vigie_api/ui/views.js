@@ -2,12 +2,13 @@
 export function node(tag, attrs = {}, ...children) {
   const n = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) { if (key.startsWith('on')) n.addEventListener(key.slice(2), value); else if (value !== null && value !== undefined) n.setAttribute(key, String(value)); }
-  for (const child of children.flat(Infinity)) if (child !== null && child !== undefined) n.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  for (const child of children.flat(Infinity)) if (child !== null && child !== undefined) n.append(child instanceof Node ? child : document.createTextNode(typeof child === 'string' ? child : text(child)));
   return n;
 }
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
-const text = value => value === null || value === undefined || value === '' ? 'Unavailable' : String(value);
-export function utc(value) { if (value === null || value === undefined || value === '') return 'Unavailable'; const d = new Date(typeof value === 'number' ? value * 1000 : value); return Number.isFinite(d.getTime()) ? d.toISOString().replace('T', ' ').replace('.000Z', ' UTC') : 'Unavailable'; }
+/* The only way an API value becomes display text: strings and finite numbers, never an object's own toString. */
+export const text = value => (typeof value === 'string' && value !== '') || (typeof value === 'number' && Number.isFinite(value)) ? String(value) : 'Unavailable';
+export function utc(value) { if (typeof value !== 'string' && typeof value !== 'number') return 'Unavailable'; if (value === '') return 'Unavailable'; const d = new Date(typeof value === 'number' ? value * 1000 : value); return Number.isFinite(d.getTime()) ? d.toISOString().replace('T', ' ').replace('.000Z', ' UTC') : 'Unavailable'; }
 export function bytes(value) { if (!finite(value)) return 'Unavailable'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; let n = value; let i = 0; while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; } return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${units[i]}`; }
 export function secondsAgo(value, now = Date.now()) { if (typeof value !== 'string' || !value) return null; const t = Date.parse(value); const age = (now - t) / 1000; return Number.isFinite(age) && age >= 0 ? age : null; }
 export function processingState(c, now = Date.now()) {
@@ -45,18 +46,37 @@ function validateHours(data) { if (!data || !Array.isArray(data.hours) || data.h
 function metric(label, value, note, tone = '') { return node('div', {class: 'metric'}, node('span', {class: 'label'}, label), node('strong', {}, value instanceof Node ? value : text(value)), node('small', {}, note), tone ? badge(tone, tone === 'Current' ? 'good' : 'warn') : null); }
 function hourLegend() { return node('div', {class: 'legend'}, ['eligible', 'partial', 'missing', 'open'].map(s => node('span', {}, node('i', {class: `swatch ${s}`, 'aria-hidden': 'true'}), s === 'eligible' ? 'Qualified' : s[0].toUpperCase() + s.slice(1)))); }
 const fresh = age => age !== null && age >= 0 && age <= 120;
-/* One honest line for the banner above every view; only complete, current, fully qualified evidence is 'ok'. */
+const UNAVAILABLE = {tone: 'error', text: 'Unavailable · coverage unavailable, so nothing can be concluded'};
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+/* Every reason the evidence is incomplete or old. Anything missing, capped or unrecognised counts: unknown is never ok. */
+function coverageReasons(data, now) {
+  const c = data.collector; const age = (value, end) => fresh(secondsAgo(value, now)) && fresh(finite(end) ? now / 1000 - end : null);
+  const flawed = hour => hour.state === 'partial' || hour.state === 'missing'; const gaps = data.hours.filter(flawed).length;
+  const gone = Array.isArray(c.monitoring_unavailable) ? c.monitoring_unavailable : null; const backlog = processingState(c, now).label;
+  return [
+    age(c.latest_observation_received_at, c.latest_window_end) ? null : 'source observation stale or missing',
+    age(c.latest_dns_observation_received_at, c.latest_dns_observation_window_end) ? null : 'parsed DNS observation stale or missing',
+    gaps ? `${plural(gaps, 'hour')} partial or missing` : null,
+    data.hours.some(h => h.state === 'eligible') ? null : 'no qualified hour yet, baseline still accumulating',
+    gone === null || c.monitoring_unavailable_capped !== false ? 'evidence incomplete: monitoring scope list missing or capped' : null,
+    c.summary_capped === false ? null : 'evidence incomplete: summary capped or unknown',
+    backlog === 'Stalled' || backlog === 'Unknown' ? `processing ${backlog.toLowerCase()}` : null,
+    gone?.length ? `monitoring unavailable for ${text(gone[0]?.device_id)} · ${text(gone[0]?.reason)}${gone.length > 1 ? ` and ${gone.length - 1} more` : ''}` : null,
+  ].filter(Boolean);
+}
+/* One honest line for the banner above every view; only complete, current evidence with a qualified hour is 'ok'. */
 export function coverageStatus(snapshot, now = Date.now()) {
-  if (snapshot?.phase === 'loading') return {tone: 'loading', text: 'Checking · checking coverage'};
-  const data = snapshot?.data; const c = data?.collector;
-  try { if (snapshot?.phase !== 'ready' || !c || typeof c !== 'object') throw new Error(); validateHours(data); }
-  catch { return {tone: 'error', text: 'Unavailable · coverage unavailable, so nothing can be concluded'}; }
-  if (!data.hours.length) return {tone: 'unknown', text: 'Unknown · no coverage data yet'};
-  const windowAge = finite(c.latest_window_end) ? now / 1000 - c.latest_window_end : null;
-  const gaps = data.hours.filter(h => h.state === 'partial' || h.state === 'missing').length; const gone = Array.isArray(c.monitoring_unavailable) ? c.monitoring_unavailable : [];
-  const reasons = [!(fresh(secondsAgo(c.latest_observation_received_at, now)) && fresh(windowAge)) ? 'source observation stale or missing' : null, gaps ? `${gaps} hour${gaps === 1 ? '' : 's'} partial or missing` : null, gone.length ? `monitoring unavailable for ${text(gone[0]?.device_id)} · ${text(gone[0]?.reason)}${gone.length > 1 ? ` and ${gone.length - 1} more` : ''}` : null].filter(Boolean);
-  if (reasons.length) return {tone: 'degraded', text: `Warning · ${reasons[0]} (${reasons.length} issue${reasons.length === 1 ? '' : 's'})`};
-  return {tone: 'ok', text: 'OK · displayed hours qualified and the source is current'};
+  try {
+    if (snapshot?.phase === 'loading') return {tone: 'loading', text: 'Checking · checking coverage'};
+    const data = snapshot?.data;
+    if (snapshot?.phase !== 'ready' || !data?.collector || typeof data.collector !== 'object') return UNAVAILABLE;
+    validateHours(data);
+    if (!data.hours.length) return {tone: 'unknown', text: 'Unknown · no coverage data yet'};
+    const reasons = coverageReasons(data, now);
+    if (reasons.length) return {tone: 'degraded', text: `Warning · ${reasons[0]} (${plural(reasons.length, 'issue')})`};
+    const qualified = data.hours.filter(h => h.state === 'eligible').length; const open = data.hours.filter(h => h.state === 'open').length;
+    return {tone: 'ok', text: `OK · coverage current; ${plural(qualified, 'qualified hour')}${open ? `, ${open} accumulating` : ''}`};
+  } catch { return UNAVAILABLE; }
 }
 export function coverageView(data) {
   validateHours(data); const c = data.collector; if (!c || typeof c !== 'object') throw new Error('Malformed coverage response');
@@ -66,7 +86,7 @@ export function coverageView(data) {
   const dnsWindowAge = finite(c.latest_dns_observation_window_end) ? Date.now() / 1000 - c.latest_dns_observation_window_end : null;
   const oldest = (received, windowEnd) => Math.min(Date.parse(received) / 1000, windowEnd);
   const proc = processingState(c); const count = value => Number.isInteger(value) && value >= 0 ? String(value) : 'Unknown';
-  const strip = node('div', {class: 'health-strip'}, metric('Observation', liveValue(fresh(currentAge) && fresh(windowAge), oldest(c.latest_observation_received_at, c.latest_window_end)), `Received ${utc(c.latest_observation_received_at)}`), metric('Parsed DNS', liveValue(fresh(dnsAge) && fresh(dnsWindowAge), oldest(c.latest_dns_observation_received_at, c.latest_dns_observation_window_end)), `Received ${utc(c.latest_dns_observation_received_at)}`), metric('Source flags', c.source_flags_latest === 0 ? '0 · None reported' : c.source_flags_latest === null || c.source_flags_latest === undefined ? 'Unknown' : String(c.source_flags_latest), c.source_flags_latest === 8 ? 'Multicast discovery unavailable' : 'Latest observation only; history remains below'), metric('Processing', badge(proc.label, proc.tone), `${count(c.backlog_batches)} pending${c.backlog_capped ? ' (capped)' : ''} · oldest ${proc.age === null ? 'unknown' : `${Math.round(proc.age)}s`}`));
+  const strip = node('div', {class: 'health-strip'}, metric('Observation', liveValue(fresh(currentAge) && fresh(windowAge), oldest(c.latest_observation_received_at, c.latest_window_end)), `Received ${utc(c.latest_observation_received_at)}`), metric('Parsed DNS', liveValue(fresh(dnsAge) && fresh(dnsWindowAge), oldest(c.latest_dns_observation_received_at, c.latest_dns_observation_window_end)), `Received ${utc(c.latest_dns_observation_received_at)}`), metric('Source flags', c.source_flags_latest === 0 ? '0 · None reported' : c.source_flags_latest === null || c.source_flags_latest === undefined ? 'Unknown' : text(c.source_flags_latest), c.source_flags_latest === 8 ? 'Multicast discovery unavailable' : 'Latest observation only; history remains below'), metric('Processing', badge(proc.label, proc.tone), `${count(c.backlog_batches)} pending${c.backlog_capped ? ' (capped)' : ''} · oldest ${proc.age === null ? 'unknown' : `${Math.round(proc.age)}s`}`));
   const counts = Object.fromEntries(['eligible', 'partial', 'missing', 'open'].map(s => [s, data.hours.filter(h => h.state === s).length]));
   const hours = node('div', {class: 'hour-strip', role: 'img', 'aria-label': `Coverage: ${counts.eligible} qualified, ${counts.partial} partial, ${counts.missing} missing, ${counts.open} open hours`}, data.hours.map(h => node('span', {class: `hour ${['eligible', 'partial', 'missing', 'open'].includes(h.state) ? h.state : 'missing'}`, title: `${utc(h.hour)} · ${text(h.state)} · ${(h.reasons || []).join(', ') || 'no reported reasons'}`})));
   const qualityRows = data.hours.filter(h => h.state !== 'eligible').map(h => node('tr', {}, node('td', {}, utc(h.hour)), node('td', {}, badge(h.state, h.state === 'partial' ? 'warn' : '')), node('td', {}, finite(h.qualified_seconds) ? `${h.qualified_seconds}s` : 'Unavailable'), node('td', {}, (h.reasons || []).join(', ') || 'Hour still open')));
@@ -80,7 +100,7 @@ export function inventoryView(data, onSelect) {
 }
 export function deviceView(d, onActivity) {
   if (!d || typeof d.id !== 'string' || !Array.isArray(d.macs)) throw new Error('Malformed device response');
-  const names = [...new Set(d.macs.map(m => m.hostname).filter(Boolean))]; const ch = d.explanation?.characterization;
+  const names = [...new Set(d.macs.map(m => m.hostname).filter(h => typeof h === 'string' && h))]; const ch = d.explanation?.characterization;
   return node('aside', {class: 'detail-panel', 'aria-label': 'Identity detail', tabindex: '-1'}, node('span', {class: 'eyebrow'}, 'SELECTED IDENTITY'), node('h2', {}, d.name || 'Unlabelled identity'), node('code', {class: 'identity-id'}, d.id), copyButton(d.id, 'detail'), facts([['Human label', d.name || 'Not assigned'], ['DHCP names', names.join(', ') || 'Not observed'], ['Last observed IP', d.last_observed_ip || 'Unavailable'], ['IP observed at', utc(d.last_observed_ip_at)], ['Type', d.type || 'unknown'], ['Type source', d.type_provenance?.source || 'No supported classification'], ['Identity state', text(d.identity_state)], ['Status', text(d.status)], ['First seen', utc(d.first_seen)], ['Last seen', utc(d.last_seen)], ['Merged into', d.merged_into || 'No active merge']]), node('button', {type: 'button', class: 'primary', 'data-focus-key': `activity:${d.id}`, onclick: () => onActivity(d.id)}, 'View activity'), node('div', {class: 'callout'}, 'IDs identify tracked inventory records. MAC rotation, merges and undo can change the relationship to a physical device. IPs are historical observations.'), ch ? node('section', {}, node('h3', {}, 'Classification evidence'), facts([['Result', ch.inferred_type], ['Strength', ch.strength], ['Reason', ch.reason], ['Model', ch.model_version], ['Valid until', utc(ch.valid_until)]]), node('ul', {class: 'plain-list'}, (ch.evidence || []).map(e => node('li', {}, `${text(e.kind)} · ${text(e.service)} · ${utc(e.observed_at)}`)))) : node('p', {class: 'small muted'}, 'Unknown means the available evidence did not support a current classification.'));
 }
 function svgNode(tag, attrs = {}, content = null) { const n = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v)); if (content !== null) n.textContent = String(content); return n; }
@@ -100,40 +120,48 @@ export function activityView(data) {
   validateHours(data); if (!data.baseline || typeof data.device_id !== 'string') throw new Error('Malformed activity response'); const b = data.baseline;
   const states = {learning: 'Learning', mature: 'Mature', rebuilding: 'Rebuilding', rebuilding_quality: 'Rebuilding after quality changes', lineage_unavailable: 'Identity lineage unavailable'};
   const rows = data.hours.map(h => node('tr', {}, node('td', {}, utc(h.hour)), node('td', {}, badge(h.state, h.state === 'partial' ? 'warn' : '')), node('td', {}, bytes(h.bytes_up)), node('td', {}, bytes(h.bytes_down)), node('td', {}, finite(h.dns_queries) ? String(h.dns_queries) : 'Unavailable'), node('td', {}, (h.reasons || []).join(', ') || '—')));
-  return node('div', {}, node('div', {class: 'section-head'}, node('h2', {}, 'Traffic over time'), badge(states[b.state] || 'Unknown reference state', b.state === 'mature' ? 'good' : '')), node('code', {class: 'identity-id'}, data.device_id), node('div', {class: 'callout'}, b.state === 'mature' ? `Qualified reference available · median upload ${bytes(b.median_upload_bytes)} per hour.` : 'A mature reference is not available for this identity and source. Observed traffic remains visible while the reference learns or rebuilds.'), facts([['Qualified hours', finite(b.sample_hours) ? String(b.sample_hours) : 'Unavailable'], ['Distinct dates', finite(b.distinct_days) ? String(b.distinct_days) : 'Unavailable'], ['Training since', utc(b.training_since)], ['Algorithm', text(b.algorithm)]]), activityChart(data), node('div', {class: 'chart-meta'}, node('span', {}, 'Paired bars · hourly totals'), node('span', {}, 'Partial/open hours are faint · missing hours remain gaps')), node('div', {class: 'legend'}, node('span', {}, node('i', {class: 'swatch upload', 'aria-hidden': 'true'}), 'Upload'), node('span', {}, node('i', {class: 'swatch download', 'aria-hidden': 'true'}), 'Download'), node('span', {}, 'Dashed area: unavailable observations')), node('details', {}, node('summary', {}, 'Hourly observations and quality'), node('div', {class: 'scroll-details'}, table(['Hour · UTC', 'Quality', 'Upload', 'Download', 'DNS', 'Reasons'], rows))), node('p', {class: 'table-note'}, 'Observed totals can be incomplete when coverage is partial. Missing data is never drawn as zero traffic.'));
+  return node('div', {}, node('div', {class: 'section-head'}, node('h2', {}, 'Traffic over time'), badge(typeof b.state === 'string' && Object.hasOwn(states, b.state) ? states[b.state] : 'Unknown reference state', b.state === 'mature' ? 'good' : '')), node('code', {class: 'identity-id'}, data.device_id), node('div', {class: 'callout'}, b.state === 'mature' ? `Qualified reference available · median upload ${bytes(b.median_upload_bytes)} per hour.` : 'A mature reference is not available for this identity and source. Observed traffic remains visible while the reference learns or rebuilds.'), facts([['Qualified hours', finite(b.sample_hours) ? String(b.sample_hours) : 'Unavailable'], ['Distinct dates', finite(b.distinct_days) ? String(b.distinct_days) : 'Unavailable'], ['Training since', utc(b.training_since)], ['Algorithm', text(b.algorithm)]]), activityChart(data), node('div', {class: 'chart-meta'}, node('span', {}, 'Paired bars · hourly totals'), node('span', {}, 'Partial/open hours are faint · missing hours remain gaps')), node('div', {class: 'legend'}, node('span', {}, node('i', {class: 'swatch upload', 'aria-hidden': 'true'}), 'Upload'), node('span', {}, node('i', {class: 'swatch download', 'aria-hidden': 'true'}), 'Download'), node('span', {}, 'Dashed area: unavailable observations')), node('details', {}, node('summary', {}, 'Hourly observations and quality'), node('div', {class: 'scroll-details'}, table(['Hour · UTC', 'Quality', 'Upload', 'Download', 'DNS', 'Reasons'], rows))), node('p', {class: 'table-note'}, 'Observed totals can be incomplete when coverage is partial. Missing data is never drawn as zero traffic.'));
 }
-const detector = value => ({large_upload: 'Large upload', upload_deviation: 'Upload above reference'}[value] || text(value));
-const INBOX_CAP = 25; const FILTERS = [['all', 'All'], ['attention', 'Needs attention'], ['quiet', 'Quiet']];
-const QUIET_LABELS = {acknowledged: 'acknowledged', expected: 'expected'};
-/* Decision label and whether a human is still needed. Unrecognised data fails loud: it needs attention. */
-function triage(d, now) {
-  const unknown = {label: 'unknown decision', attention: true}; const r = d.review; const open = d.state === 'open';
-  if (d.attention !== undefined && typeof d.attention !== 'boolean') return unknown;
-  const pick = (label, derived, forced = false) => ({label, attention: typeof d.attention === 'boolean' ? d.attention || forced : derived});
-  if (r === null || r === undefined) return pick(open ? 'needs review' : 'no decision', open);
-  if (typeof r !== 'object' || Array.isArray(r)) return unknown;
-  if (Object.hasOwn(QUIET_LABELS, r.status)) return pick(QUIET_LABELS[r.status], false);
+const DETECTORS = new Map([['large_upload', 'Large upload'], ['upload_deviation', 'Upload above reference']]);
+const detector = value => typeof value === 'string' && DETECTORS.has(value) ? DETECTORS.get(value) : text(value);
+const FILTERS = [['all', 'All'], ['attention', 'Needs attention'], ['quiet', 'Quiet']];
+const QUIET_LABELS = new Map([['acknowledged', 'acknowledged'], ['expected', 'expected']]);
+/* The decision on record, apart from the verdict: derived = does it need a human; forced = an expired snooze overrides the API flag. */
+function decide(r, open, now) {
+  if (r === null || r === undefined) return {label: 'no decision', derived: open, forced: false};
+  if (typeof r !== 'object' || Array.isArray(r) || typeof r.status !== 'string') return null;
+  if (QUIET_LABELS.has(r.status)) return {label: QUIET_LABELS.get(r.status), derived: false, forced: false};
   const until = r.status === 'snoozed' && typeof r.snooze_until === 'string' ? Date.parse(r.snooze_until) : NaN;
-  if (!Number.isFinite(until)) return unknown;
-  return now < until ? pick(`snoozed until ${utc(r.snooze_until)}`, false) : pick('snooze expired · needs review', open, open);
+  if (!Number.isFinite(until)) return null;
+  return now < until ? {label: `snoozed until ${utc(r.snooze_until)}`, derived: false, forced: false} : {label: 'snooze expired', derived: open, forced: open};
 }
-const detectedMs = d => { const t = typeof d.detected_at === 'number' ? d.detected_at * 1000 : Date.parse(d.detected_at); return Number.isFinite(t) ? t : -Infinity; };
+/* The ONE rule behind both the label and the filter bucket. Unrecognised data fails loud: it needs attention. */
+function triage(d, now) {
+  const unknown = {label: 'unknown decision', attention: true};
+  if (d.attention !== undefined && typeof d.attention !== 'boolean') return unknown;
+  const decision = decide(d.review, d.state === 'open', now); if (!decision) return unknown;
+  const attention = typeof d.attention === 'boolean' ? d.attention || decision.forced : decision.derived;
+  if (!attention) return {label: decision.label, attention};
+  return {label: decision.label === 'no decision' ? 'needs review' : `${decision.label} · needs attention`, attention};
+}
+const detectedMs = d => { const t = typeof d.detected_at === 'number' ? d.detected_at * 1000 : typeof d.detected_at === 'string' ? Date.parse(d.detected_at) : NaN; return Number.isFinite(t) ? t : -Infinity; };
 function filterBar(active, counts, onFilter) {
   return node('div', {class: 'filter-bar', role: 'group', 'aria-label': 'Filter incidents (changes this view only)'}, FILTERS.map(([name, label]) => node('button', {type: 'button', 'data-focus-key': `filter:${name}`, 'aria-pressed': String(name === active), onclick: () => onFilter(name)}, `${label} (${counts[name]})`)));
 }
-/* Read-only inbox: needs-attention first, then newest; sorts a copy and never writes a decision. */
+const activeFilter = filter => FILTERS.some(([name]) => name === filter) ? filter : 'all';
+/* Needs-attention first, then newest, ties in API order; works on copies and never writes a decision. */
+function triaged(data, now) { return data.map(d => ({d, ...triage(d, now)})).sort((a, b) => Number(b.attention) - Number(a.attention) || detectedMs(b.d) - detectedMs(a.d)); }
+export function inboxRows(data, filter, now = Date.now()) { const active = activeFilter(filter); return triaged(data, now).filter(r => active === 'all' || (active === 'attention') === r.attention); }
 export function incidentsView(data, onSelect, {filter = 'all', onFilter = () => {}, now = Date.now()} = {}) {
-  if (!Array.isArray(data) || data.length > 100 || data.some(d => !d || typeof d.id !== 'string')) throw new Error('Malformed incidents response');
+  if (!Array.isArray(data) || data.length > 25 || data.some(d => !d || typeof d.id !== 'string')) throw new Error('Malformed incidents response');  // the API page limit is 25: more is a broken contract, never truncated quietly
   if (!data.length) return empty('No incidents recorded for this scope', 'Absence of incidents is not proof of health: this does not establish healthy coverage or normal device behavior. Check the coverage banner and the Overview.');
-  const active = FILTERS.some(([name]) => name === filter) ? filter : 'all';
-  const rows = data.map(d => ({d, ...triage(d, now)})).sort((a, b) => Number(b.attention) - Number(a.attention) || detectedMs(b.d) - detectedMs(a.d));
+  const rows = triaged(data, now); const active = activeFilter(filter); const shown = inboxRows(data, active, now);
   const counts = {all: rows.length, attention: rows.filter(r => r.attention).length, quiet: rows.filter(r => !r.attention).length};
-  const shown = rows.filter(r => active === 'all' || (active === 'attention') === r.attention);
   const bar = filterBar(active, counts, onFilter);
   if (!shown.length) return node('div', {}, bar, empty('No incidents match this filter', `${rows.length} incidents on this page are hidden by the filter. Choose All to see them.`));
-  const note = shown.length > INBOX_CAP ? node('p', {class: 'table-note'}, `Showing ${INBOX_CAP} of ${shown.length} incidents on this page`) : null;
-  const row = ({d, label, attention}) => node('tr', {}, node('td', {}, node('button', {class: 'identity-button', type: 'button', 'data-focus-key': `incident:${d.id}`, onclick: () => onSelect(d.id)}, node('span', {class: 'identity-name'}, detector(d.detector)), node('code', {class: 'identity-id'}, d.id))), node('td', {}, node('code', {class: 'mono'}, d.device_id), node('span', {class: 'subline'}, d.current_lineage ? 'Current identity lineage' : 'Historical identity lineage')), node('td', {}, badge(d.state, d.state === 'open' ? 'warn' : '')), node('td', {}, badge(label, attention ? 'warn' : '')), node('td', {}, `${bytes(d.observed_bytes)} / ${bytes(d.threshold_bytes)}`), node('td', {}, utc(d.detected_at)));
-  return node('div', {}, bar, note, table(['Observation', 'Inventory identity', 'State', 'Decision', 'Observed / threshold', 'Detected · UTC'], shown.slice(0, INBOX_CAP).map(row)));
+  const note = shown.length < rows.length ? node('p', {class: 'table-note'}, `Showing ${shown.length} of ${rows.length} incidents on this page`) : null;
+  const row = ({d, label, attention}) => node('tr', {}, node('td', {}, node('button', {class: 'identity-button', type: 'button', 'data-focus-key': `incident:${d.id}`, onclick: () => onSelect(d.id)}, node('span', {class: 'identity-name'}, detector(d.detector)), node('code', {class: 'identity-id'}, d.id))), node('td', {}, node('code', {class: 'mono'}, d.device_id), node('span', {class: 'subline'}, d.current_lineage === true ? 'Current identity lineage' : 'Historical identity lineage')), node('td', {}, badge(d.state, d.state === 'open' ? 'warn' : '')), node('td', {}, badge(label, attention ? 'warn' : '')), node('td', {}, `${bytes(d.observed_bytes)} / ${bytes(d.threshold_bytes)}`), node('td', {}, utc(d.detected_at)));
+  return node('div', {}, bar, note, table(['Observation', 'Inventory identity', 'State', 'Decision', 'Observed / threshold', 'Detected · UTC'], shown.map(row)));
 }
 export function incidentView(d, onActivity) {
   if (!d || !d.evidence || typeof d.id !== 'string') throw new Error('Malformed incident response'); const e = d.evidence;

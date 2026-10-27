@@ -1,5 +1,5 @@
 import {ApiClient, ApiError, StaleResult} from './client.js';
-import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, utc} from './views.js';
+import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc} from './views.js';
 
 const byId = id => document.getElementById(id);
 const client = new ApiClient();
@@ -9,13 +9,19 @@ const titles = {overview: 'Overview', inventory: 'Inventory', activity: 'Activit
 const preview = new URLSearchParams(location.search).get('preview') === 'synthetic';
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
-const FILTER_HASH = /^#filter=(all|attention|quiet)$/;
+const FILTER_HASH = /^#filter=(all|attention|quiet)$/;  // anchored: anything else means 'all'
 // The inbox filter is view state only: it lives in the URL hash, never in storage and never in a request.
 const inboxFilter = () => FILTER_HASH.exec(location.hash)?.[1] ?? 'all';
 function setBanner() {
-  const box = byId('coverage-banner'); const status = coverageStatus(state.coverage, Date.now()); box.hidden = !state.connected;
-  if (box.textContent === status.text && box.getAttribute('data-tone') === status.tone) return;  // an unchanged live region stays quiet
-  box.setAttribute('data-tone', status.tone); box.textContent = status.text;
+  const box = byId('coverage-banner'); box.hidden = !state.connected;
+  try {
+    const status = coverageStatus(state.coverage, Date.now());
+    if (box.textContent === status.text && box.getAttribute('data-tone') === status.tone) return;  // an unchanged live region stays quiet
+    box.setAttribute('data-tone', status.tone); box.textContent = status.text;
+  } catch {  // a banner that cannot be computed or painted must never keep an old, possibly green, state
+    box.textContent = 'Unavailable · coverage status could not be computed';
+    try { box.setAttribute('data-tone', 'error'); } catch { /* the text above already says it */ }
+  }
 }
 function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
 // Which control inside #content holds focus. Controls carry a stable data-focus-key (kind + id);
@@ -91,15 +97,16 @@ async function load(clear = false, focus = null, automatic = false) {
   if (!clear && document.hidden) return;
   if (!clear && automatic && interacting()) { chrome(); schedule(); return; }
   clearTimeout(timer); client.invalidate(); const generation = ++state.generation; state.loading = !document.hidden;
-  if (clear) { state.updated = null; state.coverage = {phase: 'loading'}; byId('content').replaceChildren(node('p', {class: 'loading'}, 'Loading observations…')); notice(); }
+  if (clear) { state.updated = null; byId('content').replaceChildren(node('p', {class: 'loading'}, 'Loading observations…')); notice(); }
   chrome();
   if (document.hidden) return;
   if (clear) (focus === '#view-title' ? byId('view-title') : byId('content')).focus({preventScroll: true});
   const focusAnchor = document.activeElement;
+  let banner = null;  // coverage for non-overview views; it never rejects
   try {
     const cursor = state.cursors[state.page]; let content; let next = null; let coverage = null;
     // Other views still fetch coverage (same endpoint) so the banner is never absent; its failure never fails the view.
-    const banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
+    banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
     if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); coverage = {phase: 'ready', data: result.data}; if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
     if (state.view === 'inventory') {
       const [list, detail] = await Promise.all([client.devices(cursor), state.selectedDevice ? client.device(state.selectedDevice) : Promise.resolve(null)]);
@@ -114,7 +121,7 @@ async function load(clear = false, focus = null, automatic = false) {
     if (state.view === 'incidents') {
       const [list, detail] = await Promise.all([client.incidents(state.collector, cursor), state.selectedIncident ? client.incident(state.selectedIncident, state.collector) : Promise.resolve(null)]);
       next = list.page?.next_cursor || null;
-      content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident, {filter: inboxFilter(), onFilter: setInboxFilter}), pager(state.page, list.data.length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
+      content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident, {filter: inboxFilter(), onFilter: setInboxFilter}), pager(state.page, inboxRows(list.data, inboxFilter()).length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
     }
     if (generation !== state.generation || !state.connected) return;
     if (automatic && interacting()) return;
@@ -124,20 +131,22 @@ async function load(clear = false, focus = null, automatic = false) {
     if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});
   } catch (error) {
     if (generation !== state.generation || error instanceof StaleResult || error.name === 'AbortError') return;
-    if (state.view === 'overview') state.coverage = {phase: 'error'};
+    const snapshot = state.view === 'overview' ? {phase: 'error'} : await (banner ?? Promise.resolve({phase: 'error'}));
+    if (generation !== state.generation) return;
+    state.coverage = snapshot;
     failure(error instanceof ApiError ? error : new ApiError(0, 'malformed_response'));
-  } finally { if (generation === state.generation) { state.loading = false; chrome(); schedule(); } }
+  } finally { if (generation === state.generation) { state.loading = false; try { chrome(); } finally { schedule(); } } }
 }
 byId('connect-form').addEventListener('submit', event => {
   event.preventDefault(); const token = byId('token').value.trim(); const collector = byId('connect-collector').value.trim(); byId('token').value = '';
   if (!token || !collector || collector.length > 64) { notice('Enter a collector ID and a dedicated read-only token.'); return; }
-  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
+  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
   catch { disconnected('The connection inputs were invalid.'); }
 });
 byId('scope-form').addEventListener('submit', event => {
   event.preventDefault(); const collector = byId('collector').value.trim(); const hours = Number(byId('range').value);
   if (!collector || collector.length > 64 || ![24, 168].includes(hours)) { notice('Enter a collector ID and select a supported history range.'); return; }
-  state.collector = collector; state.hours = hours; state.selectedIncident = null; resetPage(); load(true, '#view-title');
+  state.collector = collector; state.hours = hours; state.selectedIncident = null; state.coverage = {phase: 'loading'}; resetPage(); load(true, '#view-title');
 });
 byId('disconnect').addEventListener('click', () => disconnected());
 byId('refresh').addEventListener('click', () => { if (!state.loading && Date.now() >= client.retryAt) load(false); });
