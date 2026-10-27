@@ -191,15 +191,15 @@ A runner exception is caught and logged (first occurrence and every 20th), never
 pass. A message holds the device label (the `device_overrides.name`, else the device id) and a
 relative link `/ui/#incident=<id>`, nothing else: the label goes through a
 STRICT ACCEPTOR (`delivery_publish.scrub_label`). After NFKC and whitespace collapsing it is sent
-verbatim only if all hold: 1 to 48 characters; only letters of any script, spaces, `'`, `’`, the
+verbatim only if all hold: 1 to 48 characters; only Latin letters (accented ones such as ü, é, ç, ß count; Cyrillic, Greek, CJK, Arabic and invisible fillers do not, because they can imitate ASCII or hide), spaces, `'`, `’`, the
 ASCII hyphen and ASCII digits; at most 3 digits; fewer than 12 hex-looking letters/digits once
 squashed (no MAC, however separated); no word of 20 or more characters. Otherwise the message
-carries the stable alias `Device <4 letters>` derived from a hash of the device id. Nothing is ever
+carries the stable alias `Device <6 letters>` derived from a hash of the device id. Nothing is ever
 cleaned, dropped or partly redacted, so dots, colons, slashes, `@`, invisible characters and other
 separators (hence hostnames, addresses, emails, URLs, serials) are impossible by construction, and
 the function is idempotent. This over-redacts on purpose: a name with a dot, an underscore, an
-emoji, more than 3 digits or other punctuation shows as an alias, and the owner sees the real
-name by following the link.
+emoji, more than 3 digits or other punctuation, or a name in a non-Latin script, shows as an alias, and the owner sees the real
+name by following the link. When no `device_overrides.name` exists (or the lookup fails) the message carries the alias, never the raw device id. Incident ids reach the relative link and the body by design; delivery ids are hashes.
 
 **Settings** (all in `deploy/.env.example`; invalid values stop the pipeline at startup):
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any

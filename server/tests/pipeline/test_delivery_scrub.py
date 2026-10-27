@@ -13,10 +13,12 @@ import pytest
 from vigie_pipeline.delivery_publish import alias, build_message, scrub_label
 
 DEV = "dev-1"
-ALIAS = re.compile(r"Device [a-z]{4}")
+ALIAS = re.compile(r"Device [a-z]{6}")
 HEX = set("0123456789abcdef")
 
 REJECTED = [
+    "ㅤ", "ᅠ", "ᅟ", "ㅤㅤ TV", "аа bb cc dd ee ff", "ааbbccddeeff", "Ελλάδα", "中文",
+    "المطبخ", "リビング", "спальня",
     "foo.рф", "TV 10.0.0.1x", "SN1234567", "ᄀ​ᅡ",  # Codex's cases
     "deviceaa-bb-cc-dd-ee-ff", "aa/bb/cc/dd/ee/ff", "aa–bb–cc–dd–ee–ff",
     "aa​bb​cc​dd​ee​ff", "aabbccddeeff", "TV_aabbccddeeff",
@@ -30,8 +32,8 @@ REJECTED = [
 ]  # fmt: skip
 ACCEPTED = [
     "Living room TV", "Pi-hole 2", "Kid tablet", "Mum's laptop", "Büro Drucker", "Küche",
-    "Garage door 3", "Anna’s phone", "Salle de bain", "リビング", "TV",
-    "спальня", "Bedroom 1 and 2",
+    "Garage door 3", "Anna’s phone", "Salle de bain", "TV", "Bedroom 1 and 2", "Café", "Straße",
+    "Åsa", "François",
 ]  # fmt: skip
 
 
@@ -73,6 +75,10 @@ def test_alias_is_letters_only_stable_per_device_and_differs_between_devices():
     assert scrub_label(alias("dev-1"), "dev-1") == alias("dev-1")  # accepted as is
 
 
+def test_aliases_of_similar_ids_do_not_collide():
+    assert alias("529") != alias("1497")  # four letters collided for exactly these two
+
+
 def test_build_message_uses_the_device_for_the_alias():
     msg = build_message("d" * 32, "open", "i1", "aa:bb:cc:dd:ee:ff", DEV)
     assert alias(DEV) in msg.body and "aa:bb" not in msg.body
@@ -80,12 +86,18 @@ def test_build_message_uses_the_device_for_the_alias():
 
 
 # ---- property test: an independent reference acceptor, thousands of random strings -----------
+def _latin(c: str) -> bool:
+    return unicodedata.category(c).startswith("L") and unicodedata.name(c, "").startswith("LATIN")
+
+
 def _reference(raw: str) -> str | None:
     """The spec, written independently of the implementation: the accepted text or None."""
     text = " ".join(unicodedata.normalize("NFKC", raw).split())
     if not 1 <= len(text) <= 48:
         return None
-    if not all(c.isalpha() or c in " '’-" or c in "0123456789" for c in text):
+    if not any(_latin(c) for c in text):
+        return None
+    if not all(_latin(c) or c in " '’-0123456789" for c in text):
         return None
     if sum(c in "0123456789" for c in text) > 3:
         return None
@@ -102,6 +114,8 @@ POOLS = [
     list("0123456789 "),
     list("!\"#$%&()*+,./:;<=>?@[\\]^_`{|}~'-\t\n"),
     ["​", "‍", "﻿", "­", "⁠", "‮", "\x00", "\x1b", "́", "̸"],
+    ["ㅤ", "ᅠ", "ᅟ", "а", "б", "α", "ا", "中"],
+    ["ㅤ", "ᅠ", "ᅟ", "а", "б", "α", "ا", "中"],
     ["\U0001f642", "–", "—", "‑", "。", "．", "：", " ", "　"],
     list("üéрф中文リ١٢１Ａ"),
     ["aabbccddeeff", "aa-bb-cc", "10.0.0.1", "a.b.com", "x@y.z", "deadbeef", "12345", "TV", "2"],
@@ -109,7 +123,7 @@ POOLS = [
 SAMPLES = 6000
 
 
-PLAIN = [list("ghijklmnopqrstuvwxyz GHIJKLMNOPQRSTUVWXYZ -'"), list("\u00fc\u00e9\u0440\u4e2d 012")]
+PLAIN = [list("ghijklmnopqrstuvwxyz GHIJKLMNOPQRSTUVWXYZ -'"), list("\u00fc\u00e9\u00df 012")]
 
 
 def _random_label(rng: random.Random) -> str:
@@ -133,3 +147,23 @@ def test_property_output_is_the_reference_acceptance_or_the_alias():
             assert len(out) <= 48 and sum(c.isdigit() for c in out) <= 3
             assert scrub_label(want, DEV) == want  # differential: accepted text is a fixed point
     assert SAMPLES * 0.05 < accepted < SAMPLES * 0.95  # both branches are exercised
+
+
+@pytest.mark.parametrize("raw", ["123", "1 - 2", "' -", "-", "7"])
+def test_a_label_without_a_latin_letter_is_the_alias(raw):
+    assert scrub_label(raw, DEV) == alias(DEV)
+
+
+@pytest.mark.parametrize("raw", ["\u3164", "\u1160", "\u115f"])
+def test_invisible_letters_are_never_returned(raw):
+    assert scrub_label(raw, DEV) == alias(DEV)
+    assert scrub_label(f"TV {raw}", DEV) == alias(DEV)
+
+
+def test_cyrillic_lookalike_cannot_bypass_the_hex_squash():
+    assert scrub_label("aa bb cc dd ee ff", DEV) == alias(DEV)
+    assert scrub_label("\u0430\u0430 bb cc dd ee ff", DEV) == alias(DEV)
+
+
+def test_symbols_named_latin_are_not_letters():
+    assert scrub_label("Kid \u271d tab", DEV) == alias(DEV)  # LATIN CROSS is a symbol (So)

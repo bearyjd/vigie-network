@@ -11,7 +11,7 @@ from delivery_runner_helpers import SINCE, T0, Clock, World, dconf
 
 from vigie_pipeline import delivery_runner
 from vigie_pipeline.delivery_plan import Enqueue, Expected, Expire, delivery_id
-from vigie_pipeline.delivery_publish import FakePublisher, PublishError
+from vigie_pipeline.delivery_publish import FakePublisher, PublishError, alias
 from vigie_pipeline.delivery_runner import run_delivery
 from vigie_pipeline.delivery_sql import PassError
 
@@ -61,11 +61,50 @@ def test_open_incident_sends_exactly_one_open_message(world):
     assert len(pub.sent) == 1
 
 
-def test_label_falls_back_to_device_id(world):
-    world.incident(device="dev-9")
+def _body(world, device="node-xyz"):
     pub = FakePublisher()
     go(world, pub, Clock())
-    assert "dev-9" in pub.sent[0].body
+    (msg,) = pub.sent
+    return " ".join([msg.title, msg.body])
+
+
+def test_missing_name_row_uses_the_alias_never_the_device_id(world):
+    world.incident(device="node-xyz")
+    text = _body(world)
+    assert "node-xyz" not in text and alias("node-xyz") in text
+
+
+def test_empty_and_null_names_use_the_alias(world):
+    for i, name in enumerate(("", None)):
+        device = f"node-{'ab'[i]}"
+        world.incident(f"i{i}", device=device)
+        world.ov.execute(
+            "INSERT INTO device_overrides(device_id,name,updated_at,updated_by) VALUES (?,?,?,?)",
+            (device, name, "2026-01-01T00:00:00Z", "t"),
+        )
+    pub = FakePublisher()
+    go(world, pub, Clock())
+    assert len(pub.sent) == 2
+    for msg in pub.sent:
+        assert "node-" not in msg.body and "Device " in msg.body
+
+
+def test_lookup_error_uses_the_alias_never_the_device_id(world):
+    world.incident(device="node-xyz")
+    world.ov.execute("DROP TABLE device_overrides")
+    text = _body(world)
+    assert "node-xyz" not in text and alias("node-xyz") in text
+
+
+def test_an_id_shaped_name_from_the_database_goes_through_the_acceptor(world):
+    world.incident(device="dev-1")
+    world.name("dev-1", "node-xyz")  # an admin chose it: accepted like any label
+    assert "node-xyz" in _body(world)
+    world.incident("i2", device="dev-2")
+    world.name("dev-2", "node-xyz.local")
+    pub = FakePublisher()
+    go(world, pub, Clock(T0 + 10))
+    assert all("xyz.local" not in m.body for m in pub.sent)
 
 
 def test_acknowledged_incident_is_suppressed_and_never_sent(world):

@@ -135,15 +135,16 @@ def _message(inv, ro, claimed: DeliveryView) -> Message | None:
     ).fetchone()
     if row is None:
         return None
-    label = row[0]
+    device = row[0]
+    label = None  # only a name from device_overrides may be offered; never the raw device id
     try:
-        named = ro.execute("SELECT name FROM device_overrides WHERE device_id=?", (label,))
+        named = ro.execute("SELECT name FROM device_overrides WHERE device_id=?", (device,))
         found = named.fetchone() if ro is not None else None
-        label = found[0] if found and found[0] else label
+        label = found[0] if found and found[0] else None
     except sqlite3.Error:
-        pass  # the label is a nicety: fall back to the device id
+        pass  # the label is a nicety: without it the message carries the alias
     did = delivery_id(claimed.incident_id, claimed.kind)
-    return build_message(did, claimed.kind, claimed.incident_id, label, row[0])
+    return build_message(did, claimed.kind, claimed.incident_id, label, device)
 
 
 def _prune() -> None:

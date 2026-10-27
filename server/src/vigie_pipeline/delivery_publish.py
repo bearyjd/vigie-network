@@ -60,16 +60,24 @@ class Publisher(Protocol):
 
 
 def alias(device_id: object) -> str:
-    """`Device <4 letters>` from the hash of the device id: stable, letters only (so the acceptor
+    """`Device <6 letters>` from the hash of the device id: stable, letters only (so the acceptor
     below accepts it unchanged)."""
     digest = hashlib.sha256(str(device_id).encode()).digest()
-    return "Device " + "".join(chr(ord("a") + b % 26) for b in digest[:4])
+    return "Device " + "".join(chr(ord("a") + b % 26) for b in digest[:6])
+
+
+def _latin(c: str) -> bool:
+    """A Latin letter (ü, é, ç, ß included). Other scripts are confusable with ASCII (a Cyrillic
+    `а` evades the hex check) and some are invisible (Hangul fillers), so they are not accepted."""
+    return unicodedata.category(c).startswith("L") and unicodedata.name(c, "").startswith("LATIN")
 
 
 def _acceptable(text: str) -> bool:
     if not 1 <= len(text) <= MAX_LABEL:
         return False
-    if not all(c.isalpha() or c in _PUNCT or c in _DIGITS for c in text):
+    if not any(_latin(c) for c in text):
+        return False
+    if not all(_latin(c) or c in _PUNCT or c in _DIGITS for c in text):
         return False
     if sum(c in _DIGITS for c in text) > MAX_DIGITS:
         return False
@@ -80,13 +88,14 @@ def _acceptable(text: str) -> bool:
 
 def scrub_label(raw: object, device_id: object = "") -> str:
     """STRICT ACCEPTOR. The label (NFKC, whitespace collapsed) is used verbatim only if every
-    character is a letter of any script, a space, an apostrophe, an ASCII hyphen or an ASCII digit
-    and it is short, has at most 3 digits, does not look like a MAC once squashed and holds no
-    opaque long word. Anything else becomes the stable alias of the device: text is never cleaned
-    or partly redacted, so dots, colons, slashes, `@`, separators, hostnames, addresses, serials
-    and invisible tricks cannot get through, and the function is idempotent by construction.
-    Over-redaction is intended: a name with a dot, an underscore, an emoji, more than 3 digits or
-    other punctuation shows as an alias; the owner sees the real name by following the link."""
+    character is a Latin letter, a space, an apostrophe, an ASCII hyphen or an ASCII digit (and at
+    least one is a Latin letter), and it is short, has at most 3 digits, does not look like a MAC
+    once squashed and holds no opaque long word. Anything else becomes the stable alias of the
+    device: text is never cleaned or partly redacted, so dots, colons, slashes, `@`, separators,
+    hostnames, addresses, serials and invisible tricks cannot get through, and the function is
+    idempotent by construction. Over-redaction is intended: a name in another script, with a dot,
+    an underscore, an emoji, more than 3 digits or other punctuation shows as an alias; the owner
+    sees the real name by following the link."""
     head = "" if raw is None else str(raw)[:RAW_CUT]
     text = " ".join(unicodedata.normalize("NFKC", head).split())
     return text if _acceptable(text) else alias(device_id)
