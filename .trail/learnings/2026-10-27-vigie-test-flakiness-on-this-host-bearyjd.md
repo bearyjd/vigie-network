@@ -18,5 +18,5 @@ touches:
 - Full-suite runs with `--basetemp` on disk were slower, not faster: sqlite/fsync-heavy tests; /tmp (tmpfs) is fine when it is not full.
 
 ## Watch out
-- Host load average here reaches 85-120 on 22 cores (hook processes from many sessions); a collection-time subprocess probe with a 20 s timeout aborted a whole run. Keep collection-time probes at >=120 s.
+- Host load average here reaches 85-120 on 22 cores (hook processes from many sessions); a collection-time subprocess probe with a 20 s timeout aborted a whole run. Keep collection-time probes at >=120 s as a mitigation; even that can fail on a saturated host.
 - `/tmp` is a 32 GB tmpfs shared by all projects: a full run beside other sessions' scratch can hit `Disk quota exceeded` (Errno 122), which looks like 50+ unrelated failures.

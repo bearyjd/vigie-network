@@ -14,8 +14,8 @@ touches:
 - #23 first: fix commit ce641c7 sits locally on top of unpushed D7 commit 142fc16. Verify, rebase onto main, push over SSH, CI, narrow Codex re-check, merge.
 
 ## Tried and ruled out
-- RESUME.md is stale (says main = 1a51097). STATE.md says main = 760edf1. Trust STATE.md.
+- RESUME.md is stale (says main = 1a51097). STATE.md says main = 760edf1. STATE.md is the better snapshot, but verify main against git and the remote (`git ls-remote`) before acting; both files go stale.
 
 ## Watch out
-- /home/user/.cache/vigie-wt-evidence has an uncommitted edit to server/src/vigie_api/evidence_redact.py and is behind origin/main by 2. Look at the diff before committing or rebasing.
+- the evidence-pack worktree under ~/.cache has an uncommitted edit to server/src/vigie_api/evidence_redact.py and is behind origin/main by 2. Look at the diff before committing or rebasing.
 - #24 still owes two doc fixes (Keeper fail-closed wording, lineage-mismatch claim) before the Codex re-check.
