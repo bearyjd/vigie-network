@@ -79,7 +79,9 @@ How it is enforced, honestly:
   open/read/close cycles against a continuously committing writer produced no errors, and a reader
   after the writer was SIGKILLed saw a consistent snapshot. Single-use `--once` runs and
   `compose run` helpers hold nothing.
-- **When a keeper is down, readers fail closed.** The api answers 500 on inventory reads. The
+- **When a keeper is down, readers usually fail closed.** (A writer that crashed instead of closing
+  cleanly can leave readable WAL sidecars, so a reader may see a stale but consistent snapshot; anything
+  that must notice a dead writer needs its own freshness check.) The api answers 500 on inventory reads. The
   pipeline logs `overrides_unreadable` and runs with NO identity links and NO rules from
   `overrides.db` (it never treats an unreadable file as trust or as a grant), and a shard it cannot
   read leaves its batch pending for the next pass. Consequence worth knowing: while the api is down

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from vigie_api.errors import ApiError
@@ -163,8 +164,16 @@ def _truncated(pack: Pack, section_id: str, keep: int) -> Pack:
     return Pack({**pack.body, "sections": {**sections, section_id: new}}, redacted=pack.redacted)
 
 
-def fit(pack: Pack, fmt: str, cap: int = MAX_PACK_BYTES) -> tuple[Pack, bytes]:
-    """Render, halving the largest section until it fits; 413 if nothing is left to cut."""
+def fit(
+    pack: Pack,
+    fmt: str,
+    cap: int = MAX_PACK_BYTES,
+    requery: Callable[[Pack], list[dict[str, Any]]] | None = None,
+) -> tuple[Pack, bytes]:
+    """Render, halving the largest section until it fits; 413 if nothing is left to cut.
+
+    `requery` rebuilds `search_queries` from what a truncated pack still contains, so a query never
+    points at evidence that was cut to make the pack fit."""
     render = {"json": render_json, "markdown": render_markdown}[fmt]
     current = pack
     while True:
@@ -176,3 +185,7 @@ def fit(pack: Pack, fmt: str, cap: int = MAX_PACK_BYTES) -> tuple[Pack, bytes]:
         if largest is None or sizes[largest] == 0:
             raise ApiError(413, "pack_too_large", "evidence pack exceeds the size cap")
         current = _truncated(current, largest, sizes[largest] // 2)
+        if requery is not None:
+            current = Pack(
+                {**current.body, "search_queries": requery(current)}, redacted=current.redacted
+            )
