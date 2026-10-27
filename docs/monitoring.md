@@ -85,6 +85,43 @@ to their original lineage; stale open incidents are superseded. API labels stale
 If a retained training hour later loses quality, the active reference is withheld immediately by the API. The pipeline supersedes its open incidents and restarts future learning in `rebuilding_quality`; the historical immutable reference stays attributable. Collector-hour invalidations fan out through a durable cursor in batches of1000 MACs, and incomplete identities back off60 seconds so independent scopes progress. New entities may learn qualified history already recorded since feature activation; newly attached
 MACs cannot immediately redefine an old reference.
 
+### Time-of-day baseline (tod-median-v1, not wired)
+
+`vigie_pipeline/baselines_tod.py` is a pure module (no I/O, clock or database) that is NOT used by
+the engine yet: monitoring still runs `pooled-median-v1`, and no schema, migration or environment
+variable changed.
+
+- **Cohorts.** `(is_weekend, hour_of_day // bucket_hours)` read from the sample's epoch hour in
+  UTC. `bucket_hours` divides 24 (1, 2, 3, 4, 6, 8, 12 or 24; default 4), so adjacent hours pool and
+  there are `2 * 24 / bucket_hours` cohorts. Local time and DST are deferred: a DST change never
+  moves a sample between cohorts, it only means the bucket is not the household's wall-clock hour.
+- **Maturity.** A cohort needs at least 20 valid samples AND 7 distinct UTC days, else it ABSTAINS
+  (`immature_samples`, then `immature_days`). With four-hour buckets a weekday cohort matures after
+  about 7 weekdays of history and a weekend cohort after about 7 weekend days (the fourth Saturday).
+- **Valid samples.** Ineligible (missing) hours are skipped, never counted as zero. Suspicious hours
+  and hours at or above the fixed large-upload line are excluded as contamination. At most 4368
+  samples (26 weeks) are accepted; hours and byte counts must be exact integers.
+- **Threshold.** Twice the cohort median is kept exactly; the line is
+  `max(minimum_bytes, median * multiplier)`, the same constants as `pooled-median-v1`.
+- **The caller freezes the baseline.** `fit_tod(samples, config, trained_until)` learns only from
+  hours up to `trained_until` and records it, plus each cohort's last trained hour. `findings_tod`
+  scores an hour only if it is strictly after both; otherwise it abstains with
+  `leaks_evaluated_hours`. The engine wiring unit will choose and persist `trained_until`; appending
+  later history never redefines normality, so slow drift is judged against the frozen window.
+- **Detection.** The fixed large-upload candidate is always evaluated first, even in cold start or
+  with an immature cohort. The learned deviation needs TWO consecutive eligible hours, each strictly
+  above the line of its OWN mature cohort. An immature current cohort abstains with its reason; an
+  immature previous cohort abstains with `previous_<reason>`. A nightly backup that is high every
+  night is learned, not flagged.
+- **Known blind band.** A baseline poisoned by sustained high traffic before `trained_until` can
+  raise a cohort threshold up to `multiplier` times its median-twice, so sustained exfiltration just
+  under the fixed large-upload line (1 GiB/h) may not yield an `upload_deviation` candidate. The
+  fixed detector remains the backstop; the engine wiring unit must freeze `trained_until` before
+  suspected incidents and may cap the threshold. This is the same limit as `pooled-median-v1`.
+- **Versioning.** `TodConfig.version` hashes the algorithm id and every parameter, including
+  `bucket_hours`. Results are deterministic for any input order, and backfilled history fits by its
+  own cohort.
+
 ## Bounded read API
 
 All routes require the existing bearer read token, preserve collector scope and return typed envelopes.
