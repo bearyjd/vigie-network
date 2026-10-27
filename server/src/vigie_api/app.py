@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vigie_api import (
     effective,
+    evidence_routes,
     feeds,
     identity_writes,
     incident_decisions,
@@ -189,7 +190,7 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         return ApiError(429, "rate_limited", "too many requests", {"Retry-After": str(wait)})
 
     def is_incident_write(request: Request) -> bool:
-        return request.method == "POST" and request.url.path.startswith("/incidents/")
+        return evidence_routes.is_guarded_write(request.method, request.url.path)
 
     def reject_if_unauthorized(request: Request) -> None:
         principal = check_auth(request, request.headers.get("authorization"))
@@ -794,4 +795,5 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             )
         )
 
+    evidence_routes.install(app, settings, clock, (get_inv, get_ov, writer), _errors)
     return app

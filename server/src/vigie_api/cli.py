@@ -1,4 +1,5 @@
-"""Entrypoint: `python -m vigie_api [serve opts]` and `python -m vigie_api tokens create|revoke`.
+"""Entrypoint: `python -m vigie_api [serve opts]` and `python -m vigie_api tokens create|revoke`,
+`python -m vigie_api evidence export DEVICE -o FILE`.
 
 Serving refuses to start without TLS unless --insecure-dev (same rule as vigie_ingest).
 """
@@ -14,8 +15,8 @@ from pathlib import Path
 
 import uvicorn
 
-from vigie_api import tokens
-from vigie_api.app import create_app
+from vigie_api import evidence_cli, tokens
+from vigie_api.app import VERSION, create_app
 from vigie_api.config import Settings
 from vigie_api.schema import open_overrides
 from vigie_ingest.db import iso_utc
@@ -66,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args_list[:1] == ["tokens"]:
             return _tokens_main(args_list[1:])
+        if args_list[:1] == ["evidence"]:
+            return evidence_cli.main(args_list[1:], VERSION)
         return _serve_main(args_list)
     finally:
         os.umask(previous)

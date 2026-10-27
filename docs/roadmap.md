@@ -118,7 +118,7 @@ ntfy delivery and topic ownership remain gated by D5; the local inbox works with
 Goal: help the owner see which devices may be exposed to known vulnerabilities and which traffic looks like it
 could be malicious, as **evidence with confidence labels**. Nothing here is a verdict. A match never blocks
 traffic, never changes a group or trust, and never merges identities; enforcement stays with Couvre-feu. This is
-a proposal: no code, dataset import, provider call or notification exists for it, and it needs the owner decisions D7-D9.
+a proposal: apart from the dataset-free device evidence pack below (phase 1, implemented), no dataset import, provider call or notification exists for it, and the rest is gated by per-dataset source, license and false-positive review (D7, D8 and D9 are decided).
 
 Phases, each shippable and reviewed on its own:
 1. **Identity quality first.** CVE-style matching needs vendor/product (ideally version). Measure how many
@@ -163,6 +163,30 @@ Constraints that apply to every phase:
   phase 1 coverage is useful. Proposed targets, to be calibrated with owner-labelled data.
 - Tests: fixture-replayed lists with benign and malicious domains, list-update and rollback, partial-DNS-coverage
   abstention, duplicate/overlapping sources, and a negative suite proving a match never changes trust or groups.
+
+### Device evidence pack (export for outside analysis)
+
+Requirement: the owner can export what Vigie knows about one device as a single, bounded, redacted document to
+take to an external analyst or assistant, without Vigie itself calling any network service. The pack carries
+evidence with confidence labels and provenance, never a verdict. Contract, levels, audit and the injection
+posture are in `docs/api.md` ("Evidence pack"). Phasing:
+1. **Phase 1 (implemented).** `POST /devices/{id}/evidence-pack` and `vigie-api evidence export`: identity,
+   DHCP/mDNS fingerprints, type determinations, incidents and coverage gaps, with `datasets: []`. No CVE, KEV,
+   reputation or provider data. The GUI stays GET-only and read-only; an export button is future work.
+2. **Phase 2.** A `known_issue_notes` section once D7 data exists (below). Every match cites a `dataset_id` with
+   version, date and sha256 under `datasets[]`; this is an additive minor schema bump.
+3. **Phase 3.** A `dns_reputation` section from the local parsed-DNS match, only after the incident detector exists.
+
+Owner decisions recorded 2026-10-26:
+- **D9 = A (type-level notes).** Known-issue notes may be type-level. Only the known-exploited (KEV) list qualifies,
+  and only with a product-level signal (an OUI alone never does). Notes appear in device detail only: never as
+  incidents, never in notifications. A human can mark a note "not applicable", with an audit entry.
+- **D8 = keep NextDNS upstream.** The router's dnsmasq stays the single home DNS entry point, so Vigie attributes
+  queries per device; NextDNS stays the upstream and roaming filter; provider logs are read-only context only.
+- **D7 = confirmed by the owner, 2026-10-26.** A scheduled fetch of KEV and URLhaus into a staging area, a human
+  accept step, and versioned, reversible imports; KEV and URLhaus first. Confirmation approves the plan, not an
+  implementation: no fetch, import or dataset exists yet, and each dataset still needs its source, version, license
+  and false-positive review before import.
 
 ### Resolver role: NextDNS, AdGuard Home and Vigie
 
@@ -240,9 +264,10 @@ Review each unit independently, then run the whole chain and collect deployment 
 
 D1 authoritative couvre-feu tree; D2 dnsmasq-change policy; D3 fixed-MAC policy for kid/adult devices;
 D4 server placement; D5 notification topic/ownership; D6 person IDs remain unresolved owner gates.
-Proposed new gates for M2b: D7 acceptable offline dataset import cadence (manual vs scheduled) and sources; D8 resolver strategy
-(NextDNS, AdGuard Home or hybrid) and whether provider logs may be read; D9 whether type-level known-issue notes are wanted
-or only version-exact matches.
+New gates for M2b: D7 offline dataset import cadence and sources (decided: scheduled fetch into staging with human
+accept, KEV and URLhaus first); D8 resolver strategy (decided: keep NextDNS upstream, router
+dnsmasq as the single home entry point, provider logs read-only context); D9 known-issue notes (decided: type-level,
+KEV only, product-level signal required, device detail only). See "Device evidence pack" above.
 This roadmap does not resolve them, approve PRP-002, authorize router commands or change enforcement policy.
 A future lease-only collection mode avoids dnsmasq changes but loses fingerprint/DNS evidence; show that tradeoff
 rather than promising identical coverage. Safe fixture-driven development can proceed while field-dependent

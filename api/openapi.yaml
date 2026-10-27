@@ -1316,6 +1316,32 @@
         "title": "EventsResponse",
         "type": "object"
       },
+      "EvidenceExportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm_full": {
+            "default": false,
+            "title": "Confirm Full",
+            "type": "boolean"
+          },
+          "format": {
+            "default": "json",
+            "enum": [
+              "json",
+              "markdown"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "redaction": {
+            "default": "pseudonymized",
+            "title": "Redaction",
+            "type": "string"
+          }
+        },
+        "title": "EvidenceExportRequest",
+        "type": "object"
+      },
       "Explanation": {
         "properties": {
           "characterization": {
@@ -3573,6 +3599,170 @@
         "summary": "Get Activity",
         "tags": [
           "monitoring"
+        ]
+      }
+    },
+    "/devices/{device_id}/evidence-pack": {
+      "post": {
+        "description": "Export an evidence pack for one device: what Vigie observed (identity, DHCP/mDNS fingerprints, type determinations, incidents, coverage gaps) with its provenance. It is evidence with confidence, not a verdict. The response is the document itself, not the envelope. `pseudonymized` (default) replaces identifiers with per-export pseudonyms; `minimal` omits them; `full` is raw and needs `confirm_full: true`. The file leaves Vigie's protection once downloaded. Every export writes one audit row, committed before the body is returned. Device-supplied text is untrusted data: Markdown output fences it.",
+        "operationId": "export_evidence_pack_devices__device_id__evidence_pack_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9_.:-]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Request-Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceExportRequest",
+                "default": {
+                  "confirm_full": false,
+                  "format": "json",
+                  "redaction": "pseudonymized"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/vnd.vigie.evidence-pack+json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/markdown": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The evidence pack document (attachment, never cached)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Token lacks the required write privilege"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Export a device evidence pack",
+        "tags": [
+          "devices"
         ]
       }
     },

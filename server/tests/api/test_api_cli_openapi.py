@@ -93,7 +93,8 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
     spec = json.loads(render())
     assert spec["openapi"].startswith("3.1")
     assert set(spec["paths"]) == {
-        "/coverage", "/devices/{device_id}/activity", "/incidents", "/incidents/{incident_id}",
+        "/coverage", "/devices/{device_id}/activity", "/devices/{device_id}/evidence-pack",
+        "/incidents", "/incidents/{incident_id}",
         "/incidents/{incident_id}/snooze", "/incidents/{incident_id}/{action}",
         "/healthz", "/devices", "/devices/{device_id}", "/macs/{mac}", "/events", "/suggestions",
         "/suggestions/{suggestion_id}/accept", "/suggestions/{suggestion_id}/reject",
@@ -146,10 +147,23 @@ def test_every_2xx_has_a_typed_schema_and_etag_where_expected() -> None:
     spec = json.loads(render())
     for path, item in spec["paths"].items():
         for method, operation in item.items():
+            if path.endswith("/evidence-pack"):  # the document itself, not the envelope
+                continue
             ok = operation["responses"]["200"]["content"]["application/json"]["schema"]
             assert "$ref" in ok, (method, path)
     for method, path in (("get", "/devices/{device_id}"), ("patch", "/devices/{device_id}")):
         assert "ETag" in spec["paths"][path][method]["responses"]["200"]["headers"]
+
+
+def test_evidence_pack_is_a_post_attachment_with_its_own_media_types() -> None:
+    spec = json.loads(render())
+    item = spec["paths"]["/devices/{device_id}/evidence-pack"]
+    assert set(item) == {"post"}
+    content = item["post"]["responses"]["200"]["content"]
+    assert set(content) == {"application/vnd.vigie.evidence-pack+json", "text/markdown"}
+    body = spec["components"]["schemas"]["EvidenceExportRequest"]
+    assert body["additionalProperties"] is False
+    assert {"401", "403", "404", "413", "422", "429", "503"} <= set(item["post"]["responses"])
 
 
 def test_untrusted_text_fields_are_marked_in_the_schema() -> None:
