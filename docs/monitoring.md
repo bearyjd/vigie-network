@@ -166,8 +166,9 @@ it records `eligible_since`, and incidents detected before that instant are igno
 it on never announces old open incidents.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
-`recover`; `UNIQUE(incident_id, kind)`), `state` `pending`, `sent`, `failed`, `suppressed` or
-`expired`, integer epoch-second `created_at`, `updated_at` and `next_attempt_at` (required while
+`recover`; `UNIQUE(incident_id, kind)`), `state` `pending`, `sent`, `failed`, `suppressed`,
+`expired` or `withdrawn` (a recover taken back because its incident is not resolved), integer
+epoch-second `created_at`, `updated_at` and `next_attempt_at` (required while
 pending), `attempts >= 0`, a `version` that every change increments, and `last_error` capped at
 200 characters. `delivery_id` is the first 32 hex chars of `sha256(incident_id + "\n" + kind)`.
 External payloads carry a device label and an incident link only.
@@ -191,10 +192,15 @@ state, attempts and version) as an assertion. Each action is one conditional sta
   `state='suppressed'`.
 - `Expire` and `Fail`: `UPDATE ...` with the planned state, `pending`, or `suppressed` for a
   revival that fails or expires.
-- `Withdraw` (a pending recover) and `Forget` (a terminal row): `DELETE ... WHERE delivery_id=? AND
-  state=? AND attempts=? AND version=?`. A `Forget` of an `open` row adds
-  `AND NOT EXISTS (SELECT 1 FROM incident_deliveries r WHERE r.incident_id=? AND r.kind='recover'
-  AND r.state='pending')`.
+- `Withdraw` (a pending recover): `UPDATE ... SET state='withdrawn' WHERE ... state='pending' ...`.
+  `Revive` (a withdrawn recover, when the incident is resolved again): `UPDATE ... SET
+  state='pending', attempts=0, next_attempt_at=?, created_at=? WHERE ... state='withdrawn' AND
+  attempts=? AND version=?`. A row is never deleted and recreated while its incident has rows, so
+  its `version` only grows and a sender's completion for an earlier incarnation cannot land on a
+  later one.
+- `Forget` (a terminal row): `DELETE ... WHERE delivery_id=? AND state=? AND attempts=? AND
+  version=?`. A `Forget` of an `open` row adds `AND NOT EXISTS (SELECT 1 FROM
+  incident_deliveries r WHERE r.incident_id=? AND r.kind='recover' AND r.state='pending')`.
 
 Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-finite `now` raises
 `ValueError`, action times are integer seconds):
@@ -215,15 +221,21 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
 - An incident that closes before its `open` delivery went out expires it and gets no `recover`.
   Exactly one `recover` is created, only for a `resolved` incident whose `open` was `sent`, on the
   first pass after resolution however old the open row is. A pending `recover` for an incident that
-  is no longer `resolved` (open again, or superseded) is withdrawn (deleted), so the next resolution enqueues a fresh one; a recover that
-  was already sent is not repeated. Known limit: superseded incidents, and incidents that stay open
-  because the device went silent (`monitoring_unavailable` covers silence), get no recovery notice.
-- Retention: terminal rows of a closed incident are forgotten once `updated_at` is more than 30
-  days old, but an open row stays until its recover row is terminal, and rows of a still-open
-  incident are kept so an old incident never re-announces. Terminal rows of an incident missing
-  from the list follow the same 30 day rule; pending ones expire first. An incident id that is
-  pruned and later reappears after its delivery rows have been forgotten is treated as new, and so
-  is a closed incident that reopens after its rows were forgotten (real incidents get a new id).
+  is no longer `resolved` (open again, or superseded) is withdrawn, and the next resolution revives
+  that row as a new episode (attempts, `created_at` and so ttl and lifetime restart); a recover that
+  was already sent is not repeated. Accepted window: between planner passes the sender may deliver
+  a pending recover to an incident that has reopened, been superseded or gone missing; the next
+  pass withdraws the row, so the user may see one stale recovery notice. Known limit: superseded
+  incidents, and incidents that stay open because the device went silent
+  (`monitoring_unavailable` covers silence), get no recovery notice.
+- Retention is all or nothing. An incident's rows are forgotten together, in one pass (one
+  transaction), and only when the incident is closed or missing, no recover is owed, and every row
+  is terminal (`withdrawn` counts) and more than 30 days past `updated_at`. Rows of a still-open
+  incident are never forgotten, so an old incident never re-announces, and a row is never forgotten
+  alone: a half-forgotten incident would announce again when it reopens. Pending rows of a missing
+  incident expire first. An incident id that is pruned and later reappears after all its delivery
+  rows have been forgotten is treated as new, and so is a closed incident that reopens after its
+  rows were forgotten (real incidents get a new id).
 - Watermark: an incident detected before `eligible_since` that has no delivery rows is ignored
   completely. An incident that already has any row is managed normally, so raising the watermark
   never drops an owed recover or forgets state, and lowering it only admits incidents that were

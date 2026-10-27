@@ -13,12 +13,24 @@ def test_invariants_hold_over_a_random_world(name, seed):
 
 
 def test_the_simulation_exercises_every_action_and_stale_plans():
-    seen, skips = set(), 0
+    seen, skips, dropped = set(), 0, 0
     for seed in range(300):
         world = World(seed, [None, TIGHT, EDGE][seed % 3])
         world.run()
         seen |= world.seen
         skips += world.skips
+        dropped += world.dropped
     # Fail is a defensive revival path: a consistent sender already fails rows at the budget
-    assert seen >= {"Enqueue", "Suppress", "Requeue", "Reschedule", "Expire", "Forget", "Withdraw"}
+    every = {
+        "Enqueue",
+        "Suppress",
+        "Requeue",
+        "Reschedule",
+        "Expire",
+        "Forget",
+        "Withdraw",
+        "Revive",
+    }
+    assert seen >= every
+    assert dropped > 10  # asynchronous completions that lost to a planner change
     assert skips > 20

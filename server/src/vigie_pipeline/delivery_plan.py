@@ -12,11 +12,13 @@ The rules are listed in docs/monitoring.md ("Incident delivery"); in short:
   attempt budget (past it: Fail) and by a hard lifetime: a row older than `retention_seconds`
   from `created_at` is Expired as `lifetime` and never revived;
 * an incident that closes before its open delivery went out expires it; only a `resolved` incident
-  whose open was `sent` gets exactly one `recover`; a pending recover of an incident that is no
-  longer resolved is Withdrawn (deleted);
+  whose open was `sent` gets exactly one `recover` row per delivery life; a pending recover of an
+  incident that is no longer resolved is Withdrawn (state `withdrawn`, never deleted: versions
+  only grow), and a later resolution Revives that row (attempts and created_at restart);
 * an incident behind `eligible_since` that has NO rows is ignored; one with rows is managed;
-* terminal rows of closed or missing incidents are Forgotten after `retention_seconds` since
-  `updated_at`, never while a recover is owed or pending;
+* an incident's rows are Forgotten ALL TOGETHER, in one pass, only when the incident is closed or
+  missing, no recover is owed, and every row is terminal and older than `retention_seconds`
+  (by `updated_at`); a half-forgotten incident would re-announce when it reopens;
 * unknown states or statuses and non-finite or non-numeric data fail closed
   (`unrecognised_state`, never raise); a bad `now` raises ValueError.
 
@@ -33,8 +35,15 @@ one conditional statement that also bumps `version`; 0 affected rows is a bug: l
 the pass (the transaction rolls back). A Forget of an `open` row carries
 `sibling_recover='absent_or_terminal'`: its DELETE adds `AND NOT EXISTS (SELECT 1 FROM
 incident_deliveries r WHERE r.incident_id=? AND r.kind='recover' AND r.state='pending')`.
-Times in actions are integer epoch seconds. `expected`/`sibling_recover` are excluded from
-dataclass equality so tests compare actions by meaning and assert them separately.
+Withdraw is `UPDATE state='withdrawn'`; Revive is `UPDATE state='pending', attempts=0,
+next_attempt_at=?, created_at=?` from `withdrawn`; the sender's completion is
+`UPDATE ... WHERE state='pending' AND version=<captured>`, so a result recorded for an earlier
+incarnation can never land on a later one.
+Accepted window: between planner passes the sender may deliver a pending recover to an incident
+that has reopened, been superseded or gone missing; the next pass withdraws the row. The user may
+see one stale recovery notice. Times in actions are integer epoch seconds.
+`expected`/`sibling_recover` are excluded from dataclass equality so tests compare actions by
+meaning and assert them separately.
 """
 
 from __future__ import annotations
@@ -45,8 +54,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 KINDS = ("open", "recover")
-STATES = frozenset({"pending", "sent", "failed", "suppressed", "expired"})
-TERMINAL = frozenset({"sent", "failed", "suppressed", "expired"})
+STATES = frozenset({"pending", "sent", "failed", "suppressed", "expired", "withdrawn"})
+TERMINAL = frozenset({"sent", "failed", "suppressed", "expired", "withdrawn"})
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 CLOSED_STATES = frozenset({"resolved", "superseded"})
 UNRECOGNISED = "unrecognised_state"
@@ -188,14 +197,25 @@ class Forget:
 
 @dataclass(frozen=True)
 class Withdraw:
-    """Delete a pending `recover` whose incident is open again."""
+    """Mark a pending `recover` whose incident is no longer resolved as `withdrawn`."""
 
     incident_id: str
     kind: str
     expected: Expected | None = field(default=None, compare=False)
 
 
-Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget | Withdraw
+@dataclass(frozen=True)
+class Revive:
+    """Bring a `withdrawn` recover back to pending for a new episode (attempts and created_at
+    restart, so ttl and lifetime restart too); `version` still only grows."""
+
+    incident_id: str
+    kind: str
+    not_before: int
+    expected: Expected | None = field(default=None, compare=False)
+
+
+Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget | Withdraw | Revive
 
 
 def delivery_id(incident_id: str, kind: str) -> str:
@@ -293,48 +313,45 @@ def _aged(d: DeliveryView, now: float, config: DeliveryConfig) -> bool:
     return _num(d.updated_at) and now - d.updated_at > config.retention_seconds
 
 
-def _may_forget(d: DeliveryView, state: object, ds: Mapping[str, DeliveryView], now, config):
-    """Aged terminal rows of a closed incident, unless a recover is still owed."""
-    if state not in CLOSED_STATES or not _aged(d, now, config):
-        return False
-    opened, recover = ds.get("open"), ds.get("recover")
-    if d.kind == "open" and recover is not None and recover.state == "pending":
-        return False
-    if state == "resolved" and opened is not None and opened.state == "sent":
-        if d.kind == "open":
-            return recover is not None and recover.state in TERMINAL
-        return _aged(opened, now, config)  # the recover goes together with its open row
-    return True
-
-
-def _forget(iid: str, d: DeliveryView) -> Forget:
-    return Forget(iid, d.kind, _exp(d), "absent_or_terminal" if d.kind == "open" else None)
+def _forget_all(
+    iid: str, ds: Mapping[str, DeliveryView], now: float, config: DeliveryConfig
+) -> list[Action]:
+    """All-or-nothing: an incident's rows go together, and only when every one is terminal and
+    older than retention (the dedup memory of a half-forgotten incident would re-announce it)."""
+    rows = [d for _, d in sorted(ds.items())]
+    if not rows or any(d.state not in TERMINAL or not _aged(d, now, config) for d in rows):
+        return []
+    sibling = "absent_or_terminal"
+    return [Forget(iid, d.kind, _exp(d), sibling if d.kind == "open" else None) for d in rows]
 
 
 def _row_action(
-    iid: str, d: DeliveryView, state: object, ds: Mapping[str, DeliveryView], now, config
+    iid: str, d: DeliveryView, state: object, now: float, config: DeliveryConfig
 ) -> Action | None:
-    if d.state == "pending":
-        if not _row_ok(d):
-            return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
-        if d.kind == "recover" and state != "resolved":
-            return Withdraw(iid, d.kind, _exp(d))
-        if _lifetime_over(d, now, config):
-            return Expire(iid, d.kind, "lifetime", _exp(d))
-        if now - max(d.created_at, d.next_attempt_at) >= config.pending_ttl_seconds:
-            return Expire(iid, d.kind, "ttl", _exp(d))
+    """Pending rows only: the others are inert until a verdict or a Forget touches them."""
+    if d.state != "pending":
         return None
-    return _forget(iid, d) if _may_forget(d, state, ds, now, config) else None
+    if not _row_ok(d):
+        return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
+    if d.kind == "recover" and state != "resolved":
+        return Withdraw(iid, d.kind, _exp(d))
+    if _lifetime_over(d, now, config):
+        return Expire(iid, d.kind, "lifetime", _exp(d))
+    if now - max(d.created_at, d.next_attempt_at) >= config.pending_ttl_seconds:
+        return Expire(iid, d.kind, "ttl", _exp(d))
+    return None
 
 
-def _orphan_action(
-    iid: str, d: DeliveryView, ds: Mapping[str, DeliveryView], now: float, config: DeliveryConfig
-) -> Action | None:
-    if d.state == "pending":
-        return Expire(iid, d.kind, "incident_missing", _exp(d))
-    recover = ds.get("recover")
-    blocked = d.kind == "open" and recover is not None and recover.state == "pending"
-    return _forget(iid, d) if _aged(d, now, config) and not blocked else None
+def _recover_action(iid: str, ds: Mapping[str, DeliveryView], now: float) -> Action | None:
+    """The recover a resolved incident with a sent open is owed, if its row is missing/withdrawn."""
+    opened, recover = ds.get("open"), ds.get("recover")
+    if opened is None or opened.state != "sent":
+        return None
+    if recover is None:
+        return Enqueue(iid, "recover", math.ceil(now))
+    if recover.state == "withdrawn":
+        return Revive(iid, "recover", math.ceil(now), _exp(recover))
+    return None
 
 
 def _plan_incident(
@@ -346,20 +363,22 @@ def _plan_incident(
     config: DeliveryConfig,
 ) -> list[Action]:
     if incident is None:  # pruned: nothing left to announce
-        orphans = (_orphan_action(iid, d, ds, now, config) for _, d in sorted(ds.items()))
-        return [a for a in orphans if a]
+        pending = [
+            Expire(iid, k, "incident_missing", _exp(d))
+            for k, d in sorted(ds.items())
+            if d.state == "pending"
+        ]
+        return pending or _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
-    actions: list[Action] = []
-    for _, d in sorted(ds.items()):
-        row = _row_action(iid, d, state, ds, now, config)
-        if row:
-            actions.append(row)
+    rows = (_row_action(iid, d, state, now, config) for _, d in sorted(ds.items()))
+    actions = [a for a in rows if a]
     if "open" not in {a.kind for a in actions}:
         opened = _open_action(iid, state, review, ds.get("open"), now, config)
         actions.extend([opened] if opened else [])
-    announced = ds.get("open") is not None and ds["open"].state == "sent"
-    if state == "resolved" and announced and "recover" not in ds:
-        actions.append(Enqueue(iid, "recover", math.ceil(now)))
+    recover = _recover_action(iid, ds, now) if state == "resolved" else None
+    actions.extend([recover] if recover else [])
+    if state in CLOSED_STATES and not actions:  # nothing pending, nothing owed
+        return _forget_all(iid, ds, now, config)
     return actions
 
 

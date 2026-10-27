@@ -5,7 +5,7 @@ import itertools
 import math
 
 import pytest
-from delivery_sim import apply_cas
+from delivery_sim import apply_cas, complete_send
 
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
@@ -19,6 +19,7 @@ from vigie_pipeline.delivery_plan import (
     Requeue,
     Reschedule,
     ReviewView,
+    Revive,
     Suppress,
     Withdraw,
     after_failure,
@@ -289,7 +290,7 @@ def test_open_and_recover_rows_go_together_once_the_recover_is_terminal(state):
         Forget("i1", "recover"),
     )
     young = [dv(state="sent", created=old), dv("recover", state, created=NOW - 5)]
-    assert run([inc(state="resolved")], deliveries=young) == (Forget("i1", "open"),)
+    assert run([inc(state="resolved")], deliveries=young) == ()  # all or nothing
 
 
 def test_an_old_recover_is_kept_while_its_open_row_is_still_young():
@@ -544,7 +545,7 @@ REVIEWS = [
     "bogus",
 ]
 OPEN_D = [None, "pending", "sent", "failed", "suppressed", "expired"]
-REC_D = [None, "pending", "sent"]
+REC_D = [None, "pending", "sent", "withdrawn"]
 AGES = [5, 90000, 3_000_000]
 
 
@@ -640,7 +641,7 @@ def test_resolve_reopen_resolve_and_a_double_flap_each_end_with_one_recover():
         ds = apply(ds, run([inc(state="resolved")], deliveries=ds), NOW)
         assert [d.kind for d in ds if d.state == "pending"] == ["recover"]
         ds = apply(ds, run([inc()], deliveries=ds), NOW)  # reopens: the recover is withdrawn
-        assert [d.kind for d in ds] == ["open"]
+        assert sorted((d.kind, d.state) for d in ds) == [("open", "sent"), ("recover", "withdrawn")]
     ds = apply(ds, run([inc(state="resolved")], deliveries=ds), NOW)
     assert sorted((d.kind, d.state) for d in ds) == [("open", "sent"), ("recover", "pending")]
     assert run([inc(state="resolved")], deliveries=ds) == ()
@@ -863,3 +864,94 @@ def test_bad_version_fails_closed():
     assert run([inc()], deliveries=[d]) == (Expire("i1", "open", "unrecognised_state"),)
     s = dataclasses.replace(dv(state="suppressed"), version=None)  # type: ignore[arg-type]
     assert run([inc()], deliveries=[s]) == ()
+
+
+# round 5: an incident's rows are forgotten all together, never half
+def test_a_half_forgotten_incident_cannot_announce_twice():
+    t0, d = NOW, DAY
+    rows = [dv("open", "sent", created=t0), dv("recover", "sent", created=t0 + 10 * d)]
+    resolved, at = (
+        inc(state="resolved"),
+        lambda day, incident: run(  # noqa: E731
+            [incident], deliveries=rows, now=t0 + day * d
+        ),
+    )
+    assert at(35, resolved) == ()  # the open row is old but the recover row is not: keep both
+    assert at(36, inc()) == ()  # reopened: no second announcement
+    assert at(37, resolved) == ()  # and no second recover (one per delivery life)
+    assert at(40, resolved) == ()  # exactly retention since the recover: still kept
+    both = run([resolved], deliveries=rows, now=t0 + 40 * d + 1)
+    assert both == (Forget("i1", "open"), Forget("i1", "recover"))
+
+
+def test_a_send_completion_captured_before_a_withdrawal_cannot_mark_the_new_row_sent():
+    pending = dv("recover", created=NOW - 5, nxt=NOW)
+    rows = {("i1", "open"): dv(state="sent"), ("i1", "recover"): pending}
+    captured = pending  # the sender claimed this incarnation (version 0) and is sending
+    for t, state in ((NOW, "open"), (NOW + 10, "resolved")):  # reopened, then resolved again
+        actions = run([inc(state=state)], deliveries=list(rows.values()), now=t)
+        rows, skipped = apply_cas(rows, actions, t)
+        assert not skipped
+    assert rows[("i1", "recover")].state == "pending"
+    assert rows[("i1", "recover")].version > captured.version  # versions never restart
+    after, ok = complete_send(rows, captured, NOW + 11)
+    assert not ok and after == rows
+    fresh, ok = complete_send(rows, rows[("i1", "recover")], NOW + 11)
+    assert ok and fresh[("i1", "recover")].state == "sent"
+
+
+# round 5: a withdrawn recover is revived, never deleted and recreated
+def test_a_withdrawn_recover_is_revived_when_the_incident_resolves_again():
+    ds = [dv(state="sent"), dv("recover", "withdrawn", attempts=2, created=NOW - 500, ver=3)]
+    got = run([inc(state="resolved")], deliveries=ds)
+    assert got == (Revive("i1", "recover", NOW),)
+    assert got[0].expected == Expected("withdrawn", 2, 3)
+    revived = apply(ds, got, NOW)[1]
+    assert (revived.state, revived.attempts, revived.version) == ("pending", 0, 4)
+    assert (revived.created_at, revived.next_attempt_at) == (NOW, NOW)  # a new episode
+    assert run([inc(state="resolved")], deliveries=[ds[0], revived]) == ()
+
+
+@pytest.mark.parametrize("state", ["open", "superseded"])
+def test_a_withdrawn_recover_stays_withdrawn_while_nothing_is_owed(state):
+    ds = [dv(state="sent"), dv("recover", "withdrawn")]
+    assert run([inc(state=state)], deliveries=ds) == ()
+    assert run([inc(state="resolved")], deliveries=[dv(state="failed"), ds[1]]) == ()
+
+
+def test_withdraw_marks_the_row_and_the_next_resolution_revives_it_with_a_higher_version():
+    ds = [dv(state="sent"), dv("recover")]
+    withdrawn = apply(ds, run([inc()], deliveries=ds), NOW)
+    assert [(d.kind, d.state, d.version) for d in withdrawn] == [
+        ("open", "sent", 0),
+        ("recover", "withdrawn", 1),
+    ]
+    again = apply(withdrawn, run([inc(state="resolved")], deliveries=withdrawn), NOW)
+    assert [(d.kind, d.state, d.version) for d in again][1] == ("recover", "pending", 2)
+
+
+def test_a_withdrawn_row_is_terminal_for_the_all_or_nothing_forget():
+    old = NOW - RET - 1
+    ds = [dv(state="sent", created=old), dv("recover", "withdrawn", created=old)]
+    both = (Forget("i1", "open"), Forget("i1", "recover"))
+    assert run([inc(state="superseded")], deliveries=ds) == both
+    assert run([], deliveries=ds) == both
+    assert run([inc(state="resolved")], deliveries=ds) == (Revive("i1", "recover", NOW),)
+
+
+def test_orphan_rows_are_forgotten_all_or_nothing():
+    old, young = NOW - RET - 1, NOW - 5
+    assert (
+        run([], deliveries=[dv(state="sent", created=old), dv("recover", "sent", created=young)])
+        == ()
+    )
+    both = run([], deliveries=[dv(state="sent", created=old), dv("recover", "sent", created=old)])
+    assert both == (Forget("i1", "open"), Forget("i1", "recover"))
+    live = run([], deliveries=[dv(state="sent", created=old), dv("recover", created=old, nxt=NOW)])
+    assert live == (Expire("i1", "recover", "incident_missing"),)
+
+
+def test_an_open_incident_never_loses_any_row_whatever_their_age():
+    old = NOW - 10 * RET
+    ds = [dv(state="sent", created=old), dv("recover", "sent", created=old)]
+    assert run([inc()], deliveries=ds) == ()

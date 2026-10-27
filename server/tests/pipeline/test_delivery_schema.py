@@ -66,7 +66,9 @@ def test_kind_and_state_are_checked(tmp_path, kind, state):
         conn.execute(INSERT, (A, "inc", kind, state))
 
 
-@pytest.mark.parametrize("state", ["pending", "sent", "failed", "suppressed", "expired"])
+@pytest.mark.parametrize(
+    "state", ["pending", "sent", "failed", "suppressed", "expired", "withdrawn"]
+)
 def test_every_documented_state_is_accepted(tmp_path, state):
     _fresh(tmp_path).execute(INSERT, (A, "inc", "recover", state))
 
