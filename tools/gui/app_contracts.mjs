@@ -54,16 +54,17 @@ const realNow = Date.now; let clock = Date.parse('2026-10-25T12:00:00Z'); Date.n
 let intervalTick = null; let nextTimer = 1; let scheduledTotal = 0; const intervals = new Map(); const liveTimeouts = new Map();
 globalThis.setInterval = callback => { const id = nextTimer++; intervals.set(id, callback); intervalTick = callback; return id; };
 globalThis.clearInterval = id => { intervals.delete(id); };
-globalThis.setTimeout = (callback, ms) => { const id = nextTimer++; liveTimeouts.set(id, ms); if (ms >= 30000) scheduledTotal++; return id; };
+globalThis.setTimeout = (callback, ms) => { const id = nextTimer++; liveTimeouts.set(id, {ms, callback}); if (ms >= 30000) scheduledTotal++; return id; };
 globalThis.clearTimeout = id => { liveTimeouts.delete(id); };
-const refreshTimers = () => [...liveTimeouts.values()].filter(ms => ms >= 30000).length;  // the 15 s request deadlines are shorter
+const dueTimers = () => [...liveTimeouts.entries()].filter(([, timer]) => timer.ms >= 30000);
+const refreshTimers = () => dueTimers().length;  // the 15 s request deadlines are shorter
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
-let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
+let lastHourState = 'eligible'; let incidentPages = null; let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
 let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
   const from = Number(url.searchParams.get('from_hour')); const to = Number(url.searchParams.get('to_hour'));
-  const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: i === 0 ? hourState : 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
+  const hours = Array.from({length: (to - from) / 3600}, (_, i) => ({hour: from + i * 3600, state: i === 0 ? hourState : i === (to - from) / 3600 - 1 ? lastHourState : 'eligible', observed_seconds: 3600, qualified_seconds: 3600, reasons: [], bytes_up: 1, bytes_down: 1, flows: 1, dns_queries: 1}));
   const now = clock / 1000; const stamp = new Date(clock - lag * 1000).toISOString();
   const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: unavailable, monitoring_unavailable_capped: false, ...collectorOver};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
@@ -80,6 +81,7 @@ globalThis.fetch = async (url, options) => {
   if (target.pathname === '/devices') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: []}));
   if (target.pathname.startsWith('/incidents/')) return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {id: target.pathname.slice(11), device_id: 'dev-1', detector: 'large_upload', state: 'open', current_lineage: true, evidence: {}}}));
   if (target.pathname === '/incidents' && incidentsDown) return new Response('{}', {status: 503});
+  if (target.pathname === '/incidents' && incidentPages) { const at = Number((target.searchParams.get('cursor') || 'c0').slice(1)); return new Response(JSON.stringify({ok: true, page: {next_cursor: at + 25 < incidentPages.length ? `c${at + 25}` : null}, data: incidentPages.slice(at, at + 25)})); }
   if (target.pathname === '/incidents') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: incidents}));
   return new Response(JSON.stringify(coverageBody(target)));
 };
@@ -248,7 +250,8 @@ assert.match(bannerText(), /^Unavailable.*coverage unavailable/); assert.equal(t
 mode = 'ok'; lag = 200; await reload();
 assert.match(bannerText(), /^Warning.*stale.*\(2 issues\)/); assert.equal(tone(), 'degraded'); lag = 0;
 for (const state of ['partial', 'missing']) { hourState = state; await reload(); assert.match(bannerText(), new RegExp(`^Warning.*${state}`)); assert.equal(tone(), 'degraded'); }
-hourState = 'open'; await reload(); assert.equal(tone(), 'ok', 'one open hour among qualified ones is not degraded'); assert.match(bannerText(), /^OK · coverage current; 23 qualified hours, 1 accumulating$/, 'the OK wording says what was checked');
+hourState = 'eligible'; lastHourState = 'open'; await reload(); assert.equal(tone(), 'ok', 'the current open hour among qualified ones is not degraded'); assert.match(bannerText(), /^OK · coverage current; 23 qualified hours, 1 accumulating$/, 'the OK wording says what was checked'); lastHourState = 'eligible';
+hourState = 'open'; await reload(); assert.equal(tone(), 'degraded', 'an open hour that ended long ago is missing evidence, not accumulating'); assert.match(bannerText(), /^Warning/);
 hourState = 'partial'; lag = 200; await reload(); assert.match(bannerText(), /\(3 issues\)/); assert.match(bannerText(), /stale/, 'the first reason leads'); hourState = 'eligible'; lag = 0;
 unavailable = [{device_id: '<img src=x onerror=alert(1)>', reason: '</script>'}]; await reload();
 assert.match(bannerText(), /^Warning/); assert.ok(bannerText().includes('<img src=x onerror=alert(1)>') && bannerText().includes('</script>'), 'API strings render verbatim');
@@ -339,27 +342,36 @@ const gaps = {
   'unavailable list missing': {monitoring_unavailable: undefined}, 'unavailable null': {monitoring_unavailable: null}, 'unavailable object': {monitoring_unavailable: {}}, 'unavailable string': {monitoring_unavailable: 'none'},
   'unavailable capped': {monitoring_unavailable_capped: true}, 'unavailable cap unknown': {monitoring_unavailable_capped: undefined},
   'summary capped': {summary_capped: true}, 'summary cap unknown': {summary_capped: undefined}, 'backlog capped': {backlog_capped: true},
+  'window in the future': {latest_window_end: clock / 1000 + 3600}, 'observation in the future': {latest_observation_received_at: new Date(clock + 3600000).toISOString()}, 'dns window in the future': {latest_dns_observation_window_end: clock / 1000 + 3600},
   'backlog stalled': {backlog_batches: 3, oldest_pending_received_at: oldStamp(400)}, 'backlog unknown': {backlog_batches: -1},
 };
 for (const [name, over] of Object.entries(gaps)) { const result = statusOf(over); assert.equal(result.tone, 'degraded', name); assert.match(result.text, /^Warning/, name); }
 assert.equal(statusOf({backlog_batches: 2, oldest_pending_received_at: oldStamp(60)}).tone, 'ok', 'a fresh pending batch is normal flow, not a gap');
-const allOpen = statusOf({}, [{hour: 0, state: 'open', reasons: []}, {hour: 3600, state: 'open', reasons: []}]);
+const thisHour = Math.floor(clock / 3600000) * 3600; const hour = (offset, state) => ({hour: thisHour + offset * 3600, state, reasons: []});
+const allOpen = statusOf({}, [hour(0, 'open')]);
 assert.equal(allOpen.tone, 'degraded'); assert.match(allOpen.text, /baseline still accumulating/);
-assert.match(statusOf({}, [{hour: 0, state: 'eligible', reasons: []}, {hour: 3600, state: 'open', reasons: []}]).text, /^OK · coverage current; 1 qualified hour, 1 accumulating$/);
+assert.equal(statusOf({}, [hour(-1, 'eligible'), hour(0, 'open')]).tone, 'ok'); assert.equal(statusOf({}, [hour(-3, 'eligible'), hour(-2, 'open'), hour(-1, 'eligible')]).tone, 'degraded', 'an overdue open hour in the middle is a gap');
+assert.match(statusOf({}, [hour(-1, 'eligible'), hour(0, 'open')]).text, /^OK · coverage current; 1 qualified hour, 1 accumulating$/);
 // Item 1 through the app: hostile coverage never breaks scheduling and never reads ok when incomplete.
-const hostileCoverage = [
-  [{monitoring_unavailable: [{device_id: {toString: 1}, reason: {toString: 1}}]}, true], [{monitoring_unavailable: [{device_id: ['a', {b: {c: 1}}], reason: null}]}, true], [{monitoring_unavailable: [null]}, true],
-  [{monitoring_unavailable: 'text'}, true], [{monitoring_unavailable: {}}, true], [{monitoring_unavailable: null}, true], [{monitoring_unavailable: 5}, true],
-  [{latest_observation_received_at: {toString: 1}}, true], [{latest_window_end: {toString: 1}}, true], [{backlog_batches: '9007199254740993'}, true], [{summary_capped: {toString: 1}}, true],
-  [{source_flags_latest: {toString: 1}}, false], [{collector_id: {toString: 1}}, false], [{last_seq: [1]}, false],
+const UNAVAIL = 'Unavailable · Unavailable';
+const hostileCoverage = [  // [override, banner must warn, text the Overview must still show]
+  [{monitoring_unavailable: [{device_id: {toString: 1}, reason: {toString: 1}}]}, true, UNAVAIL], [{monitoring_unavailable: [{device_id: ['a', {b: {c: 1}}], reason: null}]}, true, UNAVAIL], [{monitoring_unavailable: [null]}, true, UNAVAIL],
+  [{monitoring_unavailable: [7, 'x', [], {device_id: 'good-dev', reason: 'r1'}]}, true, 'good-dev · r1'],
+  [{monitoring_unavailable: 'text'}, true, 'Unknown / list unavailable'], [{monitoring_unavailable: {}}, true, 'Unknown / list unavailable'], [{monitoring_unavailable: null}, true, 'Unknown / list unavailable'], [{monitoring_unavailable: 5}, true, 'Unknown / list unavailable'],
+  [{latest_observation_received_at: {toString: 1}}, true, 'Received Unavailable'], [{latest_dns_observation_received_at: {toString: 1}}, true, 'Received Unavailable'], [{latest_window_end: {toString: 1}}, true, 'Stale / unknown'], [{latest_dns_observation_window_end: [1]}, true, 'Stale / unknown'],
+  [{backlog_batches: '9007199254740993'}, true, 'Unknown pending'], [{summary_capped: {toString: 1}}, true, 'Capped or unknown'],
+  [{source_flags_latest: {toString: 1}}, false, 'Unavailable'], [{collector_id: {toString: 1}}, false, 'Source record'], [{last_seq: [1]}, false, 'Unknown ·'], [{last_received_at: {toString: 1}}, false, 'Unavailable'], [{agent_rss_kb: {toString: 1}}, false, 'Unavailable'],
 ];
-mode = 'ok'; lag = 0; windowLag = null; hourState = 'eligible';
-for (const [over, mustWarn] of hostileCoverage) {
+mode = 'ok'; lag = 0; windowLag = null; hourState = 'partial'; view('overview'); await flush();
+for (const [over, mustWarn, expected] of hostileCoverage) {
   collectorOver = over; const before = scheduledTotal; await reload();
   assert.ok(scheduledTotal > before, `refresh keeps rescheduling after ${JSON.stringify(over)}`);
-  assert.ok(['ok', 'degraded', 'error'].includes(tone()), 'the banner always has a real state');
-  if (mustWarn) assert.notEqual(tone(), 'ok', `never ok for ${JSON.stringify(over)}`);
+  for (const part of ['Observation', 'Parsed DNS', 'Coverage over time', 'Source record', 'Hours that need context', 'partial']) assert.ok(content.textContent.includes(part), `Overview still renders "${part}" for ${JSON.stringify(over)}`);
+  assert.ok(content.textContent.includes(expected), `Overview shows "${expected}" for ${JSON.stringify(over)}`); assert.doesNotMatch(content.textContent, /Data unavailable/);
+  assert.ok(['ok', 'degraded'].includes(tone()), 'usable evidence still yields a real banner state, not an error');
+  if (mustWarn) assert.equal(tone(), 'degraded', `never ok for ${JSON.stringify(over)}`);
 }
+hourState = 'eligible';
 collectorOver = {}; await reload(); assert.equal(tone(), 'ok');
 // Hostile incident fields render as text and never blank the inbox or stop refresh.
 const hostileValue = [{toString: 1}, ['x'], {a: {b: 1}}, null, 7, '9007199254740993'];
@@ -394,7 +406,7 @@ assert.equal(tone(), 'ok', 'coverage is applied although the inbox failed'); ass
 // Item 6: label and filter bucket come from one rule.
 {
   const reviews = [null, undefined, {status: 'acknowledged'}, {status: 'expected'}, {status: 'snoozed', snooze_until: at(1000)}, {status: 'snoozed', snooze_until: at(-1000)}, {status: 'bogus'}, 'x'];
-  for (const state of ['open', 'resolved', 'superseded']) for (const review of reviews) for (const attention of [true, false, undefined, 'yes']) {
+  for (const state of ['open', 'resolved', 'superseded', 'bogus', undefined]) for (const review of reviews) for (const attention of [true, false, undefined, 'yes']) {
     const d = inc('p', {state, review, attention}); const label = one(d); const inAttention = idsOf(render([d], opts('attention'))).length === 1; const inQuiet = idsOf(render([d], opts('quiet'))).length === 1;
     assert.equal(inAttention, /needs|unknown decision/.test(label), `${state} ${JSON.stringify(review)} ${attention}: "${label}" must match its bucket`); assert.equal(inQuiet, !inAttention);
   }
@@ -404,9 +416,52 @@ assert.equal(tone(), 'ok', 'coverage is applied although the inbox failed'); ass
   assert.equal(one(inc('x', {attention: true, review: {status: 'acknowledged'}})), 'acknowledged · needs attention');
   assert.equal(one(inc('x', {attention: false})), 'no decision', 'the API attention flag wins over the state');
 }
+// Round 2: only the known closed states are quiet; any other state needs a human.
+for (const state of ['bogus', {toString: 1}, undefined, null, 5, 'OPEN', '']) {
+  const d = inc('u1', {state, attention: undefined}); assert.equal(one(d), 'needs review · unknown state', `state ${JSON.stringify(state)} fails loud`);
+  assert.deepEqual(idsOf(render([d], opts('attention'))), ['u1']); assert.deepEqual(idsOf(render([d], opts('quiet'))), []);
+  assert.equal(one(inc('u1', {state, attention: false})), 'no decision · unknown state', 'an explicit API flag still wins, but the state stays visible');
+  assert.deepEqual(idsOf(render([inc('k1', {state: 'resolved', attention: undefined}), d])), ['u1', 'k1'], 'unknown state sorts ahead of closed ones');
+}
+for (const state of ['resolved', 'superseded']) assert.equal(one(inc('u1', {state, attention: undefined})), 'no decision', `${state} is closed`);
 // Item 7: lookup tables never leak prototype members.
 assert.doesNotThrow(() => views.deviceView({id: 'd1', macs: [{hostname: {toString: 1}}, {hostname: 'ok'}]}, noop)); assert.match(views.activityView({device_id: 'd1', hours: [], baseline: {state: 'constructor'}}).textContent, /Unknown reference state/);
 for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) { const row = render([inc('k1', {detector: word, review: {status: word}})]); assert.ok(rowsOf(row)[0].querySelectorAll('td')[0].textContent.startsWith(word), `${word} renders verbatim`); assert.equal(one(inc('k1', {review: {status: word}})), 'unknown decision'); }
+// Round 2: real paging with a filter active, and the scheduled callbacks actually run.
+{
+  incidentPages = Array.from({length: 50}, (_, i) => inc(`i${String(i).padStart(2, '0')}`, i % 5 === 0 ? {attention: false, review: {status: 'acknowledged'}, detected_at: i} : {detected_at: i}));
+  const cursors = () => requests.filter(r => new URL(r.url).pathname === '/incidents').map(r => new URL(r.url).searchParams.get('cursor'));
+  const press = async key => { content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === key).fire('click'); await flush(); };
+  const seen = {};
+  for (const filter of ['all', 'attention', 'quiet']) {
+    location.hash = `#filter=${filter}`; view('incidents'); await flush(); const first = idsOf(content); await press('pager:next'); const second = idsOf(content); const sent = cursors();
+    assert.equal(sent.at(-1), 'c25', `Next sends the API cursor (${filter})`); assert.equal(new Set([...first, ...second]).size, first.length + second.length, `no row repeated across pages (${filter})`);
+    if (filter === 'all') { assert.equal(first.length, 25); assert.equal(second.length, 25); assert.match(content.textContent, /Page 2 · 25 rows shown/); }
+    assert.ok(first.every(id => id < 'i25') && second.every(id => id >= 'i25'), 'each page shows only its own rows'); seen[filter] = [...first, ...second];
+    await press('pager:previous'); assert.deepEqual(idsOf(content), first, 'Previous returns the same first page'); assert.equal(cursors().at(-1), null, 'the first page is requested without a cursor');
+  }
+  assert.deepEqual([...seen.attention, ...seen.quiet].sort(), seen.all.slice().sort(), 'attention plus quiet cover every row exactly once'); assert.equal(seen.quiet.length, 10);
+  incidentPages = null; location.hash = '';
+  await reload(); const due = dueTimers(); assert.equal(due.length, 1); const seenBefore = requests.length; clock += 31000; body.focus();
+  liveTimeouts.delete(due[0][0]); due[0][1].callback(); await flush();
+  assert.ok(requests.length > seenBefore, 'the scheduled refresh really ran'); assert.equal(refreshTimers(), 1, 'and re-armed exactly one timer');
+}
+// L2: schedule() called while a timer is still registered (the interacting branch re-arms without load()'s own clear) leaves ONE live timer.
+{
+  await reload(); const [[, timer]] = dueTimers(); body.focus(); const probe = content.querySelector('[data-focus-key]') || content.querySelector('[aria-label]'); probe.focus(); content.fire('focusin');
+  clock += 31000; timer.callback(); await flush();  // the fired timer is deliberately left registered, as a leaked one would be
+  assert.equal(refreshTimers(), 1, 'a re-armed refresh replaces the previous timer instead of adding one'); body.focus(); content.fire('focusout'); await flush();
+}
+// L4: nested API values never reach a recursive flatten; the page still renders.
+{
+  let deep = 'x'; for (let i = 0; i < 200000; i++) deep = [deep];
+  const row = render([inc('d1', {device_id: deep}), inc('d2')]); assert.equal(rowsOf(row).length, 2); assert.ok(rowsOf(row).some(r => r.textContent.includes('Unavailable')));
+  assert.doesNotMatch(render([inc('d3', {device_id: ['array-id']})]).textContent, /array-id/, 'only string device ids are shown');
+  const collector = {collector_id: 'c1', latest_observation_received_at: oldStamp(0), latest_window_end: clock / 1000, latest_dns_observation_received_at: oldStamp(0), latest_dns_observation_window_end: clock / 1000, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, summary_capped: false, monitoring_unavailable: [{device_id: deep, reason: deep}], monitoring_unavailable_capped: false};
+  const hours = [{hour: thisHour, state: 'eligible', reasons: []}]; const overview = views.coverageView({collector, hours});
+  assert.ok(overview.textContent.includes('Unavailable · Unavailable')); assert.equal(views.coverageStatus({phase: 'ready', data: {collector, hours}}, clock).tone, 'degraded');
+  assert.equal(views.node('p', {}, deep).textContent, 'Unavailable', 'a deeply nested child is text, not a recursion');
+}
 // Behavioural read-only (addendum B), sinks (C) and timers (D).
 await reload(); const doubleCheck = refreshTimers();
 for (const name of ['overview', 'inventory', 'activity', 'incidents', 'overview', 'incidents']) { view(name); await flush(); hashchange(); }

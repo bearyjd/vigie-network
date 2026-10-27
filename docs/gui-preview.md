@@ -85,7 +85,7 @@ fails the view itself. Each state starts with a text prefix, so colour is never 
 - `Unknown` when no coverage rows exist yet. Silence is not health.
 - `Warning` when the evidence is old or incomplete. It names the first reason and the issue count.
   Reasons: the source or parsed-DNS observation is stale (older than 120 s) or missing; any hour is
-  partial or missing; no hour is qualified yet (all open, so the baseline is still accumulating);
+  partial or missing (an open hour that already ended counts as missing); no hour is qualified yet (all open, so the baseline is still accumulating);
   `monitoring_unavailable` is not a list or is capped; the summary is capped or its cap is unknown;
   processing is `Stalled` (oldest pending batch over 180 s) or `Unknown`; or the collector reports
   unavailable monitoring scopes. Errors on the side of Warning: a missing flag is a gap, not a pass.
@@ -101,7 +101,8 @@ fails the view itself. Each state starts with a text prefix, so colour is never 
 The Incidents view is a local inbox that needs no notification publisher. Incidents the API marks
 `attention` come first, newest first, with ties kept in API order; payloads without `attention` fall
 back to the incident state. The Decision column shows `acknowledged`, `expected`,
-`snoozed until <UTC>`, `snooze expired · needs attention`, `needs review` or `no decision`; a
+`snoozed until <UTC>`, `snooze expired · needs attention`, `needs review` or `no decision`. Only `resolved` and `superseded` count as closed; any other state
+(garbage, missing) reads `... · unknown state` and needs review; a
 decision the API still flags gets ` · needs attention` appended, so the label and the filter always agree. Unrecognised
 `review` or `attention` values show `unknown decision` and sort as needing attention. The All / Needs
 attention / Quiet filter changes only the view and is kept in the URL hash (`#filter=attention`),
