@@ -4,7 +4,9 @@ A SQLite WAL database that nobody has open is checkpointed and its -wal/-shm sid
 A reader on a read-only mount cannot create them again and fails ("unable to open database
 file"). While a writer keeps ONE connection open the sidecars stay, and read-only readers in other
 containers work (tests/test_ro_mount_wal.py proves both halves). The connection is never used to
-write; it only keeps the wal-index attached. A reader that finds nothing held fails closed.
+write; it only keeps the wal-index attached. After a clean close a reader finds no sidecars and
+fails; a crashed writer can leave readable sidecars (a stale snapshot), so consumers that must
+notice a dead writer need their own freshness check rather than relying on the open error.
 """
 
 from __future__ import annotations

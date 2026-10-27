@@ -13,13 +13,30 @@ from typing import Any
 
 from vigie_api.errors import ApiError
 from vigie_api.evidence_assemble import Limits, assemble
-from vigie_api.evidence_redact import LEVELS, SALT_BYTES, redact
+from vigie_api.evidence_redact import LEVELS, SALT_BYTES, build_queries, redact
 from vigie_api.evidence_render import MAX_PACK_BYTES, content_sha256, fit, has_clipped_strings
 from vigie_api.evidence_types import (
     MEDIA_TYPE_JSON,
     MEDIA_TYPE_MARKDOWN,
     SCHEMA_VERSION,
+    Pack,
 )
+
+
+def _requery(raw: Pack, level: str) -> Callable[[Pack], list[dict[str, Any]]]:
+    """Queries for a size-fitted pack: the raw pack cut to the same item counts per section.
+
+    Redaction keeps item order and count, so the first N raw items are the N retained ones."""
+
+    def build(fitted: Pack) -> list[dict[str, Any]]:
+        sections = {
+            sid: {**sec, "items": sec["items"][: len(fitted.body["sections"][sid]["items"])]}
+            for sid, sec in raw.body["sections"].items()
+        }
+        return build_queries({**raw.body, "sections": sections}, level)
+
+    return build
+
 
 FORMATS = {
     "json": (MEDIA_TYPE_JSON, "json"),
@@ -57,7 +74,7 @@ def build_export(
 ) -> Export:
     check_request(level, confirm_full)
     pack = assemble(inv, ov, device_id, now=now, limits=Limits(), vigie_version=vigie_version)
-    final, data = fit(redact(pack, level, rng(SALT_BYTES)), fmt, cap)
+    final, data = fit(redact(pack, level, rng(SALT_BYTES)), fmt, cap, requery=_requery(pack, level))
     sections = final.body["sections"]
     media_type, suffix = FORMATS[fmt]
     detail = {
