@@ -13,15 +13,18 @@ from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
     DeliveryView,
     Enqueue,
+    Expire,
     Fail,
     Forget,
     IncidentView,
+    Reclaim,
     Requeue,
     ReviewView,
     Revive,
     Suppress,
     Withdraw,
     after_failure,
+    backoff,
     delivery_id,
     plan,
 )
@@ -29,9 +32,10 @@ from vigie_pipeline.delivery_plan import (
 DAY = 86400
 QUIET = ("acknowledged", "expected")
 ALLOWED = {
-    "pending": {"pending", "sent", "failed", "suppressed", "expired", "withdrawn"},
+    "pending": {"pending", "sending", "suppressed", "expired", "withdrawn"},
+    "sending": {"sending", "sent", "pending", "failed", "expired"},
     "withdrawn": {"withdrawn", "pending", "expired", "failed"},
-    "suppressed": {"suppressed", "pending", "failed", "expired", "sent"},
+    "suppressed": {"suppressed", "pending", "failed", "expired"},
     "sent": {"sent"},
     "failed": {"failed"},
     "expired": {"expired"},
@@ -60,12 +64,16 @@ class Store:
         self.conn = sqlite3.connect(":memory:", isolation_level=None)
         for statement in schema.PIPELINE_MIGRATIONS[10]:
             self.conn.execute(statement)
+        self._cache = None
         for d in rows:
-            marks = ",".join("?" * 9)
-            self.conn.execute(
-                f"INSERT INTO incident_deliveries (delivery_id, {COLUMNS}) VALUES ({marks})",  # noqa: S608
-                (delivery_id(d.incident_id, d.kind), *dataclasses.astuple(d)),
-            )
+            self.add(d)
+
+    def add(self, d):
+        marks = ",".join("?" * 9)
+        self.conn.execute(
+            f"INSERT INTO incident_deliveries (delivery_id, {COLUMNS}) VALUES ({marks})",  # noqa: S608
+            (delivery_id(d.incident_id, d.kind), *dataclasses.astuple(d)),
+        )
         self._cache = None
 
     def rows(self):
@@ -112,20 +120,19 @@ def apply_cas(rows, actions, now, retention=None, strict=False):
     return store.rows(), skipped
 
 
-def complete_send(rows, captured, now):
-    """The sender's completion UPDATE (version-checked only for a recover)."""
-    store = Store(rows.values())
-    done = store.run(sql.SENDER_SENT, sql.sender_params(captured, now)) == 1
-    return store.rows(), done
-
-
 def check_transitions(before, after):
     for key in before.keys() | after.keys():
         b, a = before.get(key), after.get(key)
         if b is None:
             assert a is None or a.state in ("pending", "suppressed"), (key, a)
         elif a is not None:
-            assert a.created_at == b.created_at and a.attempts >= b.attempts, (b, a)
+            assert a.created_at == b.created_at, (b, a)
+            claimed = b.state == "pending" and a.state == "sending"
+            assert a.attempts == b.attempts + (1 if claimed else 0), (
+                "attempts move at claim",
+                b,
+                a,
+            )
             assert a.version >= b.version and a.state in ALLOWED[b.state], (b, a)
             assert a.version > b.version or a == b, ("change without a version bump", b, a)
 
@@ -138,8 +145,8 @@ class World:
         self.cfg = cfg or DeliveryConfig()
         self.now, self.since, self.next_id = 1_000_000, None, 0
         self.inc, self.reviews, self.store = {}, {}, Store()
-        self.delivered, self.episode, self.opened, self.owed_at = {}, {}, set(), {}
-        self.inflight, self.dropped = {}, 0
+        self.opened, self.owed_at, self.inflight, self.zombies = set(), {}, {}, {}
+        self.transmissions, self.successes, self.crashes = {}, {}, {}
         self.seen = set()
 
     @property
@@ -215,6 +222,12 @@ class World:
         ttl, ret = self.cfg.pending_ttl_seconds, self.cfg.retention_seconds
         steps = [0, 1, 59, 60, ttl - 1, ttl, ttl + 1, ret - 1, ret, ret + 1, DAY]
         self.now += self.rnd.choice(steps) + self.rnd.choice([0, 0, 0.5, 0.999])
+        self._lapse_leases()
+
+    def _lapse_leases(self):
+        for key in sorted(self.inflight):  # a sender that outlives its lease is a crashed sender
+            if self.inflight[key][0].next_attempt_at <= self.now:
+                self._crash(key)
 
     def ev_sender(self):
         """Claim, transmit and record in one step (a fast send)."""
@@ -230,15 +243,22 @@ class World:
             assert opened is not None and opened.state == "sent", ("recover w/o open", key)
         return True
 
-    def _claim(self, key, d):
-        """The sender captures the row and transmits. A TRANSMISSION that reaches the user is
-        counted here, whether or not its completion later lands."""
-        success = self.rnd.random() < 0.6
+    def _claim(self, key, d, success=None):
+        """CLAIM (short transaction), then transmit outside any transaction. Every claim is one
+        transmission, counted independently of the persisted attempts."""
+        if self.rnd.random() < 0.3:
+            self._probe_claim_guards(d)
+        count = self.store.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg))
+        assert count == 1, ("a due pending row must be claimable", key, d)
+        self.transmissions[key] = self.transmissions.get(key, 0) + 1
+        assert self.transmissions[key] <= self.cfg.max_attempts, ("transmissions", key)
+        success = self.rnd.random() < 0.6 if success is None else success
         if success:
-            episode = (key, self.episode.get(key, 0))  # a Revive starts a new recover episode
-            self.delivered[episode] = self.delivered.get(episode, 0) + 1
-            assert self.delivered[episode] == 1, ("delivered twice", episode)
-        return d, success
+            self.successes[key] = self.successes.get(key, 0) + 1
+            # a second delivery is only possible after a crash lost the first completion
+            assert self.successes[key] <= 1 + self.crashes.get(key, 0), ("delivered twice", key)
+        self._observe()
+        return self.rows[key], success
 
     def ev_claim(self):
         for key, d in sorted(self.rows.items()):
@@ -265,26 +285,88 @@ class World:
             if self.rnd.random() < 0.6:
                 self._finish(key, *self.inflight.pop(key))
 
-    def _finish(self, key, captured, success):
-        """Record the outcome with the sender's own short transaction."""
-        before, params = dict(self.rows), sql.sender_params(captured, self.now)
+    def ev_crash(self):
+        """The sender dies between transmitting and recording the result."""
+        if self.inflight:
+            self._crash(self.rnd.choice(sorted(self.inflight)))
+
+    def _crash(self, key):
+        claimed, success = self.inflight.pop(key)
+        self.zombies[key] = (claimed, success)  # it may still try to record its result later
         if success:
-            count = self.store.run(sql.SENDER_SENT, params)
+            self.crashes[key] = self.crashes.get(key, 0) + 1
+
+    def ev_zombie_race(self):
+        """A sender dies mid-send, its lease lapses, the row is reclaimed and claimed again, and
+        only then does the dead sender's late completion arrive: it must not land."""
+        for key, d in sorted(self.rows.items()):
+            if key in self.inflight or not self._due(key, d):
+                continue
+            self._crash_after(key, d)
+            self.now += self.cfg.lease_seconds + 1
+            self._lapse_leases()
+            self.ev_pass()  # Reclaim
+            row = self.rows.get(key)
+            if row is not None and row.state == "pending":
+                self.now = max(self.now, row.next_attempt_at)
+                self._lapse_leases()
+                self.ev_pass()
+                row = self.rows[key]
+                if self._due(key, row) and key not in self.inflight:
+                    self.inflight[key] = self._claim(key, row)
+            claimed, success = self.zombies.pop(key)
+            row = self.rows.get(key)
+            same = row is not None and row.state == "sending" and row.version == claimed.version
+            self._finish(key, claimed, success, expect=1 if same else 0)
+            return
+
+    def _crash_after(self, key, d):
+        self.inflight[key] = self._claim(key, d)
+        self._crash(key)
+
+    def ev_retry_flap(self):
+        """A recover send fails (a retry is queued), then the incident flaps: Withdraw, Revive."""
+        for key, d in sorted(self.rows.items()):
+            s = self.inc[key[0]]
+            if key[1] != "recover" or key in self.inflight or not self._due(key, d):
+                continue
+            if not (s["present"] and s["state"] == "resolved"):
+                continue
+            claimed, _ = self._claim(key, d, success=False)
+            self._finish(key, claimed, False)
+            s["state"] = "open"
+            self.ev_pass()
+            s["state"] = "resolved"
+            self.ev_pass()
+            return
+
+    def ev_zombie(self):
+        """A sender whose lease lapsed records its result late: it lands only on its own claim."""
+        if self.zombies:
+            key = self.rnd.choice(sorted(self.zombies))
+            claimed, success = self.zombies.pop(key)
+            row = self.rows.get(key)
+            same = row is not None and row.state == "sending" and row.version == claimed.version
+            self._finish(key, claimed, success, expect=1 if same else 0)
+
+    def _finish(self, key, claimed, success, expect=1):
+        """Record the outcome with a short transaction, version-checked against the claim."""
+        before, params = dict(self.rows), sql.completion_params(claimed, self.now)
+        if success:
+            count = self.store.run(sql.COMPLETE_SENT, params)
         else:
-            tried = dataclasses.replace(captured, attempts=captured.attempts + 1)
-            act = after_failure(tried, self.now, self._cfg())
+            act = after_failure(claimed, self.now, self._cfg())
             if isinstance(act, Fail):
-                count = self.store.run(sql.SENDER_GIVE_UP, params)
+                count = self.store.run(sql.COMPLETE_FAILED, params)
             else:
-                count = self.store.run(
-                    sql.SENDER_RETRY, params | {"next_attempt_at": act.next_attempt_at}
-                )
+                retry = params | {"next_attempt_at": act.next_attempt_at}
+                count = self.store.run(sql.COMPLETE_RETRY, retry)
+        assert count == expect, ("completion matches its own claim only", key, claimed, count)
         if count == 0:
-            self.dropped += 1  # the planner's own transition stands; the result is dropped
-        else:
-            assert self.rows[key].updated_at == int(self.now), ("sender must stamp updated_at", key)
-            if success and key[1] == "open":
-                self.owed_at[key[0]] = int(self.now)
+            return
+        assert self.rows[key].updated_at == int(self.now), ("completion stamps updated_at", key)
+        if success and key[1] == "open":
+            self.owed_at[key[0]] = int(self.now)
         self._observe()
         check_transitions(before, self.rows)
 
@@ -303,29 +385,61 @@ class World:
         for a in actions:
             self._check_action(a)
         self._check_forgets(actions)
+        for a in actions:
+            if isinstance(a, Forget) and a.sibling_recover:
+                self._probe_sibling_guard(a)
+        live = {
+            k: d for k, d in before.items() if d.state == "sending" and d.next_attempt_at > self.now
+        }
         self.store.apply_pass(actions, self.now, self.cfg.retention_seconds)
         self.seen |= {type(a).__name__ for a in actions}
         for a in actions:
             key = (a.incident_id, a.kind)
-            if isinstance(a, Revive):
-                self.episode[key] = self.episode.get(key, 0) + 1
             if isinstance(a, Forget):  # a forgotten row ends its life: history starts over
-                for episode in [e for e in self.delivered if e[0] == key]:
-                    del self.delivered[episode]
-                self.episode.pop(key, None)
-                self.inflight.pop(key, None)  # no send outlives retention
+                for book in (self.transmissions, self.successes, self.crashes, self.zombies):
+                    book.pop(key, None)
                 if a.kind == "open":
                     self.opened.discard(a.incident_id)
                     self.owed_at.pop(a.incident_id, None)
         self._observe()
         check_transitions(before, self.rows)
+        for key, d in live.items():
+            assert self.rows.get(key) == d, ("the planner touched a live lease", d)
         for a in actions:  # every planner UPDATE stamps updated_at
             row = self.rows.get((a.incident_id, a.kind))
             if a.expected is not None and not isinstance(a, Forget | Withdraw | Revive) and row:
                 assert row.updated_at == int(self.now), ("updated_at not stamped", a, row)
             if isinstance(a, Withdraw | Revive):
                 assert self.rows[(a.incident_id, a.kind)].updated_at == int(self.now), a
-        self._check_pending_rows()
+        reclaimed = {(a.incident_id, a.kind) for a in actions if isinstance(a, Reclaim)}
+        self._check_pending_rows(reclaimed)  # a reclaimed row meets the verdict next pass
+
+    def _probe_claim_guards(self, d):
+        """On scratch copies, CLAIM refuses a row that is not due, out of budget or stale."""
+        now = int(self.now)
+        breaks = {
+            "not due": "UPDATE incident_deliveries SET next_attempt_at=:now+5",
+            "out of budget": "UPDATE incident_deliveries SET attempts=:max",
+            "stale": "UPDATE incident_deliveries SET version=version+1",
+            "already sending": "UPDATE incident_deliveries SET state='sending'",
+        }
+        for label, update in breaks.items():
+            probe = Store(self.rows.values())
+            args = {"now": now, "max": self.cfg.max_attempts, "kind": d.kind, "i": d.incident_id}
+            probe.run(update + " WHERE kind=:kind AND incident_id=:i", args)
+            assert probe.run(sql.CLAIM, sql.claim_params(d, self.now, self.cfg)) == 0, label
+
+    def _probe_sibling_guard(self, a):
+        """On a scratch copy, the DELETE of an open row must refuse while a recover is in flight."""
+        for state in ("pending", "sending"):
+            probe = Store(self.rows.values())
+            probe.run(
+                "DELETE FROM incident_deliveries WHERE kind='recover' AND incident_id=:i",
+                {"i": a.incident_id},
+            )
+            now = int(self.now)
+            probe.add(DeliveryView(a.incident_id, "recover", state, 1, now + 9, now, now, 0))
+            assert probe.run(*sql.statement(a, self.now)) == 0, ("sibling guard", state, a)
 
     def _check_forgets(self, actions):
         """All-or-nothing: an incident's rows are forgotten together, all terminal."""
@@ -352,6 +466,9 @@ class World:
     def _check_action(self, a):
         row = self.rows.get((a.incident_id, a.kind))
         inc = self.inc[a.incident_id]
+        if row is not None and row.state == "sending":
+            assert row.next_attempt_at <= self.now, ("action on a live lease", a, row)
+            assert isinstance(a, Reclaim | Fail | Expire), ("action on a sending row", a, row)
         if a.expected is None:
             assert row is None and isinstance(a, Enqueue | Suppress), (a, row)
         else:
@@ -369,6 +486,9 @@ class World:
             if a.kind == "open" and inc["present"] and inc["state"] == "resolved":
                 done = ("sent", "failed", "suppressed", "expired")
                 assert row.state != "sent" or (rec is not None and rec.state in done), (a, rec)
+        if isinstance(a, Reclaim):
+            backoff_at = math.ceil(self.now) + backoff(row.attempts, self.cfg)
+            assert a.next_attempt_at == backoff_at, ("reclaim waits out a backoff", a, row)
         if isinstance(a, Revive):
             assert a.not_before >= row.next_attempt_at, ("revive before its backoff", a, row)
             opened = self.rows.get((a.incident_id, "open"))
@@ -385,11 +505,11 @@ class World:
             detected = inc["detected"]
             assert self.since is None or detected >= self.since, ("watermark", a)  # (j)
 
-    def _check_pending_rows(self):
+    def _check_pending_rows(self, skip=()):
         """After a fresh pass, nothing pending contradicts the current decision."""
         for (iid, kind), d in self.rows.items():
             inc, review = self.inc[iid], self.reviews.get(iid)
-            if kind != "open" or d.state != "pending" or not inc["present"]:
+            if kind != "open" or d.state != "pending" or not inc["present"] or (iid, kind) in skip:
                 continue
             if inc["state"] != "open" or review is None:
                 continue
@@ -419,6 +539,8 @@ class World:
             if d.state == "pending":
                 assert self.now - max(d.created_at, d.next_attempt_at) < ttl, d  # (e)
                 assert self.now - d.created_at <= life, ("lifetime cap", d)
+            if d.state == "sending":
+                assert d.next_attempt_at > self.now, ("a lapsed lease was not reclaimed", d)
         for iid, s in self.inc.items():
             if not s["present"]:
                 continue
@@ -452,6 +574,8 @@ class World:
             (self.ev_new, 2), (self.ev_transition, 6), (self.ev_decision, 8),
             (self.ev_watermark, 3), (self.ev_time, 4), (self.ev_sender, 2),
             (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
+            (self.ev_crash, 1), (self.ev_zombie, 2),
+            (self.ev_zombie_race, 2), (self.ev_retry_flap, 2),
             (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]

@@ -166,27 +166,38 @@ it records `eligible_since`, and incidents detected before that instant are igno
 it on never announces old open incidents.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
-`recover`; `UNIQUE(incident_id, kind)`), `state` `pending`, `sent`, `failed`, `suppressed`,
-`expired` or `withdrawn` (a recover taken back because its incident is not resolved), integer
-epoch-second `created_at`, `updated_at` and `next_attempt_at` (required while
-pending), `attempts >= 0`, a `version` that every change increments, and `last_error` capped at
-200 characters. `delivery_id` is the first 32 hex chars of `sha256(incident_id + "\n" + kind)`.
-External payloads carry a device label and an incident link only.
+`recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and
+`next_attempt_at` (required while `pending` or `sending`), `attempts >= 0`, a `version` that every
+change increments, and `last_error` capped at 200 characters. `delivery_id` is the first 32 hex
+chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
+incident link only. States:
 
-**Concurrency contract (the primary defence).** Unit 4b reads the complete incident set and the
-delivery rows, runs `plan()` and applies every action inside one `BEGIN IMMEDIATE` transaction on
-the pipeline database; it skips the pass if the incident read fails (a partial list would expire
-pending rows as `incident_missing`). The sender's writes are separate short transactions
-serialised by the same lock, so the planner always sees committed sender state and a plan is never
-stale relative to another planner or to the sender.
+| state | meaning |
+| --- | --- |
+| `pending` | waiting for `next_attempt_at`, then for a sender to claim it |
+| `sending` | claimed: a sender holds a lease until `next_attempt_at`; the planner leaves it alone |
+| `sent`, `failed`, `expired` | terminal |
+| `suppressed` | held back by an acknowledged/expected decision; re-checked every pass |
+| `withdrawn` | a `recover` taken back because its incident is not resolved; revived by the next resolution |
 
-Every action also carries the row it was planned against (`expected`: none for an insert, else
-state, attempts and version) as an assertion. Each action is exactly one of the statements below
-(`vigie_pipeline.delivery_sql`; the tests run them against a table built by the production
-migration, and another test keeps this block identical to the code). Every UPDATE sets
-`updated_at=:now` and `version=version+1`. Within a pass each statement must affect exactly one
-row; anything else is a planner bug, so log it and roll the whole pass back (one
-`BEGIN IMMEDIATE` transaction).
+**Contract.** Unit 4b reads the complete incident set and the delivery rows, runs `plan()` and
+applies every action inside one `BEGIN IMMEDIATE` transaction; it skips the pass if the incident
+read fails (a partial list would expire pending rows as `incident_missing`). Each action is exactly
+one of the statements below (`vigie_pipeline.delivery_sql`; the tests run them against a table built
+by the production migration, and another test keeps this block identical to the code) and carries
+the row it was planned against (`expected`: state, attempts, version) as an assertion. Every UPDATE
+sets `updated_at=:now` and `version=version+1`. Each statement must affect exactly one row;
+anything else is a planner bug, so log it and roll the whole pass back.
+
+The sender works by lease, in short separate transactions: CLAIM a due `pending` row (this is the
+only way to transmit, and it counts the attempt, so the budget counts actual transmissions);
+transmit outside any transaction; then COMPLETE with the claimed version (`sent`, back to `pending`
+with a backoff, or `failed` past `max_attempts`). The database allows only one live claim per
+`delivery_id`, so at most one send is in flight per delivery; it is enforced, not assumed. The
+planner never touches a live `sending` row (no expiry, suppress, reschedule, withdraw or forget), so
+a completion always matches, and a retry time is set from the claimed row alone. Whatever changed
+during the send (an ack, a snooze, a resolve or a reopen) is applied on the next pass, once the row
+is `sent` or `pending` again.
 
 ```sql
 -- planner: Enqueue
@@ -219,11 +230,11 @@ UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, upd
   version=version+1
 WHERE delivery_id=:id AND state='withdrawn' AND attempts=:attempts AND version=:version
 
--- planner: Expire (state is pending, suppressed or withdrawn)
+-- planner: Expire (state is pending, suppressed, withdrawn or sending)
 UPDATE incident_deliveries SET state='expired', updated_at=:now, version=version+1
 WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
 
--- planner: Fail (pending, suppressed or withdrawn)
+-- planner: Fail (pending, suppressed, withdrawn or sending)
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
 WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
 
@@ -235,44 +246,46 @@ WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:ve
 DELETE FROM incident_deliveries
 WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
 
--- planner: Forget an open row (refuses while a recover is pending)
+-- planner: Forget an open row (refuses while a recover is pending or sending)
 DELETE FROM incident_deliveries
 WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
   AND NOT EXISTS (SELECT 1 FROM incident_deliveries r
-                  WHERE r.incident_id=:incident_id AND r.kind='recover' AND r.state='pending')
+                  WHERE r.incident_id=:incident_id AND r.kind='recover'
+                    AND r.state IN ('pending', 'sending'))
 
--- sender: a send succeeded (open: attempts only, also from suppressed; recover: version too)
-UPDATE incident_deliveries SET state='sent', attempts=attempts+1, updated_at=:now,
+-- planner: Reclaim a sending row whose lease lapsed (the sender crashed)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at, updated_at=:now,
   version=version+1
-WHERE delivery_id=:id AND attempts=:attempts
-  AND (state='pending' OR (state='suppressed' AND kind='open'))
-  AND (:version IS NULL OR version=:version)
+WHERE delivery_id=:id AND state='sending' AND attempts=:attempts AND version=:version
 
--- sender: a send failed, retry later
-UPDATE incident_deliveries SET attempts=attempts+1, next_attempt_at=:next_attempt_at,
+-- sender: claim a due pending row (the only way to transmit); the lease end is next_attempt_at
+UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
+  next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND next_attempt_at<=:now
+  AND attempts<:max_attempts AND version=:version
+
+-- sender: the send succeeded (version = the claimed version)
+UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='sending' AND version=:version
+
+-- sender: the send failed, retry later (next_attempt_at from the claimed row)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
-  AND (:version IS NULL OR version=:version)
+WHERE delivery_id=:id AND state='sending' AND version=:version
 
--- sender: a send failed for the last time
-UPDATE incident_deliveries SET state='failed', attempts=attempts+1, updated_at=:now,
-  version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
-  AND (:version IS NULL OR version=:version)
+-- sender: the send failed and the budget is spent
+UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='sending' AND version=:version
 ```
 
-The sender is not a lease holder: it transmits, then records the result in its own short
-transaction. An `open` row is never withdrawn or revived, so its completion matches on `attempts`
-alone (a planner change during the send, such as a snooze or an ack, must not make the same open go
-out again, and an ack that overtook the send still records it as sent). A `recover` completion also
-checks `version`, because Withdraw and Revive create new incarnations of the row. A completion that
-finds the row expired, failed or withdrawn is dropped and the row's own transition stands. Residual
-windows, each bounded by one send duration and accepted: (a) an open delivered while its incident
-resolves is expired as `resolved_before_send`, so the user gets the open and no recover; (b) a
-recover delivered after the incident reopened or was superseded, until the next pass withdraws it.
-A Revive keeps `attempts`, so the retry budget of a delivery is cumulative: recovery requests for
-one incident never exceed `max_attempts` however often the detector flaps, and the 30 day lifetime
-from `created_at` bounds the row.
+If the sender crashes after transmitting, the row stays `sending` until the lease (default 300 s)
+lapses; the planner then Reclaims it (back to `pending` after a backoff, `attempts` not counted
+again) or fails it past the budget. Delivery is therefore at least once: a crash after a successful
+send can cause one retransmission per reclaim, bounded by `max_attempts` for the whole life of the
+delivery. Accepted window, bounded by one send duration: a `recover` that was claimed before its
+incident reopened is delivered, so the user may see one stale recovery notice; likewise an `open`
+delivered while its incident resolves is followed by a `recover` only after it is `sent`, and one
+that expires as `resolved_before_send` before it is claimed is never sent.
 
 Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-finite `now` raises
 `ValueError`, action times are integer seconds):

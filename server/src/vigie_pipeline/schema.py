@@ -269,7 +269,7 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "incident_id TEXT NOT NULL,"
         "kind TEXT NOT NULL CHECK(kind IN ('open','recover')),"
         "state TEXT NOT NULL CHECK(state IN "
-        "('pending','sent','failed','suppressed','expired','withdrawn')),"
+        "('pending','sending','sent','failed','suppressed','expired','withdrawn')),"
         "attempts INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempts)='integer' AND attempts>=0),"
         "next_attempt_at INTEGER CHECK(next_attempt_at IS NULL OR "
         "typeof(next_attempt_at)='integer'),"
@@ -277,7 +277,8 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer'),"
         "updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer'),"
         "version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),"
-        "CHECK(state!='pending' OR next_attempt_at IS NOT NULL),CHECK(updated_at>=created_at),"
+        "CHECK(state NOT IN ('pending','sending') OR next_attempt_at IS NOT NULL),"
+        "CHECK(updated_at>=created_at),"
         "CHECK(state!='withdrawn' OR kind='recover'),"
         "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",

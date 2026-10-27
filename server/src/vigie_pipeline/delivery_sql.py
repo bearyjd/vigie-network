@@ -6,21 +6,27 @@ docs/monitoring.md quotes every constant (a test keeps them identical). Every UP
 `updated_at=:now` and `version=version+1`. Within a pass each statement must affect exactly one
 row: anything else is a planner bug, so roll the whole pass back (one `BEGIN IMMEDIATE`).
 
-The sender's three statements are separate short transactions. Its completion is version-checked
-only for `recover` rows (Withdraw/Revive create new incarnations); an `open` row is never
-withdrawn or revived, so its completion matches on `attempts` alone and also records a send that
-an acknowledgement overtook (`suppressed`), which keeps one open from being sent twice.
+SENDER PROTOCOL (a lease). CLAIM, in a short `BEGIN IMMEDIATE` transaction, is the only way to
+transmit: it moves one `pending` row to `sending`, counts the attempt and sets the lease end in
+`next_attempt_at`, so the database allows at most one live claim per delivery_id. The transmission
+happens outside any transaction. The completion statements, again short transactions, are always
+version-checked against the claimed version; the planner never touches a live `sending` row, so a
+completion always matches unless the lease lapsed first. A crash after a successful send leaves the
+row `sending`; the planner then Reclaims it (at-least-once: one retransmission per reclaim,
+bounded by `max_attempts` overall).
 """
 
 from __future__ import annotations
 
 from vigie_pipeline.delivery_plan import (
     Action,
+    DeliveryConfig,
     DeliveryView,
     Enqueue,
     Expire,
     Fail,
     Forget,
+    Reclaim,
     Requeue,
     Reschedule,
     Revive,
@@ -79,31 +85,37 @@ FORGET_OPEN_DELETE = """\
 DELETE FROM incident_deliveries
 WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
   AND NOT EXISTS (SELECT 1 FROM incident_deliveries r
-                  WHERE r.incident_id=:incident_id AND r.kind='recover' AND r.state='pending')"""
+                  WHERE r.incident_id=:incident_id AND r.kind='recover'
+                    AND r.state IN ('pending', 'sending'))"""
 
-SENDER_SENT = """\
-UPDATE incident_deliveries SET state='sent', attempts=attempts+1, updated_at=:now,
+RECLAIM_UPDATE = """\
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at, updated_at=:now,
   version=version+1
-WHERE delivery_id=:id AND attempts=:attempts
-  AND (state='pending' OR (state='suppressed' AND kind='open'))
-  AND (:version IS NULL OR version=:version)"""
+WHERE delivery_id=:id AND state='sending' AND attempts=:attempts AND version=:version"""
 
-SENDER_RETRY = """\
-UPDATE incident_deliveries SET attempts=attempts+1, next_attempt_at=:next_attempt_at,
+CLAIM = """\
+UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
+  next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND next_attempt_at<=:now
+  AND attempts<:max_attempts AND version=:version"""
+
+COMPLETE_SENT = """\
+UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='sending' AND version=:version"""
+
+COMPLETE_RETRY = """\
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
-  AND (:version IS NULL OR version=:version)"""
+WHERE delivery_id=:id AND state='sending' AND version=:version"""
 
-SENDER_GIVE_UP = """\
-UPDATE incident_deliveries SET state='failed', attempts=attempts+1, updated_at=:now,
-  version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
-  AND (:version IS NULL OR version=:version)"""
+COMPLETE_FAILED = """\
+UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='sending' AND version=:version"""
 
 ALL_SQL = (
     ENQUEUE_INSERT, SUPPRESS_INSERT, SUPPRESS_UPDATE, RESCHEDULE_UPDATE, REQUEUE_UPDATE,
     REVIVE_UPDATE, EXPIRE_UPDATE, FAIL_UPDATE, WITHDRAW_UPDATE, FORGET_DELETE,
-    FORGET_OPEN_DELETE, SENDER_SENT, SENDER_RETRY, SENDER_GIVE_UP,
+    FORGET_OPEN_DELETE, RECLAIM_UPDATE, CLAIM, COMPLETE_SENT, COMPLETE_RETRY, COMPLETE_FAILED,
 )  # fmt: skip
 
 
@@ -124,18 +136,29 @@ def statement(a: Action, now: float) -> tuple[str, dict]:
         return REVIVE_UPDATE, p | {"not_before": a.not_before}
     if isinstance(a, Reschedule):
         return RESCHEDULE_UPDATE, p | {"next_attempt_at": a.next_attempt_at}
+    if isinstance(a, Reclaim):
+        return RECLAIM_UPDATE, p | {"next_attempt_at": a.next_attempt_at}
     if isinstance(a, Forget):
         return (FORGET_OPEN_DELETE if a.sibling_recover else FORGET_DELETE), p
     table = {Expire: EXPIRE_UPDATE, Fail: FAIL_UPDATE, Withdraw: WITHDRAW_UPDATE}
     return table[type(a)], p
 
 
-def sender_params(captured: DeliveryView, now: float) -> dict:
-    """Parameters for the sender statements: only a recover completion checks the version."""
-    version = captured.version if captured.kind == "recover" else None
+def claim_params(row: DeliveryView, now: float, config: DeliveryConfig) -> dict:
+    """Parameters of CLAIM for a pending row the sender just read."""
     return {
-        "id": delivery_id(captured.incident_id, captured.kind),
-        "attempts": captured.attempts,
-        "version": version,
+        "id": delivery_id(row.incident_id, row.kind),
+        "version": row.version,
+        "now": int(now),
+        "lease_seconds": config.lease_seconds,
+        "max_attempts": config.max_attempts,
+    }
+
+
+def completion_params(claimed: DeliveryView, now: float) -> dict:
+    """Parameters of the COMPLETE_* statements: `claimed` is the row as CLAIM left it."""
+    return {
+        "id": delivery_id(claimed.incident_id, claimed.kind),
+        "version": claimed.version,
         "now": int(now),
     }

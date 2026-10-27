@@ -5,8 +5,9 @@ import itertools
 import math
 
 import pytest
-from delivery_sim import PassAborted, Store, apply_cas, complete_send
+from delivery_sim import PassAborted, Store, apply_cas
 
+from vigie_pipeline import delivery_sql as sql
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
     DeliveryView,
@@ -16,6 +17,7 @@ from vigie_pipeline.delivery_plan import (
     Fail,
     Forget,
     IncidentView,
+    Reclaim,
     Requeue,
     Reschedule,
     ReviewView,
@@ -544,8 +546,8 @@ REVIEWS = [
     "cleared",
     "bogus",
 ]
-OPEN_D = [None, "pending", "sent", "failed", "suppressed", "expired"]
-REC_D = [None, "pending", "sent", "withdrawn"]
+OPEN_D = [None, "pending", "sending", "sent", "failed", "suppressed", "expired"]
+REC_D = [None, "pending", "sending", "sent", "withdrawn"]
 AGES = [5, 90000, 3_000_000]
 
 
@@ -884,22 +886,6 @@ def test_a_half_forgotten_incident_cannot_announce_twice():
     assert both == (Forget("i1", "open"), Forget("i1", "recover"))
 
 
-def test_a_send_completion_captured_before_a_withdrawal_cannot_mark_the_new_row_sent():
-    pending = dv("recover", created=NOW - 5, nxt=NOW)
-    rows = {("i1", "open"): dv(state="sent"), ("i1", "recover"): pending}
-    captured = pending  # the sender claimed this incarnation (version 0) and is sending
-    for t, state in ((NOW, "open"), (NOW + 10, "resolved")):  # reopened, then resolved again
-        actions = run([inc(state=state)], deliveries=list(rows.values()), now=t)
-        rows, skipped = apply_cas(rows, actions, t)
-        assert not skipped
-    assert rows[("i1", "recover")].state == "pending"
-    assert rows[("i1", "recover")].version > captured.version  # versions never restart
-    after, ok = complete_send(rows, captured, NOW + 11)
-    assert not ok and after == rows
-    fresh, ok = complete_send(rows, rows[("i1", "recover")], NOW + 11)
-    assert ok and fresh[("i1", "recover")].state == "sent"
-
-
 # round 5: a withdrawn recover is revived, never deleted and recreated
 def test_a_withdrawn_recover_is_revived_with_its_budget_and_clock_kept():
     ds = [
@@ -992,36 +978,6 @@ def test_an_open_incident_never_loses_any_row_whatever_their_age():
     assert run([inc()], deliveries=ds) == ()
 
 
-# round 6: an open delivered during a planner change is recorded, not sent again
-def _send_during(*phases):
-    """Claim a pending open, let the planner act for each (state, review) phase, then complete."""
-    pending = dv(nxt=NOW - 1)
-    rows, t = {("i1", "open"): pending}, NOW
-    for review in phases:
-        t += 1
-        actions = run([inc()], review, list(rows.values()), now=t)
-        rows, skipped = apply_cas(rows, actions, t)
-        assert not skipped
-    return complete_send(rows, pending, t + 1)
-
-
-def test_a_reschedule_during_a_send_still_records_the_open_as_sent():
-    rows, ok = _send_during(snooze(100))
-    assert ok and rows[("i1", "open")].state == "sent"
-
-
-def test_ack_then_clear_during_a_send_still_records_the_open_as_sent():
-    rows, ok = _send_during({"i1": ReviewView("acknowledged", None)}, {})
-    assert ok and rows[("i1", "open")].state == "sent"
-
-
-def test_an_ack_overtaking_a_send_still_records_it_so_a_later_clear_cannot_resend():
-    rows, ok = _send_during({"i1": ReviewView("acknowledged", None)})
-    assert ok and rows[("i1", "open")].state == "sent"
-    cleared = run([inc()], deliveries=list(rows.values()))
-    assert cleared == ()
-
-
 def test_a_forget_pass_with_one_missed_precondition_rolls_back_entirely():
     old = NOW - RET - 1
     ds = [dv(state="sent", created=old), dv("recover", "sent", created=old)]
@@ -1038,17 +994,167 @@ def test_a_forget_pass_with_one_missed_precondition_rolls_back_entirely():
     assert set(store.rows()) == {("i1", "open"), ("i1", "recover")}
 
 
-def test_an_expiry_landing_before_the_completion_stands():
-    pending = dv(nxt=NOW - 1)
-    actions = run([inc(state="resolved")], deliveries=[pending])
-    rows, _ = apply_cas({("i1", "open"): pending}, actions, NOW)
-    after, ok = complete_send(rows, pending, NOW + 1)
-    assert not ok and after[("i1", "open")].state == "expired"
-
-
 def test_a_revive_never_schedules_before_the_rows_own_backoff_even_without_attempts():
     ds = [
         dv(state="sent"),
         dv("recover", "withdrawn", attempts=0, nxt=NOW + 300),
     ]  # clock stepped back
     assert run([inc(state="resolved")], deliveries=ds) == (Revive("i1", "recover", NOW + 300),)
+
+
+# round 7: the sender holds a lease; the planner hands off a live `sending` row
+LEASE = 300
+
+
+def sending(kind="open", attempts=1, nxt=NOW + LEASE, ver=1, **kw):
+    return dv(kind, "sending", attempts=attempts, nxt=nxt, ver=ver, **kw)
+
+
+@pytest.mark.parametrize("kind", ["open", "recover"])
+@pytest.mark.parametrize("incident", ["open", "resolved", "superseded", "weird", None])
+@pytest.mark.parametrize(
+    "review", [None, ACK_REVIEW := {"i1": ReviewView("acknowledged", None)}, snooze(100)]
+)
+def test_a_live_lease_gets_no_action_of_any_kind(kind, incident, review):
+    old = NOW - 10 * RET  # even a row that is past its ttl, its lifetime and retention
+    row = sending(kind, created=old)
+    ds = [row] if kind == "open" else [dv(state="sent", created=old), row]
+    incidents = [] if incident is None else [inc(state=incident)]
+    got = run(incidents, review or {}, ds)
+    assert not [a for a in got if a.kind == kind], got
+    assert not [a for a in got if type(a).__name__ == "Forget"]
+
+
+def test_a_lapsed_lease_is_reclaimed_without_counting_the_attempt_again():
+    row = sending(attempts=2, nxt=NOW, ver=7)
+    got = run([inc()], deliveries=[row])
+    assert got == (Reclaim("i1", "open", NOW + backoff(2, CFG)),)
+    assert got[0].expected == Expected("sending", 2, 7)
+    back = apply([row], got, NOW)[0]
+    assert (back.state, back.attempts, back.version) == ("pending", 2, 8)
+    assert run([inc()], deliveries=[back]) == ()
+
+
+def test_a_lapsed_lease_past_the_budget_fails_and_a_garbled_one_expires():
+    spent = sending(attempts=CFG.max_attempts, nxt=NOW - 1)
+    assert run([inc()], deliveries=[spent]) == (Fail("i1", "open", "max_attempts"),)
+    junk = dataclasses.replace(sending(nxt=NOW - 1), updated_at="soon")  # type: ignore[arg-type]
+    assert run([inc()], deliveries=[junk]) == (Expire("i1", "open", "unrecognised_state"),)
+    assert run([], deliveries=[sending(nxt=NOW - 1)]) == (Reclaim("i1", "open", NOW + 60),)
+
+
+def test_no_recover_is_enqueued_while_the_open_is_in_flight():
+    resolved = inc(state="resolved")
+    assert run([resolved], deliveries=[sending()]) == ()
+    assert run([resolved], deliveries=[dv(state="sent")]) == (Enqueue("i1", "recover", NOW),)
+
+
+def test_nothing_is_forgotten_while_any_row_is_sending_or_pending():
+    old = NOW - RET - 1
+    done = dv(state="sent", created=old)
+    for live in (sending("recover", created=old), dv("recover", created=old, nxt=NOW + 5)):
+        assert not [
+            a
+            for a in run([inc(state="superseded")], deliveries=[done, live])
+            if isinstance(a, Forget)
+        ]
+        assert not [a for a in run([], deliveries=[done, live]) if isinstance(a, Forget)]
+
+
+def test_lease_seconds_is_validated():
+    for bad in (0, -1, 1.5, True, "300", float("nan")):
+        with pytest.raises(ValueError):
+            DeliveryConfig(lease_seconds=bad)  # type: ignore[arg-type]
+    assert DeliveryConfig(lease_seconds=1).lease_seconds == 1
+
+
+def _lease_world(rows):
+    return Store(rows)
+
+
+def _claim(store, key, now):
+    assert store.run(sql.CLAIM, sql.claim_params(store.rows()[key], now, CFG)) == 1
+    return store.rows()[key]
+
+
+def _pass(store, incident, reviews, now):
+    actions = plan([inc(state=incident)], reviews, list(store.rows().values()), now, CFG)
+    store.apply_pass(actions, now)
+    return list(actions)
+
+
+def test_a_flap_during_a_recover_send_neither_withdraws_nor_resends():
+    """Codex's trace: Withdraw+Revive while a recover is in flight used to drop the completion and
+    leave the row pending, so it was transmitted again."""
+    store = _lease_world([dv(state="sent"), dv("recover", nxt=NOW - 1)])
+    claimed = _claim(store, ("i1", "recover"), NOW)  # the one transmission
+    assert (claimed.state, claimed.attempts, claimed.next_attempt_at) == ("sending", 1, NOW + LEASE)
+    assert _pass(store, "open", {}, NOW + 1) == []  # reopened mid-send: hands off
+    assert _pass(store, "resolved", {}, NOW + 2) == []
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 3)) == 1
+    done = store.rows()[("i1", "recover")]
+    assert (done.state, done.attempts) == ("sent", 1)
+    assert _pass(store, "open", {}, NOW + 4) == []  # a sent recover is never touched again
+
+
+def test_an_ack_during_an_open_send_is_applied_after_it_and_cannot_resend():
+    store = _lease_world([dv(nxt=NOW - 1)])
+    claimed = _claim(store, ("i1", "open"), NOW)
+    ack = {"i1": ReviewView("acknowledged", None)}
+    assert _pass(store, "open", ack, NOW + 1) == []
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 2)) == 1
+    assert _pass(store, "open", ack, NOW + 3) == []  # a sent row ignores the late ack
+    assert _pass(store, "open", {}, NOW + 4) == []  # and the clear
+    assert store.rows()[("i1", "open")].state == "sent"
+
+
+def test_a_snooze_during_a_failing_send_applies_on_the_next_pass():
+    store = _lease_world([dv(nxt=NOW - 1)])
+    claimed = _claim(store, ("i1", "open"), NOW)
+    assert _pass(store, "open", snooze(7200), NOW + 1) == []
+    retry = after_failure(claimed, NOW + 2, CFG)
+    params = sql.completion_params(claimed, NOW + 2) | {"next_attempt_at": retry.next_attempt_at}
+    assert store.run(sql.COMPLETE_RETRY, params) == 1  # set from the claimed row only
+    assert store.rows()[("i1", "open")].next_attempt_at == NOW + 2 + 60
+    assert _pass(store, "open", snooze(7200), NOW + 3) == [Reschedule("i1", "open", NOW + 7200)]
+
+
+def test_a_stale_or_double_completion_affects_no_row():
+    store = _lease_world([dv(nxt=NOW - 1)])
+    claimed = _claim(store, ("i1", "open"), NOW)
+    stale = dataclasses.replace(claimed, version=claimed.version - 1)
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(stale, NOW + 1)) == 0
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 1)) == 1
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 2)) == 0
+    assert store.run(sql.CLAIM, sql.claim_params(store.rows()[("i1", "open")], NOW + 3, CFG)) == 0
+
+
+def test_flapping_during_sends_never_exceeds_the_attempt_budget():
+    """Opus's trace (max_attempts=3): every claim is one transmission and is counted at claim."""
+    cfg = DeliveryConfig(max_attempts=3)
+    store = _lease_world([dv(state="sent"), dv("recover", nxt=NOW)])
+    t, claims = NOW, 0
+    for _ in range(8):
+        row = store.rows()[("i1", "recover")]
+        if row.state != "pending":
+            break
+        t = max(t, row.next_attempt_at)
+        assert store.run(sql.CLAIM, sql.claim_params(row, t, cfg)) == 1
+        claims += 1
+        claimed = store.rows()[("i1", "recover")]
+        for state in ("open", "resolved"):  # flap while the send is in flight
+            t += 1
+            assert plan([inc(state=state)], {}, list(store.rows().values()), t, cfg) == ()
+        act = after_failure(claimed, t, cfg)
+        done = sql.completion_params(claimed, t)
+        if isinstance(act, Fail):
+            assert store.run(sql.COMPLETE_FAILED, done) == 1
+        else:
+            retry = done | {"next_attempt_at": act.next_attempt_at}
+            assert store.run(sql.COMPLETE_RETRY, retry) == 1
+        for state in ("open", "resolved"):  # and flap between sends: Withdraw, then Revive
+            t += 1
+            acts = plan([inc(state=state)], {}, list(store.rows().values()), t, cfg)
+            store.apply_pass(acts, t)
+    final = store.rows()[("i1", "recover")]
+    assert claims == cfg.max_attempts == final.attempts and final.state == "failed"

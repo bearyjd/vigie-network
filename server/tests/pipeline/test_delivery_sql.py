@@ -73,6 +73,7 @@ SCENARIOS = {
     "Fail": ([inc()], {}, [row(state="suppressed", attempts=CFG.max_attempts)]),
     "Withdraw": ([inc()], {}, [row(state="sent"), row("recover", ver=1)]),
     "Revive": ([inc("resolved")], {}, [row(state="sent"), row("recover", "withdrawn", ver=2)]),  # noqa: E501
+    "Reclaim": ([inc()], {}, [row(state="sending", attempts=2, nxt=NOW - 1, ver=3)]),
     "Forget": ([inc("superseded")], {}, [row(state="sent", created=OLD), row("recover", "sent", created=OLD)]),  # noqa: E501
 }  # fmt: skip
 
@@ -119,6 +120,8 @@ def test_a_pending_recover_blocks_the_forget_of_its_open_row(conn):
     load(conn, [row("recover", created=NOW - 5)])  # a recover shows up before the delete runs
     statement, params = sql.statement(forget, NOW)
     assert conn.execute(statement, params).rowcount == 0
+    conn.execute("UPDATE incident_deliveries SET state='sending' WHERE kind='recover'")
+    assert conn.execute(statement, params).rowcount == 0  # a recover in flight blocks it too
     conn.execute("UPDATE incident_deliveries SET state='expired' WHERE kind='recover'")
     assert conn.execute(statement, params).rowcount == 1
 
@@ -139,49 +142,53 @@ def test_the_revive_statement_keeps_the_budget_and_sets_a_valid_row(conn):
     assert got.updated_at == NOW and got.created_at == NOW - 5
 
 
-def test_the_sender_statements(conn):
-    load(conn, [row(), row("recover", attempts=1, ver=5)])
-    opened, recover = (row(), row("recover", attempts=1, ver=5))
-    stale = dataclasses.replace(opened, version=99)
-
-    # an open completion ignores the version; a recover completion does not
-    def run(statement, d, **extra):
-        return conn.execute(statement, sql.sender_params(d, NOW) | extra).rowcount
-
-    assert run(sql.SENDER_SENT, dataclasses.replace(recover, version=1)) == 0
-    assert run(sql.SENDER_SENT, dataclasses.replace(recover, attempts=0)) == 0
-    assert run(sql.SENDER_SENT, recover) == 1
-    assert run(sql.SENDER_SENT, recover) == 0  # no longer pending
-    assert run(sql.SENDER_SENT, stale) == 1
-    got = fetch(conn)
-    assert (got[("i1", "open")].state, got[("i1", "open")].attempts) == ("sent", 1)
-    assert got[("i1", "recover")].version == 6 and got[("i1", "recover")].updated_at == NOW
-
-
-def test_an_acknowledged_open_is_still_recorded_as_sent(conn):
-    load(conn, [row(state="suppressed")])
-    assert conn.execute(sql.SENDER_SENT, sql.sender_params(row(), NOW)).rowcount == 1
-    assert fetch(conn)[("i1", "open")].state == "sent"
-
-
-def test_a_failed_send_retries_or_gives_up_only_while_pending(conn):
-    load(conn, [row(), row("recover", ver=1)])
-    retry = sql.SENDER_RETRY
-    assert (
-        conn.execute(retry, sql.sender_params(row(), NOW) | {"next_attempt_at": NOW + 60}).rowcount
-        == 1
-    )
+def test_claim_counts_the_attempt_and_takes_the_lease(conn):
+    load(conn, [row(nxt=NOW - 1)])
+    claim = sql.claim_params(row(nxt=NOW - 1), NOW, CFG)
+    assert conn.execute(sql.CLAIM, claim).rowcount == 1
     got = fetch(conn)[("i1", "open")]
-    assert (got.attempts, got.next_attempt_at, got.state) == (1, NOW + 60, "pending")
-    assert (
-        conn.execute(sql.SENDER_GIVE_UP, sql.sender_params(row("recover", ver=1), NOW)).rowcount
-        == 1
-    )
+    assert (got.state, got.attempts, got.version) == ("sending", 1, 1)
+    assert (got.next_attempt_at, got.updated_at) == (NOW + CFG.lease_seconds, NOW)
+    assert conn.execute(sql.CLAIM, claim).rowcount == 0  # one live claim per delivery_id
+
+
+def test_claim_refuses_a_row_that_is_not_due_stale_or_out_of_budget(conn):
+    load(conn, [row(nxt=NOW + 5), row("recover", attempts=CFG.max_attempts, nxt=NOW - 1)])
+    not_due = sql.claim_params(row(nxt=NOW + 5), NOW, CFG)
+    assert conn.execute(sql.CLAIM, not_due).rowcount == 0
+    spent = row("recover", attempts=CFG.max_attempts, nxt=NOW - 1)
+    assert conn.execute(sql.CLAIM, sql.claim_params(spent, NOW, CFG)).rowcount == 0
+    stale = dataclasses.replace(row(nxt=NOW + 5), version=9)
+    assert conn.execute(sql.CLAIM, sql.claim_params(stale, NOW + 10, CFG)).rowcount == 0
+
+
+@pytest.mark.parametrize("kind", ["open", "recover"])
+def test_completion_is_one_version_checked_rule_for_both_kinds(conn, kind):
+    load(conn, [row(kind, nxt=NOW - 1)])
+    conn.execute(sql.CLAIM, sql.claim_params(row(kind, nxt=NOW - 1), NOW, CFG))
+    claimed = fetch(conn)[("i1", kind)]
+    stale = dataclasses.replace(claimed, version=claimed.version - 1)
+    for statement in (sql.COMPLETE_SENT, sql.COMPLETE_RETRY, sql.COMPLETE_FAILED):
+        extra = {"next_attempt_at": NOW + 60}
+        assert conn.execute(statement, sql.completion_params(stale, NOW + 1) | extra).rowcount == 0
+    assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 1)).rowcount == 1
+    done = fetch(conn)[("i1", kind)]
+    assert (done.state, done.attempts, done.version) == ("sent", 1, 2)
+    assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 2)).rowcount == 0
+
+
+def test_a_failed_send_goes_back_to_pending_or_fails(conn):
+    load(conn, [row(nxt=NOW - 1), row("recover", nxt=NOW - 1)])
+    for kind in ("open", "recover"):
+        conn.execute(sql.CLAIM, sql.claim_params(row(kind, nxt=NOW - 1), NOW, CFG))
+    claimed = fetch(conn)
+    retry = sql.completion_params(claimed[("i1", "open")], NOW + 1) | {"next_attempt_at": NOW + 61}
+    assert conn.execute(sql.COMPLETE_RETRY, retry).rowcount == 1
+    got = fetch(conn)[("i1", "open")]
+    assert (got.state, got.attempts, got.next_attempt_at) == ("pending", 1, NOW + 61)
+    failed = sql.completion_params(claimed[("i1", "recover")], NOW + 1)
+    assert conn.execute(sql.COMPLETE_FAILED, failed).rowcount == 1
     assert fetch(conn)[("i1", "recover")].state == "failed"
-    assert (
-        conn.execute(sql.SENDER_GIVE_UP, sql.sender_params(row("recover", ver=1), NOW)).rowcount
-        == 0
-    )
 
 
 def test_every_update_stamps_updated_at_and_bumps_the_version():

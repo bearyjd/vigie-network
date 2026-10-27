@@ -153,6 +153,13 @@ def test_only_a_recover_can_be_withdrawn(tmp_path):
         conn.execute(INSERT, (B, "inc", "open", "withdrawn"))
 
 
+def test_a_sending_row_needs_its_lease_end(tmp_path):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "sending"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE incident_deliveries SET next_attempt_at=NULL")
+
+
 def test_only_pending_rows_need_a_next_attempt(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute(INSERT, (A, "inc", "open", "sent"))

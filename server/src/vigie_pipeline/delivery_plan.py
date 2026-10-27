@@ -24,25 +24,28 @@ The rules are listed in docs/monitoring.md ("Incident delivery"); in short:
 * unknown states or statuses and non-finite or non-numeric data fail closed
   (`unrecognised_state`, never raise); a bad `now` raises ValueError.
 
-CONCURRENCY CONTRACT (the primary defence). Unit 4b reads the incident set (the COMPLETE current
-set; skip the pass if that read fails) AND the delivery rows, runs `plan()` and applies every
-action inside ONE `BEGIN IMMEDIATE` transaction on the pipeline database, using the statements in
-`vigie_pipeline.delivery_sql`. The sender's writes are separate short transactions serialised by
-the same lock, so the planner always sees committed sender state and never plans against another
-planner.
+CONCURRENCY CONTRACT. Unit 4b reads the incident set (the COMPLETE current set; skip the pass if
+that read fails) AND the delivery rows, runs `plan()` and applies every action inside ONE
+`BEGIN IMMEDIATE` transaction, using the statements in `vigie_pipeline.delivery_sql`.
 
-`expected` is an assertion on top of the contract: None means the row must not exist (INSERT OR
-IGNORE), otherwise Expected(state, attempts, version) of the row planned against. Each action is
-one conditional statement that bumps `version` and sets `updated_at`; anything but exactly one
-affected row is a bug: log it and roll the whole pass back. A Forget of an `open` row carries
-`sibling_recover='absent_or_terminal'`: its DELETE refuses while a recover row is pending.
-Accepted windows, each bounded by one send duration: between planner passes the sender may deliver
-a pending recover to an incident that has reopened, been superseded or gone missing (the next pass
-withdraws the row; one stale recovery notice), and an open delivered while the incident resolves
-is expired as `resolved_before_send` (the user gets the open and no recover). Times in actions are
-integer epoch seconds.
-`expected`/`sibling_recover` are excluded from dataclass equality so tests compare actions by
-meaning and assert them separately.
+SENDER LEASE. The sender CLAIMs a due `pending` row (the only way to transmit: it moves the row to
+`sending`, counts the attempt and puts the lease end in `next_attempt_at`), transmits outside any
+transaction, then COMPLETEs with the claimed version. The database allows one live claim per
+delivery_id. The planner NEVER touches a live `sending` row (no action of any kind) and an
+announcement in flight counts as not yet sent (no recover until `sent`; no Forget while any row of
+the incident is `sending` or `pending`). Once the lease lapsed the sender is presumed crashed:
+Reclaim (back to `pending` after a backoff; `attempts` already counted) or Fail past the budget.
+Delivery is at least once: a crash after a successful send can cause one retransmission per
+reclaim, bounded by `max_attempts`. Accepted window: a recover claimed before its incident
+reopened is delivered (one stale recovery notice).
+
+`expected` is an assertion: None means the row must not exist (INSERT OR IGNORE), otherwise
+Expected(state, attempts, version) of the row planned against. Each action is one conditional
+statement that bumps `version` and sets `updated_at`; anything but exactly one affected row is a
+bug: log it and roll the whole pass back. A Forget of an `open` row carries
+`sibling_recover='absent_or_terminal'`: its DELETE refuses while a recover row is pending or
+sending. Times in actions are integer epoch seconds. `expected`/`sibling_recover` are excluded
+from dataclass equality so tests compare actions by meaning and assert them separately.
 """
 
 from __future__ import annotations
@@ -50,172 +53,37 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
 
-KINDS = ("open", "recover")
-STATES = frozenset({"pending", "sent", "failed", "suppressed", "expired", "withdrawn"})
-TERMINAL = frozenset({"sent", "failed", "suppressed", "expired", "withdrawn"})
-QUIET_STATUSES = frozenset({"acknowledged", "expected"})
-CLOSED_STATES = frozenset({"resolved", "superseded"})
-UNRECOGNISED = "unrecognised_state"
-
-
-def _num(value: object) -> bool:
-    """A real finite number: not a bool, not NaN/inf, not too large for a float."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (OverflowError, ValueError):
-        return False
-
-
-@dataclass(frozen=True)
-class IncidentView:
-    id: str
-    state: str
-    detected_at: int
-
-
-@dataclass(frozen=True)
-class ReviewView:
-    """`status` None with no `snooze_until` is a cleared decision, i.e. no decision."""
-
-    status: str | None
-    snooze_until: float | None
-
-
-@dataclass(frozen=True)
-class DeliveryView:
-    incident_id: str
-    kind: str
-    state: str
-    attempts: int
-    next_attempt_at: float | None
-    created_at: float
-    updated_at: float
-    version: int = 0
-
-
-@dataclass(frozen=True)
-class DeliveryConfig:
-    max_attempts: int = 6
-    backoff_base_seconds: int = 60
-    backoff_cap_seconds: int = 3600
-    pending_ttl_seconds: int = 86400
-    retention_seconds: int = 30 * 86400
-    eligible_since: float | None = None
-
-    def __post_init__(self) -> None:
-        durations = (
-            self.backoff_base_seconds,
-            self.backoff_cap_seconds,
-            self.pending_ttl_seconds,
-            self.retention_seconds,
-        )
-        if not all(_num(v) and v > 0 for v in durations):
-            raise ValueError("durations must be finite numbers > 0")
-        if not _num(self.max_attempts) or self.max_attempts < 1:
-            raise ValueError("max_attempts must be >= 1")
-        if self.backoff_cap_seconds < self.backoff_base_seconds:
-            raise ValueError("backoff cap must be >= base")
-        if self.eligible_since is not None and not _num(self.eligible_since):
-            raise ValueError("eligible_since must be a finite number or None")
-
-
-@dataclass(frozen=True)
-class Expected:
-    """Precondition of a conditional update: the row's state, attempts and version when planned."""
-
-    state: str
-    attempts: int
-    version: int
+from vigie_pipeline.delivery_types import (  # noqa: F401 - re-exported
+    CLOSED_STATES,
+    KINDS,
+    QUIET_STATUSES,
+    STATES,
+    TERMINAL,
+    UNRECOGNISED,
+    Action,
+    DeliveryConfig,
+    DeliveryView,
+    Enqueue,
+    Expected,
+    Expire,
+    Fail,
+    Forget,
+    IncidentView,
+    Reclaim,
+    Requeue,
+    Reschedule,
+    ReviewView,
+    Revive,
+    Suppress,
+    Withdraw,
+    is_number,
+)
+from vigie_pipeline.delivery_types import is_number as _num
 
 
 def _exp(d: DeliveryView) -> Expected:
     return Expected(d.state, d.attempts, d.version)
-
-
-@dataclass(frozen=True)
-class Enqueue:
-    incident_id: str
-    kind: str
-    not_before: int
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Requeue:
-    """Move a suppressed row back to pending at `not_before`, keeping attempts and created_at."""
-
-    incident_id: str
-    kind: str
-    not_before: int
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Suppress:
-    incident_id: str
-    kind: str
-    reason: str
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Expire:
-    incident_id: str
-    kind: str
-    reason: str
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Reschedule:
-    incident_id: str
-    kind: str
-    next_attempt_at: int
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Fail:
-    incident_id: str
-    kind: str
-    reason: str
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Forget:
-    incident_id: str
-    kind: str
-    expected: Expected | None = field(default=None, compare=False)
-    sibling_recover: str | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Withdraw:
-    """Mark a pending `recover` whose incident is no longer resolved as `withdrawn`."""
-
-    incident_id: str
-    kind: str
-    expected: Expected | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class Revive:
-    """Bring a `withdrawn` recover back to pending. `attempts` and `created_at` are kept (the retry
-    budget and the lifetime are cumulative for the whole life of the row) and `not_before` is not
-    earlier than the row's own backoff; `version` only grows."""
-
-    incident_id: str
-    kind: str
-    not_before: int
-    expected: Expected | None = field(default=None, compare=False)
-
-
-Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget | Withdraw | Revive
 
 
 def delivery_id(incident_id: str, kind: str) -> str:
@@ -326,10 +194,24 @@ def _forget_all(
     return [Forget(iid, d.kind, _exp(d), sibling if d.kind == "open" else None) for d in rows]
 
 
+def _lease_action(iid: str, d: DeliveryView, now: float, config: DeliveryConfig) -> Action | None:
+    """A `sending` row belongs to its sender: hands off while the lease is live. Once it lapsed the
+    sender is presumed crashed: back to pending after a backoff, or failed past the budget."""
+    if not _row_ok(d):
+        return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
+    if d.next_attempt_at > now:
+        return None
+    if d.attempts >= config.max_attempts:
+        return Fail(iid, d.kind, "max_attempts", _exp(d))
+    return Reclaim(iid, d.kind, math.ceil(now) + backoff(d.attempts, config), _exp(d))
+
+
 def _row_action(
     iid: str, d: DeliveryView, state: object, now: float, config: DeliveryConfig
 ) -> Action | None:
-    """Pending rows only: the others are inert until a verdict or a Forget touches them."""
+    """Pending and sending rows; the others are inert until a verdict or a Forget touches them."""
+    if d.state == "sending":
+        return _lease_action(iid, d, now, config)
     if d.state != "pending":
         return None
     if not _row_ok(d):
@@ -366,12 +248,16 @@ def _plan_incident(
     config: DeliveryConfig,
 ) -> list[Action]:
     if incident is None:  # pruned: nothing left to announce
-        pending = [
+        rows = sorted(ds.items())
+        live = [
             Expire(iid, k, "incident_missing", _exp(d))
-            for k, d in sorted(ds.items())
             if d.state == "pending"
+            else _lease_action(iid, d, now, config)
+            for k, d in rows
+            if d.state in ("pending", "sending")
         ]
-        return pending or _forget_all(iid, ds, now, config)
+        live = [a for a in live if a]
+        return live or _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
     rows = (_row_action(iid, d, state, now, config) for _, d in sorted(ds.items()))
     actions = [a for a in rows if a]
