@@ -38,7 +38,7 @@ A **new dedicated `endpoint-ingest` container** receives the TLS syslog stream i
 |---|---|
 | Hardening | same `x-hardening` anchor as the other services (`deploy/compose.yaml:34-45`: uid 10001, read-only, `cap_drop: [ALL]`, no-new-privileges); the anchor's `mem_limit: 512m` / `cpus: 1.0` (lines 44-45) are overridden to `mem_limit: 128m`, `cpus: 0.25` |
 | Runtime | Python asyncio + stdlib `ssl`; `num_tickets=0` so the SPKI pin check runs on every full handshake. Stdlib `ssl` cannot extract an SPKI from DER and `cryptography` is not a server dependency: **dependency decision for E2** is either to add `cryptography` (pinned in `deploy/build-constraints.txt`) or to compute the pin from the peer's DER with a small vetted parser; undecided |
-| Port | `${VIGIE_LAN_ADDR}:6514`, bound like ingest (`deploy/compose.yaml:103-106`, `VIGIE_LAN_ADDR` has no default). The per-peer limits need the real source address, which depends on the rootless network mode (`docs/deploy.md:239-241`, `deploy/.env.example:13`): **pasta is required** (slirp4netns may rewrite it); the listener checks `podman info --format '{{.Host.RootlessNetworkCmd}}'`-equivalent evidence at startup (refuses per-peer limiting it cannot trust, logged and counted) and a test covers it |
+| Port | `${VIGIE_LAN_ADDR}:6514`, bound like ingest (`deploy/compose.yaml:103-106`, `VIGIE_LAN_ADDR` has no default). The peer address the listener sees depends on the rootless network mode (`docs/deploy.md:239-241`, `deploy/.env.example:13`), and a rootless podman bridge network can rewrite source addresses even when pasta is the default tool, so the default mode proves nothing. Limits therefore do not rely on the peer address alone: per verified client certificate (SPKI) after the handshake, a global connection cap, and a pre-auth per-address cap documented as best-effort. If the real peer address is not preserved, per-address limits are disabled and the global cap carries the load. E2 acceptance test: connect from a second LAN host and assert the observed peer address, run against the actual compose network mode (host or pasta), not assumed |
 | Storage | own volume `vigie-endpoint`; own self-signed server certificate (new `gen-certs.sh --role endpoint`, keeping the ingest/API certificate separation stated at `deploy/gen-certs.sh:2-3`) |
 | Mounts | NEITHER `vigie-inv` nor `vigie-overrides`; the pipeline mounts `vigie-endpoint` read-only (`:ro`). The API does not mount it |
 | Read-only WAL mechanics | A WAL database nobody has open loses its `-wal`/`-shm` files and a `:ro` reader cannot recreate them (`server/src/vigie_ingest/keeper.py:3-7`, `docs/deploy.md:73-80`). So the listener holds a Keeper connection on every endpoint shard and on its registry database, released before retention deletes a shard. The pipeline opens with `mode=ro` plus `query_only`. A missing Keeper fails closed and is counted as a listener gap, which suppresses both endpoint detectors |
@@ -148,7 +148,7 @@ So the finest possible join key is **(device, dst_ip, dst_port, proto, window)**
 
 ## 7. Incidents
 
-Hourly, because `monitoring_incidents` uses `last_hour` and has `observed_bytes`/`threshold_bytes` `NOT NULL` (`server/src/vigie_pipeline/schema.py:228-233`). The table also has `collector_id` and `lineage` `NOT NULL` and a unique open-incident index on `(collector_id, device_id, lineage, detector)` (`server/src/vigie_pipeline/schema.py:228-235`). Proposal for endpoint incidents: `collector_id='endpoint:<host_id>'`, an explicit `lineage` value `'endpoint'`, counts stored in `observed_bytes`/`threshold_bytes` with `detector` naming the unit; the alternative is a schema migration, to be decided and committed to in E3.
+Hourly, because `monitoring_incidents` uses `last_hour` and has `observed_bytes`/`threshold_bytes` `NOT NULL` (`server/src/vigie_pipeline/schema.py:228-233`). The table also has `collector_id` and `lineage` `NOT NULL` and a unique open-incident index on `(collector_id, device_id, lineage, detector)` (`server/src/vigie_pipeline/schema.py:228-235`). That does not fit the current API as-is: incident listing requires a REGISTERED collector (`GET /incidents` needs `collector_id`) and `lineage` must match the device's identity hash (`vigie_pipeline.monitoring_identity.lineage`, used at `server/src/vigie_api/monitoring.py:185`), so `collector_id='endpoint:<host_id>'` with `lineage='endpoint'` would be rejected or invisible. Endpoint incidents therefore need an explicit schema/API change, either a registered pseudo-collector row per endpoint host or a separate incident table/detector family with its own list endpoint. It is decided and reviewed in E3 as a blocker, with the compatibility consequences for `GET /incidents`, the incident lifecycle endpoints (decisions key on incident id), the evidence pack and the GUI. Counts would be stored in `observed_bytes`/`threshold_bytes` with `detector` naming the unit unless the separate table is chosen.
 
 | Incident | Fires when | Suppressed when |
 |---|---|---|
@@ -173,7 +173,7 @@ Starting thresholds are calibrated in shadow mode against a false-alert budget s
 
 | Limit | Value |
 |---|---|
-| Connections | 32 total, 4 per peer address (IPv6 grouped by /64) |
+| Connections | 32 total (global cap); 4 per verified client certificate (SPKI) after the handshake; 4 per peer address (IPv6 grouped by /64) pre-auth, best-effort and disabled when the real peer address is not preserved |
 | TLS handshake | 5 s |
 | Idle connection | 15 min |
 | Max frame | 8 KiB |
@@ -194,7 +194,7 @@ Starting thresholds are calibrated in shadow mode against a false-alert budget s
 | JSON | duplicate `process_path`, 10^5-digit int, NaN, nested object, extra `process_args`, `"<nil>"`, bidi/ANSI/NUL characters, 1 MB `dst_host`, skew +-10 min, rsyslog resend dedup |
 | Isolation | the listener cannot open inventory or overrides; the pipeline opens endpoint shards read-only |
 | Read-only mount | E2: a real `:ro` bind mount test mirroring `server/tests/test_ro_mount_wal.py` (reader works while the Keeper runs; a missing Keeper fails closed and suppresses the detectors) |
-| Network mode | startup check for pasta vs slirp; per-peer limits keyed on the real address |
+| Network mode | second-LAN-host test asserting the observed peer address under the actual compose network mode; if not preserved, per-address limits are off and the global cap holds |
 | Identity | `clientAuth` EKU required; `host_id` equal to a server SAN refused; revocation drops a live connection |
 | Dedup | restart and disk-queue resend produce no duplicate rows (UNIQUE index) |
 | Join fixtures | long-lived flow, VPN, container NAT, IPv6 privacy address, DHCP change, laptop away then back with a late burst, coverage gap, drop counter > 0 must suppress |
@@ -250,6 +250,7 @@ All four were confirmed by the owner on 2026-10-26; the recommendation text is k
 |---|---|
 | E1 | The deploy-order gate (server before collector) |
 | E2 | Section 2 Keeper/read-only mechanics (item 1), CA key custody and name separation (section 5), the compromised-host statement (sections 1, 12), the SPKI dependency decision (section 2), and live-connection revocation (section 5) |
+| E3 | The incident schema/API decision of section 7 (pseudo-collector row vs separate incident family), reviewed with its consequences for `GET /incidents`, lifecycle endpoints, evidence packs and the GUI |
 | E5 | A stated false-alert budget AND an E0 result showing key-level matching is useful: CDN keys, NAT'd containers and kernel WireGuard may leave a structural unmatched rate that the 0.9 gate hides or keeps firing on |
 
 ## 14. Open questions
@@ -264,4 +265,4 @@ All four were confirmed by the owner on 2026-10-26; the recommendation text is k
 |---|---|---|
 | 1 | Opus critic | Verdict REVISE, 5 MAJOR: read-only WAL mechanics, API event-detail data source, CA custody and naming, compromised-host honesty, incident schema fit. All addressed in this revision (sections 1, 2, 5, 7, 8, 12), plus SHOULD-FIX items on future time, wording, network mode, binding, dedup, SPKI dependency, revocation, citations and exit gates |
 | 1 | Opus security review | to be filled when the review runs |
-| 1 | Codex review | to be filled when the review runs |
+| 1 | Codex review | Timed out with two confirmed findings (peer address visibility, incident API fit), both addressed in sections 2, 7, 8, 9 and 13; a second narrow Codex pass will follow |
