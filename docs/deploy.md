@@ -98,6 +98,8 @@ How it is enforced, honestly:
 - **Layout change.** Earlier drafts used one `vigie_data` volume. There is no migration: move
   `inventory.db` and `raw-*.db` into the new volumes by hand, or start fresh.
 
+**Incident delivery output.** Delivery is off by default and adds no mount. If you enable it, point `VIGIE_DELIVERY_FILE` at a path under a mount the pipeline can write; with the stock compose that is the inventory volume (`/inv/delivery-messages.jsonl`). The API mounts that volume read-only, so it can read the file but not modify it. Messages carry only a device alias (or, if opted in, a strictly validated name) and a relative link. See `docs/monitoring.md`.
+
 ## Backups
 
 Back up **`overrides.db` only**, plus optionally the aggregate tables of `inventory.db`. **Never back

@@ -155,15 +155,88 @@ API withholds expired or stale-lineage hints, without waiting for the next pipel
 bounded20-device refresh processes new/expired hints and round-robin work. No raw hostname, vendor
 class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numeric probability.
 
-### Incident delivery (planned)
+### Incident delivery
 
-Nothing is sent yet: this lands the outbox schema and a pure planner only. Delivery is off by
-default and the local inbox works without any publisher. The topic and ownership are still open
-(D5), so no code names a topic or calls a network service. When it is built, the pipeline (not the
-API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
-delivery is disabled the planner does not run, so nothing is created and nothing expires; enabling
-it records `eligible_since`, and incidents detected before that instant are ignored so switching
-it on never announces old open incidents.
+Delivery is **off by default** and the local inbox works without any publisher. The pipeline (not
+the API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
+delivery is disabled the runner is not called, so nothing is created and nothing expires. The
+real network adapter (topic, ownership: D5) is a later unit; no code here names a topic or opens a
+socket.
+
+**What is wired (unit 4b).** After `analyze_monitoring`, when `VIGIE_DELIVERY_ENABLED` is set,
+each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_delivery`:
+
+1. *Planner pass*: one `BEGIN IMMEDIATE`; `now` is read after it; the complete incident set, all
+   delivery rows and the decisions are read; `plan()` runs and every action is applied through
+   `delivery_sql`. A statement that does not affect exactly one row rolls the whole pass back
+   (`PassError`, logged as `delivery_stage_failed`; the rest of the pipeline pass is unaffected).
+   If `overrides.db` is absent, unreadable or locked the whole run is skipped (nothing is planned
+   and nothing is sent; `delivery_decisions_unavailable` is logged once per run).
+2. *Drain*: up to `VIGIE_DELIVERY_MAX_PER_RUN` due `pending` rows, oldest first. Per row: CLAIM in
+   its own short transaction, `may_transmit` right before the publisher (past the deadline: no
+   transmit, a failed attempt is recorded), the publish OUTSIDE any transaction under a hard wall
+   timeout of `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` enforced by the runner (a daemon worker thread
+   abandoned at the deadline), then COMPLETE with the claim token. A hung publisher ends the drain
+   for that run, so a pass is delayed by at most one deadline plus the normal drain work. Every
+   abandoned worker is tracked process-wide; once `VIGIE_DELIVERY_MAX_ABANDONED` of them are still
+   running the runner stops before CLAIMing (no attempt is burned, `delivery_transport_wedged` is
+   logged on the first such run and every 20th) until they return. A late worker's result is
+   discarded and never completes a row. Capacity is reserved atomically before the CLAIM, and a
+   delivery whose abandoned worker is still running is excluded from the candidate query and never published twice at once.
+3. *Watermark*: the first enabled run stores `pipeline_meta.delivery_eligible_since` (the floor of
+   `now`) with `INSERT OR IGNORE`; later runs, and disable/enable cycles, never move it.
+   Incidents detected before it are never announced.
+
+A runner exception is caught and logged (first occurrence and every 20th), never raised into the
+pass. A message is built from fixed
+templates, the relative link `/ui/#incident=<id>` and a device ALIAS (`Device <6 letters>`, a hash
+of the device id): by default NO free text from the database is included, and the device name is
+not even read. The owner opens the link to see the device name locally. This is the safe default
+for any future network publisher, because free text cannot be proven safe. It narrows the earlier
+"device label" payload decision; the owner can flip it with `VIGIE_DELIVERY_INCLUDE_LABEL=1`,
+meant for local-only publishers such as the FilePublisher. In that mode the name
+(`device_overrides.name`) goes through a strict acceptor (`delivery_publish.scrub_label`) that
+validates the RAW string, with no truncation, trimming, whitespace collapsing or NFKC folding
+first (each can hide content): at most 48 characters, no leading, trailing or doubled space, only
+ASCII letters and digits, space, `'`, `’`, `-` and the Latin-1 letters U+00C0-U+00FF (without
+x and division), already NFKC-stable, at most 3 digits, a letter, fewer than 12 hex-looking
+characters (no MAC), no word of 20 or more characters. The name is then sent verbatim; anything
+else, or a missing name or failed lookup, gives the alias (never the raw device id). This
+over-redacts on purpose: names with a dot, underscore, emoji, more than 3 digits, other
+punctuation or a non-Latin script show as an alias. Incident ids reach the relative link by
+design; delivery ids are hashes.
+
+**Settings** (all in `deploy/.env.example`; invalid values stop the pipeline at startup):
+`VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
+other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
+`_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+
+**FilePublisher format.** The only publisher today appends one JSON object per line to
+`VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
+created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a symlink, FIFO or
+device is refused), each message is one `write` followed by `fsync`, every append holds an exclusive `flock` across the size check and the write, a failed or short
+write is cut back to the previous size, and a message that would push
+the file past 10 MiB is refused (the delivery then fails and retries; rotate or truncate the
+file). The file must live under a mount the pipeline can write. The stock compose adds no volume for it
+(the least-privilege mount matrix is unchanged), so use the pipeline's existing writable inventory
+volume, e.g. `/inv/delivery-messages.jsonl`. The API container mounts that volume read-only, so it
+can read the file but not modify it. Messages hold only a device alias (or, if opted in, a strictly validated name) and a relative link.
+
+A failure of `fsync` (or of the cut-back itself) can leave a line that was already written while
+the delivery is retried, so the retry duplicates it: delivery is at least once. Every line carries
+`delivery_id`; consumers should dedupe on it.
+
+**Enabling safely.** Set `VIGIE_DELIVERY_FILE=/inv/delivery-messages.jsonl`, then
+`VIGIE_DELIVERY_ENABLED=1`, restart the pipeline and watch the file. Only incidents detected after
+the first enabled pass are announced. To stop, set `VIGIE_DELIVERY_ENABLED=0`: pending rows then
+wait (nothing expires) until it is switched back on.
+
+**Residual windows.** A publisher that ignores its deadline can still finish after the runner
+abandoned it, which may produce a duplicate (the row is retried); a completion that arrives after
+its lease lapsed is lost by design; the runner and the planner must share one clock; a daemon
+worker abandoned on a hang lives until its call returns (at most `MAX_ABANDONED` at a time), and
+it may still have delivered its message after the row was retried: delivery is at least once.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
 `recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and

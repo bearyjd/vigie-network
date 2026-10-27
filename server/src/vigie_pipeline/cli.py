@@ -54,6 +54,7 @@ def _config(args: argparse.Namespace) -> PipelineConfig:
         suggest_threshold=base.suggest_threshold,
         overlap_grace_s=base.overlap_grace_s,
         activity_gap_s=base.activity_gap_s,
+        delivery=base.delivery,
     )
 
 

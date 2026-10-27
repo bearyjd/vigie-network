@@ -229,7 +229,7 @@ def test_every_update_stamps_updated_at_and_bumps_the_version():
 
 def test_the_docs_quote_every_statement_verbatim():
     text = DOCS.read_text()
-    start = text.index("### Incident delivery (planned)")
+    start = text.index("### Incident delivery\n")
     section = " ".join(text[start : text.index("## Retention and verification limits")].split())
     for statement in sql.ALL_SQL:
         assert " ".join(statement.split()) in section, statement

@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from vigie_pipeline.delivery_types import DeliveryConfig
+
 TRANSIENT_WINDOW_DEFAULT_S = 24 * 3600
 TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
 PROMOTION_CAP_DEFAULT = 20
@@ -68,6 +70,88 @@ def _opt_path(value: str | None) -> Path | None:
     return Path(value) if value else None
 
 
+def _env_int(source: dict[str, str], name: str, default: int) -> int:
+    try:
+        return int(source.get(name, default))
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
+def _env_flag(source: dict[str, str], name: str) -> bool:
+    """Only 1/true/yes enable; 0/false/no/off/empty disable; anything else is a startup error."""
+    value = source.get(name, "").strip().lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be one of 1/true/yes or 0/false/no/off, not {value!r}")
+
+
+@dataclass(frozen=True)
+class DeliverySettings:
+    """Incident delivery (docs/monitoring.md). DEFAULT OFF; when enabled it needs `file`."""
+
+    enabled: bool = False
+    file: Path | None = None
+    lease_s: int = 300
+    transmit_deadline_s: int = 30
+    max_attempts: int = 6
+    backoff_base_s: int = 60
+    backoff_cap_s: int = 3600
+    ttl_s: int = 86400
+    retention_s: int = 30 * 86400
+    max_per_run: int = 20
+    max_abandoned: int = 2
+    drain_budget_s: int = 60
+    include_label: bool = False  # free text stays out of messages unless the owner opts in
+
+    def __post_init__(self) -> None:
+        self.delivery_config(None)  # DeliveryConfig's own validation, at startup
+        if self.max_per_run < 1:
+            raise ValueError("VIGIE_DELIVERY_MAX_PER_RUN must be >= 1")
+        if self.drain_budget_s < self.transmit_deadline_s:
+            raise ValueError("VIGIE_DELIVERY_DRAIN_BUDGET_S must be >= the transmit deadline")
+        if self.max_abandoned < 1:
+            raise ValueError("VIGIE_DELIVERY_MAX_ABANDONED must be >= 1")
+        if self.enabled and self.file is None:
+            raise ValueError("VIGIE_DELIVERY_FILE is required when VIGIE_DELIVERY_ENABLED is set")
+
+    def delivery_config(self, eligible_since: float | None) -> DeliveryConfig:
+        return DeliveryConfig(
+            max_attempts=self.max_attempts,
+            backoff_base_seconds=self.backoff_base_s,
+            backoff_cap_seconds=self.backoff_cap_s,
+            pending_ttl_seconds=self.ttl_s,
+            retention_seconds=self.retention_s,
+            lease_seconds=self.lease_s,
+            transmit_deadline_seconds=self.transmit_deadline_s,
+            eligible_since=eligible_since,
+        )
+
+    @classmethod
+    def from_env(cls, source: dict[str, str]) -> DeliverySettings:
+        d = cls.__dataclass_fields__
+        ints = {
+            "lease_s": "VIGIE_DELIVERY_LEASE_S",
+            "transmit_deadline_s": "VIGIE_DELIVERY_TRANSMIT_DEADLINE_S",
+            "max_attempts": "VIGIE_DELIVERY_MAX_ATTEMPTS",
+            "backoff_base_s": "VIGIE_DELIVERY_BACKOFF_BASE_S",
+            "backoff_cap_s": "VIGIE_DELIVERY_BACKOFF_CAP_S",
+            "ttl_s": "VIGIE_DELIVERY_TTL_S",
+            "retention_s": "VIGIE_DELIVERY_RETENTION_S",
+            "max_per_run": "VIGIE_DELIVERY_MAX_PER_RUN",
+            "max_abandoned": "VIGIE_DELIVERY_MAX_ABANDONED",
+            "drain_budget_s": "VIGIE_DELIVERY_DRAIN_BUDGET_S",
+        }
+        values = {k: _env_int(source, name, d[k].default) for k, name in ints.items()}
+        return cls(
+            enabled=_env_flag(source, "VIGIE_DELIVERY_ENABLED"),
+            file=_opt_path(source.get("VIGIE_DELIVERY_FILE")),
+            include_label=_env_flag(source, "VIGIE_DELIVERY_INCLUDE_LABEL"),
+            **values,
+        )
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     data_dir: Path
@@ -85,6 +169,7 @@ class PipelineConfig:
     activity_gap_s: int = ACTIVITY_GAP_DEFAULT_S  # silence longer than this splits an interval
     activity_retention_s: int = ACTIVITY_RETENTION_DEFAULT_S
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
+    delivery: DeliverySettings = DeliverySettings()
 
     def __post_init__(self) -> None:
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
@@ -132,4 +217,5 @@ class PipelineConfig:
             ),
             overlap_grace_s=int(source.get("VIGIE_OVERLAP_GRACE_S", OVERLAP_GRACE_DEFAULT_S)),
             activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
+            delivery=DeliverySettings.from_env(source),
         )
