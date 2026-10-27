@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +15,7 @@ MAX_MERGE_ACTIVITY_ROWS = 8192
 MAX_MERGE_FLATTEN_WRITES = 256
 INCIDENT_SNOOZE_MAX_S = 7 * 24 * 3600
 MIN_SNOOZE_S = 60
+EVIDENCE_CAP_BYTES = 256 * 1024
 
 
 def _opt_path(value: str | None) -> Path | None:
@@ -35,6 +38,8 @@ class Settings:
     max_merge_activity_rows: int = MAX_MERGE_ACTIVITY_ROWS
     max_merge_flatten_writes: int = MAX_MERGE_FLATTEN_WRITES
     incident_snooze_max_s: int = INCIDENT_SNOOZE_MAX_S
+    evidence_cap: int = EVIDENCE_CAP_BYTES
+    evidence_rng: Callable[[int], bytes] = secrets.token_bytes  # per-export salt source
 
     def __post_init__(self) -> None:
         if min(self.max_body_bytes, self.rate_limit_per_window, self.rate_limit_window_s) < 1:

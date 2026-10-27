@@ -62,6 +62,12 @@ def safe_id(value: Any) -> str | None:
     return value if isinstance(value, str) and SAFE_ID.fullmatch(value) else None
 
 
+def choice(value: Any, allowed: Sequence[str]) -> str | None:
+    """A value from a fixed Vigie vocabulary, or nothing. Never use safe_id for these: it only
+    checks characters, and uuids, hashes, MACs and hostnames all pass it."""
+    return value if isinstance(value, str) and value in allowed else None
+
+
 def sensitive(kind: str, value: Any, limit: int | None = None) -> Sensitive | None:
     """Wrap a device- or person-derived value after stripping forbidden characters."""
     if value is None:

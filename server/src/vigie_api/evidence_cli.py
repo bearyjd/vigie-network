@@ -80,7 +80,10 @@ def _export(inv: sqlite3.Connection, ov: sqlite3.Connection, args, version: str)
     except ApiError as err:
         return _fail(f"{err.code}: {err.message}", 2 if err.status == 422 else 1)
     path = Path(args.output)
-    fd = _create(path)
+    try:
+        fd = _create(path)
+    except OSError as exc:
+        return _fail(f"cannot create {path}: {exc.strerror or exc}", 2)
     if fd is None:
         return _fail(f"{path} already exists; refusing to overwrite it", 2)
     try:
@@ -88,15 +91,16 @@ def _export(inv: sqlite3.Connection, ov: sqlite3.Connection, args, version: str)
             ov,
             principal=CLI_PRINCIPAL,
             now_iso=iso_utc(now),
-            target=export.target,
             detail={**export.detail, "request_id": str(uuid.uuid4())},
         )
         with os.fdopen(fd, "wb") as handle:
             handle.write(export.data)
-    except (sqlite3.Error, OSError) as exc:
+    except BaseException as exc:
         with contextlib.suppress(OSError):
             os.close(fd)
         path.unlink(missing_ok=True)
-        return _fail(f"export failed, nothing written: {exc}", 3)
+        if isinstance(exc, (sqlite3.Error, OSError)):
+            return _fail(f"export failed, nothing written: {exc}", 3)
+        raise
     print(f"wrote {path} ({len(export.data)} bytes, {args.redaction})", file=sys.stderr)
     return 0

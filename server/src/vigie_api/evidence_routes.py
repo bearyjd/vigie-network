@@ -5,7 +5,6 @@ committed, and only then is the document returned; if the audit write fails noth
 """
 
 import logging
-import secrets
 import sqlite3
 import uuid
 from typing import Annotated, Any, Literal
@@ -15,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, StrictBool
 
 from vigie_api import evidence_export, evidence_writes, tokens
 from vigie_api.errors import ApiError
-from vigie_api.evidence_render import MAX_PACK_BYTES
 from vigie_api.evidence_types import MEDIA_TYPE_JSON, MEDIA_TYPE_MARKDOWN
 from vigie_ingest.db import iso_utc
 
@@ -51,7 +49,7 @@ def is_guarded_write(method: str, path: str) -> bool:
     return method == "POST" and (path.startswith("/incidents/") or export)
 
 
-def install(app: FastAPI, clock, vigie_version: str, deps: tuple[Any, ...], errors_for) -> None:
+def install(app: FastAPI, settings, clock, deps: tuple[Any, ...], errors_for) -> None:
     get_inv, get_ov, get_writer = deps
 
     @app.post(
@@ -89,16 +87,15 @@ def install(app: FastAPI, clock, vigie_version: str, deps: tuple[Any, ...], erro
             fmt=body.format,
             confirm_full=body.confirm_full,
             now=now,
-            vigie_version=vigie_version,
-            rng=getattr(request.app.state, "evidence_rng", secrets.token_bytes),
-            cap=getattr(request.app.state, "evidence_cap", MAX_PACK_BYTES),
+            vigie_version=app.version,
+            rng=settings.evidence_rng,
+            cap=settings.evidence_cap,
         )
         try:
             evidence_writes.record_export(
                 ov,
                 principal=principal.name,
                 now_iso=iso_utc(now),
-                target=export.target,
                 detail={**export.detail, "request_id": x_request_id or str(uuid.uuid4())},
             )
         except sqlite3.Error as exc:

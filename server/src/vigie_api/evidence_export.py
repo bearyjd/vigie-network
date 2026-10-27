@@ -6,7 +6,6 @@ bytes out.
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,7 +32,6 @@ class Export:
     data: bytes
     media_type: str
     filename: str
-    target: str  # short ref for the audit row and the /events feed
     detail: dict[str, Any]  # audit detail, minus request_id (added by the caller)
 
 
@@ -59,14 +57,13 @@ def build_export(
 ) -> Export:
     check_request(level, confirm_full)
     pack = assemble(inv, ov, device_id, now=now, limits=Limits(), vigie_version=vigie_version)
-    subject = pack.body["subject"]
-    canonical, requested = subject["device_ref"].value, subject["requested_ref"].value
     final, data = fit(redact(pack, level, rng(SALT_BYTES)), fmt, cap)
     sections = final.body["sections"]
     media_type, suffix = FORMATS[fmt]
     detail = {
-        "device_id": canonical,
-        "requested_id": requested,
+        # the pack's own (redacted) references: a restricted export never stores a raw id
+        "device_ref": final.body["subject"]["device_ref"],
+        "requested_ref": final.body["subject"]["requested_ref"],
         "level": level,
         "format": fmt,
         "schema_version": SCHEMA_VERSION,
@@ -74,5 +71,4 @@ def build_export(
         "truncated": any(s["status"] == "truncated" for s in sections.values()),
         "pack_sha256": content_sha256(final),
     }
-    target = "dev-" + hashlib.sha256(canonical.encode()).hexdigest()[:8]
-    return Export(data, media_type, f"vigie-evidence-pack.{suffix}", target, detail)
+    return Export(data, media_type, f"vigie-evidence-pack.{suffix}", detail)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import socket
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def e(env: Env, monkeypatch) -> Env:  # noqa: F811
         (HOST, MDNS),
     )
     env.patch(f"/devices/{DEVICE}", {"name": "Lounge Canary", "owner": "Canary Owner"}, "0")
-    env.client.app.state.evidence_rng = lambda n: bytes(range(n))
+    object.__setattr__(env.settings, "evidence_rng", lambda n: bytes(range(n)))
     return env
 
 
@@ -162,7 +163,7 @@ def test_audit_row_is_committed_with_hash_and_no_identifiers(e):
     detail = json.loads(row["detail"])
     assert detail["pack_sha256"] == r.json()["content_sha256"]
     assert detail["request_id"] == "req-1"
-    assert (detail["device_id"], detail["requested_id"]) == (DEVICE, DEVICE)
+    assert detail["device_ref"] == r.json()["subject"]["device_ref"] != DEVICE
     assert (detail["level"], detail["format"], detail["schema_version"]) == (
         "pseudonymized",
         "json",
@@ -170,12 +171,12 @@ def test_audit_row_is_committed_with_hash_and_no_identifiers(e):
     )
     assert detail["truncated"] is False
     assert detail["section_counts"]["identity"] == 1
-    assert set(detail) == {"device_id", "requested_id", "level", "format", "schema_version",
+    assert set(detail) == {"device_ref", "requested_ref", "level", "format", "schema_version",
                            "section_counts", "truncated", "pack_sha256", "request_id"}  # fmt: skip
     blob = json.dumps(row).lower()
     for secret in (HOST, MAC, MDNS, "lounge canary", "canary owner", "aabbcc123456"):
         assert secret.lower() not in blob
-    assert row["target"].startswith("dev-") and DEVICE not in row["target"]
+    assert row["target"] is None and DEVICE not in blob
 
 
 def test_audit_request_id_defaults_to_a_uuid(e):
@@ -220,20 +221,20 @@ def test_the_audit_commit_happens_before_the_body_is_built_into_a_response(e, mo
     assert seen == [1]
 
 
-def test_events_feed_shows_level_and_short_ref_only(e):
+def test_events_feed_shows_level_only(e):
     export(e, {"redaction": "minimal"})
     events = [x for x in e.get("/events").json()["data"] if x["kind"] == "device.evidence_export"]
     assert len(events) == 1
     event = events[0]
     assert event["device_id"] is None
-    assert "minimal" in event["summary"] and re.search(r"dev-[0-9a-f]{8}", event["summary"])
+    assert event["summary"].endswith("device.evidence_export minimal")
     assert DEVICE not in json.dumps(event) and "test" not in event["summary"]
 
 
 def test_two_exports_with_the_same_salt_are_identical_and_new_salt_changes_pseudonyms(e):
     first, second = export(e).json(), export(e).json()
     assert first == second
-    e.client.app.state.evidence_rng = lambda n: bytes(range(1, n + 1))
+    object.__setattr__(e.settings, "evidence_rng", lambda n: bytes(range(1, n + 1)))
     third = export(e).json()
     assert third["subject"]["device_ref"] != first["subject"]["device_ref"]
     assert third["content_sha256"] != first["content_sha256"]
@@ -241,7 +242,7 @@ def test_two_exports_with_the_same_salt_are_identical_and_new_salt_changes_pseud
 
 
 def test_default_salt_is_fresh_per_export(e):
-    del e.client.app.state.evidence_rng
+    object.__setattr__(e.settings, "evidence_rng", secrets.token_bytes)
     a, b = export(e).json(), export(e).json()
     assert a["subject"]["device_ref"] != b["subject"]["device_ref"]
 
@@ -311,7 +312,8 @@ def test_alias_resolves_to_the_canonical_device(e):
     e.link("old-alias", DEVICE)
     doc = export(e, {"redaction": "full", "confirm_full": True}, device="old-alias").json()
     assert doc["subject"]["device_ref"] == DEVICE and doc["subject"]["requested_ref"] == "old-alias"
-    assert json.loads(exports(e)[0]["detail"])["requested_id"] == "old-alias"
+    full = json.loads(exports(e)[0]["detail"])
+    assert (full["device_ref"], full["requested_ref"]) == (DEVICE, "old-alias")
 
 
 def test_incident_evidence_allowlist_holds_through_the_endpoint(e):
@@ -335,7 +337,7 @@ def test_incident_lineage_is_pseudonymized_not_raw(e):
 def test_size_cap_truncates_and_is_audited(e):
     for n in range(30):
         e.mac(f"aa:bb:cc:99:{n:02x}:00", DEVICE, last=-100 - n)
-    e.client.app.state.evidence_cap = 6_000
+    object.__setattr__(e.settings, "evidence_cap", 6_000)
     r = export(e)
     assert r.status_code == 200 and len(r.content) <= 6_000
     statuses = {s["status"] for s in r.json()["sections"].values()}
@@ -344,7 +346,7 @@ def test_size_cap_truncates_and_is_audited(e):
 
 
 def test_pack_that_cannot_be_cut_small_enough_is_413_without_audit(e):
-    e.client.app.state.evidence_cap = 200
+    object.__setattr__(e.settings, "evidence_cap", 200)
     r = export(e)
     assert (r.status_code, r.json()["error"]["code"]) == (413, "pack_too_large")
     assert exports(e) == []

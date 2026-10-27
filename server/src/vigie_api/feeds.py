@@ -89,7 +89,7 @@ def _audit_event(r: sqlite3.Row) -> dict[str, Any]:
     shown = f"{_actor(r['principal'])} {r['action']} {r['target'] or ''}".strip()
     exported = r["action"] == AUDIT_ACTION
     if exported:
-        shown = f"{_actor(r['principal'])} {r['action']} {_export_level(r['detail'])} {r['target']}"
+        shown = f"{_actor(r['principal'])} {r['action']} {_export_level(r['detail'])}"
     return {
         "rid": r["rid"],
         "id": r["id"],

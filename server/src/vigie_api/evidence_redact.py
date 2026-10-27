@@ -28,6 +28,24 @@ SERVICE_RE = re.compile(r"_[a-z0-9-]{1,32}\._(tcp|udp)")
 OUI_RE = re.compile(r"[0-9a-f]{6}")
 VENDOR_RE = re.compile(r"[a-z0-9 .-]{1,64}")
 
+# DHCP option 60 is device-controlled free text. Only these generic vendor classes are kept
+# readable (and searched); anything else is replaced by a pseudonym.
+_ARCH = "(?:armv[5-8][a-z]*|aarch64|x86_64|i[3-6]86|mips|mipsel|ppc64le|riscv64)"
+KNOWN_VENDOR_CLASSES = re.compile(
+    r"MSFT [0-9]{1,3}(?:\.[0-9])?"
+    r"|android-dhcp-[0-9]{1,2}(?:\.[0-9])?"
+    r"|dhcpcd-[0-9]{1,2}(?:\.[0-9]{1,3}){1,2}(?::Linux-[0-9]{1,2}(?:\.[0-9]{1,3}){1,2}:"
+    + _ARCH
+    + ")?"
+    r"|udhcp [0-9]{1,2}(?:\.[0-9]{1,3}){1,2}"
+    r"|Linux [0-9]{1,2}(?:\.[0-9]{1,3}){1,2}"
+)
+
+
+def is_known_vendor_class(value: str) -> bool:
+    return KNOWN_VENDOR_CLASSES.fullmatch(value) is not None
+
+
 # kind -> (prefix, hashed namespace); the namespace keeps one string from sharing a pseudonym
 # across kinds (a host called "x" and a device called "x" are different things).
 _PSEUDONYM = {
@@ -40,6 +58,9 @@ _PSEUDONYM = {
     "collector_id": ("col", "collector"),
     "incident_id": ("inc", "incident"),
     "lineage": ("lin", "lineage"),
+    "baseline_id": ("base", "baseline"),
+    "rule_ref": ("rule", "rule"),
+    "opt60": ("vc", "opt60"),
 }
 _INDEXED = {"device_id": "dev", "collector_id": "col", "incident_id": "inc"}
 _OMITTED = object()
@@ -98,6 +119,9 @@ class _Redactor:
             return value if self.level == "pseudonymized" else _round_hour(value)
         if kind == "ip":
             return _ip_class(str(value)) if self.level == "pseudonymized" else _OMITTED
+        if kind == "opt60" and self.level == "pseudonymized":
+            known = is_known_vendor_class(str(value))
+            return value if known else self._pseudonym(kind, value)
         if kind in ("oui", "opt60"):
             return value if self.level == "pseudonymized" else _OMITTED
         if self.level == "minimal":
@@ -130,7 +154,9 @@ def _fragments(body: dict[str, Any], level: str) -> list[tuple[str, str, str]]:
     for item in _items(body, "fingerprints"):
         found.append(("DHCP parameter request list {}", _raw(item.get("opt55")), "opt55"))
         if level != "minimal":
-            found.append(("DHCP vendor class {}", _raw(item.get("opt60")).lower(), "opt60"))
+            vendor = _raw(item.get("opt60"))
+            known = vendor if is_known_vendor_class(vendor) else ""
+            found.append(("DHCP vendor class {}", known.lower(), "opt60"))
     for item in _items(body, "determinations"):
         for signal in item.get("signals", []):
             found.append(("mDNS service {}", _raw(signal.get("ref")), "service_kind"))

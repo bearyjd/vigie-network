@@ -16,6 +16,7 @@ from vigie_api.effective import override_map, rows
 from vigie_api.evidence_redact import SERVICE_RE
 from vigie_api.evidence_types import (
     capped_section,
+    choice,
     has_table,
     make_section,
     not_available,
@@ -25,16 +26,20 @@ from vigie_api.evidence_types import (
 )
 
 DETERMINISTIC = "deterministic-services"
+REASON_CODES = ("large_upload_threshold", "two_qualified_upload_hours")
+DETECTORS = ("large_upload", "upload_deviation")
+INCIDENT_STATES = ("open", "resolved", "superseded")
+REVIEW_STATUSES = ("acknowledged", "snoozed", "expected")
 _INT = "int"
 # Allowlist of incident evidence fields, mirroring models.IncidentEvidence; anything else a
 # stored row carries is dropped.
 EVIDENCE_FIELDS = {
-    "reason_code": "id",
+    "reason_code": "reason",
     "hour": _INT,
     "previous_hour": _INT,
     "observed_bytes": _INT,
     "threshold_bytes": _INT,
-    "baseline_id": "id",
+    "baseline_id": "baseline",
     "algorithm": "id",
     "config_version": "id",
     "coverage_required_seconds": _INT,
@@ -59,8 +64,10 @@ def _evidence_value(kind: str, value: Any) -> Any:
         return value if _is_int(value) or isinstance(value, float) else None
     if kind == "true":
         return True if value is True else None
-    if kind == "lineage":
-        return sensitive("lineage", value) if isinstance(value, str) else None
+    if kind in ("lineage", "baseline"):
+        return sensitive(kind, value) if isinstance(value, str) else None
+    if kind == "reason":
+        return choice(value, REASON_CODES)
     return safe_id(value)
 
 
@@ -75,7 +82,7 @@ def _review(review: dict[str, Any] | None) -> dict[str, Any] | None:
     if review is None:
         return None
     return {
-        "status": safe_id(review["status"]),
+        "status": choice(review["status"], REVIEW_STATUSES),
         "snooze_until": when(review["snooze_until"]),
         "decided_at": when(review["decided_at"]),
         "version": review["version"],
@@ -88,14 +95,14 @@ def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
         "collector_id": sensitive("collector_id", row["collector_id"]),
         "lineage": sensitive("lineage", row["lineage"]),
         "current_lineage": bool(row["current_lineage"]),
-        "detector": safe_id(row["detector"]),
-        "state": safe_id(row["state"]),
+        "detector": choice(row["detector"], DETECTORS),
+        "state": choice(row["state"], INCIDENT_STATES),
         "episode_start": row["episode_start"],
         "last_hour": row["last_hour"],
         "detected_at": when(row["detected_at"]),
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
-        "baseline_id": safe_id(row["baseline_id"]),
+        "baseline_id": sensitive("baseline_id", row["baseline_id"]),
         "evidence": allowlisted_evidence(row["evidence"]),
         "review": _review(row["review"]),
         "decision_version": row["decision_version"],
@@ -104,16 +111,19 @@ def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def incidents_section(
-    inv: sqlite3.Connection, ov: sqlite3.Connection, canonical: str, now: float, limit: int
+    inv: sqlite3.Connection, ov: sqlite3.Connection, members: list[str], now: float, limit: int
 ) -> dict[str, Any]:
     if not has_table(inv, "monitoring_incidents"):
         return not_available("monitoring_incidents_table_missing")
+    marks = ",".join("?" * len(members))
     total = inv.execute(
-        "SELECT COUNT(*) FROM monitoring_incidents WHERE device_id=?", (canonical,)
+        f"SELECT COUNT(*) FROM monitoring_incidents WHERE device_id IN ({marks})",  # noqa: S608
+        tuple(members),
     ).fetchone()[0]
     found = inv.execute(
-        "SELECT * FROM monitoring_incidents WHERE device_id=? ORDER BY seq DESC LIMIT ?",
-        (canonical, limit),
+        f"SELECT * FROM monitoring_incidents WHERE device_id IN ({marks})"  # noqa: S608
+        " ORDER BY seq DESC LIMIT ?",
+        (*members, limit),
     ).fetchall()
     reviews = incident_decisions.reviews_for(ov, [r["id"] for r in found])
     items = [

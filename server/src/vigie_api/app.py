@@ -795,5 +795,5 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             )
         )
 
-    evidence_routes.install(app, clock, VERSION, (get_inv, get_ov, writer), _errors)
+    evidence_routes.install(app, settings, clock, (get_inv, get_ov, writer), _errors)
     return app

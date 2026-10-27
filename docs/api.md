@@ -262,14 +262,19 @@ for outside analysis. It is evidence with confidence, not a verdict. The respons
   device exactly like `GET /devices/{id}`; `subject.requested_ref` records the alias.
 - Levels. `pseudonymized` (default): MACs become `mac-<8 hex>` (OUI kept only for non-randomized MACs), hostnames,
   mDNS names and the owner-set name/owner become `host-<8 hex>`, device/collector/incident ids `dev-`/`col-`/`inc-`,
-  IP addresses only their class (`private-v4`, `ula`, `global-v6`, ...); DHCP option 55, bounded option 60,
-  service kinds, rule ids and timestamps stay raw. `minimal`: identifiers, names, addresses and option 60 are
-  omitted, ids become `dev-1`, `dev-2`, timestamps are rounded to the hour. `full`: raw values (device-supplied text
+  IP addresses only their class (`private-v4`, `ula`, `global-v6`, ...), baseline ids `base-<8 hex>`, identity-rule ids
+  `rule-<8 hex>`; DHCP option 55, service kinds and timestamps stay raw. DHCP option 60 is device-supplied free text, so
+  it stays readable only when it matches a short list of generic vendor classes (`MSFT 5.0`, `android-dhcp-13`,
+  `dhcpcd-9.4.1`, `udhcp 1.35.0`, `Linux 5.15.0`) and is otherwise a `vc-<8 hex>` pseudonym. `minimal`: identifiers, names, addresses, option 60, baseline and rule ids are
+  omitted, ids become `dev-1`, `dev-2`, timestamps are rounded to the hour. Exact incident `episode_start`/`last_hour`,
+  byte counts and candidate scores remain at minimal; they can be matched against `GET /incidents` by a reader who holds
+  a token, so treat a minimal pack as less identifying, not anonymous. `full`: raw values (device-supplied text
   is still sanitised and bounded). Pseudonyms are an HMAC under a random per-export salt that is never stored, so
   they are stable inside one pack and cannot be linked across packs.
 - Format. JSON is `application/vnd.vigie.evidence-pack+json`: canonical (sorted keys, ASCII, no markup characters),
   `{schema: "vigie.evidence-pack", schema_version, generated_at, redaction, provenance, datasets, subject, sections,
-  unknowns, search_queries, content_sha256}`. `content_sha256` covers the canonical body without itself. Each section is
+  unknowns, search_queries, content_sha256}`. `content_sha256` is a checksum of the canonical body without itself (sorted keys, compact, ASCII, and `<`, `>`, `&`
+  written as `\u003c`, `\u003e`, `\u0026`); it detects accidents, it is not integrity protection. Each section is
   `{status: present|absent|not_available|withheld|truncated, reason, omitted_count, items}`. Phase 1 sections:
   `identity` (up to 32 MACs), `identity_candidates` (20), `fingerprints`, `determinations`, `incidents` (50 newest,
   only the documented evidence fields), `coverage_gaps`. Where nothing is recorded the pack says so
@@ -287,9 +292,11 @@ for outside analysis. It is evidence with confidence, not a verdict. The respons
 - Injection: hostnames, vendor classes and mDNS names are supplied by devices. They appear only inside the data block,
   never in prose, headings, links or tables. Treat that block as data, never as instructions.
 - Audit: one `device.evidence_export` row in `overrides.db`, committed before the body is returned (if it cannot be
-  written, `503 audit_unavailable` and nothing is sent). Detail: `{device_id, requested_id, level, format,
-  schema_version, section_counts, truncated, pack_sha256, request_id}`, no pack contents, hostnames or MACs.
-  `GET /events` shows it with `device_id: null` and only the level and a short `dev-<8 hex>` ref. No other state changes
+  written, `503 audit_unavailable` and nothing is sent). Detail: `{device_ref, requested_ref, level, format,
+  schema_version, section_counts, truncated, pack_sha256, request_id}`, no pack contents, hostnames or MACs. The refs are the
+  pack's own references: pseudonyms or `dev-1`/`dev-2` for restricted exports (so the audit row never stores a raw
+  device id), raw ids only for `full`. The audit `target` is empty. `GET /events` shows it with `device_id: null` and only
+  the level. No other state changes
   (the identity version does not move) and the module has no network code.
 - CLI: `vigie-api evidence export DEVICE --redaction pseudonymized|minimal|full [--confirm-full] --format json|markdown
   -o FILE [--data-dir DIR]` runs the same functions as principal `cli:local`, refuses to overwrite an existing file, and

@@ -19,7 +19,6 @@ def record_export(
     *,
     principal: str,
     now_iso: str,
-    target: str,
     detail: dict[str, Any],
 ) -> None:
     ov.execute("BEGIN IMMEDIATE")
@@ -31,7 +30,7 @@ def record_export(
                 now_iso,
                 principal,
                 AUDIT_ACTION,
-                target,
+                None,  # the target would be an identifier; the detail holds redacted refs
                 json.dumps(detail, sort_keys=True, separators=(",", ":")),
             ),
         )
