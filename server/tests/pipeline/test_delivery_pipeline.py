@@ -127,6 +127,14 @@ def test_corrupt_watermark_skips_the_stage(world, tmp_path):
 def test_wiring_passes_the_abandoned_bound_to_the_runner(world, tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(delivery_wiring, "run_delivery", lambda *a, **k: seen.update(k))
-    c = cfg(tmp_path, settings(tmp_path, max_abandoned=5, max_per_run=3, drain_budget_s=45))
+    c = cfg(
+        tmp_path,
+        settings(tmp_path, max_abandoned=5, max_per_run=3, drain_budget_s=45, include_label=True),
+    )
     run_delivery_stage(world.inv, world.ro, c, Clock())
-    assert seen == {"max_per_run": 3, "max_abandoned": 5, "drain_budget_seconds": 45}
+    assert seen == {
+        "max_per_run": 3,
+        "max_abandoned": 5,
+        "drain_budget_seconds": 45,
+        "include_label": True,
+    }

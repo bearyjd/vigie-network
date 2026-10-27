@@ -14,7 +14,8 @@ NAMES = (
     "VIGIE_DELIVERY_ENABLED VIGIE_DELIVERY_FILE VIGIE_DELIVERY_LEASE_S "
     "VIGIE_DELIVERY_TRANSMIT_DEADLINE_S VIGIE_DELIVERY_MAX_ATTEMPTS VIGIE_DELIVERY_BACKOFF_BASE_S "
     "VIGIE_DELIVERY_BACKOFF_CAP_S VIGIE_DELIVERY_TTL_S VIGIE_DELIVERY_RETENTION_S "
-    "VIGIE_DELIVERY_MAX_PER_RUN VIGIE_DELIVERY_MAX_ABANDONED VIGIE_DELIVERY_DRAIN_BUDGET_S"
+    "VIGIE_DELIVERY_MAX_PER_RUN VIGIE_DELIVERY_MAX_ABANDONED VIGIE_DELIVERY_DRAIN_BUDGET_S "
+    "VIGIE_DELIVERY_INCLUDE_LABEL"
 ).split()
 
 
@@ -107,3 +108,18 @@ def test_every_env_var_is_in_env_example():
 def test_drain_budget_default_and_override():
     assert cfg().delivery.drain_budget_s == 60
     assert cfg(VIGIE_DELIVERY_DRAIN_BUDGET_S="30").delivery.drain_budget_s == 30
+
+
+def test_include_label_defaults_off_and_parses_strictly():
+    assert cfg().delivery.include_label is False
+    assert cfg(VIGIE_DELIVERY_INCLUDE_LABEL="yes").delivery.include_label is True
+    assert cfg(VIGIE_DELIVERY_INCLUDE_LABEL="0").delivery.include_label is False
+    with pytest.raises(ValueError, match="VIGIE_DELIVERY_INCLUDE_LABEL"):
+        cfg(VIGIE_DELIVERY_INCLUDE_LABEL="ture")
+
+
+def test_programmatic_defaults_are_also_off():
+    from vigie_pipeline.config import DeliverySettings
+
+    assert DeliverySettings().include_label is False and DeliverySettings().enabled is False
+    assert PipelineConfig(data_dir=Path("/nonexistent/x")).delivery.include_label is False

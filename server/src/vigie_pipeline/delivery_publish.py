@@ -27,10 +27,8 @@ MAX_LABEL = 48
 MAX_DIGITS = 3
 MAX_WORD = 20  # a word this long is an opaque token, not a name
 MAX_HEX_LETTERS = 12  # squashed hex-looking characters this many or more could be a MAC
-RAW_CUT = 4096  # bound the work on a hostile label
 MAX_LINK = 200
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
-_PUNCT = frozenset(" '\u2019-")
 _DIGITS = frozenset("0123456789")
 _HEX = frozenset("0123456789abcdef")
 _WORD_BREAKS = re.compile("[ '\u2019-]")
@@ -66,38 +64,35 @@ def alias(device_id: object) -> str:
     return "Device " + "".join(chr(ord("a") + b % 26) for b in digest[:6])
 
 
-def _latin(c: str) -> bool:
-    """A Latin letter (ü, é, ç, ß included). Other scripts are confusable with ASCII (a Cyrillic
-    `а` evades the hex check) and some are invisible (Hangul fillers), so they are not accepted."""
-    return unicodedata.category(c).startswith("L") and unicodedata.name(c, "").startswith("LATIN")
+def _allowed(c: str) -> bool:
+    if c.isascii():
+        return c.isalnum() or c in " '-"
+    return c == "\u2019" or ("\u00c0" <= c <= "\u00ff" and c not in "\u00d7\u00f7")
 
 
-def _acceptable(text: str) -> bool:
-    if not 1 <= len(text) <= MAX_LABEL:
+def _acceptable(raw: str) -> bool:
+    """Checked on the RAW string: nothing is truncated, trimmed, collapsed or NFKC-folded first,
+    because any of those can hide content from the checks below."""
+    if not 1 <= len(raw) <= MAX_LABEL or raw != raw.strip() or "  " in raw:
         return False
-    if not any(_latin(c) for c in text):
+    if not all(_allowed(c) for c in raw) or unicodedata.normalize("NFKC", raw) != raw:
         return False
-    if not all(_latin(c) or c in _PUNCT or c in _DIGITS for c in text):
+    if sum(c in _DIGITS for c in raw) > MAX_DIGITS or not any(c.isalpha() for c in raw):
         return False
-    if sum(c in _DIGITS for c in text) > MAX_DIGITS:
+    if sum(c.lower() in _HEX for c in raw if c.isascii() and c.isalnum()) >= MAX_HEX_LETTERS:
         return False
-    if sum(c.lower() in _HEX for c in text if c.isalnum()) >= MAX_HEX_LETTERS:
-        return False
-    return all(len(word) < MAX_WORD for word in _WORD_BREAKS.split(text))
+    return all(len(word) < MAX_WORD for word in _WORD_BREAKS.split(raw))
 
 
 def scrub_label(raw: object, device_id: object = "") -> str:
-    """STRICT ACCEPTOR. The label (NFKC, whitespace collapsed) is used verbatim only if every
-    character is a Latin letter, a space, an apostrophe, an ASCII hyphen or an ASCII digit (and at
-    least one is a Latin letter), and it is short, has at most 3 digits, does not look like a MAC
-    once squashed and holds no opaque long word. Anything else becomes the stable alias of the
-    device: text is never cleaned or partly redacted, so dots, colons, slashes, `@`, separators,
-    hostnames, addresses, serials and invisible tricks cannot get through, and the function is
-    idempotent by construction. Over-redaction is intended: a name in another script, with a dot,
-    an underscore, an emoji, more than 3 digits or other punctuation shows as an alias; the owner
-    sees the real name by following the link."""
-    head = "" if raw is None else str(raw)[:RAW_CUT]
-    text = " ".join(unicodedata.normalize("NFKC", head).split())
+    """STRICT ACCEPTOR for the optional free-text label. The string is validated as given and is
+    returned verbatim or not at all: ASCII letters and digits, space, `'`, `’`, `-` and the Latin-1
+    letters U+00C0-U+00FF (without x and division), at most 48 characters, no leading, trailing or
+    doubled space, already NFKC-stable, at most 3 digits, a letter, nothing that looks like a MAC
+    once squashed, no word of 20 or more characters. Anything else becomes the stable alias of the
+    device. Free text cannot be proven safe, so this is only a defence in depth for the opt-in
+    (`VIGIE_DELIVERY_INCLUDE_LABEL`); the default message carries no label at all."""
+    text = "" if raw is None else str(raw)
     return text if _acceptable(text) else alias(device_id)
 
 

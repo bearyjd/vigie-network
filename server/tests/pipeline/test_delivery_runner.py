@@ -45,6 +45,7 @@ def world(tmp_path):
 
 
 def go(world, pub, clock, config=None, **kw):
+    kw.setdefault("include_label", True)  # the label tests below opt in; the default is below
     return run_delivery(world.inv, world.ro, pub, config or dconf(), clock, **kw)
 
 
@@ -586,3 +587,41 @@ def test_budget_smaller_than_one_deadline_is_refused(world):
             config=dconf(transmit_deadline_seconds=30, lease_seconds=60),
             drain_budget_seconds=10,
         )
+
+
+class SpyConn:
+    """Delegates to the read-only decision store and records every statement."""
+
+    def __init__(self, inner):
+        self.inner, self.sql = inner, []
+
+    def execute(self, sql, *args):
+        self.sql.append(sql)
+        return self.inner.execute(sql, *args)
+
+
+def test_default_messages_carry_no_free_text_and_never_read_the_label(world, tmp_path):
+    from vigie_pipeline.delivery_publish import FilePublisher
+
+    world.incident(device="dev-1")
+    world.name("dev-1", "Kitchen cam")
+    world.incident("i2", device="dev-2", at=T0)
+    world.name("dev-2", "Router\nKitchen @secret")
+    spy = SpyConn(world.ro)
+    path = tmp_path / "out.jsonl"
+    report = run_delivery(world.inv, spy, FilePublisher(path), dconf(), Clock())
+    assert report.sent == 2
+    assert not any("device_overrides" in q for q in spy.sql)
+    text = path.read_text()
+    assert "Kitchen" not in text and "secret" not in text and "dev-1" not in text
+    assert text.count(alias("dev-1")) == 2 and "Device " in text  # title + body of one message
+
+
+def test_opt_in_reads_the_label_and_hostile_names_still_become_the_alias(world):
+    world.incident(device="dev-1")
+    world.name("dev-1", "Router\nKitchen")
+    spy = SpyConn(world.ro)
+    pub = FakePublisher()
+    run_delivery(world.inv, spy, pub, dconf(), Clock(), include_label=True)
+    assert any("device_overrides" in q for q in spy.sql)
+    assert alias("dev-1") in pub.sent[0].body and "Router" not in pub.sent[0].body

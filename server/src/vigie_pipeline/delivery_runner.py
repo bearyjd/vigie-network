@@ -129,7 +129,7 @@ def _claim(inv, row: DeliveryView, config, clock) -> tuple[DeliveryView, int] | 
     return replace(claimed, next_attempt_at=stamp + config.lease_seconds), stamp
 
 
-def _message(inv, ro, claimed: DeliveryView) -> Message | None:
+def _message(inv, ro, claimed: DeliveryView, include_label: bool) -> Message | None:
     row = inv.execute(
         "SELECT device_id FROM monitoring_incidents WHERE id=?", (claimed.incident_id,)
     ).fetchone()
@@ -137,12 +137,14 @@ def _message(inv, ro, claimed: DeliveryView) -> Message | None:
         return None
     device = row[0]
     label = None  # only a name from device_overrides may be offered; never the raw device id
-    try:
-        named = ro.execute("SELECT name FROM device_overrides WHERE device_id=?", (device,))
-        found = named.fetchone() if ro is not None else None
-        label = found[0] if found and found[0] else None
-    except sqlite3.Error:
-        pass  # the label is a nicety: without it the message carries the alias
+    if include_label and ro is not None:  # default: the label is not even read
+        try:
+            found = ro.execute(
+                "SELECT name FROM device_overrides WHERE device_id=?", (device,)
+            ).fetchone()
+            label = found[0] if found and found[0] else None
+        except sqlite3.Error:
+            pass  # the label is a nicety: without it the message carries the alias
     did = delivery_id(claimed.incident_id, claimed.kind)
     return build_message(did, claimed.kind, claimed.incident_id, label, device)
 
@@ -258,12 +260,12 @@ def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> bool:
         return inv.execute(sql, params).rowcount == 1
 
 
-def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot) -> str:
+def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot, labels) -> str:
     taken = _claim(inv, row, config, clock)
     if taken is None:
         return "skipped"
     claimed, stamp = taken
-    message = _message(inv, ro, claimed)
+    message = _message(inv, ro, claimed, labels)
     outcome = "failed"
     if message is None:
         log(logger, logging.WARNING, "delivery_incident_missing", row_id=claimed.row_id)
@@ -292,7 +294,8 @@ def _due(
     return [_delivery(r) for r in rows.fetchall()]
 
 
-def _drain(inv, ro, publisher, rows, config, clock, monotonic, max_abandoned, budget) -> Counter:
+def _drain(inv, ro, publisher, rows, config, clock, limits, labels) -> Counter:
+    monotonic, max_abandoned, budget = limits
     counts: Counter[str] = Counter()
     started = monotonic()
     for row in rows:
@@ -305,7 +308,7 @@ def _drain(inv, ro, publisher, rows, config, clock, monotonic, max_abandoned, bu
         if slot is _BUSY:
             continue  # a worker started since the SELECT still holds this very delivery
         try:
-            outcome = _send_one(inv, ro, publisher, row, config, clock, slot)
+            outcome = _send_one(inv, ro, publisher, row, config, clock, slot, labels)
         finally:
             _release(slot)
         counts[outcome] += 1
@@ -325,6 +328,7 @@ def run_delivery(
     max_abandoned: int = DEFAULT_MAX_ABANDONED,
     drain_budget_seconds: float = DEFAULT_DRAIN_BUDGET,
     monotonic: Callable[[], float] = time.monotonic,
+    include_label: bool = False,
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget."""
@@ -343,9 +347,8 @@ def run_delivery(
         rows,
         config,
         clock,
-        monotonic,
-        max_abandoned,
-        drain_budget_seconds,
+        (monotonic, max_abandoned, drain_budget_seconds),
+        include_label,
     )
     return RunReport(
         planned=planned,

@@ -188,24 +188,29 @@ each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_deli
    Incidents detected before it are never announced.
 
 A runner exception is caught and logged (first occurrence and every 20th), never raised into the
-pass. A message holds the device label (the `device_overrides.name`, else the device id) and a
-relative link `/ui/#incident=<id>`, nothing else: the label goes through a
-STRICT ACCEPTOR (`delivery_publish.scrub_label`). After NFKC and whitespace collapsing it is sent
-verbatim only if all hold: 1 to 48 characters; only Latin letters (accented ones such as ü, é, ç, ß count; Cyrillic, Greek, CJK, Arabic and invisible fillers do not, because they can imitate ASCII or hide), spaces, `'`, `’`, the
-ASCII hyphen and ASCII digits; at most 3 digits; fewer than 12 hex-looking letters/digits once
-squashed (no MAC, however separated); no word of 20 or more characters. Otherwise the message
-carries the stable alias `Device <6 letters>` derived from a hash of the device id. Nothing is ever
-cleaned, dropped or partly redacted, so dots, colons, slashes, `@`, invisible characters and other
-separators (hence hostnames, addresses, emails, URLs, serials) are impossible by construction, and
-the function is idempotent. This over-redacts on purpose: a name with a dot, an underscore, an
-emoji, more than 3 digits or other punctuation, or a name in a non-Latin script, shows as an alias, and the owner sees the real
-name by following the link. When no `device_overrides.name` exists (or the lookup fails) the message carries the alias, never the raw device id. Incident ids reach the relative link and the body by design; delivery ids are hashes.
+pass. A message is built from fixed
+templates, the relative link `/ui/#incident=<id>` and a device ALIAS (`Device <6 letters>`, a hash
+of the device id): by default NO free text from the database is included, and the device name is
+not even read. The owner opens the link to see the device name locally. This is the safe default
+for any future network publisher, because free text cannot be proven safe. It narrows the earlier
+"device label" payload decision; the owner can flip it with `VIGIE_DELIVERY_INCLUDE_LABEL=1`,
+meant for local-only publishers such as the FilePublisher. In that mode the name
+(`device_overrides.name`) goes through a strict acceptor (`delivery_publish.scrub_label`) that
+validates the RAW string, with no truncation, trimming, whitespace collapsing or NFKC folding
+first (each can hide content): at most 48 characters, no leading, trailing or doubled space, only
+ASCII letters and digits, space, `'`, `’`, `-` and the Latin-1 letters U+00C0-U+00FF (without
+x and division), already NFKC-stable, at most 3 digits, a letter, fewer than 12 hex-looking
+characters (no MAC), no word of 20 or more characters. The name is then sent verbatim; anything
+else, or a missing name or failed lookup, gives the alias (never the raw device id). This
+over-redacts on purpose: names with a dot, underscore, emoji, more than 3 digits, other
+punctuation or a non-Latin script show as an alias. Incident ids reach the relative link by
+design; delivery ids are hashes.
 
 **Settings** (all in `deploy/.env.example`; invalid values stop the pipeline at startup):
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
 other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
 `_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
-(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
@@ -216,7 +221,7 @@ the file past 10 MiB is refused (the delivery then fails and retries; rotate or 
 file). The file must live under a mount the pipeline can write. The stock compose adds no volume for it
 (the least-privilege mount matrix is unchanged), so use the pipeline's existing writable inventory
 volume, e.g. `/inv/delivery-messages.jsonl`. The API container mounts that volume read-only, so it
-can read the file but not modify it. Messages hold only the scrubbed label and a relative link.
+can read the file but not modify it. Messages hold only a device alias (or, if opted in, a strictly validated name) and a relative link.
 
 A failure of `fsync` (or of the cut-back itself) can leave a line that was already written while
 the delivery is retried, so the retry duplicates it: delivery is at least once. Every line carries

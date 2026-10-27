@@ -103,6 +103,7 @@ class DeliverySettings:
     max_per_run: int = 20
     max_abandoned: int = 2
     drain_budget_s: int = 60
+    include_label: bool = False  # free text stays out of messages unless the owner opts in
 
     def __post_init__(self) -> None:
         self.delivery_config(None)  # DeliveryConfig's own validation, at startup
@@ -146,6 +147,7 @@ class DeliverySettings:
         return cls(
             enabled=_env_flag(source, "VIGIE_DELIVERY_ENABLED"),
             file=_opt_path(source.get("VIGIE_DELIVERY_FILE")),
+            include_label=_env_flag(source, "VIGIE_DELIVERY_INCLUDE_LABEL"),
             **values,
         )
 

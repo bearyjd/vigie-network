@@ -50,9 +50,17 @@ def test_ordinary_labels_survive_verbatim(label):
     assert scrub_label(label, DEV) == label
 
 
-def test_whitespace_is_collapsed_and_edges_stripped_nothing_else_changes():
-    assert scrub_label("  Zimmer  von \t\n  Kim ", DEV) == "Zimmer von Kim"
-    assert scrub_label("ＴＶ", DEV) == "TV"  # NFKC
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Router\nKitchen", "Router" + " " * 4090 + "@secret", "Router @secret" + " " * 4090,
+        " TV", "TV ", "Two  spaces", "tab\tname", "Zimmer\u00a0von", "\uff34\uff36",
+        "\u0251b-cd-ef-\u0251b-cd-ef", "private\ua78fexample\ua78fcom", "\u0251", "TV\u0301",
+        "x" * 4090 + " @secret", "Caf\u00e9\u00d7", "Caf\u00f7", "\u00aa", "Kid\u00b5",
+    ],
+)  # fmt: skip
+def test_nothing_is_normalised_trimmed_or_truncated_before_validation(raw):
+    assert scrub_label(raw, DEV) == alias(DEV)
 
 
 def test_boundaries():
@@ -86,27 +94,25 @@ def test_build_message_uses_the_device_for_the_alias():
 
 
 # ---- property test: an independent reference acceptor, thousands of random strings -----------
-def _latin(c: str) -> bool:
-    return unicodedata.category(c).startswith("L") and unicodedata.name(c, "").startswith("LATIN")
+ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 '\u2019-") | {
+    chr(c) for c in range(0xC0, 0x100)
+} - {"\u00d7", "\u00f7"}
 
 
 def _reference(raw: str) -> str | None:
-    """The spec, written independently of the implementation: the accepted text or None."""
-    text = " ".join(unicodedata.normalize("NFKC", raw).split())
-    if not 1 <= len(text) <= 48:
+    """The spec, written independently of the implementation: the input itself or None."""
+    if not 1 <= len(raw) <= 48 or raw != raw.strip() or "  " in raw:
         return None
-    if not any(_latin(c) for c in text):
+    if not set(raw) <= ALLOWED or unicodedata.normalize("NFKC", raw) != raw:
         return None
-    if not all(_latin(c) or c in " '’-0123456789" for c in text):
+    letters = [c for c in raw if c.isalpha()]
+    if not letters or sum(c.isdigit() for c in raw) > 3:
         return None
-    if sum(c in "0123456789" for c in text) > 3:
+    if sum(c.lower() in HEX for c in raw if c.isascii() and c.isalnum()) >= 12:
         return None
-    squashed = [c.lower() for c in text if c.isalnum()]
-    if sum(c in HEX for c in squashed) >= 12:
+    if any(len(w) >= 20 for w in re.split(r"[ '\u2019-]", raw)):
         return None
-    if any(len(w) >= 20 for w in re.split(r"[ '’-]", text)):
-        return None
-    return text
+    return raw
 
 
 POOLS = [
@@ -116,6 +122,7 @@ POOLS = [
     ["​", "‍", "﻿", "­", "⁠", "‮", "\x00", "\x1b", "́", "̸"],
     ["ㅤ", "ᅠ", "ᅟ", "а", "б", "α", "ا", "中"],
     ["ㅤ", "ᅠ", "ᅟ", "а", "б", "α", "ا", "中"],
+    list("\u0251\ua78f\u03bf\u0435\u0131\u2113\uff45\u1d00\u0299\u0261\u0121\u0e00"),
     ["\U0001f642", "–", "—", "‑", "。", "．", "：", " ", "　"],
     list("üéрф中文リ١٢１Ａ"),
     ["aabbccddeeff", "aa-bb-cc", "10.0.0.1", "a.b.com", "x@y.z", "deadbeef", "12345", "TV", "2"],
@@ -130,10 +137,13 @@ def _random_label(rng: random.Random) -> str:
     if rng.random() < 0.5:  # mostly plain names, so the accepting branch is well covered
         pools = PLAIN + [rng.choice(POOLS)]
         return "".join(rng.choice(rng.choice(pools)) for _ in range(rng.randrange(1, 30)))
+    if rng.random() < 0.15:  # any codepoint of any category
+        picks = (rng.randrange(0x110000) for _ in range(rng.randrange(1, 12)))
+        return "".join(chr(c) for c in picks if not 0xD800 <= c < 0xE000)
     return "".join(rng.choice(rng.choice(POOLS)) for _ in range(rng.randrange(0, 40)))
 
 
-def test_property_output_is_the_reference_acceptance_or_the_alias():
+def test_property_output_is_the_input_verbatim_or_the_alias():
     accepted = 0
     for seed in range(SAMPLES):
         raw = _random_label(random.Random(seed))  # noqa: S311
@@ -167,3 +177,7 @@ def test_cyrillic_lookalike_cannot_bypass_the_hex_squash():
 
 def test_symbols_named_latin_are_not_letters():
     assert scrub_label("Kid \u271d tab", DEV) == alias(DEV)  # LATIN CROSS is a symbol (So)
+
+
+def test_every_allowed_character_is_already_nfkc_stable():
+    assert all(unicodedata.normalize("NFKC", c) == c for c in ALLOWED)
