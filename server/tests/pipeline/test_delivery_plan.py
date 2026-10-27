@@ -5,7 +5,7 @@ import itertools
 import math
 
 import pytest
-from delivery_sim import apply_cas, complete_send
+from delivery_sim import PassAborted, Store, apply_cas, complete_send
 
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
@@ -901,15 +901,50 @@ def test_a_send_completion_captured_before_a_withdrawal_cannot_mark_the_new_row_
 
 
 # round 5: a withdrawn recover is revived, never deleted and recreated
-def test_a_withdrawn_recover_is_revived_when_the_incident_resolves_again():
-    ds = [dv(state="sent"), dv("recover", "withdrawn", attempts=2, created=NOW - 500, ver=3)]
+def test_a_withdrawn_recover_is_revived_with_its_budget_and_clock_kept():
+    ds = [
+        dv(state="sent"),
+        dv("recover", "withdrawn", attempts=2, nxt=NOW + 300, created=NOW - 500, ver=3),
+    ]
     got = run([inc(state="resolved")], deliveries=ds)
-    assert got == (Revive("i1", "recover", NOW),)
+    assert got == (Revive("i1", "recover", NOW + 300),)  # waits out its own backoff
     assert got[0].expected == Expected("withdrawn", 2, 3)
     revived = apply(ds, got, NOW)[1]
-    assert (revived.state, revived.attempts, revived.version) == ("pending", 0, 4)
-    assert (revived.created_at, revived.next_attempt_at) == (NOW, NOW)  # a new episode
+    assert (revived.state, revived.attempts, revived.version) == ("pending", 2, 4)
+    assert (revived.created_at, revived.next_attempt_at) == (NOW - 500, NOW + 300)
     assert run([inc(state="resolved")], deliveries=[ds[0], revived]) == ()
+
+
+def test_a_revive_past_the_budget_or_the_lifetime_fails_or_expires_instead():
+    spent = dv("recover", "withdrawn", attempts=CFG.max_attempts)
+    got = run([inc(state="resolved")], deliveries=[dv(state="sent"), spent])
+    assert got == (Fail("i1", "recover", "max_attempts"),)
+    assert got[0].expected == Expected("withdrawn", CFG.max_attempts, 0)
+    old = dv("recover", "withdrawn", created=NOW - RET - 1, upd=NOW - 5)
+    got = run([inc(state="resolved")], deliveries=[dv(state="sent"), old])
+    assert got == (Expire("i1", "recover", "lifetime"),)
+
+
+def test_twenty_flaps_never_exceed_the_attempt_budget_and_keep_the_backoff_spacing():
+    rows = {("i1", "open"): dv(state="sent", created=NOW)}
+    t, sends, last = NOW, [], None
+    for cycle in range(20):
+        t += 10
+        actions = run([inc(state="resolved")], deliveries=list(rows.values()), now=t)
+        rows, skipped = apply_cas(rows, actions, t)
+        row = rows.get(("i1", "recover"))
+        if row is not None and row.state == "pending" and row.next_attempt_at <= t:
+            if last is not None:
+                assert t - last >= backoff(len(sends), CFG), (cycle, t, last)
+            sends.append(t)  # a transmission that fails
+            last = t
+            tried = dataclasses.replace(row, attempts=row.attempts + 1, version=row.version + 1)
+            act = after_failure(tried, t, CFG)
+            rows, _ = apply_cas({**rows, ("i1", "recover"): tried}, [act], t)
+        actions = run([inc()], deliveries=list(rows.values()), now=t + 1)  # reopens
+        rows, skipped = apply_cas(rows, actions, t + 1)
+    assert len(sends) <= CFG.max_attempts
+    assert rows[("i1", "recover")].attempts <= CFG.max_attempts
 
 
 @pytest.mark.parametrize("state", ["open", "superseded"])
@@ -936,7 +971,7 @@ def test_a_withdrawn_row_is_terminal_for_the_all_or_nothing_forget():
     both = (Forget("i1", "open"), Forget("i1", "recover"))
     assert run([inc(state="superseded")], deliveries=ds) == both
     assert run([], deliveries=ds) == both
-    assert run([inc(state="resolved")], deliveries=ds) == (Revive("i1", "recover", NOW),)
+    assert run([inc(state="resolved")], deliveries=ds) == (Expire("i1", "recover", "lifetime"),)
 
 
 def test_orphan_rows_are_forgotten_all_or_nothing():
@@ -955,3 +990,65 @@ def test_an_open_incident_never_loses_any_row_whatever_their_age():
     old = NOW - 10 * RET
     ds = [dv(state="sent", created=old), dv("recover", "sent", created=old)]
     assert run([inc()], deliveries=ds) == ()
+
+
+# round 6: an open delivered during a planner change is recorded, not sent again
+def _send_during(*phases):
+    """Claim a pending open, let the planner act for each (state, review) phase, then complete."""
+    pending = dv(nxt=NOW - 1)
+    rows, t = {("i1", "open"): pending}, NOW
+    for review in phases:
+        t += 1
+        actions = run([inc()], review, list(rows.values()), now=t)
+        rows, skipped = apply_cas(rows, actions, t)
+        assert not skipped
+    return complete_send(rows, pending, t + 1)
+
+
+def test_a_reschedule_during_a_send_still_records_the_open_as_sent():
+    rows, ok = _send_during(snooze(100))
+    assert ok and rows[("i1", "open")].state == "sent"
+
+
+def test_ack_then_clear_during_a_send_still_records_the_open_as_sent():
+    rows, ok = _send_during({"i1": ReviewView("acknowledged", None)}, {})
+    assert ok and rows[("i1", "open")].state == "sent"
+
+
+def test_an_ack_overtaking_a_send_still_records_it_so_a_later_clear_cannot_resend():
+    rows, ok = _send_during({"i1": ReviewView("acknowledged", None)})
+    assert ok and rows[("i1", "open")].state == "sent"
+    cleared = run([inc()], deliveries=list(rows.values()))
+    assert cleared == ()
+
+
+def test_a_forget_pass_with_one_missed_precondition_rolls_back_entirely():
+    old = NOW - RET - 1
+    ds = [dv(state="sent", created=old), dv("recover", "sent", created=old)]
+    both = run([inc(state="superseded")], deliveries=ds)
+    assert both == (Forget("i1", "open"), Forget("i1", "recover"))
+    missed = (both[0], dataclasses.replace(both[1], expected=Expected("sent", 0, 99)))
+    with pytest.raises(PassAborted):
+        apply_cas(ds, missed, NOW, strict=True)
+    rows, skipped = apply_cas(ds, both, NOW, strict=True)
+    assert rows == {} and skipped == []
+    store = Store(ds)  # the failed pass must leave both rows in place: all or nothing
+    with pytest.raises(PassAborted):
+        store.apply_pass(missed, NOW)
+    assert set(store.rows()) == {("i1", "open"), ("i1", "recover")}
+
+
+def test_an_expiry_landing_before_the_completion_stands():
+    pending = dv(nxt=NOW - 1)
+    actions = run([inc(state="resolved")], deliveries=[pending])
+    rows, _ = apply_cas({("i1", "open"): pending}, actions, NOW)
+    after, ok = complete_send(rows, pending, NOW + 1)
+    assert not ok and after[("i1", "open")].state == "expired"
+
+
+def test_a_revive_never_schedules_before_the_rows_own_backoff_even_without_attempts():
+    ds = [
+        dv(state="sent"),
+        dv("recover", "withdrawn", attempts=0, nxt=NOW + 300),
+    ]  # clock stepped back
+    assert run([inc(state="resolved")], deliveries=ds) == (Revive("i1", "recover", NOW + 300),)

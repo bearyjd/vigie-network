@@ -14,7 +14,9 @@ The rules are listed in docs/monitoring.md ("Incident delivery"); in short:
 * an incident that closes before its open delivery went out expires it; only a `resolved` incident
   whose open was `sent` gets exactly one `recover` row per delivery life; a pending recover of an
   incident that is no longer resolved is Withdrawn (state `withdrawn`, never deleted: versions
-  only grow), and a later resolution Revives that row (attempts and created_at restart);
+  only grow), and a later resolution Revives that row; the attempt budget (`attempts`) and the
+  lifetime (`created_at`) are cumulative for the whole life of a delivery_id, so a flapping
+  detector cannot raise the number of sends past `max_attempts`;
 * an incident behind `eligible_since` that has NO rows is ignored; one with rows is managed;
 * an incident's rows are Forgotten ALL TOGETHER, in one pass, only when the incident is closed or
   missing, no recover is owed, and every row is terminal and older than `retention_seconds`
@@ -24,24 +26,21 @@ The rules are listed in docs/monitoring.md ("Incident delivery"); in short:
 
 CONCURRENCY CONTRACT (the primary defence). Unit 4b reads the incident set (the COMPLETE current
 set; skip the pass if that read fails) AND the delivery rows, runs `plan()` and applies every
-action inside ONE `BEGIN IMMEDIATE` transaction on the pipeline database. The sender records its
-results with its own conditional `UPDATE ... WHERE delivery_id=? AND state='pending' AND
-version=?` (bumping `version`) and never changes rows outside that lock. A plan can then only be
-stale relative to the sender's in-flight send, never relative to another planner.
+action inside ONE `BEGIN IMMEDIATE` transaction on the pipeline database, using the statements in
+`vigie_pipeline.delivery_sql`. The sender's writes are separate short transactions serialised by
+the same lock, so the planner always sees committed sender state and never plans against another
+planner.
 
 `expected` is an assertion on top of the contract: None means the row must not exist (INSERT OR
 IGNORE), otherwise Expected(state, attempts, version) of the row planned against. Each action is
-one conditional statement that also bumps `version`; 0 affected rows is a bug: log it and abort
-the pass (the transaction rolls back). A Forget of an `open` row carries
-`sibling_recover='absent_or_terminal'`: its DELETE adds `AND NOT EXISTS (SELECT 1 FROM
-incident_deliveries r WHERE r.incident_id=? AND r.kind='recover' AND r.state='pending')`.
-Withdraw is `UPDATE state='withdrawn'`; Revive is `UPDATE state='pending', attempts=0,
-next_attempt_at=?, created_at=?` from `withdrawn`; the sender's completion is
-`UPDATE ... WHERE state='pending' AND version=<captured>`, so a result recorded for an earlier
-incarnation can never land on a later one.
-Accepted window: between planner passes the sender may deliver a pending recover to an incident
-that has reopened, been superseded or gone missing; the next pass withdraws the row. The user may
-see one stale recovery notice. Times in actions are integer epoch seconds.
+one conditional statement that bumps `version` and sets `updated_at`; anything but exactly one
+affected row is a bug: log it and roll the whole pass back. A Forget of an `open` row carries
+`sibling_recover='absent_or_terminal'`: its DELETE refuses while a recover row is pending.
+Accepted windows, each bounded by one send duration: between planner passes the sender may deliver
+a pending recover to an incident that has reopened, been superseded or gone missing (the next pass
+withdraws the row; one stale recovery notice), and an open delivered while the incident resolves
+is expired as `resolved_before_send` (the user gets the open and no recover). Times in actions are
+integer epoch seconds.
 `expected`/`sibling_recover` are excluded from dataclass equality so tests compare actions by
 meaning and assert them separately.
 """
@@ -206,8 +205,9 @@ class Withdraw:
 
 @dataclass(frozen=True)
 class Revive:
-    """Bring a `withdrawn` recover back to pending for a new episode (attempts and created_at
-    restart, so ttl and lifetime restart too); `version` still only grows."""
+    """Bring a `withdrawn` recover back to pending. `attempts` and `created_at` are kept (the retry
+    budget and the lifetime are cumulative for the whole life of the row) and `not_before` is not
+    earlier than the row's own backoff; `version` only grows."""
 
     incident_id: str
     kind: str
@@ -261,19 +261,20 @@ def _lifetime_over(d: DeliveryView, now: float, config: DeliveryConfig) -> bool:
     return now - d.created_at > config.retention_seconds
 
 
-def _revive(d: DeliveryView, target: int, now: float, config: DeliveryConfig):
-    """A suppressed row whose verdict turned loud: requeue, within the attempt budget/lifetime."""
+def _revive(d: DeliveryView, target: int, now: float, config: DeliveryConfig, make: type):
+    """Bring a suppressed (Requeue) or withdrawn (Revive) row back, within its cumulative attempt
+    budget and its lifetime; an earlier backoff is waited out."""
     nxt_ok = d.next_attempt_at is None or _num(d.next_attempt_at)
     numbers = (d.attempts, d.created_at, d.updated_at, d.version)
     if not (nxt_ok and all(_num(v) for v in numbers) and d.attempts >= 0):
-        return None  # malformed row: cannot prove the budget, stay suppressed
+        return None  # malformed row: cannot prove the budget, stay as it is
     if d.attempts >= config.max_attempts:
-        return Fail(d.incident_id, "open", "max_attempts", _exp(d))
+        return Fail(d.incident_id, d.kind, "max_attempts", _exp(d))
     if _lifetime_over(d, now, config):
-        return Expire(d.incident_id, "open", "lifetime", _exp(d))
-    if d.attempts > 0 and d.next_attempt_at is not None:  # wait out an earlier backoff
+        return Expire(d.incident_id, d.kind, "lifetime", _exp(d))
+    if d.next_attempt_at is not None and (d.attempts > 0 or make is Revive):
         target = max(target, math.ceil(d.next_attempt_at))
-    return Requeue(d.incident_id, "open", target, _exp(d))
+    return make(d.incident_id, d.kind, target, _exp(d))
 
 
 def _open_action(
@@ -292,7 +293,7 @@ def _open_action(
     kind, detail = _verdict(review, now) if state == "open" else ("unknown", None)
     target = math.ceil(detail) if kind == "until" else math.ceil(now)
     if d is not None and d.state == "suppressed":
-        return _revive(d, target, now, config) if kind in ("loud", "until") else None
+        return _revive(d, target, now, config, Requeue) if kind in ("loud", "until") else None
     if kind in ("unknown", "quiet"):
         reason = UNRECOGNISED if kind == "unknown" else str(detail)
         return Suppress(iid, "open", reason, _exp(d) if d else None)
@@ -342,7 +343,9 @@ def _row_action(
     return None
 
 
-def _recover_action(iid: str, ds: Mapping[str, DeliveryView], now: float) -> Action | None:
+def _recover_action(
+    iid: str, ds: Mapping[str, DeliveryView], now: float, config: DeliveryConfig
+) -> Action | None:
     """The recover a resolved incident with a sent open is owed, if its row is missing/withdrawn."""
     opened, recover = ds.get("open"), ds.get("recover")
     if opened is None or opened.state != "sent":
@@ -350,7 +353,7 @@ def _recover_action(iid: str, ds: Mapping[str, DeliveryView], now: float) -> Act
     if recover is None:
         return Enqueue(iid, "recover", math.ceil(now))
     if recover.state == "withdrawn":
-        return Revive(iid, "recover", math.ceil(now), _exp(recover))
+        return _revive(recover, math.ceil(now), now, config, Revive)
     return None
 
 
@@ -375,7 +378,7 @@ def _plan_incident(
     if "open" not in {a.kind for a in actions}:
         opened = _open_action(iid, state, review, ds.get("open"), now, config)
         actions.extend([opened] if opened else [])
-    recover = _recover_action(iid, ds, now) if state == "resolved" else None
+    recover = _recover_action(iid, ds, now, config) if state == "resolved" else None
     actions.extend([recover] if recover else [])
     if state in CLOSED_STATES and not actions:  # nothing pending, nothing owed
         return _forget_all(iid, ds, now, config)

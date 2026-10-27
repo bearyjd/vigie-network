@@ -1,26 +1,28 @@
-"""Compare-and-set applier and a seeded, adversarial world simulator for the delivery tests."""
+"""A real-SQLite applier and a seeded, adversarial world simulator for the delivery tests."""
 
 from __future__ import annotations
 
 import dataclasses
 import math
 import random
+import sqlite3
 
+from vigie_pipeline import delivery_sql as sql
+from vigie_pipeline import schema
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
     DeliveryView,
     Enqueue,
-    Expire,
     Fail,
     Forget,
     IncidentView,
     Requeue,
-    Reschedule,
     ReviewView,
     Revive,
     Suppress,
     Withdraw,
     after_failure,
+    delivery_id,
     plan,
 )
 
@@ -28,8 +30,8 @@ DAY = 86400
 QUIET = ("acknowledged", "expected")
 ALLOWED = {
     "pending": {"pending", "sent", "failed", "suppressed", "expired", "withdrawn"},
-    "withdrawn": {"withdrawn", "pending"},
-    "suppressed": {"suppressed", "pending", "failed", "expired"},
+    "withdrawn": {"withdrawn", "pending", "expired", "failed"},
+    "suppressed": {"suppressed", "pending", "failed", "expired", "sent"},
     "sent": {"sent"},
     "failed": {"failed"},
     "expired": {"expired"},
@@ -44,78 +46,77 @@ EDGE = DeliveryConfig(
 )
 
 
-def _transition(a, old, t):
-    bump = {"updated_at": t, "version": old.version + 1} if old is not None else {}
-    if isinstance(a, Enqueue):
-        return DeliveryView(a.incident_id, a.kind, "pending", 0, a.not_before, t, t, 0)
-    if isinstance(a, Suppress):
-        if old is None:
-            return DeliveryView(a.incident_id, a.kind, "suppressed", 0, None, t, t, 0)
-        return dataclasses.replace(old, state="suppressed", **bump)
-    if isinstance(a, Requeue):
-        return dataclasses.replace(old, state="pending", next_attempt_at=a.not_before, **bump)
-    if isinstance(a, Reschedule):
-        return dataclasses.replace(old, next_attempt_at=a.next_attempt_at, **bump)
-    if isinstance(a, Expire):
-        return dataclasses.replace(old, state="expired", **bump)
-    if isinstance(a, Fail):
-        return dataclasses.replace(old, state="failed", **bump)
-    if isinstance(a, Withdraw):
-        return dataclasses.replace(old, state="withdrawn", **bump)
-    if isinstance(a, Revive):  # a new episode: attempts, created_at (so ttl) restart
-        return dataclasses.replace(
-            old, state="pending", attempts=0, next_attempt_at=a.not_before, created_at=t, **bump
-        )
-    if isinstance(a, Forget):
-        return None
-    raise AssertionError(a)
+class PassAborted(AssertionError):
+    """An action did not affect exactly one row: the whole pass was rolled back."""
 
 
-def _stale(rows, a):
-    """True when the conditional statement for `a` would affect 0 rows."""
-    old, exp = rows.get((a.incident_id, a.kind)), a.expected
-    if exp is None:
-        return old is not None  # INSERT OR IGNORE
-    if old is None or (old.state, old.attempts, old.version) != (
-        exp.state,
-        exp.attempts,
-        exp.version,
-    ):
-        return True
-    sibling = rows.get((a.incident_id, "recover"))
-    blocked = isinstance(a, Forget) and a.sibling_recover and sibling and sibling.state == "pending"
-    return bool(blocked)
+COLUMNS = "incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at, version"
 
 
-def apply_cas(rows, actions, now, retention=None):
-    """One conditional statement per action; 0 affected rows (a stale plan) is skipped."""
-    out, skipped = dict(rows), []
-    for a in actions:
-        key = (a.incident_id, a.kind)
-        if _stale(out, a):
-            skipped.append(a)
-            continue
-        old = out.get(key)
-        if isinstance(a, Forget) and retention is not None:
-            assert now - old.updated_at > retention, ("forgotten early", a, old)
-        new = _transition(a, old, int(now))
-        if new is None:
-            del out[key]
-        else:
-            out[key] = new
-    return out, skipped
+class Store:
+    """The production `incident_deliveries` table (migration 11) in an in-memory SQLite."""
+
+    def __init__(self, rows=()):
+        self.conn = sqlite3.connect(":memory:", isolation_level=None)
+        for statement in schema.PIPELINE_MIGRATIONS[10]:
+            self.conn.execute(statement)
+        for d in rows:
+            marks = ",".join("?" * 9)
+            self.conn.execute(
+                f"INSERT INTO incident_deliveries (delivery_id, {COLUMNS}) VALUES ({marks})",  # noqa: S608
+                (delivery_id(d.incident_id, d.kind), *dataclasses.astuple(d)),
+            )
+        self._cache = None
+
+    def rows(self):
+        if self._cache is None:
+            found = self.conn.execute(f"SELECT {COLUMNS} FROM incident_deliveries")  # noqa: S608
+            views = [DeliveryView(*r) for r in found]
+            self._cache = {(d.incident_id, d.kind): d for d in views}
+        return self._cache
+
+    def run(self, statement, params):
+        self._cache = None
+        return self.conn.execute(statement, params).rowcount
+
+    def apply_pass(self, actions, now, retention=None):
+        """One transaction; any action that does not affect exactly one row rolls it all back."""
+        before = self.rows()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for a in actions:
+                old = before.get((a.incident_id, a.kind))
+                if isinstance(a, Forget) and retention is not None:
+                    assert now - old.updated_at > retention, ("forgotten early", a, old)
+                count = self.run(*sql.statement(a, now))
+                if count != 1:
+                    raise PassAborted(("affected rows", count, a))
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            self._cache = None
+            raise
+        self.conn.execute("COMMIT")
+
+
+def apply_cas(rows, actions, now, retention=None, strict=False):
+    """Apply actions through the real SQL. Lenient: skip the ones that miss (stale) and report
+    them. Strict: the whole pass is atomic and a miss raises PassAborted."""
+    store = Store(rows.values() if isinstance(rows, dict) else rows)
+    skipped = []
+    if strict:
+        store.apply_pass(actions, now, retention)
+    else:
+        for a in actions:
+            if store.run(*sql.statement(a, now)) != 1:
+                skipped.append(a)
+    return store.rows(), skipped
 
 
 def complete_send(rows, captured, now):
-    """The sender's completion: UPDATE ... WHERE state='pending' AND version=<captured>."""
-    key = (captured.incident_id, captured.kind)
-    row = rows.get(key)
-    if row is None or row.state != "pending" or row.version != captured.version:
-        return rows, False
-    done = dataclasses.replace(
-        row, state="sent", attempts=row.attempts + 1, version=row.version + 1, updated_at=int(now)
-    )
-    return {**rows, key: done}, True
+    """The sender's completion UPDATE (version-checked only for a recover)."""
+    store = Store(rows.values())
+    done = store.run(sql.SENDER_SENT, sql.sender_params(captured, now)) == 1
+    return store.rows(), done
 
 
 def check_transitions(before, after):
@@ -124,10 +125,7 @@ def check_transitions(before, after):
         if b is None:
             assert a is None or a.state in ("pending", "suppressed"), (key, a)
         elif a is not None:
-            revived = b.state == "withdrawn" and a.state == "pending"
-            assert revived or (a.created_at == b.created_at and a.attempts >= b.attempts), (b, a)
-            if revived:  # a new episode starts from scratch
-                assert a.attempts == 0 and a.created_at == a.updated_at, ("revive resets", b, a)
+            assert a.created_at == b.created_at and a.attempts >= b.attempts, (b, a)
             assert a.version >= b.version and a.state in ALLOWED[b.state], (b, a)
             assert a.version > b.version or a == b, ("change without a version bump", b, a)
 
@@ -139,10 +137,14 @@ class World:
         self.rnd = random.Random(seed)  # noqa: S311 - deterministic test data
         self.cfg = cfg or DeliveryConfig()
         self.now, self.since, self.next_id = 1_000_000, None, 0
-        self.inc, self.reviews, self.rows = {}, {}, {}
-        self.sends, self.opened, self.owed_at = {}, set(), {}
+        self.inc, self.reviews, self.store = {}, {}, Store()
+        self.delivered, self.episode, self.opened, self.owed_at = {}, {}, set(), {}
         self.inflight, self.dropped = {}, 0
-        self.seen, self.skips = set(), 0
+        self.seen = set()
+
+    @property
+    def rows(self):
+        return self.store.rows()
 
     def views(self):
         return tuple(
@@ -179,6 +181,14 @@ class World:
         else:
             s["present"] = False
 
+    def ev_flap(self):
+        """The detector flaps: reopen an incident whose recover is still waiting to be sent."""
+        for (iid, kind), d in sorted(self.rows.items()):
+            s = self.inc[iid]
+            if kind == "recover" and d.state in ("pending", "withdrawn") and s["present"]:
+                s["state"] = "open" if s["state"] == "resolved" else "resolved"
+                return
+
     def ev_decision(self):
         if not self.inc:
             return
@@ -207,10 +217,10 @@ class World:
         self.now += self.rnd.choice(steps) + self.rnd.choice([0, 0, 0.5, 0.999])
 
     def ev_sender(self):
-        """Claim and complete in one step (a fast send)."""
+        """Claim, transmit and record in one step (a fast send)."""
         for key, d in sorted(self.rows.items()):
-            if self._due(key, d) and self.rnd.random() > 0.3:
-                self._finish(key, d, self.rnd.random() < 0.6)
+            if key not in self.inflight and self._due(key, d) and self.rnd.random() > 0.3:
+                self._finish(key, *self._claim(key, d))
 
     def _due(self, key, d):
         if d.state != "pending" or d.next_attempt_at > self.now:
@@ -220,11 +230,35 @@ class World:
             assert opened is not None and opened.state == "sent", ("recover w/o open", key)
         return True
 
+    def _claim(self, key, d):
+        """The sender captures the row and transmits. A TRANSMISSION that reaches the user is
+        counted here, whether or not its completion later lands."""
+        success = self.rnd.random() < 0.6
+        if success:
+            episode = (key, self.episode.get(key, 0))  # a Revive starts a new recover episode
+            self.delivered[episode] = self.delivered.get(episode, 0) + 1
+            assert self.delivered[episode] == 1, ("delivered twice", episode)
+        return d, success
+
     def ev_claim(self):
-        """The sender captures (key, version) and sends; the result is recorded later."""
         for key, d in sorted(self.rows.items()):
             if key not in self.inflight and self._due(key, d) and self.rnd.random() < 0.5:
-                self.inflight[key] = (d, self.rnd.random() < 0.6)
+                self.inflight[key] = self._claim(key, d)
+
+    def ev_overtake(self):
+        """An ack lands while an open is in flight and is cleared again before the next send."""
+        keys = [k for k in sorted(self.inflight) if k[1] == "open" and self.inc[k[0]]["present"]]
+        if not keys:
+            return
+        key = self.rnd.choice(keys)
+        was = self.reviews.get(key[0])
+        self.reviews[key[0]] = ReviewView("acknowledged", None)
+        self.ev_pass()
+        if key in self.inflight:
+            self._finish(key, *self.inflight.pop(key))
+        self.reviews.pop(key[0]) if was is None else self.reviews.update({key[0]: was})
+        self.ev_pass()
+        self.ev_sender()
 
     def ev_complete(self):
         for key in sorted(self.inflight):
@@ -232,60 +266,66 @@ class World:
                 self._finish(key, *self.inflight.pop(key))
 
     def _finish(self, key, captured, success):
-        """Completion = UPDATE ... WHERE state='pending' AND version=<captured>."""
-        before, d = dict(self.rows), self.rows.get(key)
-        if d is None or d.state != "pending" or d.version != captured.version:
-            self.dropped += 1  # the planner changed the row meanwhile: 0 rows, result dropped
-            return
-        # independent oracle: the completion only ever lands on the incarnation that was claimed
-        assert (d.created_at, d.attempts) == (captured.created_at, captured.attempts), (d, captured)
-        tried = dataclasses.replace(
-            d, attempts=d.attempts + 1, version=d.version + 1, updated_at=int(self.now)
-        )
+        """Record the outcome with the sender's own short transaction."""
+        before, params = dict(self.rows), sql.sender_params(captured, self.now)
         if success:
-            self.rows[key] = dataclasses.replace(tried, state="sent")
-            self.sends[key] = self.sends.get(key, 0) + 1
-            assert self.sends[key] == 1, ("sent twice", key)
-            if key[1] == "open":
-                self.owed_at[key[0]] = int(self.now)
+            count = self.store.run(sql.SENDER_SENT, params)
         else:
-            self.rows[key] = tried
+            tried = dataclasses.replace(captured, attempts=captured.attempts + 1)
             act = after_failure(tried, self.now, self._cfg())
-            self.rows, skipped = apply_cas(self.rows, [act], self.now)
-            assert not skipped, ("after_failure must apply to the row it was made for", act)
+            if isinstance(act, Fail):
+                count = self.store.run(sql.SENDER_GIVE_UP, params)
+            else:
+                count = self.store.run(
+                    sql.SENDER_RETRY, params | {"next_attempt_at": act.next_attempt_at}
+                )
+        if count == 0:
+            self.dropped += 1  # the planner's own transition stands; the result is dropped
+        else:
+            assert self.rows[key].updated_at == int(self.now), ("sender must stamp updated_at", key)
+            if success and key[1] == "open":
+                self.owed_at[key[0]] = int(self.now)
         self._observe()
         check_transitions(before, self.rows)
 
     def _observe(self):
         for (iid, kind), d in self.rows.items():
+            assert d.attempts <= self.cfg.max_attempts, ("attempt budget exceeded", d)
             if kind == "open" and d.state == "sent":
                 self.opened.add(iid)
 
     # ---- planner passes -----------------------------------------------------------------
-    def _apply(self, actions, fresh):
+    def _apply(self, actions):
+        """One planner pass = one transaction; a miss rolls it back and fails the test."""
         before = dict(self.rows)
         keys = [(a.incident_id, a.kind) for a in actions]
         assert len(keys) == len(set(keys)), actions  # (h)
         for a in actions:
-            self._check_action(a, fresh)
-        if fresh:
-            self._check_forgets(actions)
-        self.rows, skipped = apply_cas(self.rows, actions, self.now, self.cfg.retention_seconds)
-        assert not (fresh and skipped), ("a fresh plan must apply in full", skipped)
-        self._check_cas(actions, skipped, before)
+            self._check_action(a)
+        self._check_forgets(actions)
+        self.store.apply_pass(actions, self.now, self.cfg.retention_seconds)
         self.seen |= {type(a).__name__ for a in actions}
-        self.skips += len(skipped)
         for a in actions:
-            if isinstance(a, Forget) and a not in skipped:  # only an APPLIED forget ends a life
-                self.sends.pop((a.incident_id, a.kind), None)
-                self.inflight.pop((a.incident_id, a.kind), None)  # no send outlives retention
+            key = (a.incident_id, a.kind)
+            if isinstance(a, Revive):
+                self.episode[key] = self.episode.get(key, 0) + 1
+            if isinstance(a, Forget):  # a forgotten row ends its life: history starts over
+                for episode in [e for e in self.delivered if e[0] == key]:
+                    del self.delivered[episode]
+                self.episode.pop(key, None)
+                self.inflight.pop(key, None)  # no send outlives retention
                 if a.kind == "open":
                     self.opened.discard(a.incident_id)
                     self.owed_at.pop(a.incident_id, None)
         self._observe()
         check_transitions(before, self.rows)
-        if fresh:
-            self._check_pending_rows()
+        for a in actions:  # every planner UPDATE stamps updated_at
+            row = self.rows.get((a.incident_id, a.kind))
+            if a.expected is not None and not isinstance(a, Forget | Withdraw | Revive) and row:
+                assert row.updated_at == int(self.now), ("updated_at not stamped", a, row)
+            if isinstance(a, Withdraw | Revive):
+                assert self.rows[(a.incident_id, a.kind)].updated_at == int(self.now), a
+        self._check_pending_rows()
 
     def _check_forgets(self, actions):
         """All-or-nothing: an incident's rows are forgotten together, all terminal."""
@@ -299,28 +339,6 @@ class World:
             assert set(rows) == kinds, ("half-forgotten incident", iid, kinds, rows)
             assert all(d.state in terminal for d in rows.values()), ("forget of live rows", rows)
 
-    def _check_cas(self, actions, skipped, before):
-        """Independent oracle: an action applied iff its expectation matched the row."""
-        for a in actions:
-            row, exp = before.get((a.incident_id, a.kind)), a.expected
-            sibling = before.get((a.incident_id, "recover"))
-            blocked = (
-                isinstance(a, Forget)
-                and a.sibling_recover is not None
-                and sibling is not None
-                and sibling.state == "pending"
-            )
-            if exp is None:
-                matches = row is None
-            else:
-                matches = (
-                    row is not None
-                    and (row.state, row.attempts, row.version)
-                    == (exp.state, exp.attempts, exp.version)
-                    and not blocked
-                )
-            assert matches == (a not in skipped), ("stale action applied or fresh skipped", a, row)
-
     def _verdict_ok(self, a):
         """An open delivery is never (re)scheduled for a quiet incident or before a snooze ends."""
         review = self.reviews.get(a.incident_id)
@@ -331,11 +349,9 @@ class World:
         if review.status == "snoozed" and isinstance(until, int | float) and self.now < until:
             assert a.not_before >= math.ceil(until), ("before snooze ends", a, review)
 
-    def _check_action(self, a, fresh):
+    def _check_action(self, a):
         row = self.rows.get((a.incident_id, a.kind))
         inc = self.inc[a.incident_id]
-        if not fresh:
-            return
         if a.expected is None:
             assert row is None and isinstance(a, Enqueue | Suppress), (a, row)
         else:
@@ -354,6 +370,7 @@ class World:
                 done = ("sent", "failed", "suppressed", "expired")
                 assert row.state != "sent" or (rec is not None and rec.state in done), (a, rec)
         if isinstance(a, Revive):
+            assert a.not_before >= row.next_attempt_at, ("revive before its backoff", a, row)
             opened = self.rows.get((a.incident_id, "open"))
             assert inc["state"] == "resolved" and row.state == "withdrawn", ("revive", a, row)
             assert opened is not None and opened.state == "sent", ("revive w/o sent open", a)
@@ -383,21 +400,7 @@ class World:
                     assert d.next_attempt_at >= math.ceil(until), ("due before snooze", d, review)
 
     def ev_pass(self):
-        self._apply(self.plan(), fresh=True)
-
-    def ev_stale(self):
-        actions = self.plan()
-        self.rnd.choice(
-            [
-                self.ev_sender,
-                self.ev_complete,
-                self.ev_decision,
-                self.ev_transition,
-                self.ev_time,
-                self.ev_pass,
-            ]
-        )()
-        self._apply(actions, fresh=False)
+        self._apply(self.plan())
 
     # ---- quiescence ---------------------------------------------------------------------
     def settle(self, limit=6):
@@ -405,7 +408,7 @@ class World:
             actions = self.plan()
             if not actions:
                 return
-            self._apply(actions, fresh=True)
+            self._apply(actions)
         raise AssertionError(("no fixpoint", self.rows, self.inc, self.reviews))
 
     def check_quiescent(self):
@@ -448,8 +451,8 @@ class World:
         ops = [
             (self.ev_new, 2), (self.ev_transition, 6), (self.ev_decision, 8),
             (self.ev_watermark, 3), (self.ev_time, 4), (self.ev_sender, 2),
-            (self.ev_claim, 3), (self.ev_complete, 4),
-            (self.ev_pass, 6), (self.ev_stale, 6),
+            (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
+            (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]
         for _ in range(steps):

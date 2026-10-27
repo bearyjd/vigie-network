@@ -176,31 +176,103 @@ External payloads carry a device label and an incident link only.
 **Concurrency contract (the primary defence).** Unit 4b reads the complete incident set and the
 delivery rows, runs `plan()` and applies every action inside one `BEGIN IMMEDIATE` transaction on
 the pipeline database; it skips the pass if the incident read fails (a partial list would expire
-pending rows as `incident_missing`). The sender records each result with its own conditional
-`UPDATE ... WHERE delivery_id=? AND state='pending' AND version=?` (bumping `version`) and never
-changes rows outside that lock. A plan can then only be stale relative to the sender's in-flight
-send, never relative to another planner.
+pending rows as `incident_missing`). The sender's writes are separate short transactions
+serialised by the same lock, so the planner always sees committed sender state and a plan is never
+stale relative to another planner or to the sender.
 
 Every action also carries the row it was planned against (`expected`: none for an insert, else
-state, attempts and version) as an assertion. Each action is one conditional statement that bumps
-`version`; 0 affected rows is a bug, so log it and abort the pass (the transaction rolls back):
+state, attempts and version) as an assertion. Each action is exactly one of the statements below
+(`vigie_pipeline.delivery_sql`; the tests run them against a table built by the production
+migration, and another test keeps this block identical to the code). Every UPDATE sets
+`updated_at=:now` and `version=version+1`. Within a pass each statement must affect exactly one
+row; anything else is a planner bug, so log it and roll the whole pass back (one
+`BEGIN IMMEDIATE` transaction).
 
-- `Enqueue`, and `Suppress` of an incident with no row (inserts a `suppressed` row): `INSERT OR
-  IGNORE`.
-- `Suppress`, `Reschedule`: `UPDATE ... WHERE delivery_id=? AND state='pending' AND attempts=? AND
-  version=?` (a suppress keeps `next_attempt_at`, so a backoff survives). `Requeue`: the same with
-  `state='suppressed'`.
-- `Expire` and `Fail`: `UPDATE ...` with the planned state, `pending`, or `suppressed` for a
-  revival that fails or expires.
-- `Withdraw` (a pending recover): `UPDATE ... SET state='withdrawn' WHERE ... state='pending' ...`.
-  `Revive` (a withdrawn recover, when the incident is resolved again): `UPDATE ... SET
-  state='pending', attempts=0, next_attempt_at=?, created_at=? WHERE ... state='withdrawn' AND
-  attempts=? AND version=?`. A row is never deleted and recreated while its incident has rows, so
-  its `version` only grows and a sender's completion for an earlier incarnation cannot land on a
-  later one.
-- `Forget` (a terminal row): `DELETE ... WHERE delivery_id=? AND state=? AND attempts=? AND
-  version=?`. A `Forget` of an `open` row adds `AND NOT EXISTS (SELECT 1 FROM
-  incident_deliveries r WHERE r.incident_id=? AND r.kind='recover' AND r.state='pending')`.
+```sql
+-- planner: Enqueue
+INSERT OR IGNORE INTO incident_deliveries
+  (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
+   version)
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, 0)
+
+-- planner: Suppress, incident without a row
+INSERT OR IGNORE INTO incident_deliveries
+  (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
+   version)
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, 0)
+
+-- planner: Suppress, pending row
+UPDATE incident_deliveries SET state='suppressed', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version
+
+-- planner: Reschedule
+UPDATE incident_deliveries SET next_attempt_at=:next_attempt_at, updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version
+
+-- planner: Requeue (suppressed -> pending)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
+  version=version+1
+WHERE delivery_id=:id AND state='suppressed' AND attempts=:attempts AND version=:version
+
+-- planner: Revive (withdrawn -> pending; attempts and created_at are kept)
+UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
+  version=version+1
+WHERE delivery_id=:id AND state='withdrawn' AND attempts=:attempts AND version=:version
+
+-- planner: Expire (state is pending, suppressed or withdrawn)
+UPDATE incident_deliveries SET state='expired', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Fail (pending, suppressed or withdrawn)
+UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Withdraw (a pending recover whose incident is not resolved)
+UPDATE incident_deliveries SET state='withdrawn', updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version
+
+-- planner: Forget a recover row (or any row without the sibling guard)
+DELETE FROM incident_deliveries
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+
+-- planner: Forget an open row (refuses while a recover is pending)
+DELETE FROM incident_deliveries
+WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+  AND NOT EXISTS (SELECT 1 FROM incident_deliveries r
+                  WHERE r.incident_id=:incident_id AND r.kind='recover' AND r.state='pending')
+
+-- sender: a send succeeded (open: attempts only, also from suppressed; recover: version too)
+UPDATE incident_deliveries SET state='sent', attempts=attempts+1, updated_at=:now,
+  version=version+1
+WHERE delivery_id=:id AND attempts=:attempts
+  AND (state='pending' OR (state='suppressed' AND kind='open'))
+  AND (:version IS NULL OR version=:version)
+
+-- sender: a send failed, retry later
+UPDATE incident_deliveries SET attempts=attempts+1, next_attempt_at=:next_attempt_at,
+  updated_at=:now, version=version+1
+WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
+  AND (:version IS NULL OR version=:version)
+
+-- sender: a send failed for the last time
+UPDATE incident_deliveries SET state='failed', attempts=attempts+1, updated_at=:now,
+  version=version+1
+WHERE delivery_id=:id AND state='pending' AND attempts=:attempts
+  AND (:version IS NULL OR version=:version)
+```
+
+The sender is not a lease holder: it transmits, then records the result in its own short
+transaction. An `open` row is never withdrawn or revived, so its completion matches on `attempts`
+alone (a planner change during the send, such as a snooze or an ack, must not make the same open go
+out again, and an ack that overtook the send still records it as sent). A `recover` completion also
+checks `version`, because Withdraw and Revive create new incarnations of the row. A completion that
+finds the row expired, failed or withdrawn is dropped and the row's own transition stands. Residual
+windows, each bounded by one send duration and accepted: (a) an open delivered while its incident
+resolves is expired as `resolved_before_send`, so the user gets the open and no recover; (b) a
+recover delivered after the incident reopened or was superseded, until the next pass withdraws it.
+A Revive keeps `attempts`, so the retry budget of a delivery is cumulative: recovery requests for
+one incident never exceed `max_attempts` however often the detector flaps, and the 30 day lifetime
+from `created_at` bounds the row.
 
 Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-finite `now` raises
 `ValueError`, action times are integer seconds):
@@ -222,10 +294,9 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
   Exactly one `recover` is created, only for a `resolved` incident whose `open` was `sent`, on the
   first pass after resolution however old the open row is. A pending `recover` for an incident that
   is no longer `resolved` (open again, or superseded) is withdrawn, and the next resolution revives
-  that row as a new episode (attempts, `created_at` and so ttl and lifetime restart); a recover that
-  was already sent is not repeated. Accepted window: between planner passes the sender may deliver
-  a pending recover to an incident that has reopened, been superseded or gone missing; the next
-  pass withdraws the row, so the user may see one stale recovery notice. Known limit: superseded
+  that row, keeping its attempts and `created_at` (the retry budget and the lifetime are cumulative);
+  a recover that was already sent is not repeated. Accepted windows are listed with the SQL above.
+  Known limit: superseded
   incidents, and incidents that stay open because the device went silent
   (`monitoring_unavailable` covers silence), get no recovery notice.
 - Retention is all or nothing. An incident's rows are forgotten together, in one pass (one

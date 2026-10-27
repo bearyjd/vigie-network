@@ -146,6 +146,13 @@ def test_numeric_columns_only_hold_integers(tmp_path, column):
             conn.execute(f"UPDATE incident_deliveries SET {column}=?", (bad,))  # noqa: S608
 
 
+def test_only_a_recover_can_be_withdrawn(tmp_path):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "recover", "withdrawn"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(INSERT, (B, "inc", "open", "withdrawn"))
+
+
 def test_only_pending_rows_need_a_next_attempt(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute(INSERT, (A, "inc", "open", "sent"))
