@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import replace
 
 import pytest
 from delivery_runner_helpers import SINCE, T0, Clock, World, dconf
 
 from vigie_pipeline import delivery_runner
-from vigie_pipeline.delivery_plan import Enqueue, Expected, Expire
+from vigie_pipeline.delivery_plan import Enqueue, Expected, Expire, delivery_id
 from vigie_pipeline.delivery_publish import FakePublisher, PublishError
 from vigie_pipeline.delivery_runner import run_delivery
 from vigie_pipeline.delivery_sql import PassError
@@ -488,21 +489,32 @@ def test_drain_budget_uses_the_monotonic_clock_not_the_wall_clock(world):
 
 
 def test_time_spent_on_skipped_candidates_counts(world, monkeypatch):
+    """Candidates: a lost CLAIM, a _BUSY delivery, another lost CLAIM, then a fresh row. Every
+    monotonic read costs 30 s and the budget is 100 s: the drain stops before the fresh row."""
     for i in range(4):
         world.incident(f"i{i}")
-    rows = _due_rows(world)
-    monkeypatch.setattr(delivery_runner, "_due", lambda *a, **k: rows)
+    r1, r2, r3, r4 = _due_rows(world)
+    stale = [replace(r, version=r.version - 1) for r in (r1, r3)]
+    gate = _gate()
+    holder = threading.Thread(target=gate.wait, args=(60,), daemon=True)
+    holder.start()
+    delivery_runner._ABANDONED[holder] = delivery_id(r2.incident_id, r2.kind)
+    monkeypatch.setattr(delivery_runner, "_due", lambda *a, **k: [stale[0], r2, stale[1], r4])
     claims = []
     real = delivery_runner._claim
 
-    def spy(*a, **k):
-        claims.append(1)
-        return real(*a, **k)
+    def spy(inv, row, *a, **k):
+        claims.append(row.row_id)
+        return real(inv, row, *a, **k)
 
     monkeypatch.setattr(delivery_runner, "_claim", spy)
-    ticks = iter(range(0, 10_000, 30))  # every monotonic read costs 30 s
-    go(world, FakePublisher(), Clock(), drain_budget_seconds=60, monotonic=lambda: next(ticks))
-    assert len(claims) == 1  # start 0, first check 30 (claims), second check 60 >= 60: stop
+    ticks = iter(range(0, 10_000, 30))
+    pub = FakePublisher()
+    report = go(world, pub, Clock(), drain_budget_seconds=100, monotonic=lambda: next(ticks))
+    assert claims == [r1.row_id, r3.row_id]  # r2 was BUSY, r4 never reached
+    assert report.claimed == 0 and pub.attempted == []
+    assert [r["attempts"] for r in world.rows()] == [0, 0, 0, 0]
+    gate.set()
 
 
 def _due_rows(world):

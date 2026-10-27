@@ -143,7 +143,7 @@ def _message(inv, ro, claimed: DeliveryView) -> Message | None:
     except sqlite3.Error:
         pass  # the label is a nicety: fall back to the device id
     did = delivery_id(claimed.incident_id, claimed.kind)
-    return build_message(did, claimed.kind, claimed.incident_id, label)
+    return build_message(did, claimed.kind, claimed.incident_id, label, row[0])
 
 
 def _prune() -> None:

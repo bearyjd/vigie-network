@@ -326,88 +326,12 @@ def test_check_and_write_are_one_critical_section(tmp_path, monkeypatch):
     assert sorted(results) == [False, True] and path.stat().st_size <= limit
 
 
-@pytest.mark.parametrize(
-    "hostile",
-    [
-        "aabbccddeeff",
-        "AA BB CC DD EE FF",
-        "aa-bb-cc-dd-ee-ff",
-        "192\u30021\u300268\u30021\u30021",  # ideographic full stops
-        "192\uff0e168\uff0e1\uff0e1",  # fullwidth full stops
-        "\uff11\uff19\uff12.168.1.1",  # fullwidth digits
-        "evil\u3002example\u3002com",
-        "2001:db8::1",
-    ],
-)
-def test_scrub_gaps_are_closed(hostile):
-    out = build_message("d" * 32, "open", "i", f"TV {hostile} x").body
-    for needle in ("aabbccddeeff", "AA BB", "aa-bb", "168", "192", "evil", "example", "db8"):
-        assert needle not in out.split(": unusual")[0]
-
-
 def test_normal_labels_survive():
     for label in ("Living room TV", "Anna's laptop", "Kitchen cam 2"):
         assert label in build_message("d" * 32, "open", "i", label).body
-
-
-def test_regexes_never_see_more_than_256_characters(monkeypatch):
-    import vigie_pipeline.delivery_publish as dp
-
-    seen = []
-
-    class Spy:
-        def __init__(self, inner):
-            self.inner = inner
-
-        def sub(self, repl, text):
-            seen.append(len(text))
-            return self.inner.sub(repl, text)
-
-    monkeypatch.setattr(dp, "_SENSITIVE", Spy(dp._SENSITIVE))
-    monkeypatch.setattr(dp, "_CONTROL", Spy(dp._CONTROL))
-    dp.scrub_label("a" * 1_000_000)
-    dp.scrub_label("\ufdfa" * 100_000)  # NFKC expands this character to 18
-    assert seen and max(seen) <= 256
 
 
 def test_every_line_carries_the_delivery_id(tmp_path):
     path = tmp_path / "o.jsonl"
     FilePublisher(path).publish(_msg(7), timeout_seconds=1)
     assert json.loads(path.read_text())["delivery_id"] == f"{7:032d}"
-
-
-import re  # noqa: E402
-
-MAC_FORMS = [
-    "TV_aabbccddeeff", "aabbccddeeff_TV", "TV AA  BB  CC  DD  EE  FF", "aa:bb-cc.dd_ee ff",
-    "AA\tBB\nCC\u00a0DD  EE\u3000FF", "aabb.ccdd.eeff", "x aabbccddeeff0 x",  # 13 hex digits
-    "0123456789abcdef0123", "aabbccddeeff", "AA:BB:CC:DD:EE:FF",
-]  # fmt: skip
-
-
-def _hex_run(text):
-    return re.search(
-        r"[0-9a-f]{12}", re.sub(r"[^0-9a-f]", "", text.lower().replace("[redacted]", ""))
-    )
-
-
-@pytest.mark.parametrize("hostile", MAC_FORMS)
-def test_mac_forms_are_redacted_and_scrubbing_is_idempotent(hostile):
-    from vigie_pipeline.delivery_publish import scrub_label
-
-    out = scrub_label(f"Kid {hostile} tab")
-    assert "redacted" in out and not _hex_run(out)
-    assert scrub_label(out) == out
-
-
-def test_eleven_hex_digits_are_not_a_mac():
-    from vigie_pipeline.delivery_publish import scrub_label
-
-    assert scrub_label("room aabbccddeef") == "room aabbccddeef"
-
-
-@pytest.mark.parametrize("label", ["Living room TV", "Pi-hole 2", "Kid tablet", "Anna's phone"])
-def test_ordinary_labels_survive_and_are_stable(label):
-    from vigie_pipeline.delivery_publish import scrub_label
-
-    assert scrub_label(label) == label

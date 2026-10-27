@@ -1,15 +1,17 @@
 """What leaves the box, and the publishers that carry it.
 
 PRIVACY. A message holds a device LABEL and an incident link and nothing else: never a
-destination, IP, MAC, domain or byte count. `build_message` takes an allowlist of three inputs
-(delivery id, kind, incident id, label), scrubs the label of anything that looks like an address
-or a size, strips control characters and bounds every length. There is no network publisher here:
-`FakePublisher` records (tests) and `FilePublisher` appends JSON lines to a local file.
+destination, IP, MAC, domain or byte count. `build_message` takes an allowlist of inputs (delivery
+id, kind, incident id, label, device id). A label that could hold an address, MAC, domain or
+mailbox is replaced by a stable alias (see `scrub_label`); all lengths are bounded. There is no
+network publisher here: `FakePublisher` records (tests) and `FilePublisher` appends JSON lines to
+a local file.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -23,25 +25,16 @@ from urllib.parse import quote
 
 MAX_LABEL = 64
 PRE_CUT = 256  # no regex ever sees more than this: their cost is superlinear on hostile input
-_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\u2024": ".", "\ufe52": "."})
 MAX_LINK = 200
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
-REDACTED = "[redacted]"
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]+")
-_HEX = r"[0-9a-fA-F]"
-_NOT_HEX_BEFORE, _NOT_HEX_AFTER = f"(?<!{_HEX})", f"(?!{_HEX})"
-_SEP = r"[:\-._ ]"
-_SENSITIVE = re.compile(
-    # a MAC in any separator style (octets or Cisco-style quads), then ANY run of 12+ hex digits
-    f"{_NOT_HEX_BEFORE}(?:{_HEX}{{2}}{_SEP}){{5}}{_HEX}{{2}}{_NOT_HEX_AFTER}"
-    f"|{_NOT_HEX_BEFORE}(?:{_HEX}{{4}}{_SEP}){{2}}{_HEX}{{4}}{_NOT_HEX_AFTER}"
-    f"|{_NOT_HEX_BEFORE}{_HEX}{{12,}}{_NOT_HEX_AFTER}"
-    r"|(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}"  # IPv6
-    r"|\d+(?:\.\d+)?\s*(?:[KMGTP]i?B|bytes?)\b"  # byte counts
-    r"|[\w-]+(?:\.[\w-]+)+"  # IPv4, domains and any dotted name
-    r"|\d{5,}",  # long numbers
-    re.IGNORECASE,
-)
+_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\u2024": ".", "\ufe52": "."})
+_KEEP = frozenset(" '\u2019-_.&0123456789")
+# Suspect-label detectors. Separators are never enumerated: the hex and digit rules run on the
+# text squashed down to its letters and digits, so any punctuation or invisible character between
+# the octets is irrelevant.
+_HOSTNAME = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b", re.IGNORECASE)
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_IPV6 = re.compile(r"(?<![0-9a-z])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-z])", re.IGNORECASE)
 TITLES = {"open": "Vigie: check {label}", "recover": "Vigie: {label} is back to normal"}
 BODIES = {
     "open": "{label}: unusual activity detected. Review it here: {link}",
@@ -67,21 +60,48 @@ class Publisher(Protocol):
         """Deliver or raise PublishError. The runner enforces a hard wall timeout on top."""
 
 
-def scrub_label(raw: object) -> str:
-    """Normalise FIRST (NFKC, control characters and every whitespace run become one space), then
-    redact on the normalised text, so a spacing trick cannot slip past a pattern and reappear."""
-    text = unicodedata.normalize("NFKC", str(raw)[:PRE_CUT]).translate(_DOTS)[:PRE_CUT]
-    text = " ".join(_CONTROL.sub(" ", text).split())
-    text = " ".join(_SENSITIVE.sub(REDACTED, text).split())[:MAX_LABEL].strip()
-    return text or "device"
+def _suspect(text: str) -> bool:
+    """Conservative on purpose: anything that could be a MAC, address, domain or mailbox."""
+    squashed = "".join(c for c in text if c.isalnum()).lower()
+    return (
+        len(re.sub("[^0-9a-f]", "", squashed)) >= 12
+        or sum(c.isdigit() for c in squashed) >= 8
+        or "@" in text
+        or "://" in text
+        or _HOSTNAME.search(text) is not None
+        or _IPV4.search(text) is not None
+        or _IPV6.search(text) is not None
+    )
+
+
+def alias(device_id: object) -> str:
+    return "Device " + hashlib.sha256(str(device_id).encode()).hexdigest()[:4]
+
+
+def scrub_label(raw: object, device_id: object = "") -> str:
+    """FAIL SAFE. A suspect label is replaced by a stable alias derived from the device id, never
+    redacted in part. Over-redaction is intentional: labels are admin-written, and this is a
+    defence-in-depth net for a future network publisher. Otherwise only letters of any script,
+    ASCII digits and ` '’-_.&` are kept, whitespace is collapsed and the result is cut."""
+    head = "" if raw is None else str(raw)[:PRE_CUT]
+    text = unicodedata.normalize("NFKC", head).translate(_DOTS)[:PRE_CUT]
+    if _suspect(text):
+        return alias(device_id)
+    kept = "".join(c for c in text if c.isalpha() or c in _KEEP)
+    clean = " ".join(kept.split())[:MAX_LABEL].strip()
+    if not clean or _suspect(clean):  # dropping characters may have joined a hostname
+        return alias(device_id)
+    return clean
 
 
 def incident_link(incident_id: object) -> str:
     return "/ui/#incident=" + quote(str(incident_id)[: MAX_LINK - 20], safe="")[: MAX_LINK - 14]
 
 
-def build_message(delivery_id: str, kind: str, incident_id: object, label: object) -> Message:
-    clean, link = scrub_label(label), incident_link(incident_id)
+def build_message(
+    delivery_id: str, kind: str, incident_id: object, label: object, device_id: object = ""
+) -> Message:
+    clean, link = scrub_label(label, device_id), incident_link(incident_id)
     fields = {"label": clean, "link": link}
     return Message(
         delivery_id, kind, TITLES[kind].format(**fields), BODIES[kind].format(**fields), link
