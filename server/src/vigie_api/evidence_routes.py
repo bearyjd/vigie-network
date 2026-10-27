@@ -43,6 +43,12 @@ RequestIdHeader = Annotated[
 ]
 
 
+def _audit_request_id(supplied: str | None, detail: dict) -> str:
+    """The caller's id only at full: the pattern admits MACs, hostnames and IPs, which a
+    restricted export's audit row must never carry."""
+    return supplied if supplied and detail["level"] == "full" else str(uuid.uuid4())
+
+
 def is_guarded_write(method: str, path: str) -> bool:
     """Writes whose 403 must precede any body error: incident decisions and evidence exports."""
     export = path.startswith("/devices/") and path.endswith(EXPORT_PATH_SUFFIX)
@@ -96,7 +102,10 @@ def install(app: FastAPI, settings, clock, deps: tuple[Any, ...], errors_for) ->
                 ov,
                 principal=principal.name,
                 now_iso=iso_utc(now),
-                detail={**export.detail, "request_id": x_request_id or str(uuid.uuid4())},
+                detail={
+                    **export.detail,
+                    "request_id": _audit_request_id(x_request_id, export.detail),
+                },
             )
         except sqlite3.Error as exc:
             LOG.error("evidence export audit write failed: %r", exc)

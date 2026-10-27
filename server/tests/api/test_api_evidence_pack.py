@@ -157,12 +157,12 @@ def test_get_is_not_allowed(e):
 
 
 def test_audit_row_is_committed_with_hash_and_no_identifiers(e):
-    r = export(e, {"format": "json"}, headers={"X-Request-ID": "req-1"})
+    r = export(e, {"format": "json"})
     (row,) = exports(e)
     assert row["principal"] == "app:test" and row["ts"] == ts(0)
     detail = json.loads(row["detail"])
     assert detail["pack_sha256"] == r.json()["content_sha256"]
-    assert detail["request_id"] == "req-1"
+    assert re.fullmatch(r"[0-9a-f-]{36}", detail["request_id"])
     assert detail["device_ref"] == r.json()["subject"]["device_ref"] != DEVICE
     assert (detail["level"], detail["format"], detail["schema_version"]) == (
         "pseudonymized",
@@ -177,6 +177,21 @@ def test_audit_row_is_committed_with_hash_and_no_identifiers(e):
     for secret in (HOST, MAC, MDNS, "lounge canary", "canary owner", "aabbcc123456"):
         assert secret.lower() not in blob
     assert row["target"] is None and DEVICE not in blob
+
+
+@pytest.mark.parametrize("leak", [MAC, HOST, DEVICE, "10.1.2.3"])
+def test_restricted_export_never_stores_a_caller_request_id(e, leak):
+    for level in ({}, {"redaction": "minimal"}):
+        assert export(e, level, headers={"X-Request-ID": leak}).status_code == 200
+    for row in exports(e):
+        assert leak.lower() not in row["detail"].lower()
+        assert re.fullmatch(r"[0-9a-f-]{36}", json.loads(row["detail"])["request_id"])
+
+
+def test_full_export_keeps_the_caller_request_id_for_correlation(e):
+    body = {"redaction": "full", "confirm_full": True}
+    assert export(e, body, headers={"X-Request-ID": "req-1"}).status_code == 200
+    assert json.loads(exports(e)[0]["detail"])["request_id"] == "req-1"
 
 
 def test_audit_request_id_defaults_to_a_uuid(e):
@@ -377,3 +392,11 @@ def test_per_token_rate_limit_applies(tmp_path: Path):
             for _ in range(3)
         ]
     assert codes[-1] == 429
+
+
+def test_clipped_strings_are_reported_as_truncation_in_the_audit_row(e, monkeypatch):
+    from vigie_api import evidence_render
+
+    monkeypatch.setattr(evidence_render, "MAX_STRING", 8)
+    assert export(e).status_code == 200
+    assert json.loads(exports(e)[0]["detail"])["truncated"] is True

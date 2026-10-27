@@ -34,6 +34,17 @@ def _check(pack: Pack) -> None:
         raise UnredactedError("evidence pack was not fully redacted; refusing to render it")
 
 
+def has_clipped_strings(node: Any) -> bool:
+    """True when _bound would shorten any string in the tree (silent loss must be reported)."""
+    if isinstance(node, str):
+        return len(node) > MAX_STRING
+    if isinstance(node, dict):
+        return any(has_clipped_strings(v) for v in node.values())
+    if isinstance(node, list):
+        return any(has_clipped_strings(v) for v in node)
+    return False
+
+
 def _bound(node: Any) -> Any:
     if isinstance(node, str):
         return node if len(node) <= MAX_STRING else node[: MAX_STRING - 1] + "…"

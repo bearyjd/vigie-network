@@ -295,7 +295,8 @@ for outside analysis. It is evidence with confidence, not a verdict. The respons
   written, `503 audit_unavailable` and nothing is sent). Detail: `{device_ref, requested_ref, level, format,
   schema_version, section_counts, truncated, pack_sha256, request_id}`, no pack contents, hostnames or MACs. The refs are the
   pack's own references: pseudonyms or `dev-1`/`dev-2` for restricted exports (so the audit row never stores a raw
-  device id), raw ids only for `full`. The audit `target` is empty. `GET /events` shows it with `device_id: null` and only
+  device id), raw ids only for `full`. `request_id` echoes the caller's `X-Request-ID` only for `full`; restricted
+  exports always get a fresh uuid. `truncated` is also true when any string was clipped to 256 characters. The audit `target` is empty. `GET /events` shows it with `device_id: null` and only
   the level. No other state changes
   (the identity version does not move) and the module has no network code.
 - CLI: `vigie-api evidence export DEVICE --redaction pseudonymized|minimal|full [--confirm-full] --format json|markdown

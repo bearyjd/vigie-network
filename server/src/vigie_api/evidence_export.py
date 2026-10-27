@@ -14,7 +14,7 @@ from typing import Any
 from vigie_api.errors import ApiError
 from vigie_api.evidence_assemble import Limits, assemble
 from vigie_api.evidence_redact import LEVELS, SALT_BYTES, redact
-from vigie_api.evidence_render import MAX_PACK_BYTES, content_sha256, fit
+from vigie_api.evidence_render import MAX_PACK_BYTES, content_sha256, fit, has_clipped_strings
 from vigie_api.evidence_types import (
     MEDIA_TYPE_JSON,
     MEDIA_TYPE_MARKDOWN,
@@ -68,7 +68,8 @@ def build_export(
         "format": fmt,
         "schema_version": SCHEMA_VERSION,
         "section_counts": {sid: len(s["items"]) for sid, s in sorted(sections.items())},
-        "truncated": any(s["status"] == "truncated" for s in sections.values()),
+        "truncated": any(s["status"] == "truncated" for s in sections.values())
+        or has_clipped_strings(final.body),
         "pack_sha256": content_sha256(final),
     }
     return Export(data, media_type, f"vigie-evidence-pack.{suffix}", detail)
