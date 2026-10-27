@@ -213,13 +213,16 @@ created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a syml
 device is refused), each message is one `write` followed by `fsync`, every append holds an exclusive `flock` across the size check and the write, a failed or short
 write is cut back to the previous size, and a message that would push
 the file past 10 MiB is refused (the delivery then fails and retries; rotate or truncate the
-file). In compose the file lives on the `vigie-delivery` volume (`/delivery/messages.jsonl`).
+file). The file must live under a mount the pipeline can write. The stock compose adds no volume for it
+(the least-privilege mount matrix is unchanged), so use the pipeline's existing writable inventory
+volume, e.g. `/inv/delivery-messages.jsonl`. The API container mounts that volume read-only, so it
+can read the file but not modify it. Messages hold only the scrubbed label and a relative link.
 
 A failure of `fsync` (or of the cut-back itself) can leave a line that was already written while
 the delivery is retried, so the retry duplicates it: delivery is at least once. Every line carries
 `delivery_id`; consumers should dedupe on it.
 
-**Enabling safely.** Set `VIGIE_DELIVERY_FILE=/delivery/messages.jsonl`, then
+**Enabling safely.** Set `VIGIE_DELIVERY_FILE=/inv/delivery-messages.jsonl`, then
 `VIGIE_DELIVERY_ENABLED=1`, restart the pipeline and watch the file. Only incidents detected after
 the first enabled pass are announced. To stop, set `VIGIE_DELIVERY_ENABLED=0`: pending rows then
 wait (nothing expires) until it is switched back on.

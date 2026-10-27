@@ -146,7 +146,6 @@ services:
       - vigie-raw:/raw:ro
       - vigie-inv:/inv:rw
       - vigie-overrides:/overrides:ro
-      - vigie-delivery:/delivery:rw  # only used when VIGIE_DELIVERY_FILE=/delivery/...
     healthcheck:
       # Heartbeat: the loop touches the file after every SUCCESSFUL pass; unhealthy once the last
       # one is older than 3 x VIGIE_PIPELINE_INTERVAL_S (a failing or wedged loop goes unhealthy).
@@ -206,7 +205,6 @@ volumes:
   vigie-raw: {}
   vigie-inv: {}
   vigie-overrides: {}
-  vigie-delivery: {}
 
 # External podman secrets, created with `podman secret create` (gen-certs.sh and
 # provision-collector.sh do it). External, not `file:`, because podman-compose only honours
