@@ -127,3 +127,15 @@ def test_dataset_staging_tables_enforce_their_checks(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.IntegrityError):  # one row per (import, key)
         conn.execute("INSERT INTO dataset_entries_staging VALUES ('i1','k','{}')")
         conn.execute("INSERT INTO dataset_entries_staging VALUES ('i1','k','{}')")
+
+
+def test_dataset_import_is_unique_per_source_and_hash(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    sql = (
+        "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,created_at,"
+        "created_by) VALUES (?,?,'v','l','h',1,'t','u')"
+    )
+    conn.execute(sql, ("a", "kev"))
+    conn.execute(sql, ("b", "urlhaus"))  # same hash under another source is fine
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql, ("c", "kev"))
