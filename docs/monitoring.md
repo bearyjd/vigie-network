@@ -173,26 +173,38 @@ pending), `attempts >= 0`, and `last_error` capped at 200 characters. `delivery_
 incident link only.
 
 `vigie_pipeline.delivery_plan.plan()` turns incidents, decisions and rows into actions (no I/O,
-`now` injected; a non-finite `now` raises `ValueError`):
+`now` injected; a non-finite `now` raises `ValueError`; action times are integer seconds).
+`incidents` must be the complete current set: a pending row whose incident is missing from a
+partial list is expired as `incident_missing`.
 
 - A loud open incident gets one `open` delivery. Acknowledged or expected incidents are suppressed;
   suppressed rows are re-checked every pass, so a cleared decision (or a cleared `NULL`-status
-  row) requeues the delivery with attempts reset.
+  row) requeues the delivery. A requeue keeps `attempts` and `created_at`: past `max_attempts` the
+  row fails instead, and past the original 24 hour ttl it expires, so ack/clear cycles cannot
+  extend the retry budget.
 - A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
   row that has not been attempted tracks the current verdict exactly, earlier or later. A row that
   already failed keeps its retry backoff and is only pushed later by a longer snooze.
 - An incident that closes before its `open` delivery went out expires it and gets no `recover`.
-  Only a `resolved` incident whose `open` was `sent` gets exactly one `recover`. Known limit:
-  superseded incidents, and incidents that stay open because the device went silent
-  (`monitoring_unavailable` covers silence), get no recovery notice.
-- Pending rows older than 24 hours expire; failures back off 60 s doubling to 1 h, six attempts.
-- Terminal rows of closed or missing incidents are forgotten after 30 days; rows of open incidents
-  are kept so an old incident never re-announces.
+  Exactly one `recover` is created, only for a `resolved` incident whose `open` was `sent`, and on
+  the first pass after resolution however old the open row is. A pending `recover` for an
+  incident that is open again expires as `reopened`. Known limit: superseded incidents, and
+  incidents that stay open because the device went silent (`monitoring_unavailable` covers
+  silence), get no recovery notice.
+- A pending row expires 24 hours after `max(created_at, next_attempt_at)` (a long snooze is not
+  expired early); failures back off 60 s doubling to 1 h, six attempts.
+- Retention: terminal rows of a closed incident are forgotten once `updated_at` is more than 30
+  days old, but an open row stays until its recover row is terminal, and rows of a still-open
+  incident are kept so an old incident never re-announces. Terminal rows of an incident missing
+  from the list follow the same 30 day rule; pending ones expire first.
+- Watermark: incidents detected before `eligible_since` are ignored completely, with no action for
+  them or their rows. Raising or lowering it never deletes state, and lowering it never
+  re-announces what was already sent.
 - Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
 
-Applying Expire, Fail, Reschedule, Requeue and Suppress must be a conditional update
-(`WHERE state='pending'`, or `'suppressed'` for Requeue) so a plan made before an in-flight send
-cannot overwrite the sender's outcome.
+Applying actions must be conditional so a plan made before an in-flight send cannot overwrite the
+sender's outcome: update with `WHERE state='pending'` (Requeue: `WHERE state='suppressed'`), and
+delete forgotten rows with `DELETE ... WHERE state != 'pending'` for the planned state.
 
 ## Retention and verification limits
 

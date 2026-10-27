@@ -13,12 +13,21 @@ row keeps its backoff unless a later snooze pushes it out; an incident that clos
 open delivery went out expires it and never gets a `recover`; only a `resolved` incident whose
 open delivery was `sent` gets exactly one `recover`; unknown states or statuses and non-finite or
 non-numeric data fail closed (`unrecognised_state`, never raise); a bad `now` is a programmer
-error (ValueError). Incidents detected before `eligible_since` are ignored. Terminal rows of
-closed or missing incidents are Forgotten after `retention_seconds`.
+error (ValueError). Incidents detected before `eligible_since` are ignored entirely: no action
+of any kind for them or their rows, so changing the watermark never deletes or re-announces
+anything. Terminal rows of closed or missing incidents are Forgotten after `retention_seconds`
+since `updated_at`, but never while a `recover` is still owed (a `sent` open of a resolved
+incident without a terminal recover row). A Requeue keeps `attempts` and `created_at`; past the
+attempt budget it becomes Fail, past the original ttl it becomes Expire. A pending `recover` of an
+incident that is open again expires as `reopened`. Times in actions are integer epoch seconds.
 
-Applying Expire/Fail/Reschedule/Requeue/Suppress MUST update with `WHERE state='pending'` (or the
-expected prior state: 'suppressed' for Requeue) so that a plan made before an in-flight send
-cannot overwrite the sender's outcome.
+`incidents` MUST be the complete current set: a pending row whose incident is absent from it is
+expired as `incident_missing`.
+
+Applying actions MUST be conditional so that a plan made before an in-flight send cannot overwrite
+the sender's outcome: Expire/Fail/Reschedule/Suppress `WHERE state='pending'` (Fail, Expire and
+Requeue may also name `state='suppressed'`), Requeue `WHERE state='suppressed'`, and Forget as
+`DELETE ... WHERE state != 'pending'` for the row's planned state.
 """
 
 from __future__ import annotations
@@ -151,6 +160,10 @@ class Forget:
 Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget
 
 
+def _ceil(value: float) -> int:
+    return math.ceil(value)
+
+
 def delivery_id(incident_id: str, kind: str) -> str:
     """Stable id: first 32 hex chars of sha256 over `incident_id`, a newline, then `kind`."""
     return hashlib.sha256(f"{incident_id}\n{kind}".encode()).hexdigest()[:32]
@@ -166,7 +179,9 @@ def after_failure(delivery: DeliveryView, now: float, config: DeliveryConfig) ->
     """`delivery.attempts` already counts the attempt that just failed."""
     if delivery.attempts >= config.max_attempts:
         return Fail(delivery.incident_id, delivery.kind, "max_attempts")
-    return Reschedule(delivery.incident_id, delivery.kind, now + backoff(delivery.attempts, config))
+    return Reschedule(
+        delivery.incident_id, delivery.kind, _ceil(now) + backoff(delivery.attempts, config)
+    )
 
 
 def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | None]:
@@ -182,7 +197,7 @@ def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | 
     return "loud", None
 
 
-def _retarget(d: DeliveryView, target: float, later_only: bool) -> Action | None:
+def _retarget(d: DeliveryView, target: int, later_only: bool) -> Action | None:
     """Pending row vs the verdict's time. A retrying row (attempts > 0) only moves later."""
     if d.next_attempt_at == target:
         return None
@@ -191,8 +206,31 @@ def _retarget(d: DeliveryView, target: float, later_only: bool) -> Action | None
     return Reschedule(d.incident_id, "open", target)
 
 
+def _revive(d: DeliveryView, kind: str, target: int, now: float, config: DeliveryConfig):
+    """A suppressed row whose verdict turned loud: requeue, within the original budget."""
+    nxt_ok = d.next_attempt_at is None or _num(d.next_attempt_at)
+    if not (
+        nxt_ok
+        and _num(d.attempts)
+        and d.attempts >= 0
+        and _num(d.created_at)
+        and _num(d.updated_at)
+    ):
+        return None  # malformed row: cannot prove the budget, stay suppressed
+    if d.attempts >= config.max_attempts:
+        return Fail(d.incident_id, "open", "max_attempts")
+    if kind == "loud" and now - d.created_at >= config.pending_ttl_seconds:
+        return Expire(d.incident_id, "open", "ttl")
+    return Requeue(d.incident_id, "open", target)
+
+
 def _open_action(
-    iid: str, state: object, review: ReviewView | None, d: DeliveryView | None, now: float
+    iid: str,
+    state: object,
+    review: ReviewView | None,
+    d: DeliveryView | None,
+    now: float,
+    config: DeliveryConfig,
 ) -> Action | None:
     pending = d is not None and d.state == "pending"
     if d is not None and not pending and d.state != "suppressed":
@@ -200,17 +238,16 @@ def _open_action(
     if state in CLOSED_STATES:
         return Expire(iid, "open", "resolved_before_send") if pending else None
     kind, detail = _verdict(review, now) if state == "open" else ("unknown", None)
+    target = _ceil(detail) if kind == "until" else _ceil(now)
     if d is not None and d.state == "suppressed":
-        if kind in ("loud", "until"):
-            return Requeue(iid, "open", detail if kind == "until" else now)
-        return None
+        return _revive(d, kind, target, now, config) if kind in ("loud", "until") else None
     if kind in ("unknown", "quiet"):
         return Suppress(iid, "open", UNRECOGNISED if kind == "unknown" else str(detail))
-    target = detail if kind == "until" else now
     if d is None:
         return Enqueue(iid, "open", target)
     if kind == "loud":
-        return Reschedule(iid, "open", now) if d.attempts == 0 and d.next_attempt_at > now else None
+        early = d.attempts == 0 and d.next_attempt_at > target
+        return Reschedule(iid, "open", target) if early else None
     return _retarget(d, target, False)
 
 
@@ -219,18 +256,40 @@ def _row_ok(d: DeliveryView) -> bool:
     return _num(d.attempts) and d.attempts >= 0 and all(_num(v) for v in numbers)
 
 
+def _aged(d: DeliveryView, now: float, config: DeliveryConfig) -> bool:
+    return _num(d.updated_at) and now - d.updated_at > config.retention_seconds
+
+
+def _may_forget(d: DeliveryView, state: object, ds: Mapping[str, DeliveryView], now, config):
+    """Aged terminal rows of a closed incident, unless a recover is still owed."""
+    if state not in CLOSED_STATES or not _aged(d, now, config):
+        return False
+    opened, recover = ds.get("open"), ds.get("recover")
+    if state == "resolved" and opened is not None and opened.state == "sent":
+        if d.kind == "open":
+            return recover is not None and recover.state in TERMINAL
+        return _aged(opened, now, config)  # the recover goes together with its open row
+    return True
+
+
 def _row_action(
-    iid: str, d: DeliveryView, closed: bool, now: float, config: DeliveryConfig
+    iid: str, d: DeliveryView, state: object, ds: Mapping[str, DeliveryView], now, config
 ) -> Action | None:
     if d.state == "pending":
         if not _row_ok(d):
             return Expire(iid, d.kind, UNRECOGNISED)
+        if d.kind == "recover" and state == "open":
+            return Expire(iid, d.kind, "reopened")
         if now - max(d.created_at, d.next_attempt_at) >= config.pending_ttl_seconds:
             return Expire(iid, d.kind, "ttl")
         return None
-    if closed and _num(d.updated_at) and now - d.updated_at > config.retention_seconds:
-        return Forget(iid, d.kind)
-    return None
+    return Forget(iid, d.kind) if _may_forget(d, state, ds, now, config) else None
+
+
+def _orphan_action(iid: str, d: DeliveryView, now: float, config: DeliveryConfig) -> Action | None:
+    if d.state == "pending":
+        return Expire(iid, d.kind, "incident_missing")
+    return Forget(iid, d.kind) if _aged(d, now, config) else None
 
 
 def _plan_incident(
@@ -241,25 +300,21 @@ def _plan_incident(
     now: float,
     config: DeliveryConfig,
 ) -> list[Action]:
-    if incident is None:  # pruned or below the watermark: nothing left to announce
-        return [
-            Expire(iid, k, "incident_missing") if d.state == "pending" else Forget(iid, k)
-            for k, d in sorted(ds.items())
-        ]
+    if incident is None:  # pruned: nothing left to announce
+        orphans = (_orphan_action(iid, d, now, config) for _, d in sorted(ds.items()))
+        return [a for a in orphans if a]
     state = incident.state if _num(incident.detected_at) else None
-    closed = state in CLOSED_STATES
     actions: list[Action] = []
     for _, d in sorted(ds.items()):
-        row = _row_action(iid, d, closed, now, config)
+        row = _row_action(iid, d, state, ds, now, config)
         if row:
             actions.append(row)
-    handled = {a.kind for a in actions}
-    if "open" not in handled:
-        opened = _open_action(iid, state, review, ds.get("open"), now)
+    if "open" not in {a.kind for a in actions}:
+        opened = _open_action(iid, state, review, ds.get("open"), now, config)
         actions.extend([opened] if opened else [])
     announced = ds.get("open") is not None and ds["open"].state == "sent"
-    if state == "resolved" and announced and "open" not in handled and "recover" not in ds:
-        actions.append(Enqueue(iid, "recover", now))
+    if state == "resolved" and announced and "recover" not in ds:
+        actions.append(Enqueue(iid, "recover", _ceil(now)))
     return actions
 
 
@@ -279,15 +334,18 @@ def plan(
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
     by_incident: dict[str, IncidentView] = {}
+    ignored: set[str] = set()
     for incident in incidents:
         if _eligible(incident, config):
             by_incident.setdefault(incident.id, incident)
+        else:
+            ignored.add(incident.id)
     grouped: dict[str, dict[str, DeliveryView]] = {}
     for d in deliveries:
         if d.kind in KINDS and d.state in STATES:
             grouped.setdefault(d.incident_id, {})[d.kind] = d
     actions: list[Action] = []
-    for iid in sorted(by_incident.keys() | grouped.keys()):
+    for iid in sorted((by_incident.keys() | grouped.keys()) - ignored):
         actions.extend(
             _plan_incident(
                 iid, by_incident.get(iid), reviews.get(iid), grouped.get(iid, {}), now, config

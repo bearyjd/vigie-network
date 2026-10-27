@@ -238,9 +238,11 @@ RET = CFG.retention_seconds
 def test_terminal_rows_of_a_closed_incident_are_forgotten_past_retention(state, kind):
     old = dv(kind, state, created=NOW - RET - 1)
     edge = dv(kind, state, created=NOW - RET)
-    assert run([inc(state="resolved")], deliveries=[old]) == (Forget("i1", kind),)
-    announce = (Enqueue("i1", "recover", NOW),) if (kind, state) == ("open", "sent") else ()
-    assert run([inc(state="resolved")], deliveries=[edge]) == announce
+    assert run([inc(state="superseded")], deliveries=[old]) == (Forget("i1", kind),)
+    assert run([inc(state="superseded")], deliveries=[edge]) == ()
+    if (kind, state) != ("open", "sent"):  # a sent open of a resolved incident owes a recover
+        assert run([inc(state="resolved")], deliveries=[old]) == (Forget("i1", kind),)
+        assert run([inc(state="resolved")], deliveries=[edge]) == ()
 
 
 @pytest.mark.parametrize("state", ["sent", "failed", "expired"])
@@ -253,21 +255,48 @@ def test_retention_counts_from_updated_at():
     assert run([inc(state="resolved")], deliveries=[d]) == (Enqueue("i1", "recover", NOW),)
 
 
-def test_forgotten_open_row_does_not_spawn_a_late_recover():
-    d = dv(state="sent", created=NOW - RET - 1)
-    assert run([inc(state="resolved")], deliveries=[d]) == (Forget("i1", "open"),)
+def test_an_old_sent_open_of_a_just_resolved_incident_still_gets_its_recover():
+    d = dv(state="sent", created=NOW - 31 * DAY)
+    assert run([inc(state="resolved")], deliveries=[d]) == (Enqueue("i1", "recover", NOW),)
 
 
-def test_orphans_expire_when_pending_and_are_forgotten_when_terminal():
+@pytest.mark.parametrize("state", ["pending"])
+def test_open_row_is_kept_while_the_recover_is_not_terminal(state):
+    old = NOW - 10 * RET
+    ds = [dv(state="sent", created=old), dv("recover", state, created=NOW - 5)]
+    assert run([inc(state="resolved")], deliveries=ds) == ()
+
+
+@pytest.mark.parametrize("state", ["sent", "failed", "suppressed", "expired"])
+def test_open_and_recover_rows_go_together_once_the_recover_is_terminal(state):
+    old = NOW - RET - 1
+    ds = [dv(state="sent", created=old), dv("recover", state, created=old)]
+    assert run([inc(state="resolved")], deliveries=ds) == (
+        Forget("i1", "open"),
+        Forget("i1", "recover"),
+    )
+    young = [dv(state="sent", created=old), dv("recover", state, created=NOW - 5)]
+    assert run([inc(state="resolved")], deliveries=young) == (Forget("i1", "open"),)
+
+
+def test_an_old_recover_is_kept_while_its_open_row_is_still_young():
+    ds = [dv(state="sent", created=NOW - 5), dv("recover", "sent", created=NOW - RET - 1)]
+    assert run([inc(state="resolved")], deliveries=ds) == ()
+
+
+def test_orphans_expire_when_pending_and_age_out_when_terminal():
     assert run([], deliveries=[dv()]) == (Expire("i1", "open", "incident_missing"),)
     for state in ("sent", "failed", "suppressed", "expired"):
-        assert run([], deliveries=[dv(state=state)]) == (Forget("i1", "open"),)
+        assert run([], deliveries=[dv(state=state)]) == ()
+        assert run([], deliveries=[dv(state=state, created=NOW - RET)]) == ()
+        old = dv(state=state, created=NOW - RET - 1)
+        assert run([], deliveries=[old]) == (Forget("i1", "open"),)
 
 
 def test_retention_is_configurable():
     cfg = DeliveryConfig(retention_seconds=100)
     old = dv(state="sent", created=NOW - 101)
-    assert run([inc(state="resolved")], deliveries=[old], cfg=cfg) == (Forget("i1", "open"),)
+    assert run([inc(state="superseded")], deliveries=[old], cfg=cfg) == (Forget("i1", "open"),)
 
 
 # (7) enable watermark
@@ -279,9 +308,34 @@ def test_incidents_older_than_the_watermark_are_ignored():
     assert run([inc(detected=NOW - 6)], cfg=DeliveryConfig()) == (Enqueue("i1", "open", NOW),)
 
 
-def test_rows_of_an_ignored_incident_are_cleaned_up_as_orphans():
+@pytest.mark.parametrize("state", ["pending", "sent", "failed", "suppressed", "expired"])
+@pytest.mark.parametrize("incident_state", ["open", "resolved"])
+def test_rows_of_an_ignored_incident_are_never_touched(state, incident_state):
     cfg = DeliveryConfig(eligible_since=NOW)
-    assert run([inc()], deliveries=[dv()], cfg=cfg) == (Expire("i1", "open", "incident_missing"),)
+    ds = [dv(state=state, created=NOW - 10 * RET), dv("recover", state, created=NOW - 10 * RET)]
+    assert run([inc(state=incident_state)], deliveries=ds, cfg=cfg) == ()
+
+
+def test_disable_enable_raise_and_lower_the_watermark():
+    old, new = inc("old", detected=NOW - 1000), inc("new", detected=NOW - 10)
+    on = DeliveryConfig(eligible_since=NOW - 500)
+    first = run([old, new], cfg=on)
+    assert first == (Enqueue("new", "open", NOW),)
+    ds = apply((), first, NOW)
+    sent = tuple(dataclasses.replace(d, state="sent") for d in ds)
+    assert run([old, new], deliveries=sent, cfg=on) == ()
+    raised = DeliveryConfig(eligible_since=NOW)  # everything is now older: hands off
+    assert run([old, new], deliveries=ds, cfg=raised) == ()
+    assert run([old, inc("new", "resolved", NOW - 10)], deliveries=sent, cfg=raised) == ()
+    lowered = DeliveryConfig(eligible_since=NOW - 5000)  # nothing already sent re-announces
+    assert run([old, new], deliveries=sent, cfg=lowered) == (Enqueue("old", "open", NOW),)
+
+
+def test_a_partial_incident_list_expires_pending_rows():
+    assert run([inc("other")], deliveries=[dv()]) == (
+        Expire("i1", "open", "incident_missing"),
+        Enqueue("other", "open", NOW),
+    )
 
 
 # (g) backoff
@@ -398,14 +452,31 @@ def test_pending_row_with_a_bad_number_is_expired_not_stuck(field, bad):
         )
 
 
+def _expected_for_bad_terminal_row(state, incident_state, field, bad):
+    if incident_state == "resolved" and state == "sent":
+        return (Enqueue("i1", "recover", NOW),)  # the open row did go out
+    if (incident_state, state, field, bad) == ("open", "suppressed", "next_attempt_at", None):
+        return (Requeue("i1", "open", NOW),)  # a suppressed row legitimately has no next time
+    return ()
+
+
 @pytest.mark.parametrize("field", ["attempts", "next_attempt_at", "created_at", "updated_at"])
 @pytest.mark.parametrize("bad", BAD)
 @pytest.mark.parametrize("state", ["sent", "failed", "suppressed", "expired"])
-def test_terminal_rows_with_bad_numbers_never_raise_or_re_announce(field, bad, state):
+@pytest.mark.parametrize("incident_state", ["open", "resolved", "superseded"])
+def test_terminal_rows_with_bad_numbers_produce_exactly_the_safe_actions(
+    field, bad, state, incident_state
+):
     d = dataclasses.replace(dv(state=state), **{field: bad})
-    for incident in (inc(), inc(state="resolved"), inc(state="superseded")):
-        got = run([incident], deliveries=[d])
-        assert not [a for a in got if isinstance(a, Enqueue) and a.kind == "open"]
+    got = run([inc(state=incident_state)], deliveries=[d])
+    assert got == _expected_for_bad_terminal_row(state, incident_state, field, bad)
+
+
+def test_still_open_incident_hidden_by_the_watermark_keeps_its_sent_row():
+    sent = dv(state="sent", created=NOW - 10 * RET)
+    hidden = DeliveryConfig(eligible_since=NOW)
+    assert run([inc(detected=NOW - 2 * RET)], deliveries=[sent], cfg=hidden) == ()
+    assert run([inc(detected=NOW - 2 * RET)], deliveries=[sent], cfg=DeliveryConfig()) == ()
 
 
 def test_garbage_review_with_a_valid_incident_is_reachable_and_suppressed():
@@ -444,8 +515,8 @@ def apply(deliveries, actions, now):
             )
         elif isinstance(a, Requeue):
             assert old.state == "suppressed"
-            by_key[key] = DeliveryView(
-                a.incident_id, a.kind, "pending", 0, a.not_before, old.created_at, now
+            by_key[key] = dataclasses.replace(
+                old, state="pending", next_attempt_at=a.not_before, updated_at=now
             )
         else:
             state = {Suppress: "suppressed", Expire: "expired", Fail: "failed"}[type(a)]
@@ -497,12 +568,12 @@ def test_plan_is_idempotent_over_every_generated_state():
     assert count > 4000
 
 
-def test_orphans_converge_to_nothing_in_two_passes():
+def test_orphans_settle_then_age_out():
     for state in ("pending", "sent", "failed", "suppressed", "expired"):
-        ds = (dv(state=state),)
-        for _ in range(2):
-            ds = apply(ds, plan((), {}, ds, NOW, CFG), NOW)
-        assert ds == ()
+        ds = apply((dv(state=state),), plan((), {}, (dv(state=state),), NOW, CFG), NOW)
+        assert plan((), {}, ds, NOW, CFG) == ()
+        later = NOW + RET + 1
+        assert ds and apply(ds, plan((), {}, ds, later, CFG), later) == ()
 
 
 def test_plan_does_not_mutate_its_inputs():
@@ -541,3 +612,98 @@ def test_rows_with_an_unknown_kind_or_state_are_ignored_not_fatal():
     odd = [dv(kind="page"), dv(state="queued")]
     assert run([inc()], deliveries=odd) == (Enqueue("i1", "open", NOW),)
     assert run([], deliveries=odd) == ()
+
+
+def test_a_pending_recover_for_an_open_incident_is_expired_as_reopened():
+    ds = [dv(state="sent"), dv("recover")]
+    assert run([inc()], deliveries=ds) == (Expire("i1", "recover", "reopened"),)
+    assert run([inc(state="resolved")], deliveries=ds) == ()
+
+
+# item 4: integer times
+def test_action_times_are_integers():
+    got = run([inc()], {"i1": ReviewView("snoozed", NOW + 100.5)})
+    assert got == (Enqueue("i1", "open", NOW + 101),)
+    assert type(got[0].not_before) is int
+    assert run([inc()], now=NOW + 0.5) == (Enqueue("i1", "open", NOW + 1),)
+    moved = run([inc()], {"i1": ReviewView("snoozed", NOW + 100.5)}, [dv(nxt=NOW)])
+    assert moved == (Reschedule("i1", "open", NOW + 101),)
+    again = run([inc()], {"i1": ReviewView("snoozed", NOW + 100.5)}, [dv(nxt=NOW + 101)])
+    assert again == ()
+    requeue = run([inc()], snooze(0.5), [dv(state="suppressed")])
+    assert requeue == (Requeue("i1", "open", NOW + 1),)
+    assert after_failure(dv(attempts=1), NOW + 0.5, CFG) == Reschedule("i1", "open", NOW + 61)
+    assert run([inc()], now=NOW + 0.5, deliveries=[dv(nxt=NOW + 1)]) == ()
+    owed = run([inc(state="resolved")], deliveries=[dv(state="sent")], now=NOW + 0.5)
+    assert owed == (Enqueue("i1", "recover", NOW + 1),)
+
+
+# item 3: a requeue never refreshes the retry budget or the ttl clock
+def test_requeue_past_the_attempt_budget_fails_instead():
+    spent = dv(state="suppressed", attempts=CFG.max_attempts)
+    assert run([inc()], deliveries=[spent]) == (Fail("i1", "open", "max_attempts"),)
+    left = dv(state="suppressed", attempts=CFG.max_attempts - 1)
+    assert run([inc()], deliveries=[left]) == (Requeue("i1", "open", NOW),)
+
+
+def test_requeue_after_the_original_ttl_expires_instead():
+    old = dv(state="suppressed", created=NOW - DAY)
+    assert run([inc()], deliveries=[old]) == (Expire("i1", "open", "ttl"),)
+    almost = dv(state="suppressed", created=NOW - DAY + 1)
+    assert run([inc()], deliveries=[almost]) == (Requeue("i1", "open", NOW),)
+
+
+def _cycle(fail_each_time, step, rounds):
+    """ack/clear alternately; optionally every delivery attempt fails. Returns (rows, trace)."""
+    ds, t, ack, clear = (), NOW, {"i1": ReviewView("acknowledged", None)}, {}
+    seen = []
+    for _ in range(rounds):
+        t += step
+        ds = apply(ds, plan((inc(),), clear, ds, t, CFG), t)
+        row = ds[0]
+        if fail_each_time and row.state == "pending":
+            failed = dataclasses.replace(row, attempts=row.attempts + 1)
+            ds = apply((failed,), (after_failure(failed, t, CFG),), t)
+        seen.append(ds[0])
+        t += step
+        ds = apply(ds, plan((inc(),), ack, ds, t, CFG), t)
+        seen.append(ds[0])
+    return ds, seen, t
+
+
+def test_ack_clear_cycles_never_exceed_the_attempt_budget():
+    ds, seen, _ = _cycle(True, 600, 30)
+    assert max(r.attempts for r in seen) <= CFG.max_attempts
+    assert ds[0].state == "failed" and ds[0].attempts == CFG.max_attempts
+
+
+def test_ack_clear_cycles_still_hit_the_ttl_on_schedule():
+    ds, seen, _ = _cycle(False, 5 * 3600, 12)
+    assert ds[0].state == "expired"
+    assert ds[0].created_at == NOW + 5 * 3600
+    assert ds[0].updated_at - ds[0].created_at >= DAY  # never expired early
+    assert ds[0].updated_at - ds[0].created_at < DAY + 2 * 5 * 3600
+    assert {r.created_at for r in seen} == {ds[0].created_at}
+
+
+# item 8: time advances, state converges, no conflicting actions
+STEPS = (0, 99, 1, 1, DAY - 102, 1, 1, 10 * DAY, RET - 10 * DAY - DAY, 1, 1, 5 * RET)
+
+
+def _settle(ds, incidents, reviews, now):
+    for _ in range(4):
+        actions = plan(tuple(incidents), reviews, tuple(ds), now, CFG)
+        keys = [(a.incident_id, a.kind) for a in actions]
+        assert len(keys) == len(set(keys)), actions
+        if not actions:
+            return ds
+        ds = apply(ds, actions, now)
+    raise AssertionError(("no fixpoint", incidents, reviews, ds))
+
+
+def test_every_generated_state_reaches_a_fixpoint_as_time_advances():
+    for incidents, reviews, ds in itertools.islice(_scenarios(), 0, None, 7):
+        now, state = NOW, tuple(ds)
+        for step in STEPS:
+            now += step
+            state = _settle(state, incidents, reviews, now)

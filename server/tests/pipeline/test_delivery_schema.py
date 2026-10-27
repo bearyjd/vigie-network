@@ -114,6 +114,24 @@ def test_row_checks(tmp_path, sql):
         conn.execute(sql)
 
 
+def test_a_null_or_wrong_length_delivery_id_is_refused(tmp_path):
+    conn = _fresh(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(INSERT, (None, "inc", "open", "sent"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(INSERT, ("a" * 31, "inc", "open", "sent"))
+    assert conn.execute("SELECT COUNT(*) FROM incident_deliveries").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("column", ["attempts", "next_attempt_at", "created_at", "updated_at"])
+def test_numeric_columns_only_hold_integers(tmp_path, column):
+    conn = _fresh(tmp_path)
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    for bad in (5.5, "soon"):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(f"UPDATE incident_deliveries SET {column}=?", (bad,))  # noqa: S608
+
+
 def test_only_pending_rows_need_a_next_attempt(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute(INSERT, (A, "inc", "open", "sent"))
