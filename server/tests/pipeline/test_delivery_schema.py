@@ -22,6 +22,7 @@ def test_fresh_install_has_the_table_and_the_due_index(tmp_path):
     conn = _fresh(tmp_path)
     cols = {r[1]: r for r in conn.execute("PRAGMA table_info(incident_deliveries)")}
     assert list(cols) == [
+        "row_id",
         "delivery_id",
         "incident_id",
         "kind",
@@ -33,7 +34,9 @@ def test_fresh_install_has_the_table_and_the_due_index(tmp_path):
         "updated_at",
         "version",
     ]
-    assert cols["delivery_id"][5] == 1  # primary key
+    assert cols["row_id"][5] == 1  # primary key: the incarnation token
+    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='incident_deliveries'")
+    assert "AUTOINCREMENT" in ddl.fetchone()[0].upper()  # ids are never reused
     assert cols["attempts"][4] == "0"  # default
     indexes = {
         r[1]: [c[2] for c in conn.execute(f"PRAGMA index_info({r[1]})")]
@@ -114,7 +117,6 @@ def test_timestamps_are_integer_epoch_columns(tmp_path):
         "UPDATE incident_deliveries SET attempts=-1",
         "UPDATE incident_deliveries SET version=-1",
         "UPDATE incident_deliveries SET next_attempt_at=NULL",  # row is pending
-        "UPDATE incident_deliveries SET updated_at=9",  # before created_at (10)
         "UPDATE incident_deliveries SET delivery_id='short'",
         "UPDATE incident_deliveries SET delivery_id='" + "a" * 33 + "'",
     ],
@@ -212,10 +214,19 @@ def test_a_newer_schema_is_still_refused(tmp_path):
         apply_pipeline_migrations(conn)
 
 
-def test_version_stays_inside_the_creation_second_window(tmp_path):
+def test_version_is_a_plain_counter_with_no_ceiling_and_no_clock_check(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute(INSERT, (A, "inc", "open", "pending"))  # created_at 10
-    top = (10 + 1) * (1 << 20) - 1
-    conn.execute("UPDATE incident_deliveries SET version=?", (top,))
-    with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("UPDATE incident_deliveries SET version=?", (top + 1,))
+    conn.execute(INSERT, (A, "inc", "open", "pending"))
+    conn.execute("UPDATE incident_deliveries SET version=version+5000000")  # no ceiling
+    conn.execute("UPDATE incident_deliveries SET updated_at=created_at-1000")  # no clock check
+    assert conn.execute("SELECT version FROM incident_deliveries").fetchone()[0] == 5000000
+
+
+def test_row_ids_are_assigned_and_never_reused(tmp_path):
+    conn = _fresh(tmp_path)
+    ids = []
+    for delivery in (A, B, C):
+        conn.execute(INSERT, (delivery, "inc", "open", "pending"))
+        ids.append(conn.execute("SELECT row_id FROM incident_deliveries").fetchone()[0])
+        conn.execute("DELETE FROM incident_deliveries")
+    assert ids == sorted(set(ids)) and len(ids) == 3

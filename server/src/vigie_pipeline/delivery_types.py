@@ -51,6 +51,7 @@ class DeliveryView:
     created_at: float
     updated_at: float
     version: int = 0
+    row_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,8 +83,6 @@ class DeliveryConfig:
         for name in ("backoff_base_seconds", "backoff_cap_seconds"):
             if type(getattr(self, name)) is not int:  # a computed time must stay an integer
                 raise ValueError(f"{name} must be an integer")
-        if self.retention_seconds < 60:
-            raise ValueError("retention_seconds must be at least 60")
         if self.lease_seconds < 60:
             raise ValueError("lease_seconds must be at least 60")
         if self.transmit_deadline_seconds * 2 > self.lease_seconds:
@@ -98,11 +97,13 @@ class DeliveryConfig:
 
 @dataclass(frozen=True)
 class Expected:
-    """Precondition of a conditional update: the row's state, attempts and version when planned."""
+    """Precondition of a conditional update: the row's state, attempts and version when planned,
+    and its `row_id`, the incarnation token (never reused, so it fences a recreated delivery)."""
 
     state: str
     attempts: int
     version: int
+    row_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,9 +126,13 @@ class Requeue:
 
 @dataclass(frozen=True)
 class Suppress:
+    """`retry_at` is set when a lapsed `sending` row is suppressed: it keeps the retry deadline a
+    Reclaim would have used, so an ack followed by a clear cannot skip the backoff."""
+
     incident_id: str
     kind: str
     reason: str
+    retry_at: int | None = None
     expected: Expected | None = field(default=None, compare=False)
 
 

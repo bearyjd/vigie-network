@@ -71,7 +71,9 @@ class PassAborted(AssertionError):
     """An action did not affect exactly one row: the whole pass was rolled back."""
 
 
-COLUMNS = "incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at, version"
+COLUMNS = (
+    "incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at, version, row_id"
+)
 
 
 class Store:
@@ -86,10 +88,11 @@ class Store:
             self.add(d)
 
     def add(self, d):
-        marks = ",".join("?" * 9)
+        marks = ",".join("?" * 10)
+        values = dataclasses.astuple(d)[:-1] + (d.row_id or None,)  # row_id 0: let SQLite assign
         self.conn.execute(
             f"INSERT INTO incident_deliveries (delivery_id, {COLUMNS}) VALUES ({marks})",  # noqa: S608
-            (delivery_id(d.incident_id, d.kind), *dataclasses.astuple(d)),
+            (delivery_id(d.incident_id, d.kind), *values),
         )
         self._cache = None
 
@@ -113,12 +116,13 @@ class Store:
                 old = before.get((a.incident_id, a.kind))
                 if isinstance(a, Forget) and retention is not None:
                     assert now - old.updated_at > retention, ("forgotten early", a, old)
-                count = self.run(*sql.statement(a, now))
-                if count != 1:
-                    raise PassAborted(("affected rows", count, a))
-        except BaseException:
+                self._cache = None
+                sql.apply_actions(self.conn, [a], now)
+        except BaseException as error:
             self.conn.execute("ROLLBACK")
             self._cache = None
+            if isinstance(error, sql.PassError):
+                raise PassAborted(str(error)) from error
             raise
         self.conn.execute("COMMIT")
 
@@ -240,6 +244,15 @@ class World:
         ttl, ret = self.cfg.pending_ttl_seconds, self.cfg.retention_seconds
         steps = [0, 1, 59, 60, ttl - 1, ttl, ttl + 1, ret - 1, ret, ret + 1, DAY]
         self._advance(self.rnd.choice(steps) + self.rnd.choice([0, 0, 0.5, 0.999]))
+
+    def ev_clock_back(self):
+        """The wall clock steps backwards. Nothing may break: time-based rules just wait, and a
+        row's incarnation never depends on the clock. Finished sends stay finished."""
+        self.now -= self.rnd.choice([1, 59, 3600, DAY])
+        for sends in self.sends.values():
+            for tx in sends:
+                if not tx.hung:
+                    tx.end = min(tx.end, self.now)
 
     def _advance(self, delta):
         """Time passes. A contract-abiding sender records its result before its lease lapses, so
@@ -491,8 +504,18 @@ class World:
                 assert row.updated_at == int(self.now), ("updated_at not stamped", a, row)
             if isinstance(a, Withdraw | Revive):
                 assert self.rows[(a.incident_id, a.kind)].updated_at == int(self.now), a
-        reclaimed = {(a.incident_id, a.kind) for a in actions if isinstance(a, Reclaim)}
-        self._check_pending_rows(reclaimed)  # a reclaimed row meets the verdict next pass
+        for (
+            a
+        ) in actions:  # a lapsed claim that is suppressed keeps the retry deadline a Reclaim has
+            prior = before.get((a.incident_id, a.kind))
+            if isinstance(a, Suppress) and prior is not None and prior.state == "sending":
+                row = self.rows[(a.incident_id, a.kind)]
+                due = math.ceil(self.now) + backoff(row.attempts, self.cfg)
+                assert row.next_attempt_at == due, ("suppress dropped the backoff", a, row)
+        moved = {
+            (a.incident_id, a.kind) for a in actions if isinstance(a, Reclaim | Requeue | Revive)
+        }
+        self._check_pending_rows(moved)  # rows moved this pass meet the verdict on the next one
 
     def _probe_claim_guards(self, d):
         """On scratch copies, CLAIM refuses a row that is not due, out of budget or stale."""
@@ -502,6 +525,7 @@ class World:
             "out of budget": "UPDATE incident_deliveries SET attempts=:max",
             "stale": "UPDATE incident_deliveries SET version=version+1",
             "already sending": "UPDATE incident_deliveries SET state='sending'",
+            "another incarnation": "UPDATE incident_deliveries SET row_id=row_id+1000000",
         }
         for label, update in breaks.items():
             probe = Store(self.rows.values())
@@ -560,8 +584,9 @@ class World:
         if a.expected is None:
             assert row is None and isinstance(a, Enqueue | Suppress), (a, row)
         else:
-            exp = (a.expected.state, a.expected.attempts, a.expected.version)
-            assert row is not None and (row.state, row.attempts, row.version) == exp, (a, row)
+            exp = (a.expected.state, a.expected.attempts, a.expected.version, a.expected.row_id)
+            got = None if row is None else (row.state, row.attempts, row.version, row.row_id)
+            assert got == exp, (a, row)
         if isinstance(a, Enqueue | Requeue | Reclaim) and a.kind == "open":
             self._verdict_ok(a)
         if isinstance(a, Enqueue) and a.kind == "recover":
@@ -607,6 +632,12 @@ class World:
                 continue
             assert review.status not in QUIET, ("pending while quiet", iid, review)
             until = review.snooze_until
+            loud = review.status is None or (review.status == "snoozed" and self.now >= until)
+            if loud and isinstance(until, int | float | type(None)):
+                bound = math.ceil(self.now)  # a loud row is due no later than its backoff allows
+                if d.attempts > 0:
+                    bound = max(bound, math.ceil(d.updated_at) + backoff(d.attempts, self.cfg))
+                assert d.next_attempt_at <= bound, ("held back by a cleared snooze", d, review)
             if review.status == "snoozed" and isinstance(until, int | float) and self.now < until:
                 if d.attempts == 0:
                     assert d.next_attempt_at >= math.ceil(until), ("due before snooze", d, review)
@@ -645,7 +676,8 @@ class World:
                 assert rec is None or rec.state != "pending", ("recover for superseded", iid)
             if s["state"] == "resolved" and iid in self.owed_at:  # (c) per episode
                 assert rec is not None and rec.state != "withdrawn", ("recover owed", iid, rec)
-                assert rec.created_at >= self.owed_at[iid], ("recover of an older episode", rec)
+                opened_row = self.rows[(iid, "open")]
+                assert rec.row_id > opened_row.row_id, ("recover of an older incarnation", rec)
             self._check_announced(iid, s)
 
     def _check_announced(self, iid, s):
@@ -668,7 +700,7 @@ class World:
             (self.ev_claim, 3), (self.ev_complete, 4), (self.ev_overtake, 3),
             (self.ev_crash, 1), (self.ev_zombie, 2),
             (self.ev_violate, 1), (self.ev_zombie_race, 2), (self.ev_recreate_race, 2),
-            (self.ev_retry_flap, 2),
+            (self.ev_retry_flap, 2), (self.ev_clock_back, 1),
             (self.ev_flap, 4), (self.ev_pass, 8),
         ]  # fmt: skip
         funcs = [f for f, w in ops for _ in range(w)]

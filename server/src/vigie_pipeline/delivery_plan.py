@@ -45,14 +45,13 @@ lapsed lease means we cannot know whether the send happened, so the normal cance
 first (lifetime, missing incident, a resolved or superseded incident for an open, a non-resolved
 incident for a recover); only otherwise Reclaim (back to `pending` after a backoff; `attempts`
 already counted) or Fail past the budget. Delivery is at least once, and a cancelled announcement
-is never retransmitted. A new row starts at `version = created_at << 20`, so its versions exceed
-any version of a forgotten row with the same delivery_id (see docs/monitoring.md), and completions
-also check `created_at`.
+is never retransmitted. Rows are fenced by `row_id`, an AUTOINCREMENT incarnation token, and
+`version`, a plain counter (see delivery_sql).
 
 `expected` is an assertion: None means the row must not exist (INSERT OR IGNORE), otherwise
-Expected(state, attempts, version) of the row planned against. Each action is one conditional
-statement that bumps `version` and sets `updated_at`; anything but exactly one affected row is a
-bug: log it and roll the whole pass back. A Forget of an `open` row carries
+Expected(state, attempts, version, row_id) of the row planned against. Each action is one
+conditional statement that bumps `version` and sets `updated_at`; anything but exactly one
+affected row is a bug: log it and roll the whole pass back. A Forget of an `open` row carries
 `sibling_recover='absent_or_terminal'`: its DELETE refuses while a recover row is pending or
 sending. Times in actions are integer epoch seconds. `expected`/`sibling_recover` are excluded
 from dataclass equality so tests compare actions by meaning and assert them separately.
@@ -92,7 +91,7 @@ from vigie_pipeline.delivery_types import is_number as _num
 
 
 def _exp(d: DeliveryView) -> Expected:
-    return Expected(d.state, d.attempts, d.version)
+    return Expected(d.state, d.attempts, d.version, d.row_id)
 
 
 def delivery_id(incident_id: str, kind: str) -> str:
@@ -128,11 +127,19 @@ def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | 
     return "loud", None
 
 
-def _retarget(d: DeliveryView, target: int) -> Action | None:
-    """Pending row vs the verdict's time. A retrying row (attempts > 0) only moves later."""
-    if d.next_attempt_at == target or (d.attempts > 0 and d.next_attempt_at > target):
-        return None
-    return Reschedule(d.incident_id, "open", target, _exp(d))
+def _retarget(
+    d: DeliveryView, target: int, snoozed: bool, now: float, config: DeliveryConfig
+) -> Action | None:
+    """A pending open against the verdict's time `target` (`now` when loud). The row is due at the
+    verdict, but never before its cumulative backoff, and never later than that: a cleared or
+    shortened snooze pulls it in. A snooze that ends later pushes it out."""
+    floor = math.ceil(now)
+    if d.attempts > 0:
+        floor = max(floor, math.ceil(d.updated_at) + backoff(d.attempts, config))
+    want = max(target, floor)
+    if d.next_attempt_at > want or (snoozed and d.next_attempt_at < target):
+        return Reschedule(d.incident_id, "open", want, _exp(d))
+    return None
 
 
 def _lifetime_over(d: DeliveryView, now: float, config: DeliveryConfig) -> bool:
@@ -174,13 +181,10 @@ def _open_action(
         return _revive(d, target, now, config, Requeue) if kind in ("loud", "until") else None
     if kind in ("unknown", "quiet"):
         reason = UNRECOGNISED if kind == "unknown" else str(detail)
-        return Suppress(iid, "open", reason, _exp(d) if d else None)
+        return Suppress(iid, "open", reason, expected=_exp(d) if d else None)
     if d is None:
         return Enqueue(iid, "open", target)
-    if kind == "loud":
-        early = d.attempts == 0 and d.next_attempt_at > target
-        return Reschedule(iid, "open", target, _exp(d)) if early else None
-    return _retarget(d, target)
+    return _retarget(d, target, kind == "until", now, config)
 
 
 def _row_ok(d: DeliveryView) -> bool:
@@ -238,7 +242,7 @@ def _lease_action(
         verdict, detail = _verdict(review, now) if state == "open" else ("unknown", None)
         if verdict in ("quiet", "unknown"):
             reason = UNRECOGNISED if verdict == "unknown" else str(detail)
-            return Suppress(iid, "open", reason, _exp(d))
+            return Suppress(iid, "open", reason, due, _exp(d))
         if verdict == "until":
             due = max(due, math.ceil(detail))
     return Reclaim(iid, d.kind, due, _exp(d))
@@ -331,13 +335,8 @@ def plan(
     """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind)."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
-    held = list(deliveries)
-    if any(_num(d.updated_at) and d.updated_at > now for d in held):
-        # row versions assume a monotonic clock (see delivery_sql); refuse to plan on a clock that
-        # is behind what the table already holds
-        raise ValueError("now is earlier than a stored updated_at: the clock stepped back")
     grouped: dict[str, dict[str, DeliveryView]] = {}
-    for d in held:
+    for d in deliveries:
         if d.kind in KINDS and d.state in STATES:
             grouped.setdefault(d.incident_id, {})[d.kind] = d
     by_incident: dict[str, IncidentView] = {}

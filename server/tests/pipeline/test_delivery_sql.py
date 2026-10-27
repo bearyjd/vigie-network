@@ -4,7 +4,6 @@ migrations: real CHECKs, real affected-row counts."""
 from __future__ import annotations
 
 import dataclasses
-import random
 import sqlite3
 from pathlib import Path
 
@@ -17,20 +16,21 @@ from vigie_pipeline.delivery_plan import (
     Enqueue,
     IncidentView,
     ReviewView,
+    Suppress,
     delivery_id,
     plan,
 )
 from vigie_pipeline.schema import open_pipeline_inventory
 
 NOW = 100_000_000
-STRIDE = 1 << 20  # a new row's version is its creation second times this
 CFG = DeliveryConfig()
 RET = CFG.retention_seconds
 DOCS = Path(__file__).resolve().parents[3] / "docs" / "monitoring.md"
 
 
 def row(kind="open", state="pending", attempts=0, nxt=NOW - 5, created=NOW - 5, ver=0, iid="i1"):
-    return DeliveryView(iid, kind, state, attempts, nxt, created, created, ver)
+    row_id = 1 if kind == "open" else 2  # explicit ids, so the params built from a row match
+    return DeliveryView(iid, kind, state, attempts, nxt, created, created, ver, row_id)
 
 
 def inc(state="open"):
@@ -45,18 +45,19 @@ def conn(tmp_path):
 
 
 INSERT_ROW = (
-    "INSERT INTO incident_deliveries (delivery_id, incident_id, kind, state, attempts,"
-    " next_attempt_at, created_at, updated_at, version) VALUES (?,?,?,?,?,?,?,?,?)"
+    "INSERT INTO incident_deliveries (row_id, delivery_id, incident_id, kind, state, attempts,"
+    " next_attempt_at, created_at, updated_at, version) VALUES (?,?,?,?,?,?,?,?,?,?)"
 )
 SELECT_ROWS = (
-    "SELECT incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at, version"
-    " FROM incident_deliveries"
+    "SELECT incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at, version,"
+    " row_id FROM incident_deliveries"
 )
 
 
 def load(conn, rows):
     for d in rows:
-        conn.execute(INSERT_ROW, (delivery_id(d.incident_id, d.kind), *dataclasses.astuple(d)))
+        values = dataclasses.astuple(d)
+        conn.execute(INSERT_ROW, (d.row_id, delivery_id(d.incident_id, d.kind), *values[:-1]))
 
 
 def fetch(conn):
@@ -235,17 +236,6 @@ def test_the_docs_quote_every_statement_verbatim():
     assert isinstance(sqlite3.sqlite_version, str)
 
 
-def test_a_new_row_starts_at_the_epoch_second_so_versions_never_repeat(conn):
-    from vigie_pipeline.delivery_plan import Enqueue, Suppress
-
-    for action in (Enqueue("i1", "open", NOW), Suppress("i1", "recover", "acknowledged")):
-        assert conn.execute(*sql.statement(action, NOW)).rowcount == 1
-    assert {d.version for d in fetch(conn).values()} == {NOW * STRIDE}
-    claim = sql.claim_params(fetch(conn)[("i1", "open")], NOW, CFG)
-    assert conn.execute(sql.CLAIM, claim).rowcount == 1
-    assert fetch(conn)[("i1", "open")].version == NOW * STRIDE + 1
-
-
 def test_failure_statements_apply_to_a_claimed_row(conn):
     load(conn, [row(nxt=NOW - 1)])
     conn.execute(sql.CLAIM, sql.claim_params(row(nxt=NOW - 1), NOW, CFG))
@@ -287,58 +277,121 @@ def test_every_statement_binds_integers_even_for_a_fractional_clock(conn):
     assert conn.execute(statement, params).rowcount == 1
 
 
-def test_the_version_stride_bounds_updates_and_separates_incarnations(conn):
-    """A row's versions lie in [created << 20, (created + 1) << 20): the CHECK refuses the 2**20-th
-    update, and a row recreated at least a second later starts above every earlier version."""
-    rnd = random.Random(7)  # noqa: S311 - deterministic test data
-    stride = 1 << 20
-    for _ in range(200):
-        conn.execute("DELETE FROM incident_deliveries")
-        created = NOW + rnd.randrange(10**6)
-        conn.execute(*sql.statement(Enqueue("i1", "open", created), created))
-        updates = rnd.choice([0, 1, 62, 1000, stride - 1, rnd.randrange(stride)])
-        conn.execute("UPDATE incident_deliveries SET version=version+?", (updates,))
-        old_top = fetch(conn)[("i1", "open")].version
-        assert old_top < (created + 1) * stride
-        conn.execute("DELETE FROM incident_deliveries")
-        again = created + rnd.choice([60, 61, 3600, 30 * 86400])  # forgotten >= retention later
-        conn.execute(*sql.statement(Enqueue("i1", "open", again), again))
-        assert fetch(conn)[("i1", "open")].version > old_top
-    conn.execute("DELETE FROM incident_deliveries")
-    conn.execute(*sql.statement(Enqueue("i1", "open", NOW), NOW))
-    conn.execute("UPDATE incident_deliveries SET version=version+?", (stride - 1,))
-    with pytest.raises(
-        sqlite3.IntegrityError
-    ):  # the 2**20-th update would cross into the next second
-        conn.execute("UPDATE incident_deliveries SET version=version+1")
+def test_a_new_row_starts_at_version_zero_with_a_fresh_row_id(conn):
+    for action in (Enqueue("i1", "open", NOW), Suppress("i1", "recover", "acknowledged")):
+        assert conn.execute(*sql.statement(action, NOW)).rowcount == 1
+    rows = fetch(conn)
+    assert {d.version for d in rows.values()} == {0}
+    assert rows[("i1", "open")].row_id != rows[("i1", "recover")].row_id
+
+
+def test_row_ids_are_never_reused_after_a_delete(conn):
+    """AUTOINCREMENT is the incarnation token: Forget then recreate gets a larger id."""
+    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='incident_deliveries'").fetchone()
+    assert "AUTOINCREMENT" in ddl[0].upper()
+    seen = []
+    for round_ in range(5):
+        conn.execute(*sql.statement(Enqueue("i1", "open", NOW + round_), NOW + round_))
+        seen.append(fetch(conn)[("i1", "open")].row_id)
+        conn.execute("DELETE FROM incident_deliveries")  # a Forget
+    assert seen == sorted(set(seen)) and len(seen) == 5
+
+
+def test_a_completion_needs_the_claimed_row_id(conn):
+    load(conn, [row(nxt=NOW - 1)])
+    conn.execute(sql.CLAIM, sql.claim_params(row(nxt=NOW - 1), NOW, CFG))
+    claimed = fetch(conn)[("i1", "open")]
+    other = dataclasses.replace(claimed, row_id=claimed.row_id + 1)  # another incarnation
+    for statement in (sql.COMPLETE_SENT, sql.COMPLETE_RETRY, sql.COMPLETE_FAILED):
+        params = sql.completion_params(other, NOW + 1) | {"next_attempt_at": NOW + 60}
+        assert conn.execute(statement, params).rowcount == 0
+    assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 1)).rowcount == 1
+
+
+def _create_claim_and_forget(conn, at, cfg):
+    """Create a delivery at `at`, claim it, and return the claim token; the row is then gone."""
+    conn.execute(*sql.statement(Enqueue("i1", "open", at), at))
+    conn.execute(sql.CLAIM, sql.claim_params(fetch(conn)[("i1", "open")], at, cfg))
+    return fetch(conn)[("i1", "open")]
+
+
+def test_a_clock_rolled_back_cannot_let_an_old_claim_complete_a_new_one(conn):
+    """Codex's trace: create+claim at t, expire at t+60, forget at t+121, the clock rolls back to
+    t, the delivery is recreated and claimed: the old completion must find nothing to match."""
+    cfg = DeliveryConfig(retention_seconds=60, lease_seconds=60)
+    old = _create_claim_and_forget(conn, NOW, cfg)
+    conn.execute("UPDATE incident_deliveries SET state='expired', version=version+1")  # t+60
+    conn.execute("DELETE FROM incident_deliveries")  # forgotten at t+121
+    again = _create_claim_and_forget(conn, NOW, cfg)  # the clock is back at t
+    assert (again.version, again.created_at) == (old.version, old.created_at)  # all else equal
+    assert again.row_id != old.row_id
+    statement, params = sql.failure_statement(dataclasses.replace(old, attempts=9), NOW + 1, cfg)
+    assert conn.execute(statement, params).rowcount == 0
+    assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(old, NOW + 1)).rowcount == 0
+    assert fetch(conn)[("i1", "open")] == again
 
 
 def test_codexs_same_second_reschedules_cannot_collide_with_a_recreated_row(conn):
     cfg = DeliveryConfig(retention_seconds=60, lease_seconds=60)
-    t = NOW
-    conn.execute(*sql.statement(Enqueue("i1", "open", t), t))
-    for _ in range(62):  # 62 reschedules in the same second
-        conn.execute("UPDATE incident_deliveries SET version=version+1")
-    conn.execute(sql.CLAIM, sql.claim_params(fetch(conn)[("i1", "open")], t, cfg))
-    old = fetch(conn)[("i1", "open")]
-    conn.execute("DELETE FROM incident_deliveries")  # expired at t+60, forgotten, recreated at t+62
-    again = t + 62
-    conn.execute(*sql.statement(Enqueue("i1", "open", again), again))
-    conn.execute(sql.CLAIM, sql.claim_params(fetch(conn)[("i1", "open")], again, cfg))
-    new = fetch(conn)[("i1", "open")]
-    assert new.version > old.version
-    statement, params = sql.failure_statement(dataclasses.replace(old, attempts=9), again, cfg)
-    assert conn.execute(statement, params).rowcount == 0
+    tokens = []
+    for _ in range(2):  # the same walk twice: 62 same-second updates, then a claim
+        conn.execute(*sql.statement(Enqueue("i1", "open", NOW), NOW))
+        conn.execute("UPDATE incident_deliveries SET version=version+62")
+        conn.execute(sql.CLAIM, sql.claim_params(fetch(conn)[("i1", "open")], NOW, cfg))
+        tokens.append(fetch(conn)[("i1", "open")])
+        if len(tokens) == 1:
+            conn.execute("DELETE FROM incident_deliveries")  # forgotten, then recreated
+    old, new = tokens
+    assert new.version == old.version and new.row_id != old.row_id  # versions may collide
+    assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(old, NOW + 1)).rowcount == 0
     assert fetch(conn)[("i1", "open")] == new
 
 
-def test_a_completion_also_needs_the_claimed_created_at(conn):
-    load(conn, [row(nxt=NOW - 1)])
-    conn.execute(sql.CLAIM, sql.claim_params(row(nxt=NOW - 1), NOW, CFG))
+def test_a_row_updated_thousands_of_times_still_transitions(conn):
+    """No version ceiling: 5000 ack/clear/reschedule cycles, then the row still claims and ends."""
+    conn.execute(*sql.statement(Enqueue("i1", "open", NOW), NOW))
+    for k in range(5000):
+        current = fetch(conn)[("i1", "open")]
+        state, update = ("pending", sql.RESCHEDULE_UPDATE)
+        params = {"row_id": current.row_id, "state": state, "attempts": 0, "now": NOW}
+        params |= {"version": current.version, "next_attempt_at": NOW - 1}
+        assert conn.execute(update, params).rowcount == 1, k
+    current = fetch(conn)[("i1", "open")]
+    assert current.version == 5000
+    assert conn.execute(sql.CLAIM, sql.claim_params(current, NOW, CFG)).rowcount == 1
     claimed = fetch(conn)[("i1", "open")]
-    other = dataclasses.replace(claimed, created_at=claimed.created_at - 1)  # an older incarnation
-    for statement in (sql.COMPLETE_SENT, sql.COMPLETE_RETRY, sql.COMPLETE_FAILED):
-        params = sql.completion_params(other, NOW + 1) | {"next_attempt_at": NOW + 60}
-        assert conn.execute(statement, params).rowcount == 0
-    assert sql.completion_params(claimed, NOW + 1)["created_at"] == claimed.created_at
     assert conn.execute(sql.COMPLETE_SENT, sql.completion_params(claimed, NOW + 1)).rowcount == 1
+
+
+@pytest.mark.parametrize("before,wait", [(0, 60), (3, 480)])
+def test_a_lapsed_claim_suppressed_then_requeued_keeps_its_retry_backoff(conn, before, wait):
+    """Codex: a normal Reclaim waits out the backoff; ack then clear must not skip it."""
+    conn.execute(*sql.statement(Enqueue("i1", "open", NOW), NOW))
+    conn.execute("UPDATE incident_deliveries SET attempts=?, next_attempt_at=?", (before, NOW))
+    pending = fetch(conn)[("i1", "open")]
+    assert conn.execute(sql.CLAIM, sql.claim_params(pending, NOW, CFG)).rowcount == 1
+    t = NOW + CFG.lease_seconds  # the lease lapses with `before + 1` attempts counted
+    for review in (ACK, {}):
+        rows = list(fetch(conn).values())
+        (action,) = plan([inc()], review, rows, t, CFG)
+        assert conn.execute(*sql.statement(action, t)).rowcount == 1
+    back = fetch(conn)[("i1", "open")]
+    assert (back.state, back.attempts, back.next_attempt_at) == ("pending", before + 1, t + wait)
+    assert conn.execute(sql.CLAIM, sql.claim_params(back, t, CFG)).rowcount == 0
+    assert conn.execute(sql.CLAIM, sql.claim_params(back, t + wait - 1, CFG)).rowcount == 0
+    assert conn.execute(sql.CLAIM, sql.claim_params(back, t + wait, CFG)).rowcount == 1
+
+
+def test_a_failed_pass_names_the_delivery_and_row_to_look_at(conn):
+    load(conn, [row(state="sent", ver=4)])
+    stale = plan([inc("resolved")], {}, list(fetch(conn).values()), NOW, CFG)
+    conn.execute("UPDATE incident_deliveries SET version=version+1")  # moved under the plan
+    (recover,) = [a for a in stale if a.kind == "recover"]
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sql.PassError) as caught:
+        sql.apply_actions(conn, [Enqueue("i1", "open", NOW), recover], NOW)
+    conn.execute("ROLLBACK")
+    message = str(caught.value)
+    assert "Enqueue affected 0 rows" in message
+    assert f"delivery_id={delivery_id('i1', 'open')}" in message and "row_id=" in message
+    assert fetch(conn)[("i1", "open")].version == 5  # nothing else changed

@@ -39,6 +39,9 @@ def inc(iid="i1", state="open", detected=NOW - 10):
     return IncidentView(id=iid, state=state, detected_at=detected)
 
 
+ROWID = {"open": 1, "recover": 2}  # explicit incarnation tokens for the helper rows
+
+
 def dv(
     kind="open",
     state="pending",
@@ -50,7 +53,7 @@ def dv(
     ver=0,
 ):
     upd = created if upd is None else upd
-    return DeliveryView(iid, kind, state, attempts, nxt, created, upd, ver)
+    return DeliveryView(iid, kind, state, attempts, nxt, created, upd, ver, ROWID.get(kind, 9))
 
 
 def run(incidents, reviews=None, deliveries=(), now=NOW, cfg=CFG):
@@ -159,13 +162,16 @@ def test_snoozed_incident_that_resolved_is_never_enqueued():
         ({}, 0, NOW + 100, Reschedule("i1", "open", NOW)),  # snooze cleared
         (snooze(0), 0, NOW + 100, Reschedule("i1", "open", NOW)),  # snooze just expired
         ({}, 0, NOW - 50, None),  # already due
-        ({}, 2, NOW + 500, None),  # backoff after failures is kept
-        (snooze(100), 2, NOW + 50, Reschedule("i1", "open", NOW + 100)),
-        (snooze(100), 2, NOW + 500, None),
+        ({}, 2, NOW + 120, None),  # backoff after failures (updated now + 120) is kept
+        ({}, 2, NOW + 500, Reschedule("i1", "open", NOW + 120)),  # a cleared snooze pulls in
+        (snooze(100), 2, NOW + 120, None),
+        (snooze(100), 2, NOW + 50, Reschedule("i1", "open", NOW + 120)),  # never before backoff
+        (snooze(100), 2, NOW + 500, Reschedule("i1", "open", NOW + 120)),  # a shortened snooze
+        (snooze(500), 2, NOW + 120, Reschedule("i1", "open", NOW + 500)),  # a longer one pushes
     ],
 )
 def test_pending_open_tracks_the_current_verdict(review, attempts, nxt, expected):
-    got = run([inc()], review, [dv(attempts=attempts, nxt=nxt)])
+    got = run([inc()], review, [dv(attempts=attempts, nxt=nxt, upd=NOW)])
     assert got == ((expected,) if expected else ())
 
 
@@ -628,7 +634,7 @@ def test_huge_but_finite_snooze_is_rejected_not_raised():
 
 
 def test_snooze_cleared_after_a_failure_keeps_the_backoff_but_a_later_snooze_wins():
-    retrying = dv(attempts=1, nxt=NOW + 60)
+    retrying = dv(attempts=1, nxt=NOW + 60, upd=NOW)
     assert run([inc()], deliveries=[retrying]) == ()  # cleared: backoff kept
     assert run([inc()], snooze(30), [retrying]) == ()  # shorter than the backoff: kept
     assert run([inc()], snooze(500), [retrying]) == (Reschedule("i1", "open", NOW + 500),)
@@ -720,13 +726,13 @@ def test_every_action_carries_the_row_state_it_was_planned_against(
     assert {type(a).__name__ for a in got} == set(expected)
     for a in got:
         want = expected[type(a).__name__]
-        assert a.expected == (Expected(*want, 0) if want else None)
+        assert a.expected == (Expected(*want, 0, ROWID[a.kind]) if want else None)
         assert a.expected is None or (a.expected.state, a.expected.attempts) == want
 
 
 def test_expected_carries_the_row_version():
     got = run([inc()], {"i1": ReviewView("acknowledged", None)}, [dv(attempts=2, ver=7)])
-    assert got[0].expected == Expected("pending", 2, 7)
+    assert got[0].expected == Expected("pending", 2, 7, 1)
 
 
 # requeue target respects an existing backoff; every revival path honours the original ttl
@@ -869,13 +875,13 @@ def test_the_apply_model_refuses_a_forget_when_a_recover_is_pending_meanwhile():
 def test_a_stale_action_cannot_hit_a_different_incarnation_of_a_row():
     ack = {"i1": ReviewView("acknowledged", None)}
     stale = run([inc()], ack, [dv(attempts=1, ver=3)])
-    reborn = dv(attempts=1, ver=5)  # same state and attempts, different incarnation
+    reborn = dataclasses.replace(dv(attempts=1, ver=3), row_id=9)  # everything equal but the row
     out, skipped = apply_cas({("i1", "open"): reborn}, stale, NOW)
     assert skipped == list(stale) and out[("i1", "open")] == reborn
     out, skipped = apply_cas({("i1", "open"): dv(attempts=1, ver=3)}, stale, NOW)
     assert not skipped and out[("i1", "open")].version == 4  # every change bumps the version
     inserted = apply_cas({}, run([inc()]), NOW)[0]
-    assert inserted[("i1", "open")].version == NOW << 20  # the creation second, see delivery_sql
+    assert inserted[("i1", "open")].version == 0  # a plain counter, fenced by the row id
 
 
 def test_bad_version_fails_closed():
@@ -911,7 +917,7 @@ def test_a_withdrawn_recover_is_revived_with_its_budget_and_clock_kept():
     ]
     got = run([inc(state="resolved")], deliveries=ds)
     assert got == (Revive("i1", "recover", NOW + 300),)  # waits out its own backoff
-    assert got[0].expected == Expected("withdrawn", 2, 3)
+    assert got[0].expected == Expected("withdrawn", 2, 3, 2)
     revived = apply(ds, got, NOW)[1]
     assert (revived.state, revived.attempts, revived.version) == ("pending", 2, 4)
     assert (revived.created_at, revived.next_attempt_at) == (NOW - 500, NOW + 300)
@@ -922,7 +928,7 @@ def test_a_revive_past_the_budget_or_the_lifetime_fails_or_expires_instead():
     spent = dv("recover", "withdrawn", attempts=CFG.max_attempts)
     got = run([inc(state="resolved")], deliveries=[dv(state="sent"), spent])
     assert got == (Fail("i1", "recover", "max_attempts"),)
-    assert got[0].expected == Expected("withdrawn", CFG.max_attempts, 0)
+    assert got[0].expected == Expected("withdrawn", CFG.max_attempts, 0, 2)
     old = dv("recover", "withdrawn", created=NOW - RET - 1, upd=NOW - 5)
     got = run([inc(state="resolved")], deliveries=[dv(state="sent"), old])
     assert got == (Expire("i1", "recover", "lifetime"),)
@@ -1004,7 +1010,7 @@ def test_a_forget_pass_with_one_missed_precondition_rolls_back_entirely():
     ds = [dv(state="sent", created=old), dv("recover", "sent", created=old)]
     both = run([inc(state="superseded")], deliveries=ds)
     assert both == (Forget("i1", "open"), Forget("i1", "recover"))
-    missed = (both[0], dataclasses.replace(both[1], expected=Expected("sent", 0, 99)))
+    missed = (both[0], dataclasses.replace(both[1], expected=Expected("sent", 0, 99, 2)))
     with pytest.raises(PassAborted):
         apply_cas(ds, missed, NOW, strict=True)
     rows, skipped = apply_cas(ds, both, NOW, strict=True)
@@ -1050,7 +1056,7 @@ def test_a_lapsed_lease_is_reclaimed_without_counting_the_attempt_again():
     row = sending(attempts=2, nxt=NOW, ver=7)
     got = run([inc()], deliveries=[row])
     assert got == (Reclaim("i1", "open", NOW + backoff(2, CFG)),)
-    assert got[0].expected == Expected("sending", 2, 7)
+    assert got[0].expected == Expected("sending", 2, 7, 1)
     back = apply([row], got, NOW)[0]
     assert (back.state, back.attempts, back.version) == ("pending", 2, 8)
     assert run([inc()], deliveries=[back]) == ()
@@ -1138,14 +1144,14 @@ def test_a_lapsed_claim_is_cancelled_by_the_normal_rules_before_it_is_reclaimed(
     incidents = [] if incident is None else [inc(state=incident)]
     got = [a for a in run(incidents, deliveries=ds) if a.kind == kind]
     assert got == [expected]
-    assert got[0].expected == Expected("sending", 1, 1)
+    assert got[0].expected == Expected("sending", 1, 1, ROWID[kind])
 
 
 def test_a_pending_row_at_the_attempt_budget_fails_instead_of_waiting_for_the_ttl():
     spent = dv(attempts=CFG.max_attempts, nxt=NOW + 500)
     got = run([inc()], deliveries=[spent])
     assert got == (Fail("i1", "open", "max_attempts"),)
-    assert got[0].expected == Expected("pending", CFG.max_attempts, 0)
+    assert got[0].expected == Expected("pending", CFG.max_attempts, 0, 1)
     assert run([inc()], deliveries=[dv(attempts=CFG.max_attempts - 1, nxt=NOW + 500)]) == ()
 
 
@@ -1169,32 +1175,30 @@ def test_an_open_that_went_out_before_its_lease_lapsed_gets_no_recover():
     assert ("i1", "recover") not in other.rows()
 
 
-def test_a_new_row_never_reuses_a_version_a_deleted_row_had():
-    """Codex's trace: reclaim, expire, forget, reopen, claim again. The old sender's late
-    completion carries the old claim's version and must not land on the new claim."""
+def test_a_recreated_delivery_is_a_new_row_whatever_the_clock_says():
+    """Codex's trace: create+claim at t, reclaim, expire, forget, the clock rolls BACK to t, the
+    delivery is recreated and claimed. Same version, same created_at; a different row_id."""
+    cfg = DeliveryConfig(retention_seconds=60, lease_seconds=60)
     t0 = NOW
-    store = Store([dv(nxt=t0 - 1)])
-    old = _claim(store, ("i1", "open"), t0)  # version V1; the sender then stalls
-    lapse = t0 + CFG.lease_seconds
-    _pass(store, "open", {}, lapse)  # Reclaim
-    _pass(store, "resolved", {}, lapse + 1)  # Expire (resolved_before_send)
+    store = Store([])
+    _pass(store, "open", {}, t0)
+    old = _claim(store, ("i1", "open"), t0, cfg)  # the sender then stalls
+    lapse = t0 + cfg.lease_seconds
+    for t, state in ((lapse, "open"), (lapse + 1, "resolved")):  # Reclaim, then Expire
+        store.apply_pass(plan([inc(state=state)], {}, list(store.rows().values()), t, cfg), t)
     assert store.rows()[("i1", "open")].state == "expired"
-    forgot = lapse + 1 + RET + 1
-    assert [type(a) for a in _pass(store, "resolved", {}, forgot)] == [Forget]
+    forgot = lapse + 1 + cfg.retention_seconds + 1
+    actions = plan([inc(state="resolved")], {}, list(store.rows().values()), forgot, cfg)
+    assert [type(a) for a in actions] == [Forget]
+    store.apply_pass(actions, forgot)
     assert store.rows() == {}
-    reopened = forgot + 10  # a fresh row, created at this epoch second
-    assert [type(a) for a in _pass(store, "open", {}, reopened)] == [Enqueue]
-    fresh = store.rows()[("i1", "open")]
-    assert fresh.version == reopened << 20 and fresh.version > old.version
-    new = _claim(store, ("i1", "open"), reopened + 1)
-    assert (
-        store.run(
-            *sql.failure_statement(
-                dataclasses.replace(old, attempts=CFG.max_attempts), reopened + 2, CFG
-            )
-        )
-        == 0
-    )
+    _pass(store, "open", {}, t0)  # the clock is back at t0: a new row
+    new = _claim(store, ("i1", "open"), t0, cfg)
+    assert (new.version, new.created_at) == (old.version, old.created_at)
+    assert new.row_id > old.row_id  # AUTOINCREMENT: never reused
+    assert store.run(sql.COMPLETE_SENT, sql.completion_params(old, t0 + 1)) == 0
+    stale = dataclasses.replace(old, attempts=cfg.max_attempts)
+    assert store.run(*sql.failure_statement(stale, t0 + 2, cfg)) == 0
     assert store.rows()[("i1", "open")] == new  # the new claim is intact
 
 
@@ -1221,8 +1225,8 @@ def _lease_world(rows):
     return Store(rows)
 
 
-def _claim(store, key, now):
-    assert store.run(sql.CLAIM, sql.claim_params(store.rows()[key], now, CFG)) == 1
+def _claim(store, key, now, cfg=CFG):
+    assert store.run(sql.CLAIM, sql.claim_params(store.rows()[key], now, cfg)) == 1
     return store.rows()[key]
 
 
@@ -1303,23 +1307,23 @@ def test_flapping_during_sends_never_exceeds_the_attempt_budget():
 
 
 # round 9
-def test_config_requires_integer_backoffs_and_a_retention_of_at_least_a_minute():
+def test_config_requires_integer_backoffs():
     for bad in (60.0, 0.5, True, "60"):
         with pytest.raises(ValueError):
             DeliveryConfig(backoff_base_seconds=bad, backoff_cap_seconds=3600)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
             DeliveryConfig(backoff_cap_seconds=bad)  # type: ignore[arg-type]
-    for bad in (1, 59, 0):  # Codex's retention=1 let a recreated row reuse a version
-        with pytest.raises(ValueError):
-            DeliveryConfig(retention_seconds=bad)
-    assert DeliveryConfig(retention_seconds=60).retention_seconds == 60
+    assert (
+        DeliveryConfig(retention_seconds=1).retention_seconds == 1
+    )  # no clock argument needs more
 
 
-def test_planning_on_a_clock_behind_the_stored_rows_is_refused():
-    row = dv(created=NOW - 5, upd=NOW + 1)
-    with pytest.raises(ValueError, match="stepped back"):
-        run([inc()], deliveries=[row])
-    assert run([inc()], deliveries=[dv(created=NOW - 5, upd=NOW)]) != () or True
+def test_planning_makes_no_assumption_about_a_monotonic_clock():
+    ahead = dv(created=NOW - 5, upd=NOW + 1000)  # stamped by a clock that has since stepped back
+    assert run([inc()], deliveries=[ahead]) == ()
+    assert run([inc(state="resolved")], deliveries=[ahead]) == (
+        Expire("i1", "open", "resolved_before_send"),
+    )
 
 
 def lapsed_open(**kw):
@@ -1333,9 +1337,9 @@ ACK_R = {"i1": ReviewView("acknowledged", None)}
     "review,expected",
     [
         ({}, Reclaim("i1", "open", NOW + 60)),
-        (ACK_R, Suppress("i1", "open", "acknowledged")),
-        ({"i1": ReviewView("expected", None)}, Suppress("i1", "open", "expected")),
-        ({"i1": ReviewView("bogus", None)}, Suppress("i1", "open", "unrecognised_state")),
+        (ACK_R, Suppress("i1", "open", "acknowledged", NOW + 60)),
+        ({"i1": ReviewView("expected", None)}, Suppress("i1", "open", "expected", NOW + 60)),
+        ({"i1": ReviewView("bogus", None)}, Suppress("i1", "open", "unrecognised_state", NOW + 60)),
         (snooze(10_000), Reclaim("i1", "open", NOW + 10_000)),
         (snooze(10), Reclaim("i1", "open", NOW + 60)),  # the backoff is the later of the two
         ({"i1": ReviewView("snoozed", NOW)}, Reclaim("i1", "open", NOW + 60)),  # elapsed
@@ -1344,7 +1348,7 @@ ACK_R = {"i1": ReviewView("acknowledged", None)}
 def test_a_lapsed_open_meets_the_current_decision_before_it_is_reclaimed(review, expected):
     got = run([inc()], review, [lapsed_open()])
     assert got == (expected,)
-    assert got[0].expected == Expected("sending", 1, 1)
+    assert got[0].expected == Expected("sending", 1, 1, 1)
 
 
 def test_a_lapsed_recover_ignores_decisions():
@@ -1388,7 +1392,7 @@ def test_opus_version_collision_sequence_cannot_complete_a_new_claim():
     tn = t + 1 + 602
     assert passes("open", tn) == ["Enqueue"]
     cur = store.rows()[key]
-    for _ in range(5000):  # the old tests walked the new row up to the old claim's version
+    for _ in range(750):  # walk the new row's version up to the old claim's, as before
         if cur.version >= old.version - 1:
             break
         passes("open", tn, ack)
@@ -1396,6 +1400,29 @@ def test_opus_version_collision_sequence_cannot_complete_a_new_claim():
         cur = store.rows()[key]
     assert store.run(sql.CLAIM, sql.claim_params(cur, tn + 1, cfg)) == 1
     new = store.rows()[key]
-    assert new.version != old.version and new.created_at != old.created_at
+    assert new.row_id > old.row_id  # the incarnation token differs even if the version matches
     assert store.run(sql.COMPLETE_SENT, sql.completion_params(old, tn + 2)) == 0
     assert store.rows()[key] == new  # the new claim is intact
+
+
+# round 10: a cleared or shortened snooze pulls a reclaimed open back in, through real SQLite
+@pytest.mark.parametrize("before", [0, 1, 3])
+@pytest.mark.parametrize("change", ["cleared", "shortened", "beyond-lifetime-cleared"])
+def test_a_reclaimed_open_parked_at_a_snooze_is_pulled_in_when_the_snooze_changes(before, change):
+    store = Store([dv(attempts=before, nxt=NOW - 1)])
+    _claim(store, ("i1", "open"), NOW)
+    lapse = NOW + CFG.lease_seconds
+    far = RET + 10 * DAY if change == "beyond-lifetime-cleared" else 7 * DAY
+    _pass(store, "open", snooze(far), lapse)  # the lapsed claim is parked at the snooze end
+    parked = store.rows()[("i1", "open")]
+    assert (parked.state, parked.next_attempt_at) == ("pending", NOW + far)
+    t = lapse + 100
+    review = snooze(lapse + 500 - NOW) if change == "shortened" else {}
+    assert [type(a) for a in _pass(store, "open", review, t)] == [Reschedule]
+    row = store.rows()[("i1", "open")]
+    floor = max(t, lapse + backoff(before + 1, CFG))  # never before the cumulative backoff
+    want = max(floor, lapse + 500) if change == "shortened" else floor
+    assert (row.state, row.next_attempt_at) == ("pending", want) and want < NOW + far
+    assert store.run(sql.CLAIM, sql.claim_params(row, want - 1, CFG)) == 0
+    assert store.run(sql.CLAIM, sql.claim_params(row, want, CFG)) == 1
+    assert _pass(store, "open", review, t) == []  # and a second pass changes nothing

@@ -263,9 +263,12 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
     (
         # Outbox for incident notifications (see vigie_pipeline.delivery_plan). Times are integer
         # epoch seconds. No FK to monitoring_incidents: incidents are pruned by retention while
-        # deliveries age out on their own. delivery_id = sha256(f"{incident_id}\n{kind}") hex[:32].
+        # deliveries age out on their own. delivery_id is deterministic: sha256 of
+        # f"{incident_id}\n{kind}", first 32 hex. row_id is the INCARNATION token: AUTOINCREMENT
+        # never reuses an id, so a recreated delivery is a different row whatever the clock says.
         "CREATE TABLE incident_deliveries ("
-        "delivery_id TEXT NOT NULL PRIMARY KEY CHECK(length(delivery_id)=32),"
+        "row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "delivery_id TEXT NOT NULL UNIQUE CHECK(length(delivery_id)=32),"
         "incident_id TEXT NOT NULL,"
         "kind TEXT NOT NULL CHECK(kind IN ('open','recover')),"
         "state TEXT NOT NULL CHECK(state IN "
@@ -278,8 +281,6 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer'),"
         "version INTEGER NOT NULL DEFAULT 0 CHECK(typeof(version)='integer' AND version>=0),"
         "CHECK(state NOT IN ('pending','sending') OR next_attempt_at IS NOT NULL),"
-        "CHECK(updated_at>=created_at),"
-        "CHECK(version<(created_at+1)*1048576),"
         "CHECK(state!='withdrawn' OR kind='recover'),"
         "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",

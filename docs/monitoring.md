@@ -167,9 +167,10 @@ it on never announces old open incidents.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
 `recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and
-`next_attempt_at` (required while `pending` or `sending`), `attempts >= 0`, a `version` that every
-change increments, and `last_error` capped at 200 characters. `delivery_id` is the first 32 hex
-chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
+`next_attempt_at` (required while `pending` or `sending`), `attempts >= 0`, a `version` (a plain
+counter: 0 at creation, +1 per change) and `last_error` capped at 200 characters. `row_id` is an
+`INTEGER PRIMARY KEY AUTOINCREMENT`, the incarnation token; `delivery_id` (unique) is the first 32
+hex chars of `sha256(incident_id + "\n" + kind)`. External payloads carry a device label and an
 incident link only. States:
 
 | state | meaning |
@@ -185,17 +186,21 @@ applies every action inside one `BEGIN IMMEDIATE` transaction; it skips the pass
 read fails (a partial list would expire pending rows as `incident_missing`). Each action is exactly
 one of the statements below (`vigie_pipeline.delivery_sql`; the tests run them against a table built
 by the production migration, and another test keeps this block identical to the code) and carries
-the row it was planned against (`expected`: state, attempts, version) as an assertion. Every UPDATE
+the row it was planned against (`expected`: state, attempts, version, row_id) as an assertion. Every UPDATE
 sets `updated_at=:now` and `version=version+1`. Each statement must affect exactly one row;
-anything else is a planner bug, so log it and roll the whole pass back.
+anything else is a planner bug, so roll the whole pass back (`delivery_sql.apply_actions` raises
+`PassError` naming `delivery_id` and `row_id`). To investigate, run `SELECT * FROM
+incident_deliveries WHERE delivery_id = '<id from the message>'`; a corrupt row may be removed by
+hand with `DELETE FROM incident_deliveries WHERE row_id = <row_id>` (the next pass then plans the
+incident afresh, so an open that was already sent may be announced again).
 
 **Sender contract (a lease).** The sender works in short separate transactions: CLAIM a due
 `pending` row (the only way to transmit; attempts are counted at claim, and a transmit aborted by
-`may_transmit` still uses one); transmit outside any transaction; then COMPLETE with the claimed version and `created_at` (`sent`;
+`may_transmit` still uses one); transmit outside any transaction; then COMPLETE with the claim token `(row_id, version)` (`sent`;
 back to `pending` with a backoff, or `failed` past `max_attempts`, via
-`delivery_sql.failure_statement`). The database allows only one live CLAIM per `delivery_id`
-(`sending`, lease end in `next_attempt_at`) and fences every write by `version`, but it cannot see a
-network call. Overlapping transmissions are prevented by the sender contract:
+`delivery_sql.failure_statement`). The database allows only one live CLAIM per delivery
+(`sending`, lease end in `next_attempt_at`) and fences every write by `row_id` and `version`, but
+it cannot see a network call. Overlapping transmissions are prevented by the sender contract:
 
 - a hard timeout covering connect, send and response, no longer than `transmit_deadline_seconds`
   (default 30);
@@ -204,14 +209,15 @@ network call. Overlapping transmissions are prevented by the sender contract:
   the claim;
 
 Recording the result before the lease lapses is what avoids a duplicate send; a completion that
-arrives later is harmless to the table, because it is fenced by `version` and `created_at`.
+arrives later is harmless to the table, because it is fenced by `row_id` and `version`.
 
 `lease_seconds` (default 300, at least 60) must be at least twice the deadline, so a sender that
 honours the contract has finished transmitting before the earliest possible Reclaim, and the next
 claim can only follow later. The lease is half-open, `[claim, claim + lease)`: at `next_attempt_at
 == now` it has lapsed, the planner's Reclaim wins, and a completion arriving in that same second
 finds a new version and is lost. Sender and planner must read one clock (the same pipeline process
-or host): clock skew between hosts, or a forward clock jump, can break the guarantee. Residual: a
+or host) for the lease timing: clock skew between hosts, or a forward clock jump, can break the
+no-overlap guarantee. Incarnation fencing does not depend on the clock at all. Residual: a
 sender that violates its timeout (a hung network call) can cause a duplicate that the receiver
 cannot detect; publisher idempotency keys are a later concern (4c).
 
@@ -219,71 +225,66 @@ The planner never touches a live `sending` row (no expiry, suppress, reschedule,
 forget). Whatever changed during the send (an ack, a snooze, a resolve or a reopen) is applied on
 the next pass, once the row is `sent` or `pending` again.
 
-**Versions.** A new row starts at `version = created_at * 2**20` and every change adds 1; a CHECK
-(`version < (created_at + 1) * 2**20`) fails loudly if a row ever takes 2**20 updates, which the
-planner and sender (bounded by `max_attempts` and the row's lifetime) never approach. Every version
-of a row therefore lies in `[created_at << 20, (created_at + 1) << 20)`. A row with the same
-deterministic `delivery_id` is only recreated more than `retention_seconds` after the old row's last
-update (30 days by default, configurable, never less than 60 s), so `new_created_at >= old_created_at + 1`, and
-`old_version < (old_created_at + 1) << 20 <= new_created_at << 20 = new initial version`. A late
-completion from the old incarnation can therefore never match the new row; as belt and braces every
-COMPLETE statement also requires `created_at` to equal the claimed row's, and a recreated row's is
-at least a second later. This needs a monotonic
-clock: `plan()` raises if `now` is earlier than any stored `updated_at`, and the drain must stop
-rather than run on a clock that stepped back. Backoffs are whole seconds (`backoff_base_seconds`
-and `backoff_cap_seconds` must be integers) and every computed time is rounded up, so no statement
-ever binds a fractional time.
+**Incarnations.** A statement keyed by a row matches `row_id = :row_id AND version = :version`.
+`row_id` is AUTOINCREMENT, so SQLite never reuses one, even after a Forget: a recreated delivery
+(same `delivery_id`) is a different row, and a claim token taken from an earlier incarnation can
+never complete it, whatever the clock, the retention or the number of updates. `version` is a plain
+counter with no ceiling. Backoffs are whole seconds (`backoff_base_seconds` and
+`backoff_cap_seconds` must be integers) and every computed time is rounded up, so no statement ever
+binds a fractional time.
 
 ```sql
--- planner: Enqueue (a new row's version is its creation second times 2**20)
+-- planner: Enqueue (version 0; SQLite assigns a fresh row_id)
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, :now * 1048576)
+VALUES (:id, :incident_id, :kind, 'pending', 0, :not_before, :now, :now, 0)
 
 -- planner: Suppress, incident without a row
 INSERT OR IGNORE INTO incident_deliveries
   (delivery_id, incident_id, kind, state, attempts, next_attempt_at, created_at, updated_at,
    version)
-VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, :now * 1048576)
+VALUES (:id, :incident_id, :kind, 'suppressed', 0, NULL, :now, :now, 0)
 
--- planner: Suppress (pending, or a lapsed sending open)
-UPDATE incident_deliveries SET state='suppressed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+-- planner: Suppress (pending, or a lapsed sending open, which keeps its retry deadline)
+UPDATE incident_deliveries SET state='suppressed',
+  next_attempt_at=COALESCE(:next_attempt_at, next_attempt_at), updated_at=:now,
+  version=version+1
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Reschedule
 UPDATE incident_deliveries SET next_attempt_at=:next_attempt_at, updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state='pending' AND attempts=:attempts AND version=:version
 
 -- planner: Requeue (suppressed -> pending)
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
   version=version+1
-WHERE delivery_id=:id AND state='suppressed' AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state='suppressed' AND attempts=:attempts AND version=:version
 
 -- planner: Revive (withdrawn -> pending; attempts and created_at are kept)
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:not_before, updated_at=:now,
   version=version+1
-WHERE delivery_id=:id AND state='withdrawn' AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state='withdrawn' AND attempts=:attempts AND version=:version
 
 -- planner: Expire (state is pending, suppressed, withdrawn or sending)
 UPDATE incident_deliveries SET state='expired', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Fail (pending, suppressed, withdrawn or sending)
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Withdraw (a recover, pending or lapsed sending, whose incident is not resolved)
 UPDATE incident_deliveries SET state='withdrawn', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Forget a recover row (or any row without the sibling guard)
 DELETE FROM incident_deliveries
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
 
 -- planner: Forget an open row (refuses while a recover is pending or sending)
 DELETE FROM incident_deliveries
-WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state=:state AND attempts=:attempts AND version=:version
   AND NOT EXISTS (SELECT 1 FROM incident_deliveries r
                   WHERE r.incident_id=:incident_id AND r.kind='recover'
                     AND r.state IN ('pending', 'sending'))
@@ -291,45 +292,46 @@ WHERE delivery_id=:id AND state=:state AND attempts=:attempts AND version=:versi
 -- planner: Reclaim a lapsed sending row that is still deliverable
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at, updated_at=:now,
   version=version+1
-WHERE delivery_id=:id AND state='sending' AND attempts=:attempts AND version=:version
+WHERE row_id=:row_id AND state='sending' AND attempts=:attempts AND version=:version
 
 -- sender: claim a due pending row (the only way to transmit); the lease end is next_attempt_at
 UPDATE incident_deliveries SET state='sending', attempts=attempts+1,
   next_attempt_at=:now+:lease_seconds, updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='pending' AND next_attempt_at<=:now
+WHERE row_id=:row_id AND state='pending' AND next_attempt_at<=:now
   AND attempts<:max_attempts AND version=:version
 
--- sender: the send succeeded (claimed version and created_at)
+-- sender: the send succeeded (claim token: row_id and version)
 UPDATE incident_deliveries SET state='sent', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version
-  AND created_at=:created_at
+WHERE row_id=:row_id AND state='sending' AND version=:version
+ 
 
 -- sender: the send failed, retry later (next_attempt_at from the claimed row)
 UPDATE incident_deliveries SET state='pending', next_attempt_at=:next_attempt_at,
   updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version
-  AND created_at=:created_at
+WHERE row_id=:row_id AND state='sending' AND version=:version
+ 
 
 -- sender: the send failed and the budget is spent
 UPDATE incident_deliveries SET state='failed', updated_at=:now, version=version+1
-WHERE delivery_id=:id AND state='sending' AND version=:version
-  AND created_at=:created_at
+WHERE row_id=:row_id AND state='sending' AND version=:version
+ 
 ```
 
 **Sender checklist (unit 4b).** Acceptance test: a fake transport with a HUNG transport.
 
-1. One planner pass = one `BEGIN IMMEDIATE` transaction over the COMPLETE incident set and all
-   rows; apply `delivery_sql.statement(action, now)` for each action and roll the whole pass back
-   unless every statement affects exactly 1 row.
+1. One planner pass = one `BEGIN IMMEDIATE` transaction; read `now` AFTER the transaction has begun
+   (so a CLAIM committed in the gap cannot leave the pass with stale time), then read the COMPLETE
+   incident set and all rows, `plan()`, and apply the actions with `delivery_sql.apply_actions`;
+   on `PassError` roll the whole pass back.
 2. CLAIM (`delivery_sql.CLAIM` with `claim_params`) in its own short transaction; it must affect 1
-   row.
+   row. Re-read the row: its `(row_id, version)` is the claim token.
 3. Call `may_transmit(claimed_at, now, config)` with `claimed_at` = the CLAIM's `:now`, which is the
    row's `updated_at`; abort without transmitting, and record a failure, if it is false.
 4. Transmit outside any transaction with a hard timeout covering connect, send and response, at
    most `transmit_deadline_seconds`.
 5. Record the result in a short transaction: `COMPLETE_SENT`, or `failure_statement(claimed, now,
-   config)`, both with `completion_params` (the claimed version and `created_at`).
-6. Sender and planner read one clock (same process or host).
+   config)`, both with `completion_params` (the claim token).
+6. Sender and planner read one clock (same process or host) for the lease timing.
 
 If the sender crashes after transmitting, the row stays `sending` until the lease lapses. The
 planner then judges the lapsed claim by the normal rules first: it expires it if its lifetime ended,
@@ -355,8 +357,11 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
   (a row is inserted as `suppressed`, so history exists). Suppressed rows are re-checked every
   pass, so a cleared decision (or a cleared `NULL`-status row) requeues the delivery.
 - A snooze defers delivery to `snooze_until` (strictly before is quiet, as in the inbox). A pending
-  row that has not been attempted tracks the current verdict exactly, earlier or later. A row that
-  already failed keeps its retry backoff and is only pushed later by a longer snooze.
+  row is due at the verdict, but never before its cumulative backoff (`updated_at` plus the
+  backoff for its attempts) and never later: a cleared or shortened snooze pulls it in, even if it
+  was parked at the old snooze end by a Reclaim, while a longer snooze pushes it out. A lapsed
+  claim that is acknowledged keeps the retry deadline a Reclaim would have used, so an ack followed
+  by a clear cannot skip the backoff.
 - An un-ack never silently drops an announcement. A pending row expires 24 hours after
   `max(created_at, next_attempt_at)`; a requeue sets `next_attempt_at` to its target, so an ack
   that lasted longer than the ttl does not expire a still-open loud incident. Spam is bounded by
