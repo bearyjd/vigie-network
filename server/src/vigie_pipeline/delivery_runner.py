@@ -52,6 +52,14 @@ from vigie_pipeline.overrides import open_overrides_ro
 
 logger = logging.getLogger("vigie_pipeline")
 DEFAULT_MAX_PER_RUN = 20
+DEFAULT_MAX_ABANDONED = 2
+LOG_WEDGED_EVERY = 20  # a wedged transport is logged on the first run and every 20th after
+# Publish workers abandoned at their deadline and still running. Process-wide: it is the bound
+# on stranded threads across runs. A worker that finishes late has its result discarded; only the
+# claim that spawned it (already completed as a failure) could have used it.
+_ABANDONED: set[threading.Thread] = set()
+_ABANDONED_LOCK = threading.Lock()
+_wedged_runs = 0
 _ROW = "row_id,incident_id,kind,state,attempts,next_attempt_at,created_at,updated_at,version"
 
 
@@ -137,6 +145,26 @@ def _message(inv, ro, claimed: DeliveryView) -> Message | None:
     return build_message(did, claimed.kind, claimed.incident_id, label)
 
 
+def abandoned_count() -> int:
+    """Abandoned publish workers still running (finished ones are dropped here)."""
+    with _ABANDONED_LOCK:
+        _ABANDONED.difference_update([t for t in _ABANDONED if not t.is_alive()])
+        return len(_ABANDONED)
+
+
+def _wedged(limit: int) -> bool:
+    """True when `limit` abandoned publishes are still running: do not claim, do not publish."""
+    global _wedged_runs
+    running = abandoned_count()
+    if running < limit:
+        return False
+    if _wedged_runs % LOG_WEDGED_EVERY == 0:
+        detail = f"delivery transport wedged: {running} abandoned publishes still running"
+        log(logger, logging.ERROR, "delivery_transport_wedged", abandoned=running, detail=detail)
+    _wedged_runs += 1
+    return True
+
+
 def _publish(publisher: Publisher, message: Message, seconds: float) -> str:
     """'sent', 'failed' or 'timeout'. The publisher runs in a daemon thread that is abandoned at
     the deadline: a hard wall timeout that does not depend on the transport honouring one."""
@@ -153,6 +181,8 @@ def _publish(publisher: Publisher, message: Message, seconds: float) -> str:
     worker.start()
     worker.join(seconds)
     if worker.is_alive() or not outcome:
+        with _ABANDONED_LOCK:
+            _ABANDONED.add(worker)
         log(logger, logging.ERROR, "delivery_publish_timeout", delivery_id=message.delivery_id)
         return "timeout"
     if outcome[0] is not None:
@@ -208,6 +238,7 @@ def run_delivery(
     clock: Callable[[], float],
     *,
     max_per_run: int = DEFAULT_MAX_PER_RUN,
+    max_abandoned: int = DEFAULT_MAX_ABANDONED,
 ) -> RunReport:
     ro = open_overrides_ro(overrides) if isinstance(overrides, Path) else overrides
     try:
@@ -218,6 +249,8 @@ def run_delivery(
             return RunReport(skipped="decisions_unavailable")
         counts: Counter[str] = Counter()
         for row in _due(inv, now, config, max_per_run):
+            if _wedged(max_abandoned):
+                break  # checked BEFORE the claim, so a dead transport burns no attempts
             outcome = _send_one(inv, ro, publisher, row, config, clock)
             counts[outcome] += 1
             if outcome == "timeout":

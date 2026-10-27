@@ -101,11 +101,14 @@ class DeliverySettings:
     ttl_s: int = 86400
     retention_s: int = 30 * 86400
     max_per_run: int = 20
+    max_abandoned: int = 2
 
     def __post_init__(self) -> None:
         self.delivery_config(None)  # DeliveryConfig's own validation, at startup
         if self.max_per_run < 1:
             raise ValueError("VIGIE_DELIVERY_MAX_PER_RUN must be >= 1")
+        if self.max_abandoned < 1:
+            raise ValueError("VIGIE_DELIVERY_MAX_ABANDONED must be >= 1")
         if self.enabled and self.file is None:
             raise ValueError("VIGIE_DELIVERY_FILE is required when VIGIE_DELIVERY_ENABLED is set")
 
@@ -133,6 +136,7 @@ class DeliverySettings:
             "ttl_s": "VIGIE_DELIVERY_TTL_S",
             "retention_s": "VIGIE_DELIVERY_RETENTION_S",
             "max_per_run": "VIGIE_DELIVERY_MAX_PER_RUN",
+            "max_abandoned": "VIGIE_DELIVERY_MAX_ABANDONED",
         }
         values = {k: _env_int(source, name, d[k].default) for k, name in ints.items()}
         return cls(

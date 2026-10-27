@@ -14,6 +14,25 @@ from vigie_pipeline.delivery_publish import FakePublisher, PublishError
 from vigie_pipeline.delivery_runner import run_delivery
 from vigie_pipeline.delivery_sql import PassError
 
+_GATES: list[threading.Event] = []
+
+
+def _gate():
+    _GATES.append(threading.Event())
+    return _GATES[-1]
+
+
+@pytest.fixture(autouse=True)
+def _no_abandoned_workers():
+    """The registry of abandoned publishes is process-wide: every test starts and ends clean."""
+    delivery_runner._ABANDONED.clear()
+    delivery_runner._wedged_runs = 0
+    yield
+    for gate in _GATES:
+        gate.set()
+    _GATES.clear()
+    _wait_idle()
+
 
 @pytest.fixture
 def world(tmp_path):
@@ -153,7 +172,7 @@ class Probe(FakePublisher):
     """Hangs like a dead transport, after checking the database is free."""
 
     def __init__(self, path):
-        super().__init__(script=[threading.Event()])
+        super().__init__(script=[_gate()])
         self.path, self.free = path, None
 
     def publish(self, message, *, timeout_seconds):
@@ -187,7 +206,7 @@ def test_hung_transport_is_abandoned_at_the_deadline_without_a_held_transaction(
 def test_hang_stops_the_drain_for_this_run(world, tmp_path):
     world.incident("a")
     world.incident("b")
-    pub = FakePublisher(script=[threading.Event()])
+    pub = FakePublisher(script=[_gate()])
     report = go(world, pub, Clock())
     assert len(pub.attempted) == 1 and report.failed == 1
 
@@ -262,3 +281,59 @@ def test_lost_claim_race_transmits_nothing(world, monkeypatch):
 def _view(row):
     keys = "row_id incident_id kind state attempts next_attempt_at created_at updated_at version"
     return {k: row[k] for k in keys.split()}
+
+
+def _hang_forever(n):
+    gates = [_gate() for _ in range(n)]
+    return gates, FakePublisher(script=list(gates))
+
+
+def _wait_idle():
+    for _ in range(500):
+        if delivery_runner.abandoned_count() == 0:
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("abandoned workers did not finish")
+
+
+def test_wedged_transport_is_bounded_across_runs_and_burns_no_attempts(world):
+    world.incident()
+    gates, pub = _hang_forever(3)
+    clock = Clock()
+    for step in range(3):
+        clock.t = T0 + step * 4000  # past any backoff
+        go(world, pub, clock, max_abandoned=2)
+    (row,) = world.rows()
+    assert len(pub.attempted) == 2 and row["attempts"] == 2  # the 3rd run never claimed
+    assert row["state"] == "pending" and delivery_runner.abandoned_count() == 2
+    workers = [t for t in threading.enumerate() if t.name == "vigie-delivery-publish"]
+    assert len(workers) == 2 and all(t.daemon for t in workers)
+    for gate in gates:
+        gate.set()
+    _wait_idle()
+    clock.t = T0 + 20000
+    go(world, pub, clock, max_abandoned=2)
+    assert len(pub.attempted) == 3 and world.rows()[0]["attempts"] == 3
+
+
+def test_wedged_transport_is_logged_once_not_every_run(world, caplog):
+    world.incident()
+    gates, pub = _hang_forever(1)
+    go(world, pub, Clock(), max_abandoned=1)
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        for step in range(1, 4):
+            report = go(world, pub, Clock(T0 + step * 4000), max_abandoned=1)
+            assert report.claimed == 0 and report.skipped is None
+    assert [r.getMessage() for r in caplog.records].count("delivery_transport_wedged") == 1
+    (rec,) = [r for r in caplog.records if r.getMessage() == "delivery_transport_wedged"]
+    assert "1 abandoned publishes still running" in rec.fields["detail"]
+
+
+def test_late_worker_result_never_touches_rows(world):
+    world.incident()
+    gates, pub = _hang_forever(1)
+    go(world, pub, Clock())
+    before = world.rows()
+    gates[0].set()  # the hung publish now "succeeds", long after its claim was failed
+    _wait_idle()
+    assert world.rows() == before and world.states() == {"open": "pending"}

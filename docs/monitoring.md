@@ -177,7 +177,11 @@ each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_deli
    transmit, a failed attempt is recorded), the publish OUTSIDE any transaction under a hard wall
    timeout of `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` enforced by the runner (a daemon worker thread
    abandoned at the deadline), then COMPLETE with the claim token. A hung publisher ends the drain
-   for that run, so a pass is delayed by at most one deadline plus the normal drain work.
+   for that run, so a pass is delayed by at most one deadline plus the normal drain work. Every
+   abandoned worker is tracked process-wide; once `VIGIE_DELIVERY_MAX_ABANDONED` of them are still
+   running the runner stops before CLAIMing (no attempt is burned, `delivery_transport_wedged` is
+   logged on the first such run and every 20th) until they return. A late worker's result is
+   discarded and never completes a row.
 3. *Watermark*: the first enabled run stores `pipeline_meta.delivery_eligible_since` (the floor of
    `now`) with `INSERT OR IGNORE`; later runs, and disable/enable cycles, never move it.
    Incidents detected before it are never announced.
@@ -191,7 +195,7 @@ like an IP, MAC, domain or byte count, stripped of control characters and cut to
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
 other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
 `_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
-(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20).
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1).
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
@@ -208,7 +212,8 @@ wait (nothing expires) until it is switched back on.
 **Residual windows.** A publisher that ignores its deadline can still finish after the runner
 abandoned it, which may produce a duplicate (the row is retried); a completion that arrives after
 its lease lapsed is lost by design; the runner and the planner must share one clock; a daemon
-worker abandoned on a hang lives until its call returns.
+worker abandoned on a hang lives until its call returns (at most `MAX_ABANDONED` at a time), and
+it may still have delivered its message after the row was retried: delivery is at least once.
 
 Pipeline schema v11 adds `incident_deliveries`: one row per incident and kind (`open` or
 `recover`; `UNIQUE(incident_id, kind)`), integer epoch-second `created_at`, `updated_at` and

@@ -14,7 +14,7 @@ NAMES = (
     "VIGIE_DELIVERY_ENABLED VIGIE_DELIVERY_FILE VIGIE_DELIVERY_LEASE_S "
     "VIGIE_DELIVERY_TRANSMIT_DEADLINE_S VIGIE_DELIVERY_MAX_ATTEMPTS VIGIE_DELIVERY_BACKOFF_BASE_S "
     "VIGIE_DELIVERY_BACKOFF_CAP_S VIGIE_DELIVERY_TTL_S VIGIE_DELIVERY_RETENTION_S "
-    "VIGIE_DELIVERY_MAX_PER_RUN"
+    "VIGIE_DELIVERY_MAX_PER_RUN VIGIE_DELIVERY_MAX_ABANDONED"
 ).split()
 
 
@@ -68,6 +68,7 @@ def test_file_alone_does_not_enable():
         {"VIGIE_DELIVERY_MAX_ATTEMPTS": "0"},
         {"VIGIE_DELIVERY_BACKOFF_BASE_S": "9999"},
         {"VIGIE_DELIVERY_MAX_PER_RUN": "0"},
+        {"VIGIE_DELIVERY_MAX_ABANDONED": "0"},
         {"VIGIE_DELIVERY_TTL_S": "abc"},
         {"VIGIE_DELIVERY_RETENTION_S": "-5"},
     ],
@@ -84,7 +85,8 @@ def test_knobs_flow_into_delivery_config():
     ).delivery  # fmt: skip
     dc = d.delivery_config(None)
     assert (dc.lease_seconds, dc.transmit_deadline_seconds, dc.max_attempts) == (600, 20, 3)
-    assert d.max_per_run == 7
+    assert d.max_per_run == 7 and d.max_abandoned == 2
+    assert cfg(VIGIE_DELIVERY_MAX_ABANDONED="5").delivery.max_abandoned == 5
 
 
 def test_cli_keeps_delivery_settings(monkeypatch, tmp_path):

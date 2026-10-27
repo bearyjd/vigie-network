@@ -58,6 +58,7 @@ def run_delivery_stage(
             settings.delivery_config(since),
             clock,
             max_per_run=settings.max_per_run,
+            max_abandoned=settings.max_abandoned,
         )
     except Exception as exc:  # noqa: BLE001 - delivery must never fail the pipeline pass
         _report_failure(exc)
