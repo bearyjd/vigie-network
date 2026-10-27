@@ -172,3 +172,23 @@ def test_dataset_import_is_unique_per_source_and_hash(tmp_path: Path) -> None:
     _import(conn, "b", source="urlhaus")  # same hash under another source is fine
     with pytest.raises(sqlite3.IntegrityError):
         _import(conn, "c")
+
+
+@pytest.mark.parametrize(
+    "column", ["version", "licence", "created_by", "created_at", "accepted_by", "accepted_at"]
+)
+@pytest.mark.parametrize("blank", ["", "  ", "\t\n"])
+def test_dataset_text_columns_reject_blank_values(tmp_path: Path, column, blank) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    row = {
+        "version": "v", "licence": "l", "created_by": "u", "created_at": "t",
+        "accepted_by": None, "accepted_at": None,
+    }  # fmt: skip
+    row[column] = blank
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,"
+            "created_at,created_by,accepted_by,accepted_at) VALUES ('i','kev',?,?,?,1,?,?,?,?)",
+            (row["version"], row["licence"], SHA, row["created_at"], row["created_by"],
+             row["accepted_by"], row["accepted_at"]),
+        )  # fmt: skip

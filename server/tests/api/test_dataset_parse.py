@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 from pathlib import Path
 
@@ -192,20 +193,21 @@ def test_a_few_hundred_crafted_rows_cannot_block_an_update():
 
 
 @pytest.mark.parametrize(
-    "raw",
+    ("raw", "message"),
     [
-        b'"1","d","http://a.test/","online"\n',  # wrong column count
-        urlhaus_row("http://a.test/", "bad\x00threat"),
-        urlhaus_row("http://a.test/", "x" * 513),
-        b'"1","d","http://a.test/","o","l","t","\x07","l","r"\n',  # control char, any column
-        b'"1","d","http://a.test/","o","l","t","","l","r\x00"\n',
-        b"\xff\xfe",
-        b"",
-        b"# only comments\n\n",
+        (b'"1","d","http://a.test/","online"\n', "expected 9 columns"),
+        (urlhaus_row("http://a.test/", "bad\x00threat"), "non-printable"),
+        (urlhaus_row("http://a.test/", "x" * 513), "longer than"),
+        (b'"1","d","http://a.test/","o","l","t","\x07","l","r"\n', "non-printable"),
+        (b'"1","d","http://a.test/","o","l","t","","l","r\x00"\n', "non-printable"),
+        (b"\xff\xfe", "UTF-8"),
+        (b"", "no usable"),
+        (b"# only comments\n\n", "no usable"),
+        (b"\n\n  \n", "expected 9 columns"),
     ],
 )
-def test_urlhaus_structural_problems_reject_the_whole_file(raw):
-    with pytest.raises(ValueError):
+def test_urlhaus_structural_problems_reject_the_whole_file(raw, message):
+    with pytest.raises(ValueError, match=message):
         parse_urlhaus(raw)
 
 
@@ -393,3 +395,119 @@ def test_quoted_multiline_fields_still_parse_as_one_row():
 def test_malformed_quoting_is_rejected_strictly(raw):
     with pytest.raises(ValueError, match="line"):
         parse_urlhaus(raw)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://a.-b.test/",
+        "http://a-.test/",
+        "http://a.test-/",
+        "http://a-.com/",
+        "http://-a.test/",
+        "http://" + "a" * 64 + ".test/",
+        "http://" + ".".join(["a" * 50] * 6) + "/",  # 305 characters in total
+        "http://evil%2ecom/",
+        "http://[::1.2.3.4]/",  # IPv4-compatible
+        "http://[64:ff9b::1.2.3.4]/",  # NAT64
+        "http://[64:ff9b::102:304]/",
+    ],
+)
+def test_odd_dns_labels_and_embedded_ipv4_forms_are_skipped(url):
+    entries, skipped = parse_urlhaus(urlhaus_row("http://ok.test/") + urlhaus_row(url))
+    assert keys(entries) == ["ok.test"] and skipped == 1
+
+
+def test_legal_labels_and_loopback_literals_are_kept():
+    urls = [
+        "http://" + "a" * 63 + ".test/",
+        "http://a-b.xn--p1ai/",
+        "http://[::1]/",
+        "http://9a.t/",
+    ]
+    entries, skipped = parse_urlhaus(b"".join(urlhaus_row(u) for u in urls))
+    assert keys(entries) == ["a" * 63 + ".test", "a-b.xn--p1ai", "::1", "9a.t"] and skipped == 0
+
+
+def test_a_bracketed_userinfo_url_is_skipped_by_this_pythons_urlsplit():
+    raw = urlhaus_row("http://ok.test/") + urlhaus_row("http://[::1]:80@evil.com/")
+    assert keys(parse_urlhaus(raw)[0]) == ["ok.test"]  # never stored as ::1 or evil.com
+
+
+def test_the_host_part_decides_whether_a_netloc_is_bracketed(monkeypatch):
+    """Another Python's urlsplit may accept this form; the host must then be evil.com."""
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        scheme="http", netloc="[::1]:80@evil.com", hostname="evil.com", port=None
+    )
+    monkeypatch.setattr(dataset_parse, "urlsplit", lambda _url: fake)
+    assert dataset_parse._urlhaus_host("http://[::1]:80@evil.com/") == "evil.com"
+
+
+def test_a_quoted_hash_cannot_swallow_rows_as_a_comment():
+    rows = b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(300))
+    with pytest.raises(ValueError, match="not valid|expected 9 columns"):
+        parse_urlhaus(b'"#x\n' + rows + b'"\n')
+
+
+def test_a_hash_line_inside_an_open_quote_is_data_not_a_comment():
+    raw = b'"1","d","http://ok.test/","o","l","t","a\n#b","l","r"\n'
+    with pytest.raises(ValueError, match="non-printable"):
+        parse_urlhaus(raw)
+
+
+def test_a_quoted_hash_first_field_is_an_ordinary_row():
+    raw = b'"#1","d","http://ok.test/","o","l","t","th","l","r"\n'
+    assert keys(parse_urlhaus(b"# header\n" + raw)[0]) == ["ok.test"]
+
+
+def test_urlhaus_is_streamed_not_copied_into_one_string(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("whole-text copy")
+
+    monkeypatch.setattr(dataset_parse.io, "StringIO", boom)
+    assert keys(parse_urlhaus(urlhaus_row("http://ok.test/"))[0]) == ["ok.test"]
+
+
+def test_a_newline_free_blob_is_cut_at_the_line_cap():
+    with pytest.raises(ValueError, match="line 1: line longer"):
+        parse_urlhaus(b"a" * (dataset_parse.MAX_LINE_LEN * 4))
+
+
+def test_invalid_utf8_in_a_later_row_is_a_structural_rejection():
+    with pytest.raises(ValueError, match="UTF-8"):
+        parse_urlhaus(urlhaus_row("http://ok.test/") + b'"1","d","\xff"\n')
+
+
+def test_a_utf8_bom_is_ignored_in_both_formats():
+    bom = b"\xef\xbb\xbf"
+    assert keys(parse_urlhaus(bom + urlhaus_row("http://ok.test/"))[0]) == ["ok.test"]
+    assert len(parse_kev(bom + (FIX / "kev_small.json").read_bytes())) == 3
+    assert keys(parse_urlhaus(bom + b"# c\n" + urlhaus_row("http://ok.test/"))[0]) == ["ok.test"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"vulnerabilities":[]}',
+        b'{"vulnerabilities" : [ ]}\n',
+        b' \n{\n"vulnerabilities":\n[\n]\n}\n',
+    ],
+)
+def test_an_empty_kev_catalog_is_rejected(raw):
+    with pytest.raises(ValueError, match="no vulnerabilities"):
+        parse_kev(raw)
+
+
+def test_the_stream_never_asks_for_more_than_one_capped_line(monkeypatch):
+    sizes = []
+
+    class Spy(io.TextIOWrapper):
+        def readline(self, size=-1):
+            sizes.append(size)
+            return super().readline(size)
+
+    monkeypatch.setattr(dataset_parse.io, "TextIOWrapper", Spy)
+    parse_urlhaus(urlhaus_row("http://ok.test/"))
+    assert sizes and set(sizes) == {dataset_parse.MAX_LINE_LEN + 1}

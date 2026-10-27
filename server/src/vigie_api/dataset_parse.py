@@ -35,7 +35,7 @@ _COMMAS_PER_ENTRY = 64  # real KEV: ~15
 
 _CVE = re.compile(r"CVE-[0-9]{4}-(?:[1-9][0-9]{4,18}|[0-9]{4})", re.ASCII)
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
-_DNS = re.compile(r"(?:[a-z0-9-]{1,63}\.)*[a-z0-9-]{1,63}", re.ASCII)
+_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 # a host whose last label is numeric (or 0x..) is an address; only strict dotted quads are kept
 _IPV4_LIKE = re.compile(r"(?:.*\.)?(?:[0-9]+|0x[0-9a-f]*)", re.ASCII)
 _KEV_FIELDS = ("cveID", "vendorProject", "product", "dateAdded")
@@ -43,6 +43,8 @@ _URLHAUS_COLUMNS = 9
 _URL_COL, _THREAT_COL = 2, 5
 _SCHEMES = frozenset({"http", "https"})
 _MAX_HOST_LEN = 253
+_BOM = b"\xef\xbb\xbf"
+_EMBEDS_IPV4 = (ipaddress.IPv6Network("::/96"), ipaddress.IPv6Network("64:ff9b::/96"))
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ def _prescan_kev(data: bytes) -> None:
 
 def parse_kev(data: bytes) -> list[Entry]:
     _check_size(data, KEV_MAX_INPUT)
+    data = data.removeprefix(_BOM)
     _prescan_kev(data)  # before json builds anything
     try:
         doc = json.loads(data)
@@ -109,6 +112,8 @@ def parse_kev(data: bytes) -> list[Entry]:
     items = doc.get("vulnerabilities") if isinstance(doc, dict) else None
     if not isinstance(items, list):
         raise ValueError("KEV JSON has no 'vulnerabilities' list")
+    if not items:
+        raise ValueError("KEV JSON has no vulnerabilities")
     if len(items) > KEV_MAX_ENTRIES:
         raise _too_many(KEV_MAX_ENTRIES)
     entries = [_kev_entry(item, index) for index, item in enumerate(items)]
@@ -124,7 +129,12 @@ def _ip_key(host: str, bracketed: bool) -> str | None:
             if "%" in host:
                 return None
             address = ipaddress.IPv6Address(host)
-            return str(address.ipv4_mapped or address)
+            if address.ipv4_mapped:
+                return str(address.ipv4_mapped)
+            # IPv4-compatible and NAT64 forms embed an address ambiguously: skipped, not guessed
+            if int(address) > 1 and any(address in net for net in _EMBEDS_IPV4):
+                return None
+            return str(address)
         return str(ipaddress.IPv4Address(host)) if _IPV4_LIKE.fullmatch(host) else None
     except ValueError:
         return None
@@ -142,11 +152,12 @@ def _urlhaus_host(url: str) -> str | None:
     # ASCII before lower(): U+212A (Kelvin) would otherwise fold into a plain k
     if split.scheme not in _SCHEMES or not split.netloc.isascii() or not split.hostname:
         return None
-    bracketed = "[" in split.netloc
+    bracketed = "[" in split.netloc.rpartition("@")[2]  # the host part, not the userinfo
     host = split.hostname.lower().removesuffix(".")  # evil.com. and evil.com are one host
     if bracketed or _IPV4_LIKE.fullmatch(host):
         return _ip_key(host, bracketed)
-    ok = len(host) <= _MAX_HOST_LEN and _DNS.fullmatch(host) and not host.startswith("-")
+    labels = host.split(".")
+    ok = len(host) <= _MAX_HOST_LEN and all(_LABEL.fullmatch(label) for label in labels)
     return host if ok else None
 
 
@@ -163,41 +174,53 @@ def _urlhaus_row(row: list[str], where: str) -> Entry | None:
     return None if host is None else Entry(host, {"host": host, "threat": row[_THREAT_COL]})
 
 
-def _decode(data: bytes) -> str:
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ValueError("URLhaus CSV is not valid UTF-8") from None
+class _Lines:
+    """Physical lines of the CSV, decoded as a stream and bounded before csv.reader sees them.
 
+    A `#` line is a comment only outside a quoted field (tracked by quote parity), so a quoted
+    `#` cannot swallow the rows after it. `number` is the physical line last read.
+    """
 
-def _lines(text: str):
-    """Physical lines, each bounded before csv.reader tokenizes it (a 1M-comma line)."""
-    for number, line in enumerate(io.StringIO(text, newline=""), start=1):
-        if len(line) > MAX_LINE_LEN:
-            raise ValueError(f"line {number}: line longer than {MAX_LINE_LEN} characters")
-        yield line
+    def __init__(self, data: bytes) -> None:
+        raw = io.BytesIO(data.removeprefix(_BOM))
+        self._text = io.TextIOWrapper(raw, encoding="utf-8", errors="strict", newline="")
+        self.number = 0
+        self._open_quote = False
+
+    def __iter__(self):
+        while line := self._text.readline(MAX_LINE_LEN + 1):  # never reads past the cap
+            self.number += 1
+            if len(line) > MAX_LINE_LEN:
+                raise ValueError(f"line {self.number}: line longer than {MAX_LINE_LEN} characters")
+            if not self._open_quote and line.startswith("#"):
+                continue
+            self._open_quote ^= line.count('"') % 2 == 1
+            yield line
 
 
 def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
     """Entries (first row per host wins) and the number of rows skipped for an unusable host."""
     _check_size(data, URLHAUS_MAX_INPUT)
-    reader = csv.reader(_lines(_decode(data)), strict=True)
+    lines = _Lines(data)
+    reader = csv.reader(lines, strict=True)
     seen: dict[str, Entry] = {}
     rows = skipped = 0
     try:
         for row in reader:
-            if not row or row[0].startswith("#"):  # blank and comment rows, after CSV parsing
+            if not row:  # blank line
                 continue
             rows += 1
             if rows > URLHAUS_MAX_ENTRIES:  # stop at cap+1, never read the rest
                 raise _too_many(URLHAUS_MAX_ENTRIES)
-            entry = _urlhaus_row(row, f"line {reader.line_num}")
+            entry = _urlhaus_row(row, f"line {lines.number}")
             if entry is None:
                 skipped += 1
             else:
                 seen.setdefault(entry.key, entry)
     except csv.Error as exc:
-        raise ValueError(f"line {reader.line_num}: URLhaus CSV is not valid: {exc}") from None
+        raise ValueError(f"line {lines.number}: URLhaus CSV is not valid: {exc}") from None
+    except UnicodeDecodeError:
+        raise ValueError("URLhaus CSV is not valid UTF-8") from None
     if not seen:
         raise ValueError("URLhaus CSV has no usable entries")
     if skipped > rows * SKIP_MAX_FRACTION:

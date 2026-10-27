@@ -34,8 +34,13 @@ simply another staged import.
   Python's recursion limit (a clean rejection), not by the counts. URLhaus: 64 MiB and 250,000
   rows, counted while a lazy CSV reader iterates and stopped at the cap, with each physical
   line bounded to 16 KiB before it is tokenized. 512 characters per field.
-- **Memory.** Decoding and tokenizing a URLhaus file peaks at roughly 5x the input size (about
-  320 MiB for a file at the cap). Run staging on a host with that headroom.
+- **Memory.** URLhaus is decoded as a stream (UTF-8, strict) one bounded line at a time, never
+  as one big string. Measured with `tracemalloc` on a synthetic 64 MiB file (224,060 rows),
+  `parse_urlhaus` allocates about 90 MiB on top of the input bytes, mostly the parsed entries;
+  the process also holds the input itself and, while staging, a second copy of the entries
+  in the insert.
+- A UTF-8 byte-order mark is ignored in both formats. An empty KEV catalog (no
+  vulnerabilities) is rejected, as is a URLhaus file with no usable rows.
 - KEV (CISA JSON): only `cveID`, `vendorProject`, `product`, `dateAdded` are kept. The CVE id is
   ASCII with no leading zeros beyond four digits; the date must be a real date. Duplicates are
   malformed.
@@ -44,10 +49,14 @@ simply another staged import.
   discarded before anything is stored. Only http/https URLs count. The host must be ASCII
   (Kelvin-sign and other lookalikes fail), one trailing dot is dropped, IPv6 literals are
   normalised and stored without brackets, and an IPv4-mapped IPv6 literal is stored as the
-  plain IPv4 address. The port must be valid. Duplicate hosts keep the first row.
+  plain IPv4 address. The port must be valid. Every DNS label must be 1-63 characters of `[a-z0-9-]` with no
+  leading or trailing hyphen (253 in total); percent-encoded hosts such as `evil%2ecom` are
+  skipped, not decoded. Duplicate hosts keep the first row. A `#` line is a comment only
+  outside a quoted field, so a quoted `#` cannot swallow the rows after it.
 - **Deliberately skipped address forms.** A host whose last label is numeric or `0x..` is an
   address and is kept only as a strict dotted quad. Browser-ambiguous forms (`0x7f.0.0.1`,
-  `127.1`, `010.0.0.1`, `2130706433`) are skipped, never guessed. The later matcher unit must
+  `127.1`, `010.0.0.1`, `2130706433`) are skipped, never guessed, and so are IPv4-compatible
+  (`[::1.2.3.4]`) and NAT64 (`64:ff9b::/96`) literals. The later matcher unit must
   treat them the same way.
 - **Skip vs reject.** A bad URL column (oversized, non-printable) or an unusable host, scheme
   or port skips that row only; it is counted in `skipped_count` (import row and audit detail)
