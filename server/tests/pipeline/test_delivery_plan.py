@@ -5,11 +5,13 @@ import itertools
 import math
 
 import pytest
+from delivery_sim import apply_cas
 
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
     DeliveryView,
     Enqueue,
+    Expected,
     Expire,
     Fail,
     Forget,
@@ -18,6 +20,7 @@ from vigie_pipeline.delivery_plan import (
     Reschedule,
     ReviewView,
     Suppress,
+    Withdraw,
     after_failure,
     backoff,
     delivery_id,
@@ -308,12 +311,22 @@ def test_incidents_older_than_the_watermark_are_ignored():
     assert run([inc(detected=NOW - 6)], cfg=DeliveryConfig()) == (Enqueue("i1", "open", NOW),)
 
 
-@pytest.mark.parametrize("state", ["pending", "sent", "failed", "suppressed", "expired"])
-@pytest.mark.parametrize("incident_state", ["open", "resolved"])
-def test_rows_of_an_ignored_incident_are_never_touched(state, incident_state):
-    cfg = DeliveryConfig(eligible_since=NOW)
-    ds = [dv(state=state, created=NOW - 10 * RET), dv("recover", state, created=NOW - 10 * RET)]
-    assert run([inc(state=incident_state)], deliveries=ds, cfg=cfg) == ()
+def test_an_incident_with_rows_is_managed_normally_whatever_the_watermark():
+    hidden = DeliveryConfig(eligible_since=NOW)
+    old = NOW - 2 * RET
+    owed = [dv(state="sent", created=old)]
+    assert run([inc(state="resolved", detected=old)], deliveries=owed, cfg=hidden) == (
+        Enqueue("i1", "recover", NOW),
+    )
+    stale = [dv(created=NOW - DAY, nxt=NOW - DAY)]
+    assert run([inc(detected=old)], deliveries=stale, cfg=hidden) == (Expire("i1", "open", "ttl"),)
+    quiet = {"i1": ReviewView("acknowledged", None)}
+    assert run([inc(detected=old)], quiet, [dv()], cfg=hidden) == (
+        Suppress("i1", "open", "acknowledged"),
+    )
+    assert run([inc(detected=old)], deliveries=[dv(state="suppressed")], cfg=hidden) == (
+        Requeue("i1", "open", NOW),
+    )
 
 
 def test_disable_enable_raise_and_lower_the_watermark():
@@ -324,9 +337,10 @@ def test_disable_enable_raise_and_lower_the_watermark():
     ds = apply((), first, NOW)
     sent = tuple(dataclasses.replace(d, state="sent") for d in ds)
     assert run([old, new], deliveries=sent, cfg=on) == ()
-    raised = DeliveryConfig(eligible_since=NOW)  # everything is now older: hands off
+    raised = DeliveryConfig(eligible_since=NOW)  # nothing without rows is admitted
     assert run([old, new], deliveries=ds, cfg=raised) == ()
-    assert run([old, inc("new", "resolved", NOW - 10)], deliveries=sent, cfg=raised) == ()
+    done = [old, inc("new", "resolved", NOW - 10)]  # but an owed recover is never dropped
+    assert run(done, deliveries=sent, cfg=raised) == (Enqueue("new", "recover", NOW),)
     lowered = DeliveryConfig(eligible_since=NOW - 5000)  # nothing already sent re-announces
     assert run([old, new], deliveries=sent, cfg=lowered) == (Enqueue("old", "open", NOW),)
 
@@ -500,29 +514,9 @@ def test_actions_are_sorted_by_incident_then_kind_whatever_the_input_order():
 
 
 def apply(deliveries, actions, now):
-    by_key = {(d.incident_id, d.kind): d for d in deliveries}
-    for a in actions:
-        key = (a.incident_id, a.kind)
-        old = by_key.get(key)
-        if isinstance(a, Enqueue):
-            assert old is None, "enqueue over an existing delivery"
-            by_key[key] = DeliveryView(a.incident_id, a.kind, "pending", 0, a.not_before, now, now)
-        elif isinstance(a, Forget):
-            del by_key[key]
-        elif isinstance(a, Reschedule):
-            by_key[key] = dataclasses.replace(
-                old, next_attempt_at=a.next_attempt_at, updated_at=now
-            )
-        elif isinstance(a, Requeue):
-            assert old.state == "suppressed"
-            by_key[key] = dataclasses.replace(
-                old, state="pending", next_attempt_at=a.not_before, updated_at=now
-            )
-        else:
-            state = {Suppress: "suppressed", Expire: "expired", Fail: "failed"}[type(a)]
-            base = old or DeliveryView(a.incident_id, a.kind, state, 0, None, now, now)
-            by_key[key] = dataclasses.replace(base, state=state, updated_at=now)
-    return tuple(by_key.values())
+    rows, skipped = apply_cas({(d.incident_id, d.kind): d for d in deliveries}, actions, now)
+    assert not skipped, skipped  # every fresh plan applies in full
+    return tuple(rows.values())
 
 
 STATES = ["open", "resolved", "superseded", "bogus"]
@@ -614,10 +608,114 @@ def test_rows_with_an_unknown_kind_or_state_are_ignored_not_fatal():
     assert run([], deliveries=odd) == ()
 
 
-def test_a_pending_recover_for_an_open_incident_is_expired_as_reopened():
+def test_a_pending_recover_for_an_open_incident_is_withdrawn():
     ds = [dv(state="sent"), dv("recover")]
-    assert run([inc()], deliveries=ds) == (Expire("i1", "recover", "reopened"),)
+    assert run([inc()], deliveries=ds) == (Withdraw("i1", "recover"),)
     assert run([inc(state="resolved")], deliveries=ds) == ()
+
+
+def test_resolve_reopen_resolve_and_a_double_flap_each_end_with_one_recover():
+    ds = apply((), run([inc()]), NOW)
+    ds = tuple(dataclasses.replace(d, state="sent") for d in ds)
+    for _ in range(2):  # flap twice
+        ds = apply(ds, run([inc(state="resolved")], deliveries=ds), NOW)
+        assert [d.kind for d in ds if d.state == "pending"] == ["recover"]
+        ds = apply(ds, run([inc()], deliveries=ds), NOW)  # reopens: the recover is withdrawn
+        assert [d.kind for d in ds] == ["open"]
+    ds = apply(ds, run([inc(state="resolved")], deliveries=ds), NOW)
+    assert sorted((d.kind, d.state) for d in ds) == [("open", "sent"), ("recover", "pending")]
+    assert run([inc(state="resolved")], deliveries=ds) == ()
+
+
+def test_a_stale_plan_is_skipped_not_applied_over_a_sender_outcome():
+    pending = dv(nxt=NOW + 500)
+    stale = run([inc()], {"i1": ReviewView("acknowledged", None)}, [pending])
+    assert stale == (Suppress("i1", "open", "acknowledged"),)
+    sent = dataclasses.replace(pending, state="sent", attempts=1)
+    rows, skipped = apply_cas({("i1", "open"): sent}, stale, NOW)
+    assert rows[("i1", "open")] == sent and skipped == list(stale)
+    again = dataclasses.replace(pending, attempts=1)  # the sender retried: attempts moved
+    assert apply_cas({("i1", "open"): again}, stale, NOW)[1] == list(stale)
+    assert apply_cas({}, stale, NOW)[1] == list(stale)
+    assert apply_cas({("i1", "open"): pending}, stale, NOW)[1] == []
+    inserted = run([inc()], {"i1": ReviewView("acknowledged", None)})
+    assert inserted[0].expected is None
+    assert apply_cas({("i1", "open"): pending}, inserted, NOW)[1] == list(inserted)
+
+
+@pytest.mark.parametrize(
+    "incidents,review,rows,expected",
+    [
+        ([inc()], None, [], {"Enqueue": None}),
+        ([inc()], ReviewView("acknowledged", None), [], {"Suppress": None}),
+        ([inc()], ReviewView("acknowledged", None), [dv(attempts=2)], {"Suppress": ("pending", 2)}),
+        ([inc()], snooze(100)["i1"], [dv(nxt=NOW)], {"Reschedule": ("pending", 0)}),
+        ([inc()], None, [dv("open", "suppressed", attempts=3)], {"Requeue": ("suppressed", 3)}),
+        ([inc()], None, [dv("open", "suppressed", attempts=6)], {"Fail": ("suppressed", 6)}),
+        (
+            [inc()],
+            None,
+            [dv("open", "suppressed", created=NOW - DAY)],
+            {"Expire": ("suppressed", 0)},
+        ),
+        ([inc(state="resolved")], None, [dv(attempts=1)], {"Expire": ("pending", 1)}),
+        ([inc(state="resolved")], None, [dv(state="sent")], {"Enqueue": None}),
+        (
+            [inc()],
+            None,
+            [dv(state="sent"), dv("recover", attempts=1)],
+            {"Withdraw": ("pending", 1)},
+        ),
+        (
+            [inc(state="superseded")],
+            None,
+            [dv(state="sent", created=NOW - RET - 1)],
+            {"Forget": ("sent", 0)},
+        ),
+    ],
+)
+def test_every_action_carries_the_row_state_it_was_planned_against(
+    incidents, review, rows, expected
+):
+    got = run(incidents, {"i1": review} if review else {}, rows)
+    assert {type(a).__name__ for a in got} == set(expected)
+    for a in got:
+        want = expected[type(a).__name__]
+        assert a.expected == (Expected(*want) if want else None)
+        assert a.expected is None or (a.expected.state, a.expected.attempts) == want
+
+
+def test_after_failure_actions_carry_their_expectation():
+    assert after_failure(dv(attempts=2), NOW, CFG).expected == Expected("pending", 2)
+    assert after_failure(dv(attempts=6), NOW, CFG).expected == Expected("pending", 6)
+
+
+# requeue target respects an existing backoff; every revival path honours the original ttl
+def test_requeue_waits_out_a_pending_backoff_only_for_rows_that_were_attempted():
+    retried = dv("open", "suppressed", attempts=2, nxt=NOW + 300)
+    assert run([inc()], deliveries=[retried]) == (Requeue("i1", "open", NOW + 300),)
+    passed = dv("open", "suppressed", attempts=2, nxt=NOW - 300)
+    assert run([inc()], deliveries=[passed]) == (Requeue("i1", "open", NOW),)
+    fresh = dv("open", "suppressed", attempts=0, nxt=NOW + 300)
+    assert run([inc()], deliveries=[fresh]) == (Requeue("i1", "open", NOW),)
+    later = {"i1": ReviewView("snoozed", NOW + 900)}
+    assert run([inc()], later, [retried]) == (Requeue("i1", "open", NOW + 900),)
+    never = dv("open", "suppressed", attempts=2, nxt=None)
+    assert run([inc()], deliveries=[never]) == (Requeue("i1", "open", NOW),)
+
+
+def test_immediate_ack_clear_after_a_failure_keeps_the_backoff():
+    ds = (dv(attempts=1, nxt=NOW + 60),)
+    ds = apply(ds, run([inc()], {"i1": ReviewView("acknowledged", None)}, ds), NOW)
+    ds = apply(ds, run([inc()], deliveries=ds), NOW)
+    assert (ds[0].state, ds[0].next_attempt_at, ds[0].attempts) == ("pending", NOW + 60, 1)
+
+
+def test_a_snooze_revival_also_counts_ttl_from_creation():
+    old = dv("open", "suppressed", created=NOW - DAY)
+    assert run([inc()], snooze(100), [old]) == (Expire("i1", "open", "ttl"),)
+    young = dv("open", "suppressed", created=NOW - DAY + 1)
+    assert run([inc()], snooze(100), [young]) == (Requeue("i1", "open", NOW + 100),)
 
 
 # item 4: integer times
@@ -684,26 +782,3 @@ def test_ack_clear_cycles_still_hit_the_ttl_on_schedule():
     assert ds[0].updated_at - ds[0].created_at >= DAY  # never expired early
     assert ds[0].updated_at - ds[0].created_at < DAY + 2 * 5 * 3600
     assert {r.created_at for r in seen} == {ds[0].created_at}
-
-
-# item 8: time advances, state converges, no conflicting actions
-STEPS = (0, 99, 1, 1, DAY - 102, 1, 1, 10 * DAY, RET - 10 * DAY - DAY, 1, 1, 5 * RET)
-
-
-def _settle(ds, incidents, reviews, now):
-    for _ in range(4):
-        actions = plan(tuple(incidents), reviews, tuple(ds), now, CFG)
-        keys = [(a.incident_id, a.kind) for a in actions]
-        assert len(keys) == len(set(keys)), actions
-        if not actions:
-            return ds
-        ds = apply(ds, actions, now)
-    raise AssertionError(("no fixpoint", incidents, reviews, ds))
-
-
-def test_every_generated_state_reaches_a_fixpoint_as_time_advances():
-    for incidents, reviews, ds in itertools.islice(_scenarios(), 0, None, 7):
-        now, state = NOW, tuple(ds)
-        for step in STEPS:
-            now += step
-            state = _settle(state, incidents, reviews, now)

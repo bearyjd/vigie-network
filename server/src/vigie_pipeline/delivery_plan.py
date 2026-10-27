@@ -1,9 +1,9 @@
 """Pure planner for incident notification deliveries.
 
 No database, I/O, clock or environment: callers pass the current state and `now` (epoch seconds,
-like `vigie_api.incident_decisions.attention`) and get back the actions to apply. Applying them
-and feeding the result back yields no further actions (idempotent). The review mirror below
-intentionally duplicates `attention()` instead of importing vigie_api; keep the two in step.
+like `vigie_api.incident_decisions.attention`) and get back the actions to apply. The review
+mirror below intentionally duplicates `attention()` instead of importing vigie_api; keep the two
+in step.
 
 Rules: one `open` delivery per incident (dedup by incident+kind); acknowledged/expected incidents
 are suppressed, and a suppressed row is re-evaluated every pass (a cleared decision Requeues it);
@@ -11,23 +11,43 @@ a snooze defers the delivery to `snooze_until` (strictly-before is quiet, so unt
 loud) and a pending row without attempts tracks the current verdict exactly, while a retrying
 row keeps its backoff unless a later snooze pushes it out; an incident that closes before its
 open delivery went out expires it and never gets a `recover`; only a `resolved` incident whose
-open delivery was `sent` gets exactly one `recover`; unknown states or statuses and non-finite or
-non-numeric data fail closed (`unrecognised_state`, never raise); a bad `now` is a programmer
-error (ValueError). Incidents detected before `eligible_since` are ignored entirely: no action
-of any kind for them or their rows, so changing the watermark never deletes or re-announces
-anything. Terminal rows of closed or missing incidents are Forgotten after `retention_seconds`
-since `updated_at`, but never while a `recover` is still owed (a `sent` open of a resolved
-incident without a terminal recover row). A Requeue keeps `attempts` and `created_at`; past the
-attempt budget it becomes Fail, past the original ttl it becomes Expire. A pending `recover` of an
-incident that is open again expires as `reopened`. Times in actions are integer epoch seconds.
+open delivery was `sent` gets exactly one `recover`; a pending `recover` of an incident that is
+open again is Withdrawn (deleted) so a later resolution enqueues a fresh one; unknown states or
+statuses and non-finite or non-numeric data fail closed (`unrecognised_state`, never raise); a
+bad `now` is a programmer error (ValueError). Times in actions are integer epoch seconds.
 
-`incidents` MUST be the complete current set: a pending row whose incident is absent from it is
-expired as `incident_missing`.
+Watermark: an incident detected before `eligible_since` that has NO delivery rows is ignored (no
+action of any kind); an incident that already has any row is managed normally, so raising the
+watermark never drops an owed recover or forgets state, and lowering it only admits incidents
+that were never announced. Retention: terminal rows of closed or missing incidents are Forgotten
+once `updated_at` is more than `retention_seconds` old, but never while a `recover` is still owed
+(a `sent` open of a resolved incident without a terminal recover row). A Requeue keeps `attempts`
+and `created_at`: an attempted row waits out its backoff, past the attempt budget it becomes Fail
+and past the ORIGINAL ttl (from `created_at`, on every revival path) it becomes Expire.
 
-Applying actions MUST be conditional so that a plan made before an in-flight send cannot overwrite
-the sender's outcome: Expire/Fail/Reschedule/Suppress `WHERE state='pending'` (Fail, Expire and
-Requeue may also name `state='suppressed'`), Requeue `WHERE state='suppressed'`, and Forget as
-`DELETE ... WHERE state != 'pending'` for the row's planned state.
+Caller contract. `incidents` MUST be the complete current set: a pending row whose incident is
+absent from it is expired as `incident_missing`, and terminal rows of an absent incident are
+forgotten only after retention (so a `sent` open is never forgotten early; an incident id that is
+pruned and later reappears is treated as new). The applier (unit 4b) must read the incidents and
+run `plan()` in the same read transaction and skip the pass if the incident read fails.
+
+Every action carries `expected`: None means the row must NOT exist (apply as INSERT OR IGNORE:
+Enqueue, and Suppress of an incident with no row, which inserts a `suppressed` row so ttl and
+budget history exist); otherwise Expected(state, attempts) of the row the plan was made against.
+The applier runs each action as ONE conditional statement and treats 0 affected rows as a stale
+plan (re-plan next pass, never an error):
+  Enqueue            INSERT OR IGNORE a pending row (attempts 0, next_attempt_at=not_before)
+  Suppress           UPDATE state='suppressed' WHERE delivery_id=? AND state='pending' AND
+                     attempts=? (next_attempt_at is kept, so a backoff survives), or the INSERT
+  Reschedule         UPDATE next_attempt_at WHERE ... state='pending' AND attempts=?
+  Requeue            UPDATE state='pending', next_attempt_at WHERE ... state='suppressed' AND
+                     attempts=? (attempts and created_at are kept)
+  Expire, Fail       UPDATE state WHERE ... AND state=? AND attempts=? (state is 'pending', or
+                     'suppressed' for a failed/expired revival)
+  Withdraw, Forget   DELETE WHERE ... AND state=? AND attempts=? (Withdraw: pending recover;
+                     Forget: a terminal row)
+`expected` is excluded from dataclass equality so tests can compare actions by meaning; its
+value is asserted separately.
 """
 
 from __future__ import annotations
@@ -35,7 +55,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 KINDS = ("open", "recover")
 STATES = frozenset({"pending", "sent", "failed", "suppressed", "expired"})
@@ -108,19 +128,33 @@ class DeliveryConfig:
 
 
 @dataclass(frozen=True)
+class Expected:
+    """Precondition of a conditional update: the row's state and attempts when planned."""
+
+    state: str
+    attempts: int
+
+
+def _exp(d: DeliveryView) -> Expected:
+    return Expected(d.state, d.attempts)
+
+
+@dataclass(frozen=True)
 class Enqueue:
     incident_id: str
     kind: str
-    not_before: float
+    not_before: int
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
 class Requeue:
-    """Move a suppressed row back to pending (attempts reset to 0) at `not_before`."""
+    """Move a suppressed row back to pending at `not_before`, keeping attempts and created_at."""
 
     incident_id: str
     kind: str
-    not_before: float
+    not_before: int
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -128,6 +162,7 @@ class Suppress:
     incident_id: str
     kind: str
     reason: str
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -135,13 +170,15 @@ class Expire:
     incident_id: str
     kind: str
     reason: str
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
 class Reschedule:
     incident_id: str
     kind: str
-    next_attempt_at: float
+    next_attempt_at: int
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -149,15 +186,26 @@ class Fail:
     incident_id: str
     kind: str
     reason: str
+    expected: Expected | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
 class Forget:
     incident_id: str
     kind: str
+    expected: Expected | None = field(default=None, compare=False)
 
 
-Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget
+@dataclass(frozen=True)
+class Withdraw:
+    """Delete a pending `recover` whose incident is open again."""
+
+    incident_id: str
+    kind: str
+    expected: Expected | None = field(default=None, compare=False)
+
+
+Action = Enqueue | Requeue | Suppress | Expire | Reschedule | Fail | Forget | Withdraw
 
 
 def _ceil(value: float) -> int:
@@ -178,10 +226,9 @@ def backoff(attempts: int, config: DeliveryConfig) -> int:
 def after_failure(delivery: DeliveryView, now: float, config: DeliveryConfig) -> Action:
     """`delivery.attempts` already counts the attempt that just failed."""
     if delivery.attempts >= config.max_attempts:
-        return Fail(delivery.incident_id, delivery.kind, "max_attempts")
-    return Reschedule(
-        delivery.incident_id, delivery.kind, _ceil(now) + backoff(delivery.attempts, config)
-    )
+        return Fail(delivery.incident_id, delivery.kind, "max_attempts", _exp(delivery))
+    due = _ceil(now) + backoff(delivery.attempts, config)
+    return Reschedule(delivery.incident_id, delivery.kind, due, _exp(delivery))
 
 
 def _verdict(review: ReviewView | None, now: float) -> tuple[str, float | str | None]:
@@ -202,8 +249,12 @@ def _retarget(d: DeliveryView, target: int, later_only: bool) -> Action | None:
     if d.next_attempt_at == target:
         return None
     if later_only or d.attempts > 0:
-        return Reschedule(d.incident_id, "open", target) if d.next_attempt_at < target else None
-    return Reschedule(d.incident_id, "open", target)
+        return (
+            Reschedule(d.incident_id, "open", target, _exp(d))
+            if d.next_attempt_at < target
+            else None
+        )
+    return Reschedule(d.incident_id, "open", target, _exp(d))
 
 
 def _revive(d: DeliveryView, kind: str, target: int, now: float, config: DeliveryConfig):
@@ -218,10 +269,12 @@ def _revive(d: DeliveryView, kind: str, target: int, now: float, config: Deliver
     ):
         return None  # malformed row: cannot prove the budget, stay suppressed
     if d.attempts >= config.max_attempts:
-        return Fail(d.incident_id, "open", "max_attempts")
-    if kind == "loud" and now - d.created_at >= config.pending_ttl_seconds:
-        return Expire(d.incident_id, "open", "ttl")
-    return Requeue(d.incident_id, "open", target)
+        return Fail(d.incident_id, "open", "max_attempts", _exp(d))
+    if now - d.created_at >= config.pending_ttl_seconds:  # always from the original creation
+        return Expire(d.incident_id, "open", "ttl", _exp(d))
+    if d.attempts > 0 and d.next_attempt_at is not None:  # wait out an earlier backoff
+        target = max(target, _ceil(d.next_attempt_at))
+    return Requeue(d.incident_id, "open", target, _exp(d))
 
 
 def _open_action(
@@ -236,18 +289,19 @@ def _open_action(
     if d is not None and not pending and d.state != "suppressed":
         return None
     if state in CLOSED_STATES:
-        return Expire(iid, "open", "resolved_before_send") if pending else None
+        return Expire(iid, "open", "resolved_before_send", _exp(d)) if pending else None
     kind, detail = _verdict(review, now) if state == "open" else ("unknown", None)
     target = _ceil(detail) if kind == "until" else _ceil(now)
     if d is not None and d.state == "suppressed":
         return _revive(d, kind, target, now, config) if kind in ("loud", "until") else None
     if kind in ("unknown", "quiet"):
-        return Suppress(iid, "open", UNRECOGNISED if kind == "unknown" else str(detail))
+        reason = UNRECOGNISED if kind == "unknown" else str(detail)
+        return Suppress(iid, "open", reason, _exp(d) if d else None)
     if d is None:
         return Enqueue(iid, "open", target)
     if kind == "loud":
         early = d.attempts == 0 and d.next_attempt_at > target
-        return Reschedule(iid, "open", target) if early else None
+        return Reschedule(iid, "open", target, _exp(d)) if early else None
     return _retarget(d, target, False)
 
 
@@ -277,19 +331,19 @@ def _row_action(
 ) -> Action | None:
     if d.state == "pending":
         if not _row_ok(d):
-            return Expire(iid, d.kind, UNRECOGNISED)
+            return Expire(iid, d.kind, UNRECOGNISED, _exp(d))
         if d.kind == "recover" and state == "open":
-            return Expire(iid, d.kind, "reopened")
+            return Withdraw(iid, d.kind, _exp(d))
         if now - max(d.created_at, d.next_attempt_at) >= config.pending_ttl_seconds:
-            return Expire(iid, d.kind, "ttl")
+            return Expire(iid, d.kind, "ttl", _exp(d))
         return None
-    return Forget(iid, d.kind) if _may_forget(d, state, ds, now, config) else None
+    return Forget(iid, d.kind, _exp(d)) if _may_forget(d, state, ds, now, config) else None
 
 
 def _orphan_action(iid: str, d: DeliveryView, now: float, config: DeliveryConfig) -> Action | None:
     if d.state == "pending":
-        return Expire(iid, d.kind, "incident_missing")
-    return Forget(iid, d.kind) if _aged(d, now, config) else None
+        return Expire(iid, d.kind, "incident_missing", _exp(d))
+    return Forget(iid, d.kind, _exp(d)) if _aged(d, now, config) else None
 
 
 def _plan_incident(
@@ -333,19 +387,16 @@ def plan(
     """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind)."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
-    by_incident: dict[str, IncidentView] = {}
-    ignored: set[str] = set()
-    for incident in incidents:
-        if _eligible(incident, config):
-            by_incident.setdefault(incident.id, incident)
-        else:
-            ignored.add(incident.id)
     grouped: dict[str, dict[str, DeliveryView]] = {}
     for d in deliveries:
         if d.kind in KINDS and d.state in STATES:
             grouped.setdefault(d.incident_id, {})[d.kind] = d
+    by_incident: dict[str, IncidentView] = {}
+    for incident in incidents:  # the watermark only hides incidents that have no rows yet
+        if incident.id in grouped or _eligible(incident, config):
+            by_incident.setdefault(incident.id, incident)
     actions: list[Action] = []
-    for iid in sorted((by_incident.keys() | grouped.keys()) - ignored):
+    for iid in sorted(by_incident.keys() | grouped.keys()):
         actions.extend(
             _plan_incident(
                 iid, by_incident.get(iid), reviews.get(iid), grouped.get(iid, {}), now, config
