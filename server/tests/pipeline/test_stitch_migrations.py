@@ -23,7 +23,7 @@ NEW_TABLES = {
 
 def test_a_fresh_install_has_the_final_shape_and_no_legacy_columns(tmp_path):
     conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert NEW_TABLES <= names and set(PIPELINE_TABLES) <= names
     assert not names & {"mac_last_seen", "mac_collectors", "collector_gaps"}
@@ -39,8 +39,8 @@ def test_a_fresh_install_has_the_final_shape_and_no_legacy_columns(tmp_path):
             "idx_obs_rule", "idx_mac_activity_end", "idx_evidence_gaps_end"} <= indexes  # fmt: skip
     assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'"
                         " AND tbl_name='mac_activity'").fetchone()[0] == 0  # fmt: skip
-    assert apply_pipeline_migrations(conn) == 10  # re-apply is a no-op
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 10
+    assert apply_pipeline_migrations(conn) == 11  # re-apply is a no-op
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 11
 
 
 def test_main_has_no_stitching_table_to_migrate_from(tmp_path, monkeypatch):
@@ -78,7 +78,7 @@ def test_upgrade_from_a_populated_main_v3_database_keeps_every_row(tmp_path, mon
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     rows = conn.execute("SELECT id, dedup FROM events ORDER BY seq").fetchall()
     assert [tuple(r) for r in rows] == [("e1", None), ("e2", None)]  # NULL dedup stays NULL
     assert conn.execute("SELECT COUNT(*) FROM identity_candidates").fetchone()[0] == 1
@@ -89,7 +89,7 @@ def test_upgrade_from_a_populated_main_v3_database_keeps_every_row(tmp_path, mon
     conn.execute(ins, ("e3",))  # NULLs never collide on the partial unique index
     assert emit_once(conn, "d", "k", "warn", "s", "tok", 1.0) is True
     assert emit_once(conn, "d", "k", "warn", "s", "tok", 1.0) is False
-    assert apply_pipeline_migrations(conn) == 10
+    assert apply_pipeline_migrations(conn) == 11
 
 
 def test_a_newer_pipeline_schema_is_refused(tmp_path):
@@ -144,7 +144,7 @@ def test_upgrade_from_mains_frozen_schema_text_survives_duplicate_candidate_rows
     conn.close()
     monkeypatch.undo()
     conn = open_pipeline_inventory(path)
-    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     rows = conn.execute("SELECT id FROM identity_candidates ORDER BY id").fetchall()
     assert [r[0] for r in rows] == ["c2"]  # the newest of the duplicates is kept
     folds = conn.execute("SELECT hostname_fold, mdns_fold FROM observations").fetchone()

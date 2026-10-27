@@ -129,7 +129,7 @@ def test_upgrade_from_v9_preserves_identity_and_processing_cursor(tmp_path, monk
         "time",
     )
     assert db.execute("SELECT count(*) FROM mac_last_ip").fetchone()[0] == 0
-    assert db.execute("SELECT max(version) FROM pipeline_schema").fetchone()[0] == 10
+    assert db.execute("SELECT max(version) FROM pipeline_schema").fetchone()[0] == 11
     db.close()
 
 
