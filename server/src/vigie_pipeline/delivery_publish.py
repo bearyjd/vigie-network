@@ -15,18 +15,23 @@ import os
 import re
 import stat
 import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 
 MAX_LABEL = 64
+PRE_CUT = 256  # no regex ever sees more than this: their cost is superlinear on hostile input
+_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\u2024": ".", "\ufe52": "."})
 MAX_LINK = 200
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
 REDACTED = "[redacted]"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]+")
 _SENSITIVE = re.compile(
     r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}"  # MAC
+    r"|(?:[0-9a-fA-F]{2} ){5}[0-9a-fA-F]{2}"  # MAC separated by spaces
+    r"|\b[0-9a-fA-F]{12}\b"  # MAC without separators
     r"|(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}"  # IPv6
     r"|\d+(?:\.\d+)?\s*(?:[KMGTP]i?B|bytes?)\b"  # byte counts
     r"|[\w-]+(?:\.[\w-]+)+"  # IPv4, domains and any dotted name
@@ -59,7 +64,8 @@ class Publisher(Protocol):
 
 
 def scrub_label(raw: object) -> str:
-    text = _CONTROL.sub(" ", str(raw))
+    text = unicodedata.normalize("NFKC", str(raw)[:PRE_CUT]).translate(_DOTS)[:PRE_CUT]
+    text = _CONTROL.sub(" ", text)
     text = _SENSITIVE.sub(REDACTED, text)
     text = " ".join(text.split())[:MAX_LABEL].strip()
     return text or "device"

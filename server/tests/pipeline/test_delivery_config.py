@@ -14,7 +14,7 @@ NAMES = (
     "VIGIE_DELIVERY_ENABLED VIGIE_DELIVERY_FILE VIGIE_DELIVERY_LEASE_S "
     "VIGIE_DELIVERY_TRANSMIT_DEADLINE_S VIGIE_DELIVERY_MAX_ATTEMPTS VIGIE_DELIVERY_BACKOFF_BASE_S "
     "VIGIE_DELIVERY_BACKOFF_CAP_S VIGIE_DELIVERY_TTL_S VIGIE_DELIVERY_RETENTION_S "
-    "VIGIE_DELIVERY_MAX_PER_RUN VIGIE_DELIVERY_MAX_ABANDONED"
+    "VIGIE_DELIVERY_MAX_PER_RUN VIGIE_DELIVERY_MAX_ABANDONED VIGIE_DELIVERY_DRAIN_BUDGET_S"
 ).split()
 
 
@@ -69,6 +69,8 @@ def test_file_alone_does_not_enable():
         {"VIGIE_DELIVERY_BACKOFF_BASE_S": "9999"},
         {"VIGIE_DELIVERY_MAX_PER_RUN": "0"},
         {"VIGIE_DELIVERY_MAX_ABANDONED": "0"},
+        {"VIGIE_DELIVERY_DRAIN_BUDGET_S": "10"},  # below the 30 s transmit deadline
+        {"VIGIE_DELIVERY_DRAIN_BUDGET_S": "x"},
         {"VIGIE_DELIVERY_TTL_S": "abc"},
         {"VIGIE_DELIVERY_RETENTION_S": "-5"},
     ],
@@ -100,3 +102,8 @@ def test_every_env_var_is_in_env_example():
     text = ENV_EXAMPLE.read_text()
     missing = [n for n in NAMES if n not in text]
     assert not missing
+
+
+def test_drain_budget_default_and_override():
+    assert cfg().delivery.drain_budget_s == 60
+    assert cfg(VIGIE_DELIVERY_DRAIN_BUDGET_S="30").delivery.drain_budget_s == 30

@@ -324,3 +324,53 @@ def test_check_and_write_are_one_critical_section(tmp_path, monkeypatch):
     for t in threads:
         t.join(30)
     assert sorted(results) == [False, True] and path.stat().st_size <= limit
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "aabbccddeeff",
+        "AA BB CC DD EE FF",
+        "aa-bb-cc-dd-ee-ff",
+        "192\u30021\u300268\u30021\u30021",  # ideographic full stops
+        "192\uff0e168\uff0e1\uff0e1",  # fullwidth full stops
+        "\uff11\uff19\uff12.168.1.1",  # fullwidth digits
+        "evil\u3002example\u3002com",
+        "2001:db8::1",
+    ],
+)
+def test_scrub_gaps_are_closed(hostile):
+    out = build_message("d" * 32, "open", "i", f"TV {hostile} x").body
+    for needle in ("aabbccddeeff", "AA BB", "aa-bb", "168", "192", "evil", "example", "db8"):
+        assert needle not in out.split(": unusual")[0]
+
+
+def test_normal_labels_survive():
+    for label in ("Living room TV", "Anna's laptop", "Kitchen cam 2"):
+        assert label in build_message("d" * 32, "open", "i", label).body
+
+
+def test_regexes_never_see_more_than_256_characters(monkeypatch):
+    import vigie_pipeline.delivery_publish as dp
+
+    seen = []
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def sub(self, repl, text):
+            seen.append(len(text))
+            return self.inner.sub(repl, text)
+
+    monkeypatch.setattr(dp, "_SENSITIVE", Spy(dp._SENSITIVE))
+    monkeypatch.setattr(dp, "_CONTROL", Spy(dp._CONTROL))
+    dp.scrub_label("a" * 1_000_000)
+    dp.scrub_label("\ufdfa" * 100_000)  # NFKC expands this character to 18
+    assert seen and max(seen) <= 256
+
+
+def test_every_line_carries_the_delivery_id(tmp_path):
+    path = tmp_path / "o.jsonl"
+    FilePublisher(path).publish(_msg(7), timeout_seconds=1)
+    assert json.loads(path.read_text())["delivery_id"] == f"{7:032d}"

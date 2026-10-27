@@ -25,7 +25,6 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
 
 from vigie_ingest.db import immediate
 from vigie_pipeline.delivery_plan import (
@@ -48,16 +47,16 @@ from vigie_pipeline.delivery_sql import (
 )
 from vigie_pipeline.delivery_types import tick_ceil, tick_floor
 from vigie_pipeline.logs import log
-from vigie_pipeline.overrides import open_overrides_ro
 
 logger = logging.getLogger("vigie_pipeline")
 DEFAULT_MAX_PER_RUN = 20
 DEFAULT_MAX_ABANDONED = 2
+DEFAULT_DRAIN_BUDGET = 60
 LOG_WEDGED_EVERY = 20  # a wedged transport is logged on the first run and every 20th after
 # Publish workers abandoned at their deadline and still running. Process-wide: it is the bound
 # on stranded threads across runs. A worker that finishes late has its result discarded; only the
 # claim that spawned it (already completed as a failure) could have used it.
-_ABANDONED: set[threading.Thread] = set()
+_ABANDONED: dict[threading.Thread, str] = {}  # worker -> the delivery_id it is publishing
 _ABANDONED_LOCK = threading.Lock()
 _IN_FLIGHT = 0  # reserved publishes (claimed or about to be) that are not abandoned yet
 _wedged_runs = 0
@@ -146,10 +145,15 @@ def _message(inv, ro, claimed: DeliveryView) -> Message | None:
     return build_message(did, claimed.kind, claimed.incident_id, label)
 
 
+def _prune() -> None:
+    for worker in [t for t in _ABANDONED if not t.is_alive()]:
+        del _ABANDONED[worker]
+
+
 def abandoned_count() -> int:
     """Abandoned publish workers still running (finished ones are dropped here)."""
     with _ABANDONED_LOCK:
-        _ABANDONED.difference_update([t for t in _ABANDONED if not t.is_alive()])
+        _prune()
         return len(_ABANDONED)
 
 
@@ -158,18 +162,28 @@ class _Slot:
 
     held = True
 
+    def __init__(self, delivery: str = "") -> None:
+        self.delivery = delivery
 
-def _reserve(limit: int) -> _Slot | None:
+
+_BUSY = _Slot()  # sentinel: this delivery already has a live abandoned worker
+_BUSY.held = False
+
+
+def _reserve(limit: int, delivery: str = "") -> _Slot | None:
     """Atomically take capacity BEFORE the CLAIM: in-flight plus still-running abandoned publishes
     never exceed `limit` (so it also bounds concurrent publishes across the process). None when
-    full: the caller ends its drain without claiming anything."""
+    full: the caller ends its drain without claiming anything. `_BUSY` when `delivery` still has a
+    live abandoned worker: that row is skipped, never published twice concurrently."""
     global _IN_FLIGHT, _wedged_runs
     with _ABANDONED_LOCK:
-        _ABANDONED.difference_update([t for t in _ABANDONED if not t.is_alive()])
+        _prune()
+        if delivery and delivery in _ABANDONED.values():
+            return _BUSY
         running, active = len(_ABANDONED), _IN_FLIGHT
         if running + active < limit:
             _IN_FLIGHT += 1
-            return _Slot()
+            return _Slot(delivery)
         noisy = _wedged_runs % LOG_WEDGED_EVERY == 0
         _wedged_runs += 1
     if noisy:
@@ -193,7 +207,7 @@ def _abandon(slot: _Slot, worker: threading.Thread) -> None:
     """The deadline expired: the reservation becomes an abandoned entry in one locked step."""
     global _IN_FLIGHT
     with _ABANDONED_LOCK:
-        _ABANDONED.add(worker)
+        _ABANDONED[worker] = slot.delivery
         if slot.held:
             slot.held = False
             _IN_FLIGHT -= 1
@@ -225,20 +239,24 @@ def _publish(publisher: Publisher, message: Message, seconds: float, slot: _Slot
     return "sent"
 
 
-def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> bool:
+def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> tuple[bool, float]:
+    """(recorded, the clock read of the completion)"""
     with immediate(inv):
         now = clock()
         if ok:
             sql, params = COMPLETE_SENT, completion_params(claimed, now)
         else:
             sql, params = failure_statement(claimed, now, config)
-        return inv.execute(sql, params).rowcount == 1
+        return inv.execute(sql, params).rowcount == 1, now
 
 
-def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot) -> str:
+def _send_one(
+    inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot
+) -> tuple[str, float | None]:
+    """(outcome, the last clock read, None when nothing was claimed)"""
     taken = _claim(inv, row, config, clock)
     if taken is None:
-        return "skipped"
+        return "skipped", None
     claimed, stamp = taken
     message = _message(inv, ro, claimed)
     outcome = "failed"
@@ -248,10 +266,11 @@ def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot)
         outcome = "aborted"
     else:
         outcome = _publish(publisher, message, config.transmit_deadline_seconds, slot)
-    if not _complete(inv, claimed, outcome == "sent", config, clock):
+    recorded, ended = _complete(inv, claimed, outcome == "sent", config, clock)
+    if not recorded:
         log(logger, logging.WARNING, "delivery_completion_lost", row_id=claimed.row_id)
-        return "lost"
-    return outcome
+        return "lost", ended
+    return outcome, ended
 
 
 def _due(inv, now: float, config: DeliveryConfig, limit: int) -> list[DeliveryView]:
@@ -263,43 +282,57 @@ def _due(inv, now: float, config: DeliveryConfig, limit: int) -> list[DeliveryVi
     return [_delivery(r) for r in rows.fetchall()]
 
 
+def _drain(inv, ro, publisher, rows, config, clock, start, max_abandoned, budget) -> Counter:
+    counts: Counter[str] = Counter()
+    last = start
+    for row in rows:
+        if last - start >= budget:
+            log(logger, logging.WARNING, "delivery_drain_budget_spent", budget=budget)
+            break  # nothing more is claimed: the pipeline pass must stay short
+        slot = _reserve(max_abandoned, delivery_id(row.incident_id, row.kind))
+        if slot is None:
+            break  # reserved BEFORE the claim, so a dead transport burns no attempts
+        if slot is _BUSY:
+            continue  # a live abandoned worker still holds this very delivery
+        try:
+            outcome, ended = _send_one(inv, ro, publisher, row, config, clock, slot)
+        finally:
+            _release(slot)
+        counts[outcome] += 1
+        last = last if ended is None else ended
+        if outcome == "timeout":
+            break  # the transport is wedged: do not strand more worker threads this run
+    return counts
+
+
 def run_delivery(
     inv: sqlite3.Connection,
-    overrides: sqlite3.Connection | Path | None,
+    overrides: sqlite3.Connection | None,
     publisher: Publisher,
     config: DeliveryConfig,
     clock: Callable[[], float],
     *,
     max_per_run: int = DEFAULT_MAX_PER_RUN,
     max_abandoned: int = DEFAULT_MAX_ABANDONED,
+    drain_budget_seconds: float = DEFAULT_DRAIN_BUDGET,
 ) -> RunReport:
-    ro = open_overrides_ro(overrides) if isinstance(overrides, Path) else overrides
+    """`overrides` is the READ-ONLY decision store connection (None: unavailable)."""
+    if drain_budget_seconds < config.transmit_deadline_seconds:
+        raise ValueError("drain_budget must be at least the transmit deadline")
     try:
-        try:
-            planned, now = _plan_pass(inv, ro, config, clock)
-        except DecisionsUnavailable as exc:
-            log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
-            return RunReport(skipped="decisions_unavailable")
-        counts: Counter[str] = Counter()
-        for row in _due(inv, now, config, max_per_run):
-            slot = _reserve(max_abandoned)
-            if slot is None:
-                break  # reserved BEFORE the claim, so a dead transport burns no attempts
-            try:
-                outcome = _send_one(inv, ro, publisher, row, config, clock, slot)
-            finally:
-                _release(slot)
-            counts[outcome] += 1
-            if outcome == "timeout":
-                break  # the transport is wedged: do not strand more worker threads this run
-        return RunReport(
-            planned=planned,
-            claimed=sum(counts.values()) - counts["skipped"],
-            sent=counts["sent"],
-            failed=counts["failed"] + counts["timeout"],
-            aborted=counts["aborted"],
-            lost=counts["lost"],
-        )
-    finally:
-        if isinstance(overrides, Path) and ro is not None:
-            ro.close()
+        planned, now = _plan_pass(inv, overrides, config, clock)
+    except DecisionsUnavailable as exc:
+        log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
+        return RunReport(skipped="decisions_unavailable")
+    rows = _due(inv, now, config, max_per_run)
+    counts = _drain(
+        inv, overrides, publisher, rows, config, clock, now, max_abandoned, drain_budget_seconds
+    )
+    return RunReport(
+        planned=planned,
+        claimed=sum(counts.values()) - counts["skipped"],
+        sent=counts["sent"],
+        failed=counts["failed"] + counts["timeout"],
+        aborted=counts["aborted"],
+        lost=counts["lost"],
+    )

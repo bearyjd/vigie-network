@@ -299,15 +299,16 @@ def _wait_idle():
 
 
 def test_wedged_transport_is_bounded_across_runs_and_burns_no_attempts(world):
-    world.incident()
+    for name in "abc":
+        world.incident(name)
     gates, pub = _hang_forever(3)
     clock = Clock()
     for step in range(3):
         clock.t = T0 + step * 4000  # past any backoff
         go(world, pub, clock, max_abandoned=2)
-    (row,) = world.rows()
-    assert len(pub.attempted) == 2 and row["attempts"] == 2  # the 3rd run never claimed
-    assert row["state"] == "pending" and delivery_runner.abandoned_count() == 2
+    # run 1 hangs on a; run 2 skips a (live worker) and hangs on b; run 3 finds the bound full
+    assert sorted(r["attempts"] for r in world.rows()) == [0, 1, 1]
+    assert len(pub.attempted) == 2 and delivery_runner.abandoned_count() == 2
     workers = [t for t in threading.enumerate() if t.name == "vigie-delivery-publish"]
     assert len(workers) == 2 and all(t.daemon for t in workers)
     for gate in gates:
@@ -315,11 +316,12 @@ def test_wedged_transport_is_bounded_across_runs_and_burns_no_attempts(world):
     _wait_idle()
     clock.t = T0 + 20000
     go(world, pub, clock, max_abandoned=2)
-    assert len(pub.attempted) == 3 and world.rows()[0]["attempts"] == 3
+    assert len(pub.attempted) == 5 and all(r["attempts"] >= 1 for r in world.rows())
 
 
 def test_wedged_transport_is_logged_once_not_every_run(world, caplog):
-    world.incident()
+    for name in "abc":
+        world.incident(name)
     gates, pub = _hang_forever(1)
     go(world, pub, Clock(), max_abandoned=1)
     with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
@@ -445,3 +447,52 @@ def test_reservation_released_when_the_worker_cannot_start(world, monkeypatch):
         go(world, FakePublisher(), Clock())
     monkeypatch.undo()
     assert delivery_runner._IN_FLIGHT == 0 and delivery_runner.abandoned_count() == 0
+
+
+def test_no_publish_for_a_delivery_with_a_live_worker(world):
+    world.incident()
+    gates, pub = _hang_forever(1)
+    go(world, pub, Clock(), max_abandoned=5)  # abandoned, still hanging
+    clock = Clock(T0 + 4000)  # backoff over: the row is due again
+    report = go(world, pub, clock, max_abandoned=5)
+    assert report.claimed == 0 and len(pub.attempted) == 1
+    assert world.rows()[0]["attempts"] == 1
+    gates[0].set()
+    _wait_idle()
+    assert go(world, pub, clock, max_abandoned=5).sent == 1
+
+
+class Ticking(FakePublisher):
+    """Every publish takes `step` seconds of the injected clock."""
+
+    def __init__(self, clock, step):
+        super().__init__()
+        self.clock, self.step = clock, step
+
+    def publish(self, message, *, timeout_seconds):
+        self.clock.t += self.step
+        super().publish(message, timeout_seconds=timeout_seconds)
+
+
+def test_drain_budget_stops_claiming_and_burns_no_attempts(world):
+    for i in range(5):
+        world.incident(f"i{i}")
+    clock = Clock()
+    pub = Ticking(clock, 40)
+    report = go(world, pub, clock, drain_budget_seconds=60)
+    assert report.sent == 2  # 40 s spent < 60: second row; 80 s spent: stop
+    attempts = sorted(r["attempts"] for r in world.rows())
+    assert attempts == [0, 0, 0, 1, 1]
+    assert go(world, pub, clock, drain_budget_seconds=60).sent == 2  # rest next run
+
+
+def test_budget_smaller_than_one_deadline_is_refused(world):
+    world.incident()
+    with pytest.raises(ValueError, match="drain_budget"):
+        go(
+            world,
+            FakePublisher(),
+            Clock(),
+            config=dconf(transmit_deadline_seconds=30, lease_seconds=60),
+            drain_budget_seconds=10,
+        )

@@ -181,7 +181,8 @@ each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_deli
    abandoned worker is tracked process-wide; once `VIGIE_DELIVERY_MAX_ABANDONED` of them are still
    running the runner stops before CLAIMing (no attempt is burned, `delivery_transport_wedged` is
    logged on the first such run and every 20th) until they return. A late worker's result is
-   discarded and never completes a row.
+   discarded and never completes a row. Capacity is reserved atomically before the CLAIM, and a
+   delivery whose abandoned worker is still running is skipped, never published twice at once.
 3. *Watermark*: the first enabled run stores `pipeline_meta.delivery_eligible_since` (the floor of
    `now`) with `INSERT OR IGNORE`; later runs, and disable/enable cycles, never move it.
    Incidents detected before it are never announced.
@@ -195,14 +196,19 @@ like an IP, MAC, domain or byte count, stripped of control characters and cut to
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
 other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
 `_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
-(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1).
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
 created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a symlink, FIFO or
-device is refused), each message is one `write` followed by `fsync`, and a message that would push
+device is refused), each message is one `write` followed by `fsync`, every append holds an exclusive `flock` across the size check and the write, a failed or short
+write is cut back to the previous size, and a message that would push
 the file past 10 MiB is refused (the delivery then fails and retries; rotate or truncate the
 file). In compose the file lives on the `vigie-delivery` volume (`/delivery/messages.jsonl`).
+
+A failure of `fsync` (or of the cut-back itself) can leave a line that was already written while
+the delivery is retried, so the retry duplicates it: delivery is at least once. Every line carries
+`delivery_id`; consumers should dedupe on it.
 
 **Enabling safely.** Set `VIGIE_DELIVERY_FILE=/delivery/messages.jsonl`, then
 `VIGIE_DELIVERY_ENABLED=1`, restart the pipeline and watch the file. Only incidents detected after
