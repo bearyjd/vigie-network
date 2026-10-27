@@ -125,7 +125,9 @@ async function load(clear = false, focus = null, automatic = false) {
     }
     if (generation !== state.generation || !state.connected) return;
     if (automatic && interacting()) return;
-    state.coverage = coverage ?? await banner; if (generation !== state.generation || !state.connected) return;
+    const snapshot = coverage ?? await banner;  // settle first: an obsolete load must not touch shared state
+    if (generation !== state.generation || !state.connected) return;
+    state.coverage = snapshot;
     const held = focusedInContent();
     state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice(); restoreContentFocus(held);
     if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});

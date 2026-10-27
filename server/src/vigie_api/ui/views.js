@@ -141,11 +141,11 @@ function decide(r, open, now) {
 function triage(d, now) {
   const unknown = {label: 'unknown decision', attention: true};
   if (d.attention !== undefined && typeof d.attention !== 'boolean') return unknown;
-  const closed = d.state === 'resolved' || d.state === 'superseded';  // only the API's known closed states are quiet; anything else is a state we cannot vouch for
-  const decision = decide(d.review, !closed, now); if (!decision) return unknown;
-  const attention = typeof d.attention === 'boolean' ? d.attention || decision.forced : decision.derived;
+  const known = d.state === 'open' || d.state === 'resolved' || d.state === 'superseded';  // the API's real set; any other state is one we cannot vouch for
+  const decision = decide(d.review, d.state !== 'resolved' && d.state !== 'superseded', now); if (!decision) return unknown;
+  const attention = !known || (typeof d.attention === 'boolean' ? d.attention || decision.forced : decision.derived);  // an unrecognised state needs a human whatever the payload says
   const base = attention ? (decision.label === 'no decision' ? 'needs review' : `${decision.label} · needs attention`) : decision.label;
-  return {label: closed || d.state === 'open' ? base : `${base} · unknown state`, attention};
+  return {label: known ? base : `${base} · unknown state`, attention};
 }
 const detectedMs = d => { const t = typeof d.detected_at === 'number' ? d.detected_at * 1000 : typeof d.detected_at === 'string' ? Date.parse(d.detected_at) : NaN; return Number.isFinite(t) ? t : -Infinity; };
 function filterBar(active, counts, onFilter) {

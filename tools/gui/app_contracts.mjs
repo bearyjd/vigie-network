@@ -52,15 +52,16 @@ for (const name of ['localStorage', 'sessionStorage']) Object.defineProperty(glo
 const realNow = Date.now; let clock = Date.parse('2026-10-25T12:00:00Z'); Date.now = () => clock;
 // Timers are counted, never fired: the suite drives time itself.
 let intervalTick = null; let nextTimer = 1; let scheduledTotal = 0; const intervals = new Map(); const liveTimeouts = new Map();
-globalThis.setInterval = callback => { const id = nextTimer++; intervals.set(id, callback); intervalTick = callback; return id; };
+globalThis.setInterval = (callback, ms) => { const id = nextTimer++; intervals.set(id, {callback, ms}); intervalTick = callback; return id; };
 globalThis.clearInterval = id => { intervals.delete(id); };
-globalThis.setTimeout = (callback, ms) => { const id = nextTimer++; liveTimeouts.set(id, {ms, callback}); if (ms >= 30000) scheduledTotal++; return id; };
+globalThis.setTimeout = (callback, ms) => { const id = nextTimer++; liveTimeouts.set(id, {ms, callback, due: clock + ms}); if (ms >= 30000) scheduledTotal++; return id; };
 globalThis.clearTimeout = id => { liveTimeouts.delete(id); };
 const dueTimers = () => [...liveTimeouts.entries()].filter(([, timer]) => timer.ms >= 30000);
 const refreshTimers = () => dueTimers().length;  // the 15 s request deadlines are shorter
+const tick = async ms => { clock += ms; for (const [id, timer] of [...liveTimeouts]) if (timer.due <= clock) { liveTimeouts.delete(id); timer.callback(); } await flush(); };  // fire a timer only when the fake clock reaches it
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
-let lastHourState = 'eligible'; let incidentPages = null; let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
+let holdCoverage = null; let lastHourState = 'eligible'; let incidentPages = null; let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
 let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
   const from = Number(url.searchParams.get('from_hour')); const to = Number(url.searchParams.get('to_hour'));
@@ -74,6 +75,7 @@ const requests = [];  // every request the page makes, for the read-only contrac
 globalThis.fetch = async (url, options) => {
   requests.push({url: String(url), options});
   if (gate) await gate;
+  if (new URL(String(url)).pathname === '/coverage' && holdCoverage) { const held = holdCoverage; holdCoverage = null; await held.promise; return new Response('{}', {status: 503}); }  // one slow, soon obsolete coverage response
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
@@ -362,14 +364,19 @@ const hostileCoverage = [  // [override, banner must warn, text the Overview mus
   [{backlog_batches: '9007199254740993'}, true, 'Unknown pending'], [{summary_capped: {toString: 1}}, true, 'Capped or unknown'],
   [{source_flags_latest: {toString: 1}}, false, 'Unavailable'], [{collector_id: {toString: 1}}, false, 'Source record'], [{last_seq: [1]}, false, 'Unknown ·'], [{last_received_at: {toString: 1}}, false, 'Unavailable'], [{agent_rss_kb: {toString: 1}}, false, 'Unavailable'],
 ];
-mode = 'ok'; lag = 0; windowLag = null; hourState = 'partial'; view('overview'); await flush();
-for (const [over, mustWarn, expected] of hostileCoverage) {
-  collectorOver = over; const before = scheduledTotal; await reload();
-  assert.ok(scheduledTotal > before, `refresh keeps rescheduling after ${JSON.stringify(over)}`);
-  for (const part of ['Observation', 'Parsed DNS', 'Coverage over time', 'Source record', 'Hours that need context', 'partial']) assert.ok(content.textContent.includes(part), `Overview still renders "${part}" for ${JSON.stringify(over)}`);
-  assert.ok(content.textContent.includes(expected), `Overview shows "${expected}" for ${JSON.stringify(over)}`); assert.doesNotMatch(content.textContent, /Data unavailable/);
-  assert.ok(['ok', 'degraded'].includes(tone()), 'usable evidence still yields a real banner state, not an error');
-  if (mustWarn) assert.equal(tone(), 'degraded', `never ok for ${JSON.stringify(over)}`);
+mode = 'ok'; lag = 0; windowLag = null; view('overview'); await flush();
+for (const base of ['partial', 'healthy']) {  // 'healthy' = every hour qualified, so only the hostile field can make the banner warn
+  hourState = base === 'partial' ? 'partial' : 'eligible';
+  for (const [over, mustWarn, expected] of hostileCoverage) {
+    collectorOver = over; const before = scheduledTotal; await reload(); const where = `${base} base, ${JSON.stringify(over)}`;
+    assert.ok(scheduledTotal > before, `refresh keeps rescheduling after ${where}`);
+    for (const part of ['Observation', 'Parsed DNS', 'Coverage over time', 'Source record', 'Hours that need context']) assert.ok(content.textContent.includes(part), `Overview still renders "${part}" for ${where}`);
+    if (base === 'partial') assert.ok(content.textContent.includes('partial'), `partial hour listed for ${where}`);
+    assert.ok(content.textContent.includes(expected), `Overview shows "${expected}" for ${where}`); assert.doesNotMatch(content.textContent, /Data unavailable/);
+    assert.ok(['ok', 'degraded'].includes(tone()), 'usable evidence still yields a real banner state, not an error');
+    if (base === 'healthy') assert.equal(tone(), mustWarn ? 'degraded' : 'ok', `healthy base: hostile field alone decides the banner for ${where}`);
+    else if (mustWarn) assert.equal(tone(), 'degraded', `never ok for ${where}`);
+  }
 }
 hourState = 'eligible';
 collectorOver = {}; await reload(); assert.equal(tone(), 'ok');
@@ -420,10 +427,13 @@ assert.equal(tone(), 'ok', 'coverage is applied although the inbox failed'); ass
 for (const state of ['bogus', {toString: 1}, undefined, null, 5, 'OPEN', '']) {
   const d = inc('u1', {state, attention: undefined}); assert.equal(one(d), 'needs review · unknown state', `state ${JSON.stringify(state)} fails loud`);
   assert.deepEqual(idsOf(render([d], opts('attention'))), ['u1']); assert.deepEqual(idsOf(render([d], opts('quiet'))), []);
-  assert.equal(one(inc('u1', {state, attention: false})), 'no decision · unknown state', 'an explicit API flag still wins, but the state stays visible');
+  for (const attention of [false, true]) { const e = inc('u1', {state, attention}); assert.equal(one(e), 'needs review · unknown state', `attention:${attention} cannot make state ${JSON.stringify(state)} quiet`); assert.deepEqual(idsOf(render([e], opts('quiet'))), []); assert.deepEqual(idsOf(render([e], opts('attention'))), ['u1']); }
+  assert.match(one(inc('u1', {state, attention: null})), /unknown/); assert.deepEqual(idsOf(render([inc('u1', {state, attention: null})], opts('attention'))), ['u1']);
+  assert.equal(one(inc('u1', {state, attention: false, review: {status: 'acknowledged'}})), 'acknowledged · needs attention · unknown state', 'a decision on an unrecognised state does not quiet it');
   assert.deepEqual(idsOf(render([inc('k1', {state: 'resolved', attention: undefined}), d])), ['u1', 'k1'], 'unknown state sorts ahead of closed ones');
 }
 for (const state of ['resolved', 'superseded']) assert.equal(one(inc('u1', {state, attention: undefined})), 'no decision', `${state} is closed`);
+assert.equal(one(inc('u1', {state: 'open', attention: false, review: {status: 'acknowledged'}})), 'acknowledged', 'a known state keeps the documented quiet rules');
 // Item 7: lookup tables never leak prototype members.
 assert.doesNotThrow(() => views.deviceView({id: 'd1', macs: [{hostname: {toString: 1}}, {hostname: 'ok'}]}, noop)); assert.match(views.activityView({device_id: 'd1', hours: [], baseline: {state: 'constructor'}}).textContent, /Unknown reference state/);
 for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) { const row = render([inc('k1', {detector: word, review: {status: word}})]); assert.ok(rowsOf(row)[0].querySelectorAll('td')[0].textContent.startsWith(word), `${word} renders verbatim`); assert.equal(one(inc('k1', {review: {status: word}})), 'unknown decision'); }
@@ -442,9 +452,22 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   }
   assert.deepEqual([...seen.attention, ...seen.quiet].sort(), seen.all.slice().sort(), 'attention plus quiet cover every row exactly once'); assert.equal(seen.quiet.length, 10);
   incidentPages = null; location.hash = '';
-  await reload(); const due = dueTimers(); assert.equal(due.length, 1); const seenBefore = requests.length; clock += 31000; body.focus();
-  liveTimeouts.delete(due[0][0]); due[0][1].callback(); await flush();
-  assert.ok(requests.length > seenBefore, 'the scheduled refresh really ran'); assert.equal(refreshTimers(), 1, 'and re-armed exactly one timer');
+  body.focus(); await reload(); assert.equal(dueTimers().length, 1); assert.equal(dueTimers()[0][1].ms, 30000, 'the documented refresh interval is 30 s'); assert.deepEqual([...intervals.values()].map(i => i.ms), [5000], 'one 5 s banner recompute');
+  const seenBefore = requests.length; await tick(29999); assert.equal(requests.length, seenBefore, 'nothing fires before the interval elapses'); assert.equal(refreshTimers(), 1);
+  await tick(1); assert.ok(requests.length > seenBefore, 'the scheduled refresh really ran at 30 s'); assert.equal(refreshTimers(), 1, 'and re-armed exactly one timer'); assert.equal(dueTimers()[0][1].ms, 30000);
+  // while the user holds focus in the content, the due refresh re-arms quietly: no request, same node, same text
+  await reload(); body.focus(); const probe = content.querySelector('[data-focus-key]') || content.querySelector('[aria-label]'); probe.focus(); content.fire('focusin');
+  const firstChild = content.children[0]; const probeText = probe.textContent; const quietBefore = requests.length;
+  await tick(30000); assert.equal(requests.length, quietBefore, 'no request while interacting'); assert.equal(document.activeElement, probe); assert.equal(content.children[0], firstChild); assert.equal(probe.textContent, probeText);
+  assert.equal(refreshTimers(), 1, 'exactly one timer re-armed'); assert.equal(dueTimers()[0][1].ms, 30000); body.focus(); content.fire('focusout'); await flush();
+}
+// Round 3: an obsolete coverage response must not overwrite a fresher banner.
+{
+  collectorOver = {}; hourState = 'eligible'; lastHourState = 'eligible'; location.hash = ''; view('overview'); await flush(); await reload(); assert.equal(tone(), 'ok');
+  let releaseStale; holdCoverage = {promise: new Promise(resolve => { releaseStale = resolve; })};
+  view('inventory'); await flush();  // its coverage request is held
+  view('overview'); await flush(); assert.equal(tone(), 'ok', 'the fresh overview owns the banner');
+  releaseStale(); await flush(); intervalTick(); assert.equal(tone(), 'ok', 'the obsolete response must not flip the banner'); assert.match(bannerText(), /^OK/);
 }
 // L2: schedule() called while a timer is still registered (the interacting branch re-arms without load()'s own clear) leaves ONE live timer.
 {

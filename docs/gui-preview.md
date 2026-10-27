@@ -101,8 +101,9 @@ fails the view itself. Each state starts with a text prefix, so colour is never 
 The Incidents view is a local inbox that needs no notification publisher. Incidents the API marks
 `attention` come first, newest first, with ties kept in API order; payloads without `attention` fall
 back to the incident state. The Decision column shows `acknowledged`, `expected`,
-`snoozed until <UTC>`, `snooze expired · needs attention`, `needs review` or `no decision`. Only `resolved` and `superseded` count as closed; any other state
-(garbage, missing) reads `... · unknown state` and needs review; a
+`snoozed until <UTC>`, `snooze expired · needs attention`, `needs review` or `no decision`. The known states are `open`, `resolved` and `superseded`; any other state
+(garbage, missing) always needs review and reads `... · unknown state`, whatever `attention` or
+`review` say; a
 decision the API still flags gets ` · needs attention` appended, so the label and the filter always agree. Unrecognised
 `review` or `attention` values show `unknown decision` and sort as needing attention. The All / Needs
 attention / Quiet filter changes only the view and is kept in the URL hash (`#filter=attention`),
