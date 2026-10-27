@@ -151,13 +151,14 @@ def test_main_installs_both_sigterm_and_sighup_handlers(namespace, monkeypatch, 
 # ---------------------------------------------------------------- M1 non-UTF-8 argv
 
 
+@pytest.mark.timeout(120)  # the scan reads every /proc cmdline on the host
 def test_non_utf8_argv_of_any_process_does_not_break_the_orphan_scan(namespace, listener, sleeper):
     junk = subprocess.Popen(  # noqa: S603 -- throwaway child with deliberately invalid argv.
         [os.fsencode(sys.executable), b"-c", b"import time; time.sleep(60)", b"\xff\xfe"],
         stdin=subprocess.DEVNULL,
     )
     try:
-        identity = settled_identity(junk.pid)
+        identity = settled_identity(junk)
         assert identity is not None and identity["argv"][-1] == "\udcff\udcfe"
         child, argv, _, inode = live(namespace, listener, sleeper)
         attempt(namespace, argv, inode, [])  # prepared-only, the scan reads every /proc cmdline

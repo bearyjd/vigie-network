@@ -49,12 +49,12 @@ def namespace(tmp_path, monkeypatch):
     root = tmp_path / "synthetic"
     preview.seed(root)
     monkeypatch.setattr(preview, "LOCK", tmp_path / "shared.lock")
-    with (
-        socket.socket() as probe
-    ):  # never the real port: a live preview on this host must not leak in
+    # never the real port: a live preview on this host must not leak in; the probe stays bound
+    # (not listening) for the fixture's life so nothing else can take the number
+    with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         monkeypatch.setattr(preview, "PORT", probe.getsockname()[1])
-    return root
+        yield root
 
 
 @pytest.fixture
@@ -123,17 +123,22 @@ def attempt(root, argv, inode, states, identity=None, **extra):
     return journal
 
 
-def settled_identity(pid, argv=None):
-    """process_identity once /proc shows the child's argv (it is empty for a moment around exec,
-    worst under load); `argv` additionally waits for that exact value."""
+def settled_identity(proc, argv=None):
+    """process_identity once /proc shows the child's own argv. Between fork and exec /proc shows
+    the parent's argv (and briefly nothing), worst under load, so a bare "non-empty" is not enough:
+    wait for the exact argv (a Popen carries its own in `.args`) and fail loudly if it never
+    settles. A bare pid needs `argv`."""
+    pid = getattr(proc, "pid", proc)
+    if argv is None:
+        assert hasattr(proc, "args"), "settled_identity needs a Popen or an explicit argv"
+        argv = [os.fsdecode(arg) for arg in proc.args]
     deadline = time.monotonic() + 5
     while True:
         identity = preview.process_identity(pid)
-        done = (
-            identity is not None and identity["argv"] and (argv is None or identity["argv"] == argv)
-        )
-        if done or time.monotonic() > deadline:
+        if identity is not None and identity["argv"] == argv:
             return identity
+        if time.monotonic() > deadline:
+            raise AssertionError(f"pid {pid} never showed argv {argv!r}: {identity!r}")
         time.sleep(0.01)
 
 
@@ -142,7 +147,7 @@ def live(root, listener, sleeper, *, hold=True):
     fd = listener.fileno()
     argv = serve_argv(root, fd)
     child = sleeper(argv, pass_fds=(fd,) if hold else ())
-    identity = settled_identity(child.pid, argv)
+    identity = settled_identity(child, argv)
     assert identity is not None and identity["argv"] == argv
     return child, argv, identity, str(os.fstat(fd).st_ino)
 
@@ -497,7 +502,7 @@ def test_health_with_non_object_json_is_unhealthy_not_an_exception(monkeypatch):
 def test_process_identity_reads_real_proc_start_ticks_uid_argv_and_boot(sleeper, tmp_path):
     before = time.time()
     child = sleeper([sys.executable, "-c", "import time; time.sleep(60)"])
-    identity = settled_identity(child.pid)
+    identity = settled_identity(child)
     after = time.time()
     raw = Path(f"/proc/{child.pid}/stat").read_text()
     parsed = re.match(r"^\d+ \(.*\) (.*)$", raw, re.S)

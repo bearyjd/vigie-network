@@ -158,8 +158,7 @@ def children():
 
 
 def _line(child) -> str:
-    identity = settled_identity(child.pid)
-    assert identity is not None
+    identity = settled_identity(child)
     return f"{child.pid} {identity['start_ticks']} {identity['boot_id']}\n"
 
 
@@ -229,6 +228,7 @@ def test_a_start_shaped_holder_of_another_uid_is_unverified(
     namespace, children, tmp_path, monkeypatch
 ):
     holder = _start_shaped(children, "start", tmp_path, monkeypatch)
+    settled_identity(holder)  # settle before the mock below: it expands the real identity
     real = preview.process_identity
     monkeypatch.setattr(
         preview,
@@ -583,8 +583,7 @@ def test_an_unpinned_startup_hook_name_is_never_opened(sandbox_owners, tmp_path,
 
 
 def _recognised(holder) -> bool:
-    identity = settled_identity(holder.pid)
-    assert identity is not None
+    identity = settled_identity(holder)
     return preview._is_controller(identity)
 
 
