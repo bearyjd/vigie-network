@@ -51,8 +51,10 @@ simply another staged import.
   normalised and stored without brackets, and an IPv4-mapped IPv6 literal is stored as the
   plain IPv4 address. The port must be valid. Every DNS label must be 1-63 characters of `[a-z0-9-]` with no
   leading or trailing hyphen (253 in total); percent-encoded hosts such as `evil%2ecom` are
-  skipped, not decoded. Duplicate hosts keep the first row. A `#` line is a comment only
-  outside a quoted field, so a quoted `#` cannot swallow the rows after it.
+  skipped, not decoded. Duplicate hosts keep the first row. A comment is a row that is one
+  physical line starting with `#` in column 0, as `csv.reader` itself sees it; a `#` line that
+  opens a multi-line quoted field would swallow rows and rejects the file. A `#` anywhere else
+  is plain data.
 - **Deliberately skipped address forms.** A host whose last label is numeric or `0x..` is an
   address and is kept only as a strict dotted quad. Browser-ambiguous forms (`0x7f.0.0.1`,
   `127.1`, `010.0.0.1`, `2130706433`) are skipped, never guessed, and so are IPv4-compatible

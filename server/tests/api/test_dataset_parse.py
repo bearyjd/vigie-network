@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import io
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -445,10 +447,13 @@ def test_the_host_part_decides_whether_a_netloc_is_bracketed(monkeypatch):
     assert dataset_parse._urlhaus_host("http://[::1]:80@evil.com/") == "evil.com"
 
 
-def test_a_quoted_hash_cannot_swallow_rows_as_a_comment():
-    rows = b"".join(urlhaus_row(f"http://h{i}.test/") for i in range(300))
-    with pytest.raises(ValueError, match="not valid|expected 9 columns"):
-        parse_urlhaus(b'"#x\n' + rows + b'"\n')
+def test_a_comment_like_row_cannot_swallow_rows_that_would_otherwise_parse():
+    """Without the guard this parses (nine fields) and silently drops the 30 rows it spans."""
+    swallowed = b"".join(b"1,d,http://h%d.test/,o,l,t,,l,r\n" % i for i in range(30))
+    attack = b'#x,"swallow\n' + swallowed + b'",c,d,e,f,g,h,i\n'
+    raw = urlhaus_row("http://before.test/") + attack + urlhaus_row("http://after.test/")
+    with pytest.raises(ValueError, match="comment-like line opens a multi-line field"):
+        parse_urlhaus(raw)
 
 
 def test_a_hash_line_inside_an_open_quote_is_data_not_a_comment():
@@ -511,3 +516,59 @@ def test_the_stream_never_asks_for_more_than_one_capped_line(monkeypatch):
     monkeypatch.setattr(dataset_parse.io, "TextIOWrapper", Spy)
     parse_urlhaus(urlhaus_row("http://ok.test/"))
     assert sizes and set(sizes) == {dataset_parse.MAX_LINE_LEN + 1}
+
+
+def test_a_comment_after_a_row_ending_in_a_literal_quote_is_still_a_comment():
+    row = b'"1","d","http://ok.test/","o","l","t","","l",r"\n'  # odd quote count, valid for csv
+    comment = b"#2,d,http://comment.test/,o,l,t,x,l,r\n"
+    entries, skipped = parse_urlhaus(row + comment + urlhaus_row("http://next.test/"))
+    assert keys(entries) == ["ok.test", "next.test"] and skipped == 0
+
+
+def test_comments_with_crlf_and_a_final_comment_without_newline():
+    raw = b"# header\r\n" + urlhaus_row("http://ok.test/").replace(b"\n", b"\r\n") + b"# last"
+    assert keys(parse_urlhaus(raw)[0]) == ["ok.test"]
+
+
+def reference_rows(text: str):
+    """Independent oracle: whole-file csv.reader, comment status from the physical line index."""
+    lines = io.StringIO(text, newline="").readlines()
+    reader = csv.reader(lines, strict=True)
+    start, out = 0, []
+    try:
+        for row in reader:
+            first, span = lines[start], reader.line_num - start
+            start = reader.line_num
+            if first.startswith("#"):
+                if span > 1:
+                    return "error"
+                continue
+            out.append(row)
+    except csv.Error:
+        return "error"
+    return out
+
+
+def streamed_rows(text: str):
+    lines = dataset_parse._Lines(text.encode())
+    try:
+        return list(dataset_parse._data_rows(csv.reader(lines, strict=True), lines))
+    except (csv.Error, ValueError):
+        return "error"
+
+
+FUZZ_LINES = [
+    '"1","a","b"', "x,y,z", "# comment", '#x,"open', '"#q",1', 'tail"', 'r"', '"multi', 'end"',
+    "", "#", '# a "quoted" word', '"a""b",c', "\x20#not column zero", '"#',
+]  # fmt: skip
+
+
+def test_streamed_comment_logic_matches_the_reference_on_random_files():
+    rng = random.Random(20261027)  # noqa: S311 - seeded test data, not security
+    for _ in range(600):
+        picked = [rng.choice(FUZZ_LINES) for _ in range(rng.randint(1, 8))]
+        ends = [rng.choice(["\n", "\r\n"]) for _ in picked]
+        if rng.random() < 0.3:
+            ends[-1] = ""
+        text = "".join(line + end for line, end in zip(picked, ends, strict=True))
+        assert streamed_rows(text) == reference_rows(text), repr(text)

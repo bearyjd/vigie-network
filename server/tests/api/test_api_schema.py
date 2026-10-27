@@ -177,7 +177,9 @@ def test_dataset_import_is_unique_per_source_and_hash(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "column", ["version", "licence", "created_by", "created_at", "accepted_by", "accepted_at"]
 )
-@pytest.mark.parametrize("blank", ["", "  ", "\t\n"])
+@pytest.mark.parametrize(
+    "blank", ["", " ", "\t", "\n", "\x0b", "\x0c", "\r", "\u00a0", " \t\n\x0b\x0c\r\u00a0"]
+)
 def test_dataset_text_columns_reject_blank_values(tmp_path: Path, column, blank) -> None:
     conn = open_overrides(tmp_path / "o.db")
     row = {

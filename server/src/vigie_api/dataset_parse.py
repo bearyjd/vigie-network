@@ -175,27 +175,51 @@ def _urlhaus_row(row: list[str], where: str) -> Entry | None:
 
 
 class _Lines:
-    """Physical lines of the CSV, decoded as a stream and bounded before csv.reader sees them.
+    """Physical lines of the CSV, decoded as a stream and capped before csv.reader sees them.
 
-    A `#` line is a comment only outside a quoted field (tracked by quote parity), so a quoted
-    `#` cannot swallow the rows after it. `number` is the physical line last read.
+    It only feeds lines and remembers, for the row csv.reader is currently building, the raw
+    first physical line and how many were consumed; quoting is left entirely to csv.reader.
+    `number` is the physical line last read.
     """
 
     def __init__(self, data: bytes) -> None:
         raw = io.BytesIO(data.removeprefix(_BOM))
         self._text = io.TextIOWrapper(raw, encoding="utf-8", errors="strict", newline="")
         self.number = 0
-        self._open_quote = False
+        self.first = ""
+        self.count = 0
+
+    def begin_row(self) -> None:
+        self.first, self.count = "", 0
 
     def __iter__(self):
         while line := self._text.readline(MAX_LINE_LEN + 1):  # never reads past the cap
             self.number += 1
             if len(line) > MAX_LINE_LEN:
                 raise ValueError(f"line {self.number}: line longer than {MAX_LINE_LEN} characters")
-            if not self._open_quote and line.startswith("#"):
-                continue
-            self._open_quote ^= line.count('"') % 2 == 1
+            if self.count == 0:
+                self.first = line
+            self.count += 1
             yield line
+
+
+def _data_rows(reader, lines: _Lines):
+    """Rows of the CSV without comments.
+
+    A comment is a row of exactly one physical line that starts with `#` in column 0. One that
+    starts that way but runs on over several lines would silently swallow rows: rejected.
+    """
+    while True:
+        lines.begin_row()
+        try:
+            row = next(reader)
+        except StopIteration:
+            return
+        if lines.first.startswith("#"):
+            if lines.count > 1:
+                raise ValueError(f"line {lines.number}: comment-like line opens a multi-line field")
+            continue
+        yield row
 
 
 def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
@@ -206,7 +230,7 @@ def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
     seen: dict[str, Entry] = {}
     rows = skipped = 0
     try:
-        for row in reader:
+        for row in _data_rows(reader, lines):
             if not row:  # blank line
                 continue
             rows += 1
