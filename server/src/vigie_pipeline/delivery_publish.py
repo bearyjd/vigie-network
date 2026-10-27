@@ -28,10 +28,14 @@ MAX_LINK = 200
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
 REDACTED = "[redacted]"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]+")
+_HEX = r"[0-9a-fA-F]"
+_NOT_HEX_BEFORE, _NOT_HEX_AFTER = f"(?<!{_HEX})", f"(?!{_HEX})"
+_SEP = r"[:\-._ ]"
 _SENSITIVE = re.compile(
-    r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}"  # MAC
-    r"|(?:[0-9a-fA-F]{2} ){5}[0-9a-fA-F]{2}"  # MAC separated by spaces
-    r"|\b[0-9a-fA-F]{12}\b"  # MAC without separators
+    # a MAC in any separator style (octets or Cisco-style quads), then ANY run of 12+ hex digits
+    f"{_NOT_HEX_BEFORE}(?:{_HEX}{{2}}{_SEP}){{5}}{_HEX}{{2}}{_NOT_HEX_AFTER}"
+    f"|{_NOT_HEX_BEFORE}(?:{_HEX}{{4}}{_SEP}){{2}}{_HEX}{{4}}{_NOT_HEX_AFTER}"
+    f"|{_NOT_HEX_BEFORE}{_HEX}{{12,}}{_NOT_HEX_AFTER}"
     r"|(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}"  # IPv6
     r"|\d+(?:\.\d+)?\s*(?:[KMGTP]i?B|bytes?)\b"  # byte counts
     r"|[\w-]+(?:\.[\w-]+)+"  # IPv4, domains and any dotted name
@@ -64,10 +68,11 @@ class Publisher(Protocol):
 
 
 def scrub_label(raw: object) -> str:
+    """Normalise FIRST (NFKC, control characters and every whitespace run become one space), then
+    redact on the normalised text, so a spacing trick cannot slip past a pattern and reappear."""
     text = unicodedata.normalize("NFKC", str(raw)[:PRE_CUT]).translate(_DOTS)[:PRE_CUT]
-    text = _CONTROL.sub(" ", text)
-    text = _SENSITIVE.sub(REDACTED, text)
-    text = " ".join(text.split())[:MAX_LABEL].strip()
+    text = " ".join(_CONTROL.sub(" ", text).split())
+    text = " ".join(_SENSITIVE.sub(REDACTED, text).split())[:MAX_LABEL].strip()
     return text or "device"
 
 

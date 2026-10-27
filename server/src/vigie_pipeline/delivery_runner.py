@@ -21,6 +21,7 @@ import logging
 import math
 import sqlite3
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -150,6 +151,13 @@ def _prune() -> None:
         del _ABANDONED[worker]
 
 
+def busy_deliveries() -> frozenset[str]:
+    """delivery_ids that still have a live abandoned worker."""
+    with _ABANDONED_LOCK:
+        _prune()
+        return frozenset(_ABANDONED.values())
+
+
 def abandoned_count() -> int:
     """Abandoned publish workers still running (finished ones are dropped here)."""
     with _ABANDONED_LOCK:
@@ -239,24 +247,20 @@ def _publish(publisher: Publisher, message: Message, seconds: float, slot: _Slot
     return "sent"
 
 
-def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> tuple[bool, float]:
-    """(recorded, the clock read of the completion)"""
+def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> bool:
     with immediate(inv):
         now = clock()
         if ok:
             sql, params = COMPLETE_SENT, completion_params(claimed, now)
         else:
             sql, params = failure_statement(claimed, now, config)
-        return inv.execute(sql, params).rowcount == 1, now
+        return inv.execute(sql, params).rowcount == 1
 
 
-def _send_one(
-    inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot
-) -> tuple[str, float | None]:
-    """(outcome, the last clock read, None when nothing was claimed)"""
+def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot: _Slot) -> str:
     taken = _claim(inv, row, config, clock)
     if taken is None:
-        return "skipped", None
+        return "skipped"
     claimed, stamp = taken
     message = _message(inv, ro, claimed)
     outcome = "failed"
@@ -266,40 +270,44 @@ def _send_one(
         outcome = "aborted"
     else:
         outcome = _publish(publisher, message, config.transmit_deadline_seconds, slot)
-    recorded, ended = _complete(inv, claimed, outcome == "sent", config, clock)
-    if not recorded:
+    if not _complete(inv, claimed, outcome == "sent", config, clock):
         log(logger, logging.WARNING, "delivery_completion_lost", row_id=claimed.row_id)
-        return "lost", ended
-    return outcome, ended
+        return "lost"
+    return outcome
 
 
-def _due(inv, now: float, config: DeliveryConfig, limit: int) -> list[DeliveryView]:
+def _due(
+    inv, now: float, config: DeliveryConfig, limit: int, busy: frozenset[str] = frozenset()
+) -> list[DeliveryView]:
+    """Due pending rows, oldest first. Busy deliveries are excluded BEFORE the LIMIT, so a row
+    that owns a hung worker can never starve the others (the list is bounded by max_abandoned)."""
+    skip = ",".join("?" * len(busy))
     rows = inv.execute(
         f"SELECT {_ROW} FROM incident_deliveries WHERE state='pending' AND next_attempt_at<=?"  # noqa: S608
-        " AND attempts<? ORDER BY next_attempt_at,row_id LIMIT ?",
-        (tick_floor(now), config.max_attempts, limit),
+        f" AND attempts<?{f' AND delivery_id NOT IN ({skip})' if busy else ''}"
+        " ORDER BY next_attempt_at,row_id LIMIT ?",
+        (tick_floor(now), config.max_attempts, *sorted(busy), limit),
     )
     return [_delivery(r) for r in rows.fetchall()]
 
 
-def _drain(inv, ro, publisher, rows, config, clock, start, max_abandoned, budget) -> Counter:
+def _drain(inv, ro, publisher, rows, config, clock, monotonic, max_abandoned, budget) -> Counter:
     counts: Counter[str] = Counter()
-    last = start
+    started = monotonic()
     for row in rows:
-        if last - start >= budget:
+        if monotonic() - started >= budget:  # before EVERY claim attempt, skipped ones included
             log(logger, logging.WARNING, "delivery_drain_budget_spent", budget=budget)
             break  # nothing more is claimed: the pipeline pass must stay short
         slot = _reserve(max_abandoned, delivery_id(row.incident_id, row.kind))
         if slot is None:
             break  # reserved BEFORE the claim, so a dead transport burns no attempts
         if slot is _BUSY:
-            continue  # a live abandoned worker still holds this very delivery
+            continue  # a worker started since the SELECT still holds this very delivery
         try:
-            outcome, ended = _send_one(inv, ro, publisher, row, config, clock, slot)
+            outcome = _send_one(inv, ro, publisher, row, config, clock, slot)
         finally:
             _release(slot)
         counts[outcome] += 1
-        last = last if ended is None else ended
         if outcome == "timeout":
             break  # the transport is wedged: do not strand more worker threads this run
     return counts
@@ -315,8 +323,10 @@ def run_delivery(
     max_per_run: int = DEFAULT_MAX_PER_RUN,
     max_abandoned: int = DEFAULT_MAX_ABANDONED,
     drain_budget_seconds: float = DEFAULT_DRAIN_BUDGET,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> RunReport:
-    """`overrides` is the READ-ONLY decision store connection (None: unavailable)."""
+    """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
+    the database; `monotonic` (never steps back) measures the drain budget."""
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
     try:
@@ -324,9 +334,17 @@ def run_delivery(
     except DecisionsUnavailable as exc:
         log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
         return RunReport(skipped="decisions_unavailable")
-    rows = _due(inv, now, config, max_per_run)
+    rows = _due(inv, now, config, max_per_run, busy_deliveries())
     counts = _drain(
-        inv, overrides, publisher, rows, config, clock, now, max_abandoned, drain_budget_seconds
+        inv,
+        overrides,
+        publisher,
+        rows,
+        config,
+        clock,
+        monotonic,
+        max_abandoned,
+        drain_budget_seconds,
     )
     return RunReport(
         planned=planned,

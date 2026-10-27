@@ -463,27 +463,66 @@ def test_no_publish_for_a_delivery_with_a_live_worker(world):
 
 
 class Ticking(FakePublisher):
-    """Every publish takes `step` seconds of the injected clock."""
+    """Every publish takes `step` seconds of the monotonic clock while the WALL clock goes back."""
 
-    def __init__(self, clock, step):
+    def __init__(self, mono, wall, step):
         super().__init__()
-        self.clock, self.step = clock, step
+        self.mono, self.wall, self.step = mono, wall, step
 
     def publish(self, message, *, timeout_seconds):
-        self.clock.t += self.step
+        self.mono.t += self.step
+        self.wall.t -= self.step
         super().publish(message, timeout_seconds=timeout_seconds)
 
 
-def test_drain_budget_stops_claiming_and_burns_no_attempts(world):
+def test_drain_budget_uses_the_monotonic_clock_not_the_wall_clock(world):
     for i in range(5):
         world.incident(f"i{i}")
-    clock = Clock()
-    pub = Ticking(clock, 40)
-    report = go(world, pub, clock, drain_budget_seconds=60)
-    assert report.sent == 2  # 40 s spent < 60: second row; 80 s spent: stop
-    attempts = sorted(r["attempts"] for r in world.rows())
-    assert attempts == [0, 0, 0, 1, 1]
-    assert go(world, pub, clock, drain_budget_seconds=60).sent == 2  # rest next run
+    go(world, FakePublisher(), Clock(T0), max_per_run=0)  # plan only: rows are due at T0
+    wall, mono = Clock(T0 + 5000), Clock(0)
+    pub = Ticking(mono, wall, 40)
+    report = go(world, pub, wall, drain_budget_seconds=60, monotonic=mono)
+    assert report.sent == 2  # 40 s spent < 60: second row; 80 s spent: stop (wall went backwards)
+    assert sorted(r["attempts"] for r in world.rows()) == [0, 0, 0, 1, 1]
+    assert go(world, pub, wall, drain_budget_seconds=60, monotonic=mono).sent == 2
+
+
+def test_time_spent_on_skipped_candidates_counts(world, monkeypatch):
+    for i in range(4):
+        world.incident(f"i{i}")
+    rows = _due_rows(world)
+    monkeypatch.setattr(delivery_runner, "_due", lambda *a, **k: rows)
+    claims = []
+    real = delivery_runner._claim
+
+    def spy(*a, **k):
+        claims.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(delivery_runner, "_claim", spy)
+    ticks = iter(range(0, 10_000, 30))  # every monotonic read costs 30 s
+    go(world, FakePublisher(), Clock(), drain_budget_seconds=60, monotonic=lambda: next(ticks))
+    assert len(claims) == 1  # start 0, first check 30 (claims), second check 60 >= 60: stop
+
+
+def _due_rows(world):
+    go(world, FakePublisher(), Clock(), max_per_run=0)  # plan only
+    cur = world.inv.execute(
+        "SELECT row_id,incident_id,kind,state,attempts,next_attempt_at,created_at,updated_at,"
+        "version FROM incident_deliveries ORDER BY row_id"
+    )
+    return [delivery_runner._delivery(r) for r in cur.fetchall()]
+
+
+def test_a_busy_first_row_does_not_starve_the_others(world):
+    world.incident("a")
+    gates, pub = _hang_forever(1)
+    go(world, pub, Clock(), max_per_run=1, max_abandoned=2)  # a hangs and is abandoned
+    world.incident("b", at=T0 + 3000)
+    clock = Clock(T0 + 4000)  # a is due again and first by order, but its worker is alive
+    report = go(world, pub, clock, max_per_run=1, max_abandoned=2)
+    assert report.sent == 1 and [m.link for m in pub.sent] == ["/ui/#incident=b"]
+    gates[0].set()
 
 
 def test_budget_smaller_than_one_deadline_is_refused(world):

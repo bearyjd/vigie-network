@@ -374,3 +374,40 @@ def test_every_line_carries_the_delivery_id(tmp_path):
     path = tmp_path / "o.jsonl"
     FilePublisher(path).publish(_msg(7), timeout_seconds=1)
     assert json.loads(path.read_text())["delivery_id"] == f"{7:032d}"
+
+
+import re  # noqa: E402
+
+MAC_FORMS = [
+    "TV_aabbccddeeff", "aabbccddeeff_TV", "TV AA  BB  CC  DD  EE  FF", "aa:bb-cc.dd_ee ff",
+    "AA\tBB\nCC\u00a0DD  EE\u3000FF", "aabb.ccdd.eeff", "x aabbccddeeff0 x",  # 13 hex digits
+    "0123456789abcdef0123", "aabbccddeeff", "AA:BB:CC:DD:EE:FF",
+]  # fmt: skip
+
+
+def _hex_run(text):
+    return re.search(
+        r"[0-9a-f]{12}", re.sub(r"[^0-9a-f]", "", text.lower().replace("[redacted]", ""))
+    )
+
+
+@pytest.mark.parametrize("hostile", MAC_FORMS)
+def test_mac_forms_are_redacted_and_scrubbing_is_idempotent(hostile):
+    from vigie_pipeline.delivery_publish import scrub_label
+
+    out = scrub_label(f"Kid {hostile} tab")
+    assert "redacted" in out and not _hex_run(out)
+    assert scrub_label(out) == out
+
+
+def test_eleven_hex_digits_are_not_a_mac():
+    from vigie_pipeline.delivery_publish import scrub_label
+
+    assert scrub_label("room aabbccddeef") == "room aabbccddeef"
+
+
+@pytest.mark.parametrize("label", ["Living room TV", "Pi-hole 2", "Kid tablet", "Anna's phone"])
+def test_ordinary_labels_survive_and_are_stable(label):
+    from vigie_pipeline.delivery_publish import scrub_label
+
+    assert scrub_label(label) == label
