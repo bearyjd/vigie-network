@@ -9,6 +9,7 @@ or a size, strips control characters and bounds every length. There is no networ
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -127,6 +128,9 @@ class FilePublisher:
             os.close(fd)
 
     def _append(self, fd: int, line: bytes) -> None:
+        """Capacity check and write in ONE exclusive flock section (across instances and
+        processes). Whatever fails after a partial write, the file is cut back to its old size."""
+        fcntl.flock(fd, fcntl.LOCK_EX)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise PublishError("delivery file is not a regular file")
@@ -134,6 +138,17 @@ class FilePublisher:
             raise PublishError(f"delivery file is full (limit {self._max} bytes)")
         if stat.S_IMODE(info.st_mode) != 0o600:
             os.fchmod(fd, 0o600)
-        if os.write(fd, line) != len(line):
-            raise PublishError("short write to delivery file")
-        os.fsync(fd)
+        try:
+            pending = memoryview(line)
+            while pending:
+                written = os.write(fd, pending)
+                if written <= 0:
+                    raise OSError("write made no progress")
+                pending = pending[written:]
+            os.fsync(fd)
+        except BaseException:
+            try:
+                os.ftruncate(fd, info.st_size)
+            except OSError:
+                pass  # the original failure is what the caller must see
+            raise
