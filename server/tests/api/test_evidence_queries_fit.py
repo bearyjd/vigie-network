@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
 from evidence_helpers import SALT_A, sample, section
 
 from vigie_api import evidence_export
-from vigie_api.evidence_redact import build_queries, redact
+from vigie_api.evidence_redact import redact
 from vigie_api.evidence_render import fit
-from vigie_api.evidence_types import Pack, Sensitive
+from vigie_api.evidence_types import Pack, Sensitive, UnredactedError
 
 QUERY_FRAGMENT = re.compile(r"^DHCP parameter request list (.+)$")
 
@@ -60,7 +61,24 @@ def test_export_queries_only_cover_fingerprints_that_survived_size_fitting(monke
     assert len(fragments) <= min(len(kept_lists), 12)
 
 
-def test_queries_for_the_full_pack_are_unchanged_when_nothing_is_dropped():
+def test_fit_leaves_queries_alone_when_nothing_needs_cutting():
+    calls = []
+    body = {**redact(sample(), "pseudonymized", SALT_A).body, "search_queries": [{"q": "x"}]}
+    out, _ = fit(Pack(body, redacted=True), "json", requery=lambda p: calls.append(p) or [])
+    assert calls == [] and out.body["search_queries"] == [{"q": "x"}]
+
+
+def test_redaction_keeps_every_section_item_in_order_and_count():
     pack = sample()
-    redacted = redact(pack, "pseudonymized", SALT_A)
-    assert redacted.body["search_queries"] == build_queries(pack.body, "pseudonymized")
+    redacted = redact(pack, "minimal", SALT_A)
+    for sid, sec in pack.body["sections"].items():
+        assert len(redacted.body["sections"][sid]["items"]) == len(sec["items"])
+
+
+def test_requery_refuses_misaligned_sections(monkeypatch):
+    raw = sample()
+    bare = {**raw.body["sections"], "identity": section([Sensitive("mac", "aa:bb:cc:00:11:22")])}
+    raw = Pack({**raw.body, "sections": bare})
+    build = evidence_export._requery(raw, "pseudonymized")
+    with pytest.raises(UnredactedError):
+        build(redact(sample(), "pseudonymized", SALT_A))

@@ -20,6 +20,7 @@ from vigie_api.evidence_types import (
     MEDIA_TYPE_MARKDOWN,
     SCHEMA_VERSION,
     Pack,
+    UnredactedError,
 )
 
 
@@ -29,10 +30,13 @@ def _requery(raw: Pack, level: str) -> Callable[[Pack], list[dict[str, Any]]]:
     Redaction keeps item order and count, so the first N raw items are the N retained ones."""
 
     def build(fitted: Pack) -> list[dict[str, Any]]:
-        sections = {
-            sid: {**sec, "items": sec["items"][: len(fitted.body["sections"][sid]["items"])]}
-            for sid, sec in raw.body["sections"].items()
-        }
+        sections = {}
+        for sid, sec in raw.body["sections"].items():
+            kept = fitted.body["sections"].get(sid)
+            if kept is None or not all(isinstance(item, dict) for item in sec["items"]):
+                # a dropped section or a bare leaf would misalign raw vs redacted items
+                raise UnredactedError(f"section {sid} is not index-aligned after redaction")
+            sections[sid] = {**sec, "items": sec["items"][: len(kept["items"])]}
         return build_queries({**raw.body, "sections": sections}, level)
 
     return build
