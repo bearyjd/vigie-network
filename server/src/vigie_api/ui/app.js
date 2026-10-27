@@ -1,14 +1,28 @@
 import {ApiClient, ApiError, StaleResult} from './client.js';
-import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, utc} from './views.js';
+import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc} from './views.js';
 
 const byId = id => document.getElementById(id);
 const client = new ApiClient();
-const state = {connected: false, collector: '', hours: 24, view: 'overview', selectedDevice: null, selectedIncident: null, cursors: [null], page: 0, next: null, generation: 0, loading: false, updated: null};
+const state = {connected: false, collector: '', hours: 24, view: 'overview', selectedDevice: null, selectedIncident: null, cursors: [null], page: 0, next: null, generation: 0, loading: false, updated: null, coverage: {phase: 'loading'}};
 let timer = null;
 const titles = {overview: 'Overview', inventory: 'Inventory', activity: 'Activity', incidents: 'Incidents'};
 const preview = new URLSearchParams(location.search).get('preview') === 'synthetic';
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
+const FILTER_HASH = /^#filter=(all|attention|quiet)$/;  // anchored: anything else means 'all'
+// The inbox filter is view state only: it lives in the URL hash, never in storage and never in a request.
+const inboxFilter = () => FILTER_HASH.exec(location.hash)?.[1] ?? 'all';
+function setBanner() {
+  const box = byId('coverage-banner'); box.hidden = !state.connected;
+  try {
+    const status = coverageStatus(state.coverage, Date.now());
+    if (box.textContent === status.text && box.getAttribute('data-tone') === status.tone) return;  // an unchanged live region stays quiet
+    box.setAttribute('data-tone', status.tone); box.textContent = status.text;
+  } catch {  // a banner that cannot be computed or painted must never keep an old, possibly green, state
+    box.textContent = 'Unavailable · coverage status could not be computed';
+    try { box.setAttribute('data-tone', 'error'); } catch { /* the text above already says it */ }
+  }
+}
 function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
 // Which control inside #content holds focus. Controls carry a stable data-focus-key (kind + id);
 // text and rank are only the fallback for unkeyed controls, so a re-render that changes a label
@@ -48,7 +62,7 @@ function chrome() {
   byId('connect-panel').hidden = state.connected; byId('workspace').hidden = !state.connected; byId('disconnect').hidden = !state.connected;
   byId('connection-state').textContent = state.connected ? 'Connected · read-only view' : 'Disconnected';
   document.querySelectorAll('nav button[data-view]').forEach(button => { button.disabled = !state.connected; if (button.dataset.view === state.view && state.connected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
-  byId('view-title').textContent = titles[state.view];
+  byId('view-title').textContent = titles[state.view]; setBanner();
   byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
   byId('refresh').setAttribute('aria-disabled', String(state.loading || Date.now() < client.retryAt));
   byId('content').setAttribute('aria-busy', String(state.loading));
@@ -58,11 +72,12 @@ function chrome() {
 }
 function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false, null, true), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
 function disconnected(message = '') {
-  client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.selectedDevice = null; state.selectedIncident = null; resetPage(); clearTimeout(timer);
+  client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; resetPage(); clearTimeout(timer);
   byId('token').value = ''; byId('content').replaceChildren(); byId('collector').value = ''; chrome(); notice(message); byId('token').focus();
 }
 function selectDevice(id) { state.selectedDevice = id; load(true, '[aria-label="Identity detail"]'); }
 function activity(id) { state.selectedDevice = id; navigate('activity'); }
+function setInboxFilter(name) { location.hash = `#filter=${name}`; }
 function selectIncident(id) { state.selectedIncident = id; load(true, '[aria-label="Incident evidence"]'); }
 function page(direction) {
   if (direction > 0 && state.next) { state.cursors[state.page + 1] = state.next; state.page++; }
@@ -87,9 +102,12 @@ async function load(clear = false, focus = null, automatic = false) {
   if (document.hidden) return;
   if (clear) (focus === '#view-title' ? byId('view-title') : byId('content')).focus({preventScroll: true});
   const focusAnchor = document.activeElement;
+  let banner = null;  // coverage for non-overview views; it never rejects
   try {
-    const cursor = state.cursors[state.page]; let content; let next = null;
-    if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
+    const cursor = state.cursors[state.page]; let content; let next = null; let coverage = null;
+    // Other views still fetch coverage (same endpoint) so the banner is never absent; its failure never fails the view.
+    banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
+    if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); coverage = {phase: 'ready', data: result.data}; if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
     if (state.view === 'inventory') {
       const [list, detail] = await Promise.all([client.devices(cursor), state.selectedDevice ? client.device(state.selectedDevice) : Promise.resolve(null)]);
       next = list.page?.next_cursor || null;
@@ -103,28 +121,34 @@ async function load(clear = false, focus = null, automatic = false) {
     if (state.view === 'incidents') {
       const [list, detail] = await Promise.all([client.incidents(state.collector, cursor), state.selectedIncident ? client.incident(state.selectedIncident, state.collector) : Promise.resolve(null)]);
       next = list.page?.next_cursor || null;
-      content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident), pager(state.page, list.data.length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
+      content = node('div', {}, node('div', {class: 'callout'}, 'Incidents describe unusual observations. An empty list does not establish normality or healthy coverage.'), node('div', {class: 'split'}, node('section', {}, heading('Retained observations', 'Collector-scoped evidence'), incidentsView(list.data, selectIncident, {filter: inboxFilter(), onFilter: setInboxFilter}), pager(state.page, inboxRows(list.data, inboxFilter()).length, next, page)), detail ? incidentView(detail.data, activity) : empty('Read the evidence', 'Select an incident to inspect observed values, thresholds, coverage requirements and model provenance.')));
     }
     if (generation !== state.generation || !state.connected) return;
-    if (automatic && interacting()) return;
+    const snapshot = coverage ?? await banner;  // settle first: an obsolete load must not touch shared state
+    if (generation !== state.generation || !state.connected) return;
+    state.coverage = snapshot;
+    if (automatic && interacting()) return;  // checked after the LAST await: the user may have started using the content meanwhile
     const held = focusedInContent();
     state.next = next; state.updated = Date.now() / 1000; byId('content').replaceChildren(content); notice(); restoreContentFocus(held);
     if (focus && document.activeElement === focusAnchor) document.querySelector(focus)?.focus({preventScroll: true});
   } catch (error) {
     if (generation !== state.generation || error instanceof StaleResult || error.name === 'AbortError') return;
+    const snapshot = state.view === 'overview' ? {phase: 'error'} : await (banner ?? Promise.resolve({phase: 'error'}));
+    if (generation !== state.generation) return;
+    state.coverage = snapshot;
     failure(error instanceof ApiError ? error : new ApiError(0, 'malformed_response'));
-  } finally { if (generation === state.generation) { state.loading = false; chrome(); schedule(); } }
+  } finally { if (generation === state.generation) { state.loading = false; try { chrome(); } finally { schedule(); } } }
 }
 byId('connect-form').addEventListener('submit', event => {
   event.preventDefault(); const token = byId('token').value.trim(); const collector = byId('connect-collector').value.trim(); byId('token').value = '';
   if (!token || !collector || collector.length > 64) { notice('Enter a collector ID and a dedicated read-only token.'); return; }
-  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
+  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
   catch { disconnected('The connection inputs were invalid.'); }
 });
 byId('scope-form').addEventListener('submit', event => {
   event.preventDefault(); const collector = byId('collector').value.trim(); const hours = Number(byId('range').value);
   if (!collector || collector.length > 64 || ![24, 168].includes(hours)) { notice('Enter a collector ID and select a supported history range.'); return; }
-  state.collector = collector; state.hours = hours; state.selectedIncident = null; resetPage(); load(true, '#view-title');
+  state.collector = collector; state.hours = hours; state.selectedIncident = null; state.coverage = {phase: 'loading'}; resetPage(); load(true, '#view-title');
 });
 byId('disconnect').addEventListener('click', () => disconnected());
 byId('refresh').addEventListener('click', () => { if (!state.loading && Date.now() >= client.retryAt) load(false); });
@@ -132,6 +156,7 @@ document.querySelectorAll('nav button[data-view]').forEach(button => button.addE
 byId('content').addEventListener('focusin', chrome);
 byId('content').addEventListener('focusout', () => queueMicrotask(chrome));
 document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (document.hidden) { client.invalidate(); state.generation++; state.loading = false; chrome(); } else if (state.connected) load(false, null, true); });
+window.addEventListener('hashchange', () => { if (state.connected && state.view === 'incidents') load(false); });
 window.addEventListener('pagehide', () => disconnected());
 chrome();
 setInterval(() => { if (state.connected) chrome(); }, 5000);
