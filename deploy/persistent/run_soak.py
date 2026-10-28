@@ -434,6 +434,44 @@ def collect(config):
     return result
 
 
+INGEST_UNBOUND = "ingest_address_unbound"
+
+
+def local_ipv4_addresses() -> frozenset[str]:
+    """IPv4 addresses currently assigned to this host (Linux fib_trie LOCAL entries)."""
+    found = set()
+    current = None
+    for line in Path("/proc/net/fib_trie").read_text().splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "|--":
+            current = parts[1]
+        elif current and parts[-2:] == ["host", "LOCAL"]:
+            found.add(current)
+    return frozenset(found)
+
+
+def ingest_address_issue(address: str | None, lookup=None) -> str | None:
+    """Return the failure reason when the configured ingest address is not bound locally."""
+    if address is None:
+        return None
+    present = (lookup or local_ipv4_addresses)()
+    return None if address in present else INGEST_UNBOUND
+
+
+def unbound_report(samples: list) -> dict:
+    report = (
+        assess(samples, mode="real")
+        if samples
+        else {
+            "status": "fail",
+            "evidence_mode": "real",
+            "reasons": [],
+        }
+    )
+    reasons = sorted({*report["reasons"], INGEST_UNBOUND})
+    return dict(report, status="fail", reasons=reasons)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
@@ -453,9 +491,10 @@ def main():
         "meter_sha256",
         "router_address",
     }
+    optional = {"ingest_address"}
     if (
         not isinstance(config, dict)
-        or set(config) != required
+        or not required <= set(config) <= required | optional
         or type(config["api_port"]) is not int
         or not 1024 <= config["api_port"] <= 65535
     ):
@@ -472,6 +511,14 @@ def main():
     address = ipaddress.IPv4Address(config["router_address"])
     if address.is_unspecified or address.is_loopback or address.is_multicast:
         raise ValueError("invalid router address")
+    ingest = config.get("ingest_address")
+    if ingest is not None:
+        # Literal, concrete IPv4 only: the address the ingest container is published on.
+        if not isinstance(ingest, str) or ipaddress.IPv4Address(ingest).is_unspecified:
+            raise ValueError("invalid ingest address")
+    if ingest_address_issue(ingest):
+        print(json.dumps(unbound_report([])))
+        return 1
     first = collect(config)
     failures, missing, quality = sample_issues(first)
     if args.preflight:
@@ -498,6 +545,9 @@ def main():
                     break
                 next_time = journal.samples[-1]["monotonic"] + CADENCE_SECONDS
                 time.sleep(max(0, next_time - time.monotonic()))
+                if ingest_address_issue(ingest):
+                    report = unbound_report(journal.samples)
+                    break
                 journal.append(collect(config))
         except KeyboardInterrupt:
             report = assess(journal.samples, mode="real")

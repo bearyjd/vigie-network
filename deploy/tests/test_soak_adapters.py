@@ -625,5 +625,116 @@ class ProcessingBacklogContract(unittest.TestCase):
         self.assertEqual(result["processing_backlog_reference_wall"], 1039)
 
 
+HEALTHY_SAMPLE = {
+    "wall": 1800000000,
+    "monotonic": 1000,
+    "boottime": 2000,
+    "host_boot_id": "host",
+    "router_boot_id": "router",
+    "collector_start": 10,
+    "helper_start": 20,
+    "collector_rss_kib": 1700,
+    "helper_rss_kib": 1000,
+    "mem_available_kib": 200000,
+    "log_used_kib": 100,
+    "log_capacity_kib": 20480,
+    "collector_cpu_ticks": 0,
+    "total_cpu_ticks": 100,
+    "logical_cpus": 2,
+    "freshness_s": 30,
+    "backlog_batches": 0,
+    "dropped_batches": 0,
+    "source_flags": 0,
+    "dns_log_quiet": False,
+    "ct_unmapped_flows": 0,
+    "ct_unmapped_bytes": 0,
+    "dns_probe_ok": True,
+    "dns_parsed_age_s": 30,
+    "processing_backlog_age_s": 0,
+    "processing_backlog_reference_wall": 1800000000,
+    "oldest_pending_received_at": None,
+    "backlog_capped": False,
+}
+
+
+class IngestAddressPrecheckTests(unittest.TestCase):
+    ADDRESS = "192.0.2.10"
+
+    def test_precheck_passes_when_address_is_on_a_local_interface(self):
+        def lookup():
+            return frozenset({"127.0.0.1", self.ADDRESS})
+
+        self.assertIsNone(runner.ingest_address_issue(self.ADDRESS, lookup))
+
+    def test_precheck_fails_with_distinct_reason_when_address_is_absent(self):
+        def lookup():
+            return frozenset({"127.0.0.1", "198.51.100.7"})
+
+        self.assertEqual(
+            runner.ingest_address_issue(self.ADDRESS, lookup), "ingest_address_unbound"
+        )
+
+    def test_precheck_is_skipped_when_no_ingest_address_is_configured(self):
+        def lookup():
+            raise AssertionError("must not look up interfaces")
+
+        self.assertIsNone(runner.ingest_address_issue(None, lookup))
+
+    def run_main(self, bound_answers):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = {
+                "api_port": 18444,
+                "api_token_file": "/unused",
+                "api_ca_file": "/unused",
+                "collector_id": "test",
+                "meter_executable": "/unused",
+                "meter_sha256": "a" * 64,
+                "router_address": "192.0.2.1",
+                "ingest_address": self.ADDRESS,
+            }
+            config_path = base / "config"
+            config_path.write_bytes(json.dumps(config).encode())
+            config_path.chmod(0o600)
+            answers = iter(bound_answers)
+            lookups = []
+
+            def lookup():
+                lookups.append(1)
+                return frozenset({self.ADDRESS} if next(answers) else set())
+
+            out = io.StringIO()
+            with (
+                patch.object(
+                    sys, "argv", ["run_soak", str(config_path), str(base / "journal")]
+                ),
+                patch.object(runner, "local_ipv4_addresses", lookup),
+                patch.object(runner, "collect", return_value=dict(HEALTHY_SAMPLE)),
+                patch.object(runner.time, "sleep"),
+                redirect_stdout(out),
+            ):
+                code = runner.main()
+            return code, json.loads(out.getvalue()), len(lookups), base
+
+    def test_start_aborts_before_collecting_when_address_is_unbound(self):
+        code, report, lookups, base = self.run_main([False])
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["reasons"], ["ingest_address_unbound"])
+        self.assertEqual(lookups, 1)
+        self.assertFalse((base / "journal").exists())
+
+    def test_periodic_check_aborts_run_when_address_disappears(self):
+        code, report, lookups, _ = self.run_main([True, False])
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "fail")
+        self.assertIn("ingest_address_unbound", report["reasons"])
+        self.assertEqual(lookups, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
