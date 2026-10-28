@@ -19,8 +19,8 @@ Neither repository holds private household information. Examples here use placeh
 
 They should support each other and respect each other:
 
-1. **Authority stays put.** Vigie never changes the router and never causes enforcement. couvre-feu never edits Vigie's identity data.
-2. **Neither needs the other to do its own job.** If Vigie is down, enforcement is unchanged. If couvre-feu is down, Vigie keeps collecting and queues what it would have shared.
+1. **Authority stays put.** Vigie never changes enforcement or couvre-feu's router objects, and never causes enforcement. couvre-feu never edits Vigie's identity data.
+2. **Neither needs the other to do its own job.** If Vigie is down, enforcement is unchanged. If couvre-feu is down, Vigie keeps collecting, and its events stay available to pull once couvre-feu returns.
 3. **Humans decide in one place.** Suggestions from Vigie are approved by a parent in couvre-feu, never applied automatically.
 4. **Share the minimum.** Labels, MAC sets, device types and events only. No DNS names, no raw logs, no secrets.
 5. **Nothing private lives in git**, in either repo.
@@ -64,7 +64,7 @@ Proposal: couvre-feu's inventory stays the *ledger of who is on the LAN and who 
 
 ## 5. Coverage-gap detection (the shared value)
 
-Vigie compares couvre-feu's coverage report with its own inventory and emits events:
+Vigie compares couvre-feu's coverage report with its own inventory and emits events. ("Coverage" here means which MACs are enforced. It is unrelated to the existing `coverage` data in `api/openapi.yaml`, which describes collector data coverage.)
 
 - `coverage_gap_new_mac`: a device assigned to person P shows a MAC outside P's enforced set (for example a private-address rotation). High severity for child-owned devices.
 - `unassigned_device`: a device with no owner is active on the LAN.
@@ -77,7 +77,7 @@ Vigie already authenticates API callers with bearer tokens, including integratio
 
 | Option | How | Cost |
 |---|---|---|
-| **A. couvre-feu pulls and pushes** | A small outbound-only client in couvre-feu reads Vigie's devices and events, and posts the coverage report, using a Vigie integration token | Adds outbound HTTP and a secret to an enforcement service. Could sit behind a flag like its other new features. |
+| **A. couvre-feu pulls and pushes** | A small outbound-only client in couvre-feu reads Vigie's devices and events, and posts the coverage report, using a Vigie token | Adds outbound HTTP and a secret to an enforcement service. Could sit behind a flag like its other new features. Vigie's `integration` and `read-only` tokens get `403` on writes today (`docs/api.md`), so the coverage endpoint also needs a new, narrowly scoped write permission on Vigie. |
 | **B. Vigie pulls an export** | couvre-feu exposes a read-only, token-protected export of assignments and enforced MAC sets | Adds an inbound machine-auth endpoint to couvre-feu. Vigie then initiates calls, which rev 1 avoided. |
 | **C. File handoff** | couvre-feu writes a read-only snapshot file that Vigie reads from a shared location | No new network surface, but needs a shared location and has no freshness guarantee beyond the file time. |
 
@@ -91,7 +91,7 @@ Rev 1 listed these. Status today needs re-verifying in phase I1.
 |---|---|---|
 | C1 | The collector's dnsmasq logging drop-in (`log-queries=extra`, `log-dhcp`) and the dnsmasq restart it implies, against couvre-feu's "never change dnsmasq" rule | **Still open.** The drop-in is still the collector's design. Decision D2. Until decided, do not enable it on the shared router. |
 | C2 | Vigie docs suggesting force-DNS or DoH-block rules that couvre-feu already owns | Re-verify. Vigie should only detect DoH bypass, never enforce. |
-| C3 | A cron watchdog editing root's crontab, which couvre-feu journals | Likely addressed by the supervised wrapper; re-verify no cron edit remains. |
+| C3 | A cron watchdog editing root's crontab, which couvre-feu journals | **Still open.** The collector's init script and `vigie-log-watchdog.sh` document a root cron job (`collector/agent/deploy/vigie-collector.init:15`, `collector/agent/deploy/vigie-log-watchdog.sh:2`). Replace it with a supervised loop that touches no crontab, or agree an exception with couvre-feu's owner. |
 | C4 | Naming collisions | Router objects use only `vigie_*`, `/etc/vigie`, `/tmp/vigie`; never `cf_`, `cf2_`, `cf:v1`, `cf_sched_`. Add a static check. |
 | C5 | Operator SSH sessions and couvre-feu's SSH guard | Document: Vigie install commands do not invoke `cfctl`. |
 | C6 | Vigie `groups` mistaken for enforcement | Document as advisory UI zones. |
@@ -99,7 +99,7 @@ Rev 1 listed these. Status today needs re-verifying in phase I1.
 ## 8. Failure behaviour and privacy
 
 - Vigie down or stale: enforcement unchanged; couvre-feu shows inventory age; no policy action derived from stale Vigie data.
-- couvre-feu down: Vigie keeps collecting and queues events; coverage reports stop and `coverage_report_stale` fires.
+- couvre-feu down: Vigie keeps collecting and its events stay available to pull; coverage reports stop and `coverage_report_stale` fires.
 - Disagreement (Vigie says device X has MAC m, couvre-feu's policy lacks m): never auto-resolved; it becomes an event for a human.
 - A wrong Vigie merge cannot cause enforcement, because assignment is a human action in couvre-feu, and its protected-adult and one-MAC-one-person rules remain the backstop.
 - Both systems stay inside the household network; no cloud. Tokens, pins and real identifiers live in owner-only private config outside both source trees.
@@ -111,7 +111,7 @@ Rev 1 listed these. Status today needs re-verifying in phase I1.
 |---|---|---|---|
 | **I0** | Owner | Decisions D2 to D8 (section 11) | Written answers |
 | **I1** | Vigie | Router coexistence: re-verify C1 to C6, a `dhcp_source = leases` collector mode with no dnsmasq change, the naming check | Tests, docs, review |
-| **I2** | Vigie | Integration token scope, coverage endpoint, gap events, `owner`, `unassigned` and `updated_since` filters, contract tests against the OpenAPI client | Tests, independent review |
+| **I2** | Vigie | A new narrowly scoped write permission for the coverage endpoint (integration tokens are read-only today), the endpoint, gap events, `owner`, `unassigned` and `updated_since` filters, contract tests against the OpenAPI client | Tests, independent review |
 | **I3** | couvre-feu (its own PRP) | Flagged-off Vigie client, enrichment of the inventory rows, inbox, assignment action | Its acceptance process |
 | **I4** | Both | End to end on the demo router: a rolling-MAC device owned by a child raises `coverage_gap_new_mac`, and a parent assigns the new MAC through the human path | Demo run and write-up |
 | **I5** | Both | Assisted MAC-set maintenance for rolling devices | Blocked, see below |
