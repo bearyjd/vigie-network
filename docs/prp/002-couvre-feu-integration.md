@@ -35,7 +35,7 @@ They should support each other and respect each other:
 | Receipts (**changed**) | The 128-receipt budget still exists, but the router now evicts the oldest receipt instead of failing at capacity (`docs/contracts/tier1-rpc.md`). Two older docs still say "fails closed". |
 | Reconstruction (**changed**) | A guarded, staged-generation swap is built. It is explicitly not one atomic transaction, and production remains gated on it. |
 | Scope (**changed**) | `scope-add` and `scope-remove` exist, but only as root, interactive, TTY-confirmed commands that the service cannot reach by design. Live rehearsal is pending. |
-| Device inventory (**new**) | A read-only router verb `rpc-inventory` and a service inventory with flags `new`, `private`, `unassigned`, polled every 60 s, admin-only (`/admin/inventory`). No inventory web UI yet. `GET /devices` is a demo stub. |
+| Device inventory (**new**) | A read-only router verb `rpc-inventory` and a service inventory with flags `new`, `private`, `unassigned`, polled every 60 s, admin-only (`/admin/inventory`), with an admin "Devices on the network" panel in the web app. `GET /devices` is a demo stub. |
 | Auth and network | WebAuthn passkeys, roles `admin` and `parent`. **No bearer or machine tokens and no outbound HTTP** (router access is SSH only). Loopback or private listener behind a TLS proxy. |
 | Router co-tenancy | Unchanged: it owns the `cf_*` and `cf2_*` firewall objects and `cf_sched_*` UCI sections, and edits `/etc/config/firewall`, `/etc/sysupgrade.conf` and root's crontab. `AGENTS.md`: never change dnsmasq configuration or the WAN zone. |
 | New, flagged off | Per-account flag gate, audit log, ask-for-time (service and parent card), reward time, a static DoH resolver list for kids. |
