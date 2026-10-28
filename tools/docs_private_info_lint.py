@@ -4,16 +4,27 @@ r"""Fail when tracked docs hold private household information.
 Scope: DOCS ONLY - tracked docs/**, README.md and .trail/learnings/**. Code, tests and
 fixtures elsewhere in the repo are deliberately NOT scanned. Flags private-range and
 Tailscale IPv4 addresses, MAC addresses (colon, dash and Cisco dotted forms), absolute home
-paths (/home, /var/home, /Users, C:\Users, ~name/) and an operator-supplied list of
+paths (/home, /var/home, /Users, /mnt/<drive>/Users, C:\Users, ~name/) and an operator-supplied list of
 forbidden words (env VIGIE_LINT_FORBIDDEN_WORDS, comma separated, and/or an untracked
---words-file, one word per line). CI feeds the env var from an optional repo secret the
+--words-file, one word per line; # starts a comment only at the start of a line or
+after whitespace). CI feeds the env var from an optional repo secret the
 owner adds; unset is a no-op. The shipped list is empty: never commit real names.
 
-Every diagnostic (paths, matches, error messages) has forbidden words replaced by
-`<redacted N chars>` so a public CI log never repeats them.
+Every diagnostic (paths, matches, error messages) has forbidden word substrings
+replaced by `[***]` so a public CI log never repeats them. Detection uses NFKC,
+casefold (including Turkish dotted I) and letter boundaries, including filenames
+even when content is skipped. Underscores and digits are boundaries: max matches
+max_alias_ids. Adjacent CJK/Arabic letters prevent Latin word detection. Owners
+should avoid short common words such as `or` or `files` in the forbidden list.
+Each physical line is HTML-decoded and stripped of all Unicode Cf formatting
+characters and U+034F before scanning and output redaction checks.
+Known limitation: addresses wrapped across physical lines are not detected.
+Redaction suppresses an entire line if normalized text still contains a forbidden word;
+if a forbidden word occurs in the marker, that line becomes empty.
 
 Allowlist (tools/docs_private_info_lint.allowlist): `path <exact path>` and
-`value <literal>`, each with a `# reason`. Wildcard paths are rejected.
+`value <literal>`, each with a whitespace-delimited `# reason`. A literal hash inside a
+word/path is preserved. Value entries never exempt forbidden words. Wildcard paths are rejected.
 
 Exit codes: 0 clean, 1 findings, 2 usage/IO error. Run as `python3 -I`.
 """
@@ -21,14 +32,17 @@ Exit codes: 0 clean, 1 findings, 2 usage/IO error. Run as `python3 -I`.
 from __future__ import annotations
 
 import argparse
+import html
+import inspect
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 SCOPE_GLOBS = ("docs/**", "README.md", ".trail/learnings/**")
 WORDS_ENV = "VIGIE_LINT_FORBIDDEN_WORDS"
@@ -50,11 +64,14 @@ IPV4_RE = re.compile(
     rf"(?<![A-Za-z0-9.]){_OCTET}\.{_OCTET}\.{_OCTET}\.{_OCTET}(?!\d|\.\d)"
 )
 MAC_RE = re.compile(
-    r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])"
+    r"(?<![^0-9A-Za-z][0-9A-Fa-f]{2}[:-])(?<!^[0-9A-Fa-f]{2}[:-])"
+    r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}"
+    r"[0-9A-Fa-f]{2}(?![0-9A-Fa-f]|[:-][0-9A-Fa-f])"
     r"|(?<![0-9A-Fa-f.])(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}(?![0-9A-Fa-f]|\.[0-9A-Fa-f])"
 )
+IPV6_PREFIX_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{1,4}:|[0-9A-Fa-f]{0,4}::)$")
 HOME_RE = re.compile(
-    r"(?<![\w.\-])/(?:var/home|home|Users)/\w[^\s/]*"
+    r"(?<![\w.\-/])/(?:var/home|home|Users|mnt/[A-Za-z]/Users)/[\w.][^\s/]*"
     r"|[A-Za-z]:\\Users\\[^\\\s]+"
     r"|(?<![\w/~])~[^\W\d][\w.-]*/"
 )
@@ -101,40 +118,94 @@ def _mac_matches(line: str) -> list[str]:
     return [
         m.group(0)
         for m in MAC_RE.finditer(line)
-        if not _normalize_mac(m.group(0)).startswith(ALLOWED_MAC_PREFIXES)
+        if not IPV6_PREFIX_RE.search(line, 0, m.start())
+        and not _normalize_mac(m.group(0)).startswith(ALLOWED_MAC_PREFIXES)
     ]
 
 
-def _word_matches(line: str, words: tuple[str, ...]) -> list[str]:
-    return [
-        m.group(0)
-        for w in words
-        for m in re.finditer(rf"(?<!\w){re.escape(w)}(?!\w)", line, re.IGNORECASE)
-    ]
+# Normalize each physical line independently so rendering cannot join separate lines.
+_COMMENT_RE = re.compile(r"(?<!\S)#")
 
 
-def redact(text: str, words: tuple[str, ...]) -> str:
-    """Replace every case-insensitive occurrence of any word, in one pass."""
-    if not words:
+def _render(text: str) -> str:
+    visible = "".join(
+        ch for ch in html.unescape(text)
+        if unicodedata.category(ch) != "Cf" and ch != "\u034f"
+    )
+    return unicodedata.normalize("NFKC", visible)
+
+
+def _fold(text: str) -> str:
+    return text.casefold().replace("i\u0307", "i")
+
+
+@dataclass(frozen=True)
+class WordMatcher:
+    pattern: re.Pattern[str] | None
+    redaction_pattern: re.Pattern[str] | None
+    marker: str = "[***]"
+
+    @classmethod
+    def build(cls, words: tuple[str, ...]) -> WordMatcher:
+        normalized = {rendered for w in words if (rendered := _fold(_render(w)))}
+        ordered = sorted(normalized, key=lambda w: (-len(w), w))
+        if not ordered:
+            return cls(None, None)
+        alternatives = "|".join(re.escape(w) for w in ordered)
+        redaction_pattern = re.compile(alternatives, re.IGNORECASE)
+        return cls(
+            re.compile(r"(?<![^\W\d_])(?:" + alternatives + r")(?![^\W\d_])"),
+            redaction_pattern,
+            "" if redaction_pattern.search("[***]") else "[***]",
+        )
+
+    def matches(self, text: str) -> list[str]:
+        return self.matches_rendered(_fold(_render(text)))
+
+    def matches_rendered(self, normalized: str) -> list[str]:
+        if self.pattern is None:
+            return []
+        return [m.group() for m in self.pattern.finditer(normalized)]
+
+
+def _matcher(words: tuple[str, ...] | WordMatcher) -> WordMatcher:
+    return words if isinstance(words, WordMatcher) else WordMatcher.build(words)
+
+
+def redact(text: str, words: tuple[str, ...] | WordMatcher) -> str:
+    """Redact once, then suppress lines whose normalized spelling still matches.
+
+    Case folding can change lengths, so a whole-line fallback avoids unsafe index
+    translation. If an operator forbids the marker itself, emit an empty line.
+    """
+    matcher = _matcher(words)
+    pattern = matcher.redaction_pattern
+    if pattern is None:
         return text
-    ordered = sorted(words, key=len, reverse=True)
-    pattern = re.compile("|".join(re.escape(w) for w in ordered), re.IGNORECASE)
-    return pattern.sub(lambda m: f"<redacted {len(m.group(0))} chars>", text)
+    marker = matcher.marker
+    replaced = pattern.sub(lambda _: marker, text)
+    return "\n".join(
+        marker if pattern.search(_fold(_render(line))) else line
+        for line in replaced.split("\n")
+    )
 
 
 def scan_text(
-    path: str, text: str, words: tuple[str, ...], allowed_values: frozenset[str]
+    path: str, text: str, words: tuple[str, ...] | WordMatcher, allowed_values: frozenset[str]
 ) -> list[Finding]:
     findings: list[Finding] = []
-    for number, line in enumerate(text.split("\n"), start=1):
+    matcher = _matcher(words)
+    for number, raw in enumerate(text.split("\n"), start=1):
+        line = _render(raw)
         hits = (
             [("private-ip", s) for s in _ip_matches(line)]
             + [("mac", s) for s in _mac_matches(line)]
             + [("home-path", m.group(0)) for m in HOME_RE.finditer(line)]
-            + [("forbidden-word", s) for s in _word_matches(line, words)]
+            + [("forbidden-word", s) for s in matcher.matches_rendered(_fold(line))]
         )
         findings.extend(
-            Finding(path, number, kind, s) for kind, s in hits if s not in allowed_values
+            Finding(path, number, kind, s)
+            for kind, s in hits if kind == "forbidden-word" or s not in allowed_values
         )
     return findings
 
@@ -152,7 +223,9 @@ def parse_allowlist(path: Path) -> tuple[tuple[str, ...], frozenset[str]]:
     paths: list[str] = []
     values: list[str] = []
     for number, raw in enumerate(_read_utf8(path, "allowlist").splitlines(), start=1):
-        entry, _, reason = raw.partition("#")
+        comment = _COMMENT_RE.search(raw)
+        entry = raw[:comment.start()] if comment else raw
+        reason = raw[comment.end():] if comment else ""
         if not entry.strip():
             continue
         parts = entry.split()
@@ -179,7 +252,7 @@ def _env_words() -> list[str]:
 
 
 def _file_words(text: str) -> list[str]:
-    return [ln.split("#", 1)[0].strip() for ln in text.splitlines()]
+    return [_COMMENT_RE.split(ln, maxsplit=1)[0].strip() for ln in text.splitlines()]
 
 
 def _dedupe(words: list[str]) -> tuple[str, ...]:
@@ -198,9 +271,11 @@ def best_effort_words(argv: list[str]) -> tuple[str, ...]:
     words = _env_words()
     for i, arg in enumerate(argv):
         target = None
-        if arg == "--words-file" and i + 1 < len(argv):
+        option = arg.split("=", 1)[0]
+        recognizable = option.startswith("--") and len(option) > 2 and "--words-file".startswith(option)
+        if recognizable and "=" not in arg and i + 1 < len(argv):
             target = argv[i + 1]
-        elif arg.startswith("--words-file="):
+        elif recognizable and "=" in arg:
             target = arg.split("=", 1)[1]
         if target:
             try:
@@ -233,26 +308,32 @@ def _read_scannable(path: Path) -> str | None:
 
 
 def lint_repo(
-    root: Path, words: tuple[str, ...], paths: tuple[str, ...], values: frozenset[str]
+    root: Path, words: tuple[str, ...] | WordMatcher, paths: tuple[str, ...], values: frozenset[str]
 ) -> list[Finding]:
     findings: list[Finding] = []
+    matcher = _matcher(words)
     for rel in tracked_files(root):
+        findings.extend(Finding(rel, 1, "forbidden-word", word) for word in matcher.matches(rel))
         if is_path_allowed(rel, paths):
             continue
         text = _read_scannable(root / rel)
         if text is not None:
-            findings.extend(scan_text(rel, text, words, values))
+            findings.extend(scan_text(rel, text, matcher, values))
     return findings
 
 
-def format_finding(f: Finding, words: tuple[str, ...] = ()) -> str:
+def format_finding(f: Finding, words: tuple[str, ...] | WordMatcher = ()) -> str:
     return redact(f"{f.path}:{f.line}: {f.kind}: {f.match}", words)
 
 
 class _Parser(argparse.ArgumentParser):
     """Usage errors exit 2 and never echo forbidden words."""
 
-    redact_words: tuple[str, ...] = ()
+    redact_words: tuple[str, ...] | WordMatcher = ()
+
+    def _print_message(self, message: str | None, file: TextIO | None = None) -> None:
+        if message:
+            super()._print_message(redact(message, self.redact_words), file)
 
     def error(self, message: str) -> NoReturn:
         print(redact(f"docs-private-info-lint: error: {message}", self.redact_words), file=sys.stderr)
@@ -260,8 +341,13 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main(argv: list[str]) -> int:
-    parser = _Parser(description=(__doc__ or "").split("\n", 1)[0])
-    parser.redact_words = best_effort_words(argv)
+    parser = _Parser(
+        prog="docs-private-info-lint", allow_abbrev=False,
+        description=(__doc__ or "").split("\n", 1)[0],
+        **({"color": False} if "color" in inspect.signature(argparse.ArgumentParser).parameters else {}),
+    )
+    early_words = best_effort_words(argv)
+    parser.redact_words = WordMatcher.build(early_words)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     parser.add_argument("--words-file", type=Path, default=None)
@@ -269,7 +355,10 @@ def main(argv: list[str]) -> int:
     words = parser.redact_words
     try:
         paths, values = parse_allowlist(args.allowlist)
-        words = load_words(args.words_file)
+        loaded_words = load_words(args.words_file)
+        if loaded_words != early_words:
+            # A file may change after early parsing; keep both sets safe in output.
+            words = WordMatcher.build(_dedupe([*early_words, *loaded_words]))
         findings = lint_repo(args.root, words, paths, values)
     except LintError as exc:
         print(redact(f"docs-private-info-lint: error: {exc}", words), file=sys.stderr)
@@ -277,7 +366,7 @@ def main(argv: list[str]) -> int:
     for f in findings:
         print(format_finding(f, words))
     if findings:
-        print(f"docs-private-info-lint: {len(findings)} finding(s)", file=sys.stderr)
+        print(redact(f"docs-private-info-lint: {len(findings)} finding(s)", words), file=sys.stderr)
         return 1
     return 0
 

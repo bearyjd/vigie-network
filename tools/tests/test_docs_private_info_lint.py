@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -75,7 +77,7 @@ def test_home_paths_flagged(path: str) -> None:
     assert kinds(f"cd {path}") == ["home-path"]
 
 
-def test_forbidden_words_case_insensitive_whole_word() -> None:
+def test_forbidden_words_case_insensitive_letter_boundaries() -> None:
     assert kinds("Say Zorbo hi", ("zorbo",)) == ["forbidden-word"]
     assert kinds("zorbonic", ("zorbo",)) == []
     assert kinds("Say Zorbo hi", ()) == []
@@ -282,7 +284,7 @@ def test_ipv4_found_through_markdown_emphasis_and_percent_encoding(text: str) ->
     assert kinds(text) == ["private-ip"]
 
 
-@pytest.mark.parametrize("path", ["/home/Élodie/x", "/Users/李/x", "/var/home/Zoë/"])
+@pytest.mark.parametrize("path", ["/home/Zorbö/x", "/Users/佐尔博/x", "/var/home/Quüx/"])
 def test_non_ascii_home_usernames_flagged(path: str) -> None:
     assert kinds(f"cd {path}") == ["home-path"]
 
@@ -316,8 +318,8 @@ def test_redaction_covers_path_home_path_and_overlapping_findings(tmp_path: Path
     r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "zorbo"})
     assert r.returncode == 1
     _no_leak(r)
-    assert "docs/<redacted 5 chars>.md:1: private-ip: 10.0.0.9" in r.stdout
-    assert "docs/<redacted 5 chars>.md:2: home-path: /home/<redacted 5 chars>" in r.stdout
+    assert "docs/[***].md:1: private-ip: 10.0.0.9" in r.stdout
+    assert "docs/[***].md:2: home-path: /home/[***]" in r.stdout
     assert "10.0.0.8" in r.stdout
 
 
@@ -332,7 +334,7 @@ def test_redaction_of_error_messages_for_exit_2(tmp_path: Path) -> None:
     for r in (missing, bad, arg):
         assert r.returncode == 2
         _no_leak(r)
-    assert "<redacted 5 chars>" in missing.stderr
+    assert "[***]" in missing.stderr
 
 
 def test_redaction_uses_words_from_file_for_errors(tmp_path: Path) -> None:
@@ -349,10 +351,10 @@ def test_redaction_uses_words_from_file_for_errors(tmp_path: Path) -> None:
 
 
 def test_redact_function_is_single_pass_and_case_insensitive() -> None:
-    assert lint.redact("A ZORBO b zorbo", ("zorbo",)) == "A <redacted 5 chars> b <redacted 5 chars>"
+    assert lint.redact("A ZORBO b zorbo", ("zorbo",)) == "A [***] b [***]"
     assert lint.redact("x", ()) == "x"
     assert lint.redact("redacted chars", ("redacted", "chars")) == (
-        "<redacted 8 chars> <redacted 5 chars>"
+        "[***] [***]"
     )
 
 
@@ -365,3 +367,360 @@ def test_undecodable_words_file_and_allowlist_exit_2_without_traceback(tmp_path:
         assert r.returncode == 2
         assert "Traceback" not in r.stderr
         assert "docs-private-info-lint: error:" in r.stderr
+
+
+@pytest.mark.parametrize("option", ["--words-f", "--words", "--words-fi"])
+@pytest.mark.parametrize("equals", [False, True])
+def test_abbreviated_words_option_rejected_but_used_for_error_redaction(
+    tmp_path: Path, option: str, equals: bool
+) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    words = tmp_path / "words.txt"
+    words.write_text("zorbo\n")
+    args = (f"{option}={words}",) if equals else (option, str(words))
+    r = _run(root, *args, "--zorbo-unknown", "zorbo")
+    assert r.returncode == 2
+    _no_leak(r)
+
+
+@pytest.mark.parametrize("option", ["--words-f", "--words", "--words-fi", "--roo", "--allow"])
+def test_argparse_never_accepts_abbreviated_options(tmp_path: Path, option: str) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    value = tmp_path / "empty.txt"
+    value.write_text("")
+    assert _run(root, option, str(value)).returncode == 2
+
+
+def test_canonical_equals_words_option_redacts_parse_errors(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    words = tmp_path / "words.txt"
+    words.write_text("zorbo\n")
+    r = _run(root, f"--words-file={words}", "--zorbo-unknown")
+    assert r.returncode == 2
+    _no_leak(r)
+
+
+@pytest.mark.parametrize(
+    ("word", "rendered"),
+    [
+        ("Zorbö", "Zorbo\u0308"),
+        ("Zorbo\u0308", "ZORBÖ"),
+        ("Zorßo", "ZORSSO"),
+        ("zorbo", "Ｚｏｒｂｏ"),
+    ],
+)
+def test_unicode_normalization_matches_and_redacts(word: str, rendered: str) -> None:
+    assert kinds(rendered, (word,)) == ["forbidden-word"]
+    redacted = lint.redact(f"before {rendered} after", (word,))
+    normalized_word = unicodedata.normalize("NFKC", word).casefold()
+    assert normalized_word not in unicodedata.normalize("NFKC", redacted).casefold()
+    assert "[***]" in redacted
+
+
+@pytest.mark.parametrize("suffix", ["_notes", "42", ".md", "-notes.md", "/"])
+def test_forbidden_word_with_suffix_is_detected(suffix: str) -> None:
+    assert kinds(f"zorbo{suffix}", ("zorbo",)) == ["forbidden-word"]
+
+
+@pytest.mark.parametrize("filename", ["docs/zorbo_notes.md", "docs/zorbo42.png"])
+def test_filename_only_forbidden_words_are_detected(tmp_path: Path, filename: str) -> None:
+    root = _repo(tmp_path, {filename: "clean content\n"})
+    r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "zorbo"})
+    assert r.returncode == 1
+    assert "forbidden-word" in r.stdout
+    _no_leak(r)
+
+
+@pytest.mark.parametrize("words", [("redacted", "chars", "finding"), ("[",), ("***",), ("[***]",)])
+def test_redaction_marker_never_reintroduces_forbidden_words(words: tuple[str, ...]) -> None:
+    result = lint.redact(" ".join(words), words)
+    normalized = unicodedata.normalize("NFKC", result).casefold()
+    assert all(unicodedata.normalize("NFKC", word).casefold() not in normalized for word in words)
+
+
+def test_summary_is_redacted(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "10.0.0.9\n"})
+    r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "finding,docs"})
+    assert r.returncode == 1
+    _no_leak(r, "finding")
+    _no_leak(r, "docs")
+
+
+def test_help_redacts_every_output_surface(tmp_path: Path) -> None:
+    r = _run(tmp_path, "--help", env={"VIGIE_LINT_FORBIDDEN_WORDS": "root,words,tracked"})
+    assert r.returncode == 0
+    for word in ("root", "words", "tracked"):
+        _no_leak(r, word)
+
+
+def test_help_uses_fixed_neutral_program_name(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["zorbo-sensitive-script.py"])
+    monkeypatch.delenv("VIGIE_LINT_FORBIDDEN_WORDS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        lint.main(["--help"])
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "zorbo" not in captured.out + captured.err
+    assert "docs-private-info-lint" in captured.out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "address:3c:22:fb:12:34:56", "(address:3c:22:fb:12:34:56)",
+        "mac:3c:22:fb:12:34:56", "MAC:3C:22:FB:12:34:56",
+        "id:3c:22:fb:12:34:56", "bssid-3c-22-fb-12-34-56",
+        "mac::3c:22:fb:12:34:56",
+    ],
+)
+def test_mac_immediately_after_colon_is_detected(text: str) -> None:
+    assert kinds(text) == ["mac"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "aa:3c:22:fb:12:34:56", "3c:22:fb:12:34:56:aa", "ff-3c-22-fb-12-34-56",
+        "(aa:3c:22:fb:12:34:56)", "mac:aa:3c:22:fb:12:34:56",
+        "aa:bb:3c:22:fb:12:34:56", "ff-aa-3c-22-fb-12-34-56",
+    ],
+)
+def test_mac_is_not_extracted_from_longer_hex_runs(text: str) -> None:
+    assert kinds(text) == []
+
+
+def test_word_patterns_are_compiled_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = lint.re.compile
+    calls: list[str] = []
+
+    def counted(pattern, *args, **kwargs):
+        calls.append(pattern)
+        return original(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(lint.re, "compile", counted)
+    matcher = lint.WordMatcher.build(("zorbo", "quux"))
+    assert len(calls) == 2  # Letter-boundary detection and substring redaction.
+    for _ in range(3):
+        assert lint.scan_text("docs/a.md", "alpha\nbeta\ngamma\n", matcher, frozenset()) == []
+        assert lint.redact("zorbonic quux", matcher) == "[***]nic [***]"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("finding_count", [20, 5000])
+def test_thousand_words_scan_realistic_two_megabytes_within_ten_seconds(finding_count: int) -> None:
+    script = fr"""
+import importlib.util
+import random
+import sys
+import time
+spec = importlib.util.spec_from_file_location('docs_private_info_lint', {str(TOOL)!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+words = tuple('word' + str(i) + 'token' for i in range(1000))
+vocabulary = 'system documentation explains network settings with practical examples for operators who maintain services and review changes before release'.split()
+rng = random.Random(481)
+lines = [' '.join(rng.choices(vocabulary, k=20)) + '.' for _ in range(16000)]
+text = '\n'.join(lines)
+text = text[:2 * 1024 * 1024]
+text += '\n' + '\n'.join(words[i % len(words)] for i in range({finding_count}))
+started = time.perf_counter()
+matcher = module.WordMatcher.build(words)
+findings = module.scan_text('docs/a.md', text, matcher, frozenset())
+output = '\n'.join(module.format_finding(finding, matcher) for finding in findings)
+assert 'word0token' not in output
+elapsed = time.perf_counter() - started
+assert len(findings) == {finding_count}, len(findings)
+assert elapsed < 10, elapsed
+print(f'findings={{len(findings)}} elapsed={{elapsed:.3f}}s bytes={{len(text)}}')
+"""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-I", "-c", script], capture_output=True,
+            text=True, timeout=15, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("1000-word scan of realistic 2 MiB prose exceeded fifteen seconds")
+    assert r.returncode == 0, r.stderr
+    print(r.stdout.strip())
+
+
+def test_hash_inside_word_is_literal_and_whitespace_hash_starts_comment() -> None:
+    assert lint._file_words("zorbo#tag\nquux # comment\n# comment\n") == ["zorbo#tag", "quux", ""]
+
+
+def test_hash_inside_allowlist_path_is_literal(tmp_path: Path) -> None:
+    allow = tmp_path / "allow"
+    allow.write_text("path docs/zorbo#notes.md # synthetic reason\n")
+    assert lint.parse_allowlist(allow)[0] == ("docs/zorbo#notes.md",)
+
+
+def test_value_allowlist_cannot_suppress_forbidden_words() -> None:
+    assert kinds("zorbo", ("zorbo",)) == ["forbidden-word"]
+    found = lint.scan_text("docs/a.md", "zorbo", ("zorbo",), frozenset({"zorbo"}))
+    assert [f.kind for f in found] == ["forbidden-word"]
+
+
+@pytest.mark.parametrize("path", ["/mnt/c/Users/zorbo/notes", "/home/.zorbo/notes", "/Users/.zorbo/notes"])
+def test_wsl_and_dot_prefixed_home_usernames_are_detected(path: str) -> None:
+    assert kinds(path) == ["home-path"]
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("10.23.\u200b45.67", "private-ip"),
+        ("10&#46;23&#46;45&#46;67", "private-ip"),
+        ("3c&#58;22&#58;fb&#58;12&#58;34&#58;56", "mac"),
+        ("/home/\u200bzorbo/notes", "home-path"),
+        ("&#47;home&#47;zorbo/notes", "home-path"),
+        ("zor\u200bbo", "forbidden-word"),
+        ("zor&#98;o", "forbidden-word"),
+    ],
+)
+def test_rendered_addresses_and_words_are_detected(text: str, kind: str) -> None:
+    assert kinds(text, ("zorbo",) if kind == "forbidden-word" else ()) == [kind]
+
+
+@pytest.mark.parametrize(
+    "zero_width", ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad", "\u034f", "\u200e", "\u202e"]
+)
+def test_all_zero_width_characters_are_removed(zero_width: str) -> None:
+    assert kinds(f"10.23.{zero_width}45.67") == ["private-ip"]
+    assert kinds(f"zor{zero_width}bo", ("zorbo",)) == ["forbidden-word"]
+
+
+@pytest.mark.parametrize("location", ["body", "filename"])
+def test_cli_unicode_home_paths_and_filenames_never_leak(tmp_path: Path, location: str) -> None:
+    nfd_name = "Zorbo\u0308"
+    filename = f"docs/{nfd_name}.md" if location == "filename" else "docs/a.md"
+    root = _repo(tmp_path, {filename: f"/home/{nfd_name}/notes\n"})
+    r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "Zorbö"})
+    assert r.returncode == 1
+    if location == "body":
+        assert "forbidden-word" in r.stdout
+    else:
+        assert "[***]" in r.stdout
+    output = unicodedata.normalize("NFKC", r.stdout + r.stderr).casefold()
+    assert "zorbö" not in output
+
+
+@pytest.mark.parametrize("hidden", ["\u200b", "&#8203;"])
+def test_zero_width_before_combining_mark_redacts(hidden: str) -> None:
+    rendered = f"Zorbo{hidden}\u0308"
+    matcher = lint.WordMatcher.build(("Zorbö",))
+    assert matcher.matches(f"docs/{rendered}.md") == ["zorbö"]
+    redacted = lint.redact(rendered, matcher)
+    # Strip the formatting character before normalization, as a renderer does.
+    normalized = unicodedata.normalize("NFKC", html.unescape(redacted).replace("\u200b", "")).casefold()
+    assert "zorbö" not in normalized
+
+
+def test_cli_zero_width_combining_unicode_filename_only_never_leaks(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/Zorbo\u200b\u0308.md": "clean body\n"})
+    r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "Zorbö"})
+    assert r.returncode == 1
+    normalized = unicodedata.normalize("NFKC", (r.stdout + r.stderr).replace("\u200b", "")).casefold()
+    assert "zorbö" not in normalized
+
+
+def test_nested_html_entities_are_decoded_only_once() -> None:
+    assert kinds("zor&amp;#98;o", ("zorbo",)) == []
+
+
+@pytest.mark.parametrize("text", ["elixir", "annual", "maximum", "éeli", "elié", "字max字", "مmaxم"])
+def test_forbidden_short_words_do_not_match_inside_unicode_letters(text: str) -> None:
+    assert kinds(text, ("eli", "ann", "max")) == []
+
+
+@pytest.mark.parametrize("text", ["zorbo_x", "zorbo2", "/home/zorbo/", "zorbo.md", "docs/zorbo-notes.md"])
+def test_unicode_letter_boundary_includes_paths_digits_and_underscores(text: str) -> None:
+    assert "forbidden-word" in kinds(text, ("zorbo",))
+
+
+def test_redaction_remains_substring_based_for_other_findings() -> None:
+    finding = lint.Finding("docs/elixir.md", 1, "private-ip", "10.0.0.9")
+    assert lint.format_finding(finding, ("eli",)) == "docs/[***]xir.md:1: private-ip: 10.0.0.9"
+    assert "eli" not in lint.redact("docs/ＥＬＩxir.md", ("eli",)).casefold()
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["fe80::3c:22:fb:12:34:56", "2001:db8::3c:22:fb:12:34:56", "::3c:22:fb:12:34:56"],
+)
+def test_mac_is_not_extracted_after_ipv6_double_colon(text: str) -> None:
+    assert kinds(text) == []
+
+
+@pytest.mark.parametrize("text", ["2001:db8:3c:22:fb:12:34:56", "2001:abcd:3c:22:fb:12:34:56"])
+def test_mac_is_not_extracted_from_uncompressed_ipv6(text: str) -> None:
+    assert kinds(text) == []
+
+
+def test_changed_words_file_merges_early_and_loaded_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    words = tmp_path / "words.txt"
+    words.write_text("earlysecret\n")
+    monkeypatch.delenv(lint.WORDS_ENV, raising=False)
+    original_load = lint.load_words
+
+    def changed_load(path):
+        words.write_text("latersecret\n")
+        return original_load(path)
+
+    def findings(root, matcher, paths, values):
+        assert matcher.matches("earlysecret latersecret") == ["earlysecret", "latersecret"]
+        return [lint.Finding("docs/earlysecret-latersecret.md", 1, "private-ip", "10.0.0.9")]
+
+    monkeypatch.setattr(lint, "load_words", changed_load)
+    monkeypatch.setattr(lint, "lint_repo", findings)
+    assert lint.main(["--root", str(tmp_path), "--words-file", str(words)]) == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "earlysecret" not in output
+    assert "latersecret" not in output
+    assert "docs/[***]-[***].md:1: private-ip: 10.0.0.9" in output
+
+
+def test_force_color_help_has_no_terminal_escapes(tmp_path: Path) -> None:
+    result = _run(tmp_path, "--help", env={"FORCE_COLOR": "1"})
+    assert result.returncode == 0
+    assert "\x1b" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("hidden", ["\u00ad", "\u034f", "\u200e", "\u202e"])
+@pytest.mark.parametrize("location", ["filename", "path", "body"])
+def test_cli_formatting_characters_never_hide_or_leak_words(
+    tmp_path: Path, hidden: str, location: str,
+) -> None:
+    name = f"Zorbo{hidden}\u0308"
+    filename = {
+        "filename": f"docs/{name}.md",
+        "path": f"docs/{name}/notes.md",
+        "body": "docs/a.md",
+    }[location]
+    body = f"/home/{name}/notes 10.23.45.67\n" if location == "body" else "clean\n"
+    root = _repo(tmp_path, {filename: body})
+    result = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "Zorbö"})
+    # Independently emulate rendered output, including CGJ (category Mn).
+    visible = "".join(
+        ch for ch in result.stdout + result.stderr
+        if unicodedata.category(ch) != "Cf" and ch != "\u034f"
+    )
+    assert "zorbö" not in unicodedata.normalize("NFKC", visible).casefold()
+    assert result.returncode == 1
+    if location == "body":
+        assert "private-ip" in result.stdout
+
+
+@pytest.mark.parametrize(("word", "text"), [("irem", "İrem"), ("İrem", "irem")])
+def test_turkish_dotted_i_matches_and_redacts_in_both_directions(word: str, text: str) -> None:
+    assert kinds(text, (word,)) == ["forbidden-word"]
+    output = lint.redact(f"docs/{text}.md", (word,))
+    assert "irem" not in unicodedata.normalize("NFKC", output).casefold().replace("i\u0307", "i")
+
+
+@pytest.mark.parametrize("mac", ["00:00:5e:00:53:01", "02:00:00:aa:bb:cc"])
+def test_labeled_documentation_and_dummy_macs_remain_allowed(mac: str) -> None:
+    assert kinds(f"mac:{mac}") == []

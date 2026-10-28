@@ -1,9 +1,14 @@
 # Allowlist for tools/docs_private_info_lint.py. One entry per line:
-#   path <exact path>  skip that one tracked file (wildcards are rejected, so no whole
-#                      directory or scope root can be switched off)
-#   value <literal>    accept this exact matched string anywhere
+#   path <exact path>  skip that file's content; its filename is still checked
+# Wildcard paths are rejected: no whole directory or scope root can be switched off.
+#   value <literal>    accept an exact address/home-path match; never exempt forbidden words
 # Every entry REQUIRES a '# reason' (missing reason is a usage error). Never list real
 # household data.
+# Forbidden words use letter boundaries: underscores/digits are boundaries, so max
+# matches max_alias_ids. A value allowlist never exempts forbidden words. Owners
+# should avoid short common words such as `or` or `files` in the forbidden list.
+# Adjacent CJK/Arabic letters prevent Latin word detection; addresses wrapped across
+# physical lines are not detected.
 # SCOPE: the lint scans docs ONLY (docs/**, README.md, .trail/learnings/**), not code/fixtures.
 # DECISION: MACs with the 02:00:00 prefix (locally administered dummy) and the IANA
 # documentation range 00:00:5E:00:53 are always allowed: the repo's fixtures and README use
