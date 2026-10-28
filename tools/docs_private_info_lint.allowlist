@@ -1,0 +1,10 @@
+# Allowlist for tools/docs_private_info_lint.py. One entry per line:
+#   path <glob>      skip matching tracked files (fnmatch; '*' crosses '/')
+#   value <literal>  accept this exact matched string anywhere
+# Every entry needs a reason in a trailing comment. Never list real household data.
+
+path tests/fixtures/**   # synthetic fixtures, not documentation
+value 192.168.1.1        # OpenWrt factory-default router address, used as the example router in docs/spikes/ and docs/deployment-validation-*.md
+value 192.168.8.1        # GL.iNet factory-default router address (README states it is the default)
+value 192.168.1.50       # synthetic e2e fixture host documented in docs/e2e.md (matches tests/e2e data)
+value c2:11:22:33:44:01  # synthetic e2e fixture MAC range documented in docs/e2e.md (matches tests/e2e data)

@@ -21,6 +21,10 @@ jobs:
           version: '0.11.6'
           enable-cache: true
           cache-dependency-glob: '**/uv.lock'
+      - name: Docs private-info lint (and its tests)
+        run: |
+          python -I tools/docs_private_info_lint.py
+          uvx --from pytest==8.4.2 pytest -q -p no:cacheprovider tools/tests
       - name: Install host Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Run the full local gate

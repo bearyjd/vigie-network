@@ -86,8 +86,8 @@ cp .env.example .env && $EDITOR .env            # set VIGIE_LAN_ADDR (required)
 
 # 1. Self-signed certificates (ECDSA P-256) and podman secrets: one for ingest (collectors pin it,
 #    note the printed pin) and a SEPARATE one for the API, so ingest never holds the API's key.
-VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --create-secrets
-VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --role api --create-secrets
+VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.0.2.10" ./gen-certs.sh --create-secrets
+VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.0.2.10" ./gen-certs.sh --role api --create-secrets
 
 # 2. Build the image (one image, three services)
 podman build -f Containerfile -t localhost/vigie-server:dev ..
@@ -117,19 +117,19 @@ Call the API (responses use the envelope `{ok, data, error, page}`):
 ```sh
 TOKEN=vgt_...   # the token printed above
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  "https://192.168.1.10:8444/devices?include_transient=1"
+  "https://192.0.2.10:8444/devices?include_transient=1"
 # {"ok":true,"data":[...],"error":null,"page":{"next_cursor":null}}
 
-curl --cacert deploy/certs-api/server.crt https://192.168.1.10:8444/healthz       # unauthenticated
+curl --cacert deploy/certs-api/server.crt https://192.0.2.10:8444/healthz       # unauthenticated
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  "https://192.168.1.10:8444/events?since=0"
+  "https://192.0.2.10:8444/events?since=0"
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  https://192.168.1.10:8444/macs/aa:bb:cc:dd:ee:ff            # 404 = unknown MAC = unassigned
+  https://192.0.2.10:8444/macs/02:00:00:dd:ee:ff            # 404 = unknown MAC = unassigned
 
 # Writes need If-Match with the device's current ETag (428 if absent, 412 on mismatch):
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   -H 'If-Match: "0"' -H 'Content-Type: application/json' -X PATCH \
-  -d '{"name":"Kitchen speaker","group_id":"kids"}' https://192.168.1.10:8444/devices/<device-id>
+  -d '{"name":"Kitchen speaker","group_id":"kids"}' https://192.0.2.10:8444/devices/<device-id>
 ```
 
 (`--cacert` works because the certificate's SAN contains the address you connect to. The ETag
@@ -154,19 +154,19 @@ Design notes that affect operation:
   default zones (for example `FedoraWorkstation`) may already open ports 1025-65535, so merely
   "not opening" a port is not enough: add an explicit reject for every other source. Assumptions
   (flagged): rootless podman, so the published ports terminate in a host process that firewalld's
-  input rules see; the router is `192.168.8.1`; the control app host is `192.168.8.50`; the zone is
+  input rules see; the router is `192.168.8.1`; the control app host is `192.0.2.50`; the zone is
   the default zone. Rich rules are evaluated reject/drop first, then accept, so use the
   `source not address` form (a reject that never matches the allowed source) rather than a blanket
   reject:
   ```sh
   sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.8.1" port port="8443" protocol="tcp" accept'
   sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source not address="192.168.8.1" port port="8443" protocol="tcp" reject'
-  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.8.50" port port="8444" protocol="tcp" accept'
-  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source not address="192.168.8.50" port port="8444" protocol="tcp" reject'
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.0.2.50" port port="8444" protocol="tcp" accept'
+  sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source not address="192.0.2.50" port port="8444" protocol="tcp" reject'
   sudo firewall-cmd --reload
   sudo firewall-cmd --list-rich-rules
   ```
-  Verify from a SECOND host that is not allowed (`nc -vz 192.168.1.10 8443` must be refused, and the
+  Verify from a SECOND host that is not allowed (`nc -vz 192.0.2.10 8443` must be refused, and the
   same for 8444) and from the router or control app that it still connects. Undo: run the same four
   commands with `--remove-rich-rule` instead of `--add-rich-rule`, then `--reload`.
   Rootless networking may rewrite the peer address the ingest rate limiter sees; check

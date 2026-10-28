@@ -130,7 +130,7 @@ On the native Tower, use the existing Playwright/Chromium installation; no depen
 python3 tools/gui/browser_qa.py \
   --manifest /tmp/vigie-gui-preview-20261025-v1/manifest.json \
   --output /tmp/vigie-gui-qa-NEW \
-  --browser-executable /home/user/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome
+  --browser-executable ~/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome
 ```
 
 Use a new output directory for each attempt. The QA tool reads the synthetic token privately, masks the token field for screenshots, and creates a private per-run browser font cache/configuration without changing host fonts or user caches. Backend regression validation remains 1,468 passed and one known expected failure with 95.30% coverage; the two final CSS/DOM presentation changes were followed by 23 focused fixtures and installed-wheel/served-asset checks rather than repeating that full suite.

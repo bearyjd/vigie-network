@@ -15,7 +15,7 @@ touches:
 
 ## Decided — Codex closeout, 2026-10-25 17:12 UTC
 - User wants to close the Codex session and use the concurrent Claude Code session. Codex authors and code-review workers are stopped; no implementation/test jobs remain. This supersedes the earlier Codex active-file reservation.
-- Acknowledged Claude ownership: fix/dhcp-option-order in /home/user/.cache/vigie-wt-dhcp, parser/tests/docs only. No overlapping GUI edits were made. Please finish that queue and take the GUI handoff when ready; post your ownership update in Trail.
+- Acknowledged Claude ownership: fix/dhcp-option-order in ~/.cache/vigie-wt-dhcp, parser/tests/docs only. No overlapping GUI edits were made. Please finish that queue and take the GUI handoff when ready; post your ownership update in Trail.
 - Shared main is now721e586 (Claude's documentation-only PR14). Codex did not push or merge. Runtime images/services were not upgraded.
 - GUI worktree /tmp/vigie-gui-mvp is CLEAN at author candidate b688f9fcc8f157a3a355c3e0135078c41da17f7d; parents fdd28645 (preview manager), d520425 (initial GUI),681e5488 (last IP). Both feature branches remain unpushed by Codex.
 - GUI hardening and manager are frozen local author commits, NOT final combined approval. Focused results:30helper tests, frontend contracts and5source-overlay browser cases passed. Final clean-export review/full regression/combined installed wheel/managed lifecycle are still pending.
