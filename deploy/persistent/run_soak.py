@@ -454,7 +454,11 @@ def ingest_address_issue(address: str | None, lookup=None) -> str | None:
     """Return the failure reason when the configured ingest address is not bound locally."""
     if address is None:
         return None
-    present = (lookup or local_ipv4_addresses)()
+    try:
+        present = (lookup or local_ipv4_addresses)()
+    except OSError:
+        # Fail closed: an unreadable interface table cannot prove the address is bound.
+        return INGEST_UNBOUND
     return None if address in present else INGEST_UNBOUND
 
 
@@ -512,9 +516,19 @@ def main():
     if address.is_unspecified or address.is_loopback or address.is_multicast:
         raise ValueError("invalid router address")
     ingest = config.get("ingest_address")
-    if ingest is not None:
-        # Literal, concrete IPv4 only: the address the ingest container is published on.
-        if not isinstance(ingest, str) or ipaddress.IPv4Address(ingest).is_unspecified:
+    if "ingest_address" in config:
+        # Concrete unicast IPv4 only: the address the ingest container is published on.
+        if not isinstance(ingest, str):
+            raise ValueError("invalid ingest address")
+        bound = ipaddress.IPv4Address(ingest)
+        if (
+            bound.is_unspecified
+            or bound.is_loopback
+            or bound.is_multicast
+            or bound.is_reserved
+            or bound.is_link_local
+            or bound == ipaddress.IPv4Address("255.255.255.255")
+        ):
             raise ValueError("invalid ingest address")
     if ingest_address_issue(ingest):
         print(json.dumps(unbound_report([])))

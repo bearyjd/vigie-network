@@ -680,7 +680,8 @@ class IngestAddressPrecheckTests(unittest.TestCase):
 
         self.assertIsNone(runner.ingest_address_issue(None, lookup))
 
-    def run_main(self, bound_answers):
+    def run_main(self, lookup_for, ingest_address=ADDRESS):
+        import hashlib
         import io
         import json
         from contextlib import redirect_stdout
@@ -695,45 +696,105 @@ class IngestAddressPrecheckTests(unittest.TestCase):
                 "meter_executable": "/unused",
                 "meter_sha256": "a" * 64,
                 "router_address": "192.0.2.1",
-                "ingest_address": self.ADDRESS,
+                "ingest_address": ingest_address,
             }
+            raw = json.dumps(config).encode()
             config_path = base / "config"
-            config_path.write_bytes(json.dumps(config).encode())
+            config_path.write_bytes(raw)
             config_path.chmod(0o600)
-            answers = iter(bound_answers)
+            journal_path = base / "journal"
             lookups = []
 
             def lookup():
                 lookups.append(1)
-                return frozenset({self.ADDRESS} if next(answers) else set())
+                return lookup_for(len(lookups))
 
             out = io.StringIO()
             with (
                 patch.object(
-                    sys, "argv", ["run_soak", str(config_path), str(base / "journal")]
+                    sys, "argv", ["run_soak", str(config_path), str(journal_path)]
                 ),
                 patch.object(runner, "local_ipv4_addresses", lookup),
-                patch.object(runner, "collect", return_value=dict(HEALTHY_SAMPLE)),
+                patch.object(
+                    runner, "collect", return_value=dict(HEALTHY_SAMPLE)
+                ) as collect,
                 patch.object(runner.time, "sleep"),
                 redirect_stdout(out),
             ):
                 code = runner.main()
-            return code, json.loads(out.getvalue()), len(lookups), base
+            samples = None
+            if journal_path.exists():
+                metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
+                with runner.Journal(
+                    journal_path, mode="real", metadata=metadata
+                ) as journal:
+                    samples = len(journal.samples)
+            return {
+                "code": code,
+                "report": json.loads(out.getvalue()),
+                "lookups": len(lookups),
+                "collect_calls": collect.call_count,
+                "journal_samples": samples,
+            }
+
+    def bound_then(self, *answers):
+        def lookup_for(call):
+            return frozenset({self.ADDRESS} if answers[call - 1] else set())
+
+        return lookup_for
 
     def test_start_aborts_before_collecting_when_address_is_unbound(self):
-        code, report, lookups, base = self.run_main([False])
-        self.assertEqual(code, 1)
-        self.assertEqual(report["status"], "fail")
-        self.assertEqual(report["reasons"], ["ingest_address_unbound"])
-        self.assertEqual(lookups, 1)
-        self.assertFalse((base / "journal").exists())
+        result = self.run_main(self.bound_then(False))
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(result["report"]["status"], "fail")
+        self.assertEqual(result["report"]["reasons"], ["ingest_address_unbound"])
+        self.assertEqual(result["lookups"], 1)
+        self.assertEqual(result["collect_calls"], 0)
+        self.assertIsNone(result["journal_samples"])
 
     def test_periodic_check_aborts_run_when_address_disappears(self):
-        code, report, lookups, _ = self.run_main([True, False])
-        self.assertEqual(code, 1)
-        self.assertEqual(report["status"], "fail")
-        self.assertIn("ingest_address_unbound", report["reasons"])
-        self.assertEqual(lookups, 2)
+        result = self.run_main(self.bound_then(True, False))
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(result["report"]["status"], "fail")
+        self.assertIn("ingest_address_unbound", result["report"]["reasons"])
+        self.assertEqual(result["lookups"], 2)
+        self.assertEqual(result["collect_calls"], 1)
+        self.assertEqual(result["journal_samples"], 1)
+
+    def test_unreadable_interface_table_fails_closed_at_precheck(self):
+        def lookup():
+            raise OSError("no fib_trie")
+
+        self.assertEqual(
+            runner.ingest_address_issue(self.ADDRESS, lookup), "ingest_address_unbound"
+        )
+
+    def test_unreadable_interface_table_mid_run_still_prints_report(self):
+        def lookup_for(call):
+            if call == 1:
+                return frozenset({self.ADDRESS})
+            raise OSError("no fib_trie")
+
+        result = self.run_main(lookup_for)
+        self.assertEqual(result["code"], 1)
+        self.assertIn("ingest_address_unbound", result["report"]["reasons"])
+        self.assertEqual(result["journal_samples"], 1)
+
+    def test_unusable_ingest_addresses_are_rejected_before_any_lookup(self):
+        for bad in (
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "169.254.1.1",
+            "240.0.0.1",
+            "not-an-ip",
+            None,
+            10,
+        ):
+            with self.subTest(address=bad):
+                with self.assertRaises(ValueError):
+                    self.run_main(self.bound_then(True, True), ingest_address=bad)
 
 
 if __name__ == "__main__":
