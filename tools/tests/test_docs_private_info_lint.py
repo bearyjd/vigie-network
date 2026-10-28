@@ -88,14 +88,15 @@ def test_allowed_value_suppresses_exact_match_only() -> None:
     assert [f.match for f in found] == ["192.168.1.10"]
 
 
-def test_parse_allowlist_and_glob_matching(tmp_path: Path) -> None:
+def test_parse_allowlist_and_exact_path_matching(tmp_path: Path) -> None:
     f = tmp_path / "allow"
-    f.write_text("# c\n\npath tests/fixtures/**  # why\nvalue 192.168.1.1 # default\n")
-    globs, values = lint.parse_allowlist(f)
-    assert globs == ("tests/fixtures/**",)
+    f.write_text("# c\n\npath docs/a/b.md  # why\nvalue 192.168.1.1 # default\n")
+    paths, values = lint.parse_allowlist(f)
+    assert paths == ("docs/a/b.md",)
     assert values == frozenset({"192.168.1.1"})
-    assert lint.is_path_allowed("tests/fixtures/a/b.md", globs)
-    assert not lint.is_path_allowed("docs/a.md", globs)
+    assert lint.is_path_allowed("docs/a/b.md", paths)
+    assert not lint.is_path_allowed("docs/a/b.mdx", paths)
+    assert not lint.is_path_allowed("docs/a.md", paths)
 
 
 def test_parse_allowlist_rejects_bad_line(tmp_path: Path) -> None:
@@ -155,7 +156,7 @@ def test_cli_ignores_untracked_files(tmp_path: Path) -> None:
 def test_cli_allowlist_path_glob(tmp_path: Path) -> None:
     root = _repo(tmp_path, {"docs/fixtures/a.md": "10.0.0.1\n"})
     allow = tmp_path / "allow.txt"
-    allow.write_text("path docs/fixtures/**  # synthetic\n")
+    allow.write_text("path docs/fixtures/a.md  # synthetic\n")
     assert _run(root, "--allowlist", str(allow)).returncode == 0
 
 
@@ -213,26 +214,58 @@ def test_mac_allowed_only_in_documentation_range() -> None:
     assert kinds("00:00:5e:12:34:56") == ["mac"]
 
 
-@pytest.mark.parametrize("glob", ["*", "**", "docs/*", "docs/**", "*.md"])
-def test_overbroad_allowlist_globs_rejected(tmp_path: Path, glob: str) -> None:
+@pytest.mark.parametrize(
+    "glob",
+    ["*", "**", "docs/*", "docs/**", "*.md", ".trail/learnings/**", "docs/spikes/*", "a/b?.md"],
+)
+def test_wildcard_allowlist_paths_rejected(tmp_path: Path, glob: str) -> None:
     f = tmp_path / "allow"
     f.write_text(f"path {glob}  # nope\n")
     with pytest.raises(lint.LintError):
         lint.parse_allowlist(f)
 
 
-def test_exact_and_deep_allowlist_paths_accepted(tmp_path: Path) -> None:
+def test_exact_allowlist_path_accepted(tmp_path: Path) -> None:
     f = tmp_path / "allow"
-    f.write_text("path .trail/learnings/one.md\npath tests/fixtures/**\n")
-    globs, _ = lint.parse_allowlist(f)
-    assert globs == (".trail/learnings/one.md", "tests/fixtures/**")
+    f.write_text("path .trail/learnings/one.md  # historical\n")
+    paths, _ = lint.parse_allowlist(f)
+    assert paths == (".trail/learnings/one.md",)
 
 
-def test_cli_skips_binary_files(tmp_path: Path) -> None:
-    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
-    (root / "docs/pic.png").write_bytes(b"10.0.0.1")
-    (root / "docs/blob.dat").write_bytes(b"\x89PNG\x00 10.0.0.2 \xff\xfe")
+@pytest.mark.parametrize("line", ["path docs/a.md", "value 192.168.1.1", "path docs/a.md  #   "])
+def test_allowlist_entry_without_reason_rejected(tmp_path: Path, line: str) -> None:
+    f = tmp_path / "allow"
+    f.write_text(line + "\n")
+    with pytest.raises(lint.LintError):
+        lint.parse_allowlist(f)
+
+
+def _add(root: Path) -> None:
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+
+
+def test_cli_scans_file_with_nul_byte(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    (root / "docs/nul.md").write_bytes(b"x\x00 10.23.45.67 \x00")
+    _add(root)
+    r = _run(root)
+    assert r.returncode == 1
+    assert "docs/nul.md:1: private-ip: 10.23.45.67" in r.stdout
+
+
+def test_cli_scans_file_with_invalid_utf8(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    (root / "docs/bad.md").write_bytes(b"10.23.45.67\xff\n")
+    _add(root)
+    r = _run(root)
+    assert r.returncode == 1
+    assert "docs/bad.md:1: private-ip: 10.23.45.67" in r.stdout
+
+
+def test_cli_skips_known_binary_suffix(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    (root / "docs/pic.png").write_bytes(b"10.23.45.67")
+    _add(root)
     assert _run(root).returncode == 0
 
 
@@ -240,3 +273,95 @@ def test_cli_skips_binary_files(tmp_path: Path) -> None:
 def test_cli_empty_forbidden_words_env_is_clean_noop(tmp_path: Path, value: str) -> None:
     root = _repo(tmp_path, {"docs/a.md": "hello\n"})
     assert _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": value}).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "text", ["_10.23.45.67_", "*10.23.45.67*", "**10.23.45.67**", "10%2E23%2E45%2E67", "10%2e23%2e45%2e67"]
+)
+def test_ipv4_found_through_markdown_emphasis_and_percent_encoding(text: str) -> None:
+    assert kinds(text) == ["private-ip"]
+
+
+@pytest.mark.parametrize("path", ["/home/Élodie/x", "/Users/李/x", "/var/home/Zoë/"])
+def test_non_ascii_home_usernames_flagged(path: str) -> None:
+    assert kinds(f"cd {path}") == ["home-path"]
+
+
+def test_bare_home_directory_mentions_not_flagged() -> None:
+    assert kinds("under `/home/` and (/Users/)") == []
+
+
+@pytest.mark.parametrize("mac", ["3c22.fb12.3456", "3C22.FB12.3456."])
+def test_cisco_dotted_mac_flagged(mac: str) -> None:
+    assert kinds(f"dev {mac}") == ["mac"]
+
+
+@pytest.mark.parametrize("mac", ["0000.5e00.5301", "0200.0000.0001"])
+def test_cisco_dotted_documentation_and_dummy_macs_allowed(mac: str) -> None:
+    assert kinds(f"dev {mac}") == []
+
+
+def _no_leak(r, word: str = "zorbo") -> None:
+    assert word not in (r.stdout + r.stderr).lower()
+
+
+def test_redaction_covers_path_home_path_and_overlapping_findings(tmp_path: Path) -> None:
+    root = _repo(
+        tmp_path,
+        {
+            "docs/Zorbo.md": "ip 10.0.0.9 and Zorbo at 10.0.0.8\n/home/Zorbo/notes\n",
+            "docs/ok.md": "fine\n",
+        },
+    )
+    r = _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": "zorbo"})
+    assert r.returncode == 1
+    _no_leak(r)
+    assert "docs/<redacted 5 chars>.md:1: private-ip: 10.0.0.9" in r.stdout
+    assert "docs/<redacted 5 chars>.md:2: home-path: /home/<redacted 5 chars>" in r.stdout
+    assert "10.0.0.8" in r.stdout
+
+
+def test_redaction_of_error_messages_for_exit_2(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    env = {"VIGIE_LINT_FORBIDDEN_WORDS": "zorbo"}
+    missing = _run(root, "--words-file", str(tmp_path / "zorbo-words.txt"), env=env)
+    bad_allow = tmp_path / "zorbo-allow"
+    bad_allow.write_text("bogus Zorbo line\n")
+    bad = _run(root, "--allowlist", str(bad_allow), env=env)
+    arg = _run(root, "--zorbo-flag", env=env)
+    for r in (missing, bad, arg):
+        assert r.returncode == 2
+        _no_leak(r)
+    assert "<redacted 5 chars>" in missing.stderr
+
+
+def test_redaction_uses_words_from_file_for_errors(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/Zorbo.md": "10.0.0.9\n"})
+    words = tmp_path / "words.txt"
+    words.write_text("zorbo\n")
+    bad_allow = tmp_path / "zorbo-allow"
+    bad_allow.write_text("bogus\n")
+    r1 = _run(root, "--words-file", str(words))
+    r2 = _run(root, "--words-file", str(words), "--allowlist", str(bad_allow))
+    assert (r1.returncode, r2.returncode) == (1, 2)
+    _no_leak(r1)
+    _no_leak(r2)
+
+
+def test_redact_function_is_single_pass_and_case_insensitive() -> None:
+    assert lint.redact("A ZORBO b zorbo", ("zorbo",)) == "A <redacted 5 chars> b <redacted 5 chars>"
+    assert lint.redact("x", ()) == "x"
+    assert lint.redact("redacted chars", ("redacted", "chars")) == (
+        "<redacted 8 chars> <redacted 5 chars>"
+    )
+
+
+def test_undecodable_words_file_and_allowlist_exit_2_without_traceback(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\xff\xfe\xfa")
+    for args in (("--words-file", str(bad)), ("--allowlist", str(bad))):
+        r = _run(root, *args)
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+        assert "docs-private-info-lint: error:" in r.stderr

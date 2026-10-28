@@ -1,11 +1,15 @@
 # Allowlist for tools/docs_private_info_lint.py. One entry per line:
-#   path <glob>      skip matching tracked files (fnmatch; '*' crosses '/'; wildcards need
-#                    2+ literal leading directories, so '*', '**', 'docs/*' are rejected)
-#   value <literal>  accept this exact matched string anywhere
-# Every entry needs a reason in a trailing comment. Never list real household data.
+#   path <exact path>  skip that one tracked file (wildcards are rejected, so no whole
+#                      directory or scope root can be switched off)
+#   value <literal>    accept this exact matched string anywhere
+# Every entry REQUIRES a '# reason' (missing reason is a usage error). Never list real
+# household data.
 # SCOPE: the lint scans docs ONLY (docs/**, README.md, .trail/learnings/**), not code/fixtures.
+# DECISION: MACs with the 02:00:00 prefix (locally administered dummy) and the IANA
+# documentation range 00:00:5E:00:53 are always allowed: the repo's fixtures and README use
+# 02:00:00:xx:xx:xx as dummy devices. Other locally-administered MACs are NOT exempt, since
+# phones use randomised ones.
 
-path tests/fixtures/**   # synthetic fixtures, not documentation
 path .trail/learnings/2026-10-25-claude-owns-dhcp-option-order-parser-bearyjd.md  # historical learning, immutable; `user` is a generic account name
 path .trail/learnings/2026-10-25-codex-closeout-frozen-gui-candidate-released-codex.md  # historical learning, immutable; `user` is a generic account name
 
