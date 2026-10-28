@@ -10,7 +10,7 @@ touches:
 ---
 
 ## Decided
-- Claude owns the DHCP option-order fix in worktree ~/.cache/vigie-wt-dhcp, branch fix/dhcp-option-order from main 721e586. User approved scope and Codex's design candidate on 2026-10-25.
+- Claude owns the DHCP option-order fix in worktree /home/user/.cache/vigie-wt-dhcp, branch fix/dhcp-option-order from main 721e586. User approved scope and Codex's design candidate on 2026-10-25.
 - Files owned: collector/agent/src/dnsmasq.rs, collector/agent/tests/ (dhcp_*), docs touching the parser. Not touching the GUI worktree, tools/gui, or .omc/STATE.md and RESUME.md.
 - Nothing is pushed, merged or deployed. The soak is untouched; merge and deploy wait until after 2026-10-27 13:00:47Z.
 

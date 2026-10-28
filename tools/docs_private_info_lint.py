@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Fail when tracked docs hold private household information.
+r"""Fail when tracked docs hold private household information.
 
-Scope: tracked docs/**, README.md and .trail/learnings/**. Flags private-range and
-Tailscale IPv4 addresses, MAC addresses, absolute home paths and an operator-supplied
-list of forbidden words (env VIGIE_LINT_FORBIDDEN_WORDS, comma separated, and/or an
-untracked --words-file, one word per line). The shipped list is empty: never commit real
-names. Allowlist (tools/docs_private_info_lint.allowlist): `path <glob>` and `value <literal>`.
+Scope: DOCS ONLY - tracked docs/**, README.md and .trail/learnings/**. Code, tests and
+fixtures elsewhere in the repo are deliberately NOT scanned. Flags private-range and
+Tailscale IPv4 addresses, MAC addresses, absolute home paths (/home, /var/home, /Users,
+C:\Users, ~name/) and an operator-supplied list of forbidden words (env
+VIGIE_LINT_FORBIDDEN_WORDS, comma separated, and/or an untracked --words-file, one word per
+line). CI feeds the env var from an optional repo secret the owner adds; unset is a no-op.
+The shipped list is empty: never commit real names. Allowlist (tools/docs_private_info_lint.allowlist): `path <glob>` and `value <literal>`.
 
 Exit codes: 0 clean, 1 findings, 2 usage/IO error. Run as `python3 -I`.
 """
@@ -24,13 +26,18 @@ from pathlib import Path
 SCOPE_GLOBS = ("docs/**", "README.md", ".trail/learnings/**")
 WORDS_ENV = "VIGIE_LINT_FORBIDDEN_WORDS"
 DEFAULT_ALLOWLIST = Path(__file__).resolve().with_name("docs_private_info_lint.allowlist")
-ALLOWED_MAC_PREFIXES = ("00:00:5e", "02:00:00")
+ALLOWED_MAC_PREFIXES = ("00:00:5e:00:53:", "02:00:00:")
+BINARY_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf"})
 
 IPV4_RE = re.compile(
-    r"(?<![\d.])(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})(?!\d|\.\d)"
+    r"(?<![\w.])(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})(?!\d|\.\d)"
 )
 MAC_RE = re.compile(r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}([:-])){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
-HOME_RE = re.compile(r"/(?:var/)?home/[A-Za-z0-9_.-]+")
+HOME_RE = re.compile(
+    r"(?<![\w.\-])/(?:var/home|home|Users)/[A-Za-z0-9_.-]+"
+    r"|[A-Za-z]:\\Users\\[^\\\s]+"
+    r"|(?<![\w/~])~[A-Za-z][\w.-]*/"
+)
 
 
 class LintError(Exception):
@@ -111,8 +118,25 @@ def parse_allowlist(path: Path) -> tuple[tuple[str, ...], frozenset[str]]:
         parts = entry.split()
         if len(parts) != 2 or parts[0] not in ("path", "value"):
             raise LintError(f"{path}:{number}: expected 'path <glob>' or 'value <literal>'")
+        if parts[0] == "path" and _is_overbroad(parts[1]):
+            raise LintError(
+                f"{path}:{number}: over-broad glob '{parts[1]}' "
+                "(wildcards need 2+ literal leading directories)"
+            )
         (globs if parts[0] == "path" else values).append(parts[1])
     return tuple(globs), frozenset(values)
+
+
+def _is_wild(segment: str) -> bool:
+    return any(c in segment for c in "*?[")
+
+
+def _is_overbroad(glob: str) -> bool:
+    segments = glob.split("/")
+    if not any(_is_wild(s) for s in segments):
+        return False
+    leading = [s for s in segments[: next(i for i, s in enumerate(segments) if _is_wild(s))]]
+    return len(leading) < 2
 
 
 def is_path_allowed(rel: str, globs: tuple[str, ...]) -> bool:
@@ -153,12 +177,26 @@ def lint_repo(
     for rel in tracked_files(root):
         if is_path_allowed(rel, globs):
             continue
-        try:
-            text = (root / rel).read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            raise LintError(f"cannot read {rel}: {exc}") from exc
-        findings.extend(scan_text(rel, text, words, values))
+        text = _read_text(root / rel)
+        if text is not None:
+            findings.extend(scan_text(rel, text, words, values))
     return findings
+
+
+def _read_text(path: Path) -> str | None:
+    """File text, or None for binary files (known image suffix, NUL bytes, non-UTF-8)."""
+    if path.suffix.lower() in BINARY_SUFFIXES:
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise LintError(f"cannot read {path}: {exc}") from exc
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def format_finding(f: Finding) -> str:
@@ -168,7 +206,7 @@ def format_finding(f: Finding) -> str:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     parser.add_argument("--words-file", type=Path, default=None)

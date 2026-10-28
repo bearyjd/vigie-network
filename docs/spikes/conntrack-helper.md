@@ -118,13 +118,13 @@ the neighbor table.
      Caveat: a source address is attacker-chosen, so spoofed RFC1918/ULA sources arriving from the
      WAN can fill the LAN quota (they cannot touch the WAN quota, and totals stay exact). A quiet
      LAN host is then folded into the global record. The owner should pass the real LAN prefixes
-     (e.g. `--lan-cidr 192.0.2.0/24`) and have the router drop WAN-side packets with private
+     (e.g. `--lan-cidr 192.168.8.0/24`) and have the router drop WAN-side packets with private
      sources (rp_filter / bogon rules). Tests: a quiet LAN host keeps its attribution under 1000
      spoofed WAN sources; 2000 spoofed private sources fill only `k_lan`.
    - Flows whose original source is external (port-forwards, router-originated) are emitted
      too; the agent decides what to drop.
 3. **Serve**: one JSON line per interval to the connected reader, example:
-   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"acct_off":false,"folded":0,"evicted":0,"recounted_flows":0,"dropped_new_keys":0,"table_pressure":false,"records":[{"src":"192.0.2.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
+   `{"v":1,"seq":3,"ts":1700000000,"interval_s":60,"skipped_lines":0,"acct_off":false,"folded":0,"evicted":0,"recounted_flows":0,"dropped_new_keys":0,"table_pressure":false,"records":[{"src":"192.168.8.10","dst":"8.8.8.8","dport":53,"proto":"udp","bytes_up":70,"bytes_down":120,"packets_up":1,"packets_down":1,"flows":1,"new_flows":0}]}`.
    `ts` comes from the router clock (no RTC): the agent should stamp by its own sane clock and use
    `seq` for ordering.
    - **One reader at a time.** A new connection never cuts a line already in flight: it waits

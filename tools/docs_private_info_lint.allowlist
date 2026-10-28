@@ -1,10 +1,19 @@
 # Allowlist for tools/docs_private_info_lint.py. One entry per line:
-#   path <glob>      skip matching tracked files (fnmatch; '*' crosses '/')
+#   path <glob>      skip matching tracked files (fnmatch; '*' crosses '/'; wildcards need
+#                    2+ literal leading directories, so '*', '**', 'docs/*' are rejected)
 #   value <literal>  accept this exact matched string anywhere
 # Every entry needs a reason in a trailing comment. Never list real household data.
+# SCOPE: the lint scans docs ONLY (docs/**, README.md, .trail/learnings/**), not code/fixtures.
 
 path tests/fixtures/**   # synthetic fixtures, not documentation
+path .trail/learnings/2026-10-25-claude-owns-dhcp-option-order-parser-bearyjd.md  # historical learning, immutable; `user` is a generic account name
+path .trail/learnings/2026-10-25-codex-closeout-frozen-gui-candidate-released-codex.md  # historical learning, immutable; `user` is a generic account name
+
 value 192.168.1.1        # OpenWrt factory-default router address, used as the example router in docs/spikes/ and docs/deployment-validation-*.md
 value 192.168.8.1        # GL.iNet factory-default router address (README states it is the default)
+value 192.168.8.0        # GL.iNet factory-default LAN prefix (192.168.8.0/24), the documented default LAN set in docs/spikes/conntrack-helper.md
+value 192.168.8.10       # example server/record host inside the GL.iNet default subnet (README, docs/spikes/conntrack-helper.md); keeps router/server/control host in one subnet
+value 192.168.8.50       # example control-app host inside the GL.iNet default subnet (README firewall section)
+value 10.9.9.9           # unassigned test address recorded in a measurement in docs/spikes/p1-collector-net.md
 value 192.168.1.50       # synthetic e2e fixture host documented in docs/e2e.md (matches tests/e2e data)
 value c2:11:22:33:44:01  # synthetic e2e fixture MAC range documented in docs/e2e.md (matches tests/e2e data)

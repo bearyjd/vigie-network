@@ -176,3 +176,67 @@ def test_cli_missing_words_file_is_usage_error(tmp_path: Path) -> None:
     r = _run(root, "--words-file", str(tmp_path / "nope"))
     assert r.returncode == 2
     assert "nope" in r.stderr
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["cd /Users/someone/x", r"dir C:\Users\someone\Desktop", "see ~someone/notes", "p=/home/someone"],
+)
+def test_other_home_path_forms_flagged(text: str) -> None:
+    assert kinds(text) == ["home-path"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://host.example/home/foo",
+        "https://host.example/Users/foo/bar",
+        "see ~/notes and ~ alone",
+        "a/b/home/foo",
+    ],
+)
+def test_home_path_false_positives_avoided(text: str) -> None:
+    assert kinds(text) == []
+
+
+@pytest.mark.parametrize("text", ["v10.1.2.3", "version10.1.2.3", "10.0.0.1.5", "10.0.0.1.5.6"])
+def test_ipv4_not_matched_inside_versions_or_longer_dotted_runs(text: str) -> None:
+    assert kinds(text) == []
+
+
+def test_leading_zero_ipv4_is_not_flagged() -> None:
+    assert kinds("`010.0.0.1` is skipped") == []
+
+
+def test_mac_allowed_only_in_documentation_range() -> None:
+    assert kinds("00:00:5e:00:53:af") == []
+    assert kinds("00:00:5e:12:34:56") == ["mac"]
+
+
+@pytest.mark.parametrize("glob", ["*", "**", "docs/*", "docs/**", "*.md"])
+def test_overbroad_allowlist_globs_rejected(tmp_path: Path, glob: str) -> None:
+    f = tmp_path / "allow"
+    f.write_text(f"path {glob}  # nope\n")
+    with pytest.raises(lint.LintError):
+        lint.parse_allowlist(f)
+
+
+def test_exact_and_deep_allowlist_paths_accepted(tmp_path: Path) -> None:
+    f = tmp_path / "allow"
+    f.write_text("path .trail/learnings/one.md\npath tests/fixtures/**\n")
+    globs, _ = lint.parse_allowlist(f)
+    assert globs == (".trail/learnings/one.md", "tests/fixtures/**")
+
+
+def test_cli_skips_binary_files(tmp_path: Path) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "ok\n"})
+    (root / "docs/pic.png").write_bytes(b"10.0.0.1")
+    (root / "docs/blob.dat").write_bytes(b"\x89PNG\x00 10.0.0.2 \xff\xfe")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    assert _run(root).returncode == 0
+
+
+@pytest.mark.parametrize("value", ["", " , ,"])
+def test_cli_empty_forbidden_words_env_is_clean_noop(tmp_path: Path, value: str) -> None:
+    root = _repo(tmp_path, {"docs/a.md": "hello\n"})
+    assert _run(root, env={"VIGIE_LINT_FORBIDDEN_WORDS": value}).returncode == 0
