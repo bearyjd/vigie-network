@@ -1,0 +1,28 @@
+# Allowlist for tools/docs_private_info_lint.py. One entry per line:
+#   path <exact path>  skip that file's content; its filename is still checked
+# Wildcard paths are rejected: no whole directory or scope root can be switched off.
+#   value <literal>    accept an exact address/home-path match; never exempt forbidden words
+# Every entry REQUIRES a '# reason' (missing reason is a usage error). Never list real
+# household data.
+# Forbidden words use letter boundaries: underscores/digits are boundaries, so max
+# matches max_alias_ids. A value allowlist never exempts forbidden words. Owners
+# should avoid short common words such as `or` or `files` in the forbidden list.
+# Adjacent CJK/Arabic letters prevent Latin word detection; addresses wrapped across
+# physical lines are not detected.
+# SCOPE: the lint scans docs ONLY (docs/**, README.md, .trail/learnings/**), not code/fixtures.
+# DECISION: MACs with the 02:00:00 prefix (locally administered dummy) and the IANA
+# documentation range 00:00:5E:00:53 are always allowed: the repo's fixtures and README use
+# 02:00:00:xx:xx:xx as dummy devices. Other locally-administered MACs are NOT exempt, since
+# phones use randomised ones.
+
+path .trail/learnings/2026-10-25-claude-owns-dhcp-option-order-parser-bearyjd.md  # historical learning, immutable; `user` is a generic account name
+path .trail/learnings/2026-10-25-codex-closeout-frozen-gui-candidate-released-codex.md  # historical learning, immutable; `user` is a generic account name
+
+value 192.168.1.1        # OpenWrt factory-default router address, used as the example router in docs/spikes/ and docs/deployment-validation-*.md
+value 192.168.8.1        # GL.iNet factory-default router address (README states it is the default)
+value 192.168.8.0        # GL.iNet factory-default LAN prefix (192.168.8.0/24), the documented default LAN set in docs/spikes/conntrack-helper.md
+value 192.168.8.10       # example server/record host inside the GL.iNet default subnet (README, docs/spikes/conntrack-helper.md); keeps router/server/control host in one subnet
+value 192.168.8.50       # example control-app host inside the GL.iNet default subnet (README firewall section)
+value 10.9.9.9           # unassigned test address recorded in a measurement in docs/spikes/p1-collector-net.md
+value 192.168.1.50       # synthetic e2e fixture host documented in docs/e2e.md (matches tests/e2e data)
+value c2:11:22:33:44:01  # synthetic e2e fixture MAC range documented in docs/e2e.md (matches tests/e2e data)

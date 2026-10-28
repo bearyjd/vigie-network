@@ -86,8 +86,8 @@ cp .env.example .env && $EDITOR .env            # set VIGIE_LAN_ADDR (required)
 
 # 1. Self-signed certificates (ECDSA P-256) and podman secrets: one for ingest (collectors pin it,
 #    note the printed pin) and a SEPARATE one for the API, so ingest never holds the API's key.
-VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --create-secrets
-VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.1.10" ./gen-certs.sh --role api --create-secrets
+VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.8.10" ./gen-certs.sh --create-secrets
+VIGIE_CERT_SAN="DNS:vigie.lan,IP:192.168.8.10" ./gen-certs.sh --role api --create-secrets
 
 # 2. Build the image (one image, three services)
 podman build -f Containerfile -t localhost/vigie-server:dev ..
@@ -117,19 +117,19 @@ Call the API (responses use the envelope `{ok, data, error, page}`):
 ```sh
 TOKEN=vgt_...   # the token printed above
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  "https://192.168.1.10:8444/devices?include_transient=1"
+  "https://192.168.8.10:8444/devices?include_transient=1"
 # {"ok":true,"data":[...],"error":null,"page":{"next_cursor":null}}
 
-curl --cacert deploy/certs-api/server.crt https://192.168.1.10:8444/healthz       # unauthenticated
+curl --cacert deploy/certs-api/server.crt https://192.168.8.10:8444/healthz       # unauthenticated
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  "https://192.168.1.10:8444/events?since=0"
+  "https://192.168.8.10:8444/events?since=0"
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
-  https://192.168.1.10:8444/macs/aa:bb:cc:dd:ee:ff            # 404 = unknown MAC = unassigned
+  https://192.168.8.10:8444/macs/02:00:00:dd:ee:ff            # 404 = unknown MAC = unassigned
 
 # Writes need If-Match with the device's current ETag (428 if absent, 412 on mismatch):
 curl --cacert deploy/certs-api/server.crt -H "Authorization: Bearer $TOKEN" \
   -H 'If-Match: "0"' -H 'Content-Type: application/json' -X PATCH \
-  -d '{"name":"Kitchen speaker","group_id":"kids"}' https://192.168.1.10:8444/devices/<device-id>
+  -d '{"name":"Kitchen speaker","group_id":"kids"}' https://192.168.8.10:8444/devices/<device-id>
 ```
 
 (`--cacert` works because the certificate's SAN contains the address you connect to. The ETag
@@ -166,7 +166,7 @@ Design notes that affect operation:
   sudo firewall-cmd --reload
   sudo firewall-cmd --list-rich-rules
   ```
-  Verify from a SECOND host that is not allowed (`nc -vz 192.168.1.10 8443` must be refused, and the
+  Verify from a SECOND host that is not allowed (`nc -vz 192.168.8.10 8443` must be refused, and the
   same for 8444) and from the router or control app that it still connects. Undo: run the same four
   commands with `--remove-rich-rule` instead of `--add-rich-rule`, then `--reload`.
   Rootless networking may rewrite the peer address the ingest rate limiter sees; check
