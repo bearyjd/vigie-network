@@ -474,7 +474,11 @@ def write_ingest_marker(journal: Path) -> None:
             handle.flush()
             os.fsync(handle.fileno())
     except FileExistsError:
-        pass
+        if not marker.is_file() or marker.is_symlink():
+            print(
+                f"warning: {marker.name} exists but is not a regular file",
+                file=sys.stderr,
+            )
     except OSError as error:
         # The fail report must still be printed; tell the operator the verdict is not sticky.
         print(f"warning: could not write {marker.name}: {error}", file=sys.stderr)
@@ -559,7 +563,7 @@ def main():
             or bound.is_link_local
         ):
             raise ValueError("invalid ingest address")
-    if ingest is not None and ingest_marker(args.journal).exists():
+    if os.path.lexists(ingest_marker(args.journal)):
         # A recorded ingest failure is sticky until the operator deletes the marker.
         print(json.dumps(unbound_report([])))
         return 1

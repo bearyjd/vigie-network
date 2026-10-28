@@ -681,14 +681,16 @@ class IngestAddressPrecheckTests(unittest.TestCase):
 
         self.assertIsNone(runner.ingest_address_issue(None, lookup))
 
-    def run_main(self, lookup_for, ingest_address=ADDRESS, setup=None):
+    OMIT = object()
+
+    def run_main(self, lookup_for, ingest_address=ADDRESS, setup=None, args=()):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             if setup:
                 setup(base)
-            return self.run_in(base, lookup_for, ingest_address)
+            return self.run_in(base, lookup_for, ingest_address, args)
 
-    def run_in(self, base, lookup_for, ingest_address=ADDRESS):
+    def run_in(self, base, lookup_for, ingest_address=ADDRESS, args=()):
         import hashlib
         import io
         import json
@@ -705,6 +707,8 @@ class IngestAddressPrecheckTests(unittest.TestCase):
                 "router_address": "192.0.2.1",
                 "ingest_address": ingest_address,
             }
+            if ingest_address is self.OMIT:
+                del config["ingest_address"]
             raw = json.dumps(config).encode()
             config_path = base / "config"
             config_path.write_bytes(raw)
@@ -719,7 +723,9 @@ class IngestAddressPrecheckTests(unittest.TestCase):
             out = io.StringIO()
             with (
                 patch.object(
-                    sys, "argv", ["run_soak", str(config_path), str(journal_path)]
+                    sys,
+                    "argv",
+                    ["run_soak", str(config_path), str(journal_path), *args],
                 ),
                 patch.object(runner, "local_ipv4_addresses", lookup),
                 patch.object(
@@ -732,10 +738,13 @@ class IngestAddressPrecheckTests(unittest.TestCase):
             samples = None
             if journal_path.exists():
                 metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
-                with runner.Journal(
-                    journal_path, mode="real", metadata=metadata
-                ) as journal:
-                    samples = len(journal.samples)
+                try:
+                    with runner.Journal(
+                        journal_path, mode="real", metadata=metadata
+                    ) as journal:
+                        samples = len(journal.samples)
+                except ValueError:
+                    samples = "config-mismatch"
             marker = base / "journal.ingest_address_unbound"
             return {
                 "marker": json.loads(marker.read_text()) if marker.exists() else None,
@@ -898,6 +907,53 @@ class IngestAddressPrecheckTests(unittest.TestCase):
         self.assertEqual(result["code"], 1)
         self.assertIn("ingest_address_unbound", result["report"]["reasons"])
         self.assertIsNone(result["marker"])
+
+    def test_preflight_start_abort_writes_no_marker(self):
+        result = self.run_main(self.bound_then(False), args=("--preflight",))
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(result["report"]["reasons"], ["ingest_address_unbound"])
+        self.assertIsNone(result["marker"])
+
+    def test_run_without_ingest_address_and_without_marker_is_unchanged(self):
+        def lookup_for(call):
+            raise AssertionError("no lookup without ingest_address")
+
+        result = self.run_main(lookup_for, ingest_address=self.OMIT)
+        self.assertEqual(result["lookups"], 0)
+        self.assertEqual(result["collect_calls"], 2)
+        self.assertEqual(result["journal_samples"], 2)
+        self.assertIsNone(result["marker"])
+        self.assertNotIn("ingest_address_unbound", result["report"]["reasons"])
+
+    def test_marker_blocks_resume_even_after_ingest_address_key_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.run_in(base, self.bound_then(True, False))
+            second = self.run_in(base, self.bound_then(), self.OMIT)
+            self.assertEqual(second["code"], 1)
+            self.assertEqual(second["report"]["reasons"], ["ingest_address_unbound"])
+            self.assertEqual(second["collect_calls"], 0)
+
+    def test_write_marker_warns_when_path_is_a_dangling_symlink(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "journal.ingest_address_unbound").symlink_to(base / "nowhere")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                runner.write_ingest_marker(base / "journal")
+            self.assertIn("not a regular file", err.getvalue())
+            self.assertFalse((base / "nowhere").exists())
+
+    def test_dangling_symlink_blocks_start_even_when_address_is_bound(self):
+        def plant(base):
+            (base / "journal.ingest_address_unbound").symlink_to(base / "nowhere")
+
+        result = self.run_main(self.bound_then(True), setup=plant)
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(result["lookups"], 0)
 
 
 FIB_TRIE = """\
