@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import struct
 import sys
 import tempfile
@@ -680,14 +681,20 @@ class IngestAddressPrecheckTests(unittest.TestCase):
 
         self.assertIsNone(runner.ingest_address_issue(None, lookup))
 
-    def run_main(self, lookup_for, ingest_address=ADDRESS):
+    def run_main(self, lookup_for, ingest_address=ADDRESS, setup=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            if setup:
+                setup(base)
+            return self.run_in(base, lookup_for, ingest_address)
+
+    def run_in(self, base, lookup_for, ingest_address=ADDRESS):
         import hashlib
         import io
         import json
         from contextlib import redirect_stdout
 
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
+        if True:
             config = {
                 "api_port": 18444,
                 "api_token_file": "/unused",
@@ -729,7 +736,12 @@ class IngestAddressPrecheckTests(unittest.TestCase):
                     journal_path, mode="real", metadata=metadata
                 ) as journal:
                     samples = len(journal.samples)
+            marker = base / "journal.ingest_address_unbound"
             return {
+                "marker": json.loads(marker.read_text()) if marker.exists() else None,
+                "marker_mode": marker.stat().st_mode & 0o777
+                if marker.exists()
+                else None,
                 "code": code,
                 "report": json.loads(out.getvalue()),
                 "lookups": len(lookups),
@@ -779,22 +791,183 @@ class IngestAddressPrecheckTests(unittest.TestCase):
         self.assertEqual(result["code"], 1)
         self.assertIn("ingest_address_unbound", result["report"]["reasons"])
         self.assertEqual(result["journal_samples"], 1)
+        self.assertEqual(result["collect_calls"], 1)
+        self.assertEqual(result["lookups"], 2)
+
+    def test_unreadable_interface_table_at_start_fails_without_collecting(self):
+        def lookup_for(call):
+            raise OSError("no fib_trie")
+
+        result = self.run_main(lookup_for)
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(result["report"]["status"], "fail")
+        self.assertEqual(result["report"]["reasons"], ["ingest_address_unbound"])
+        self.assertEqual(result["collect_calls"], 0)
+        self.assertIsNone(result["journal_samples"])
+
+    def test_undecodable_interface_table_fails_closed(self):
+        def lookup():
+            raise ValueError("bad bytes")
+
+        self.assertEqual(
+            runner.ingest_address_issue(self.ADDRESS, lookup), "ingest_address_unbound"
+        )
 
     def test_unusable_ingest_addresses_are_rejected_before_any_lookup(self):
         for bad in (
             "127.0.0.1",
+            "127.1.2.3",
             "0.0.0.0",
             "224.0.0.1",
             "255.255.255.255",
             "169.254.1.1",
             "240.0.0.1",
+            "2001:db8::1",
+            "::1",
             "not-an-ip",
             None,
             10,
         ):
             with self.subTest(address=bad):
-                with self.assertRaises(ValueError):
-                    self.run_main(self.bound_then(True, True), ingest_address=bad)
+                lookups = []
+
+                def lookup_for(call):
+                    lookups.append(call)
+                    return frozenset({self.ADDRESS})
+
+                with (
+                    patch.object(runner, "collect") as collect,
+                    self.assertRaises(ValueError),
+                ):
+                    self.run_main(lookup_for, ingest_address=bad)
+                self.assertEqual(lookups, [])
+                collect.assert_not_called()
+
+    # Sticky failure marker -------------------------------------------------
+
+    def test_mid_run_abort_writes_private_marker(self):
+        result = self.run_main(self.bound_then(True, False))
+        self.assertEqual(result["marker"]["reason"], "ingest_address_unbound")
+        self.assertEqual(set(result["marker"]), {"reason", "wall"})
+        self.assertEqual(result["marker_mode"], 0o600)
+
+    def test_start_abort_writes_marker(self):
+        result = self.run_main(self.bound_then(False))
+        self.assertEqual(result["marker"]["reason"], "ingest_address_unbound")
+
+    def test_no_marker_when_check_passes(self):
+        def lookup_for(call):
+            if call > 2:
+                raise KeyboardInterrupt
+            return frozenset({self.ADDRESS})
+
+        with patch.object(runner, "collect", return_value=dict(HEALTHY_SAMPLE)):
+            result = self.run_main(lookup_for)
+        self.assertIsNone(result["marker"])
+
+    def test_resume_with_marker_fails_even_when_address_is_bound_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = self.run_in(base, self.bound_then(True, False))
+            self.assertEqual(first["code"], 1)
+            second = self.run_in(base, self.bound_then(True, True, True))
+            self.assertEqual(second["code"], 1)
+            self.assertEqual(second["report"]["status"], "fail")
+            self.assertEqual(second["report"]["reasons"], ["ingest_address_unbound"])
+            self.assertEqual(second["collect_calls"], 0)
+            self.assertEqual(second["journal_samples"], 1)
+
+    def test_deleting_marker_allows_deliberate_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.run_in(base, self.bound_then(True, False))
+            (base / "journal.ingest_address_unbound").unlink()
+            second = self.run_in(base, self.bound_then(True, False))
+            self.assertEqual(second["collect_calls"], 1)
+
+    def test_marker_write_failure_does_not_mask_fail_report(self):
+        real_open = os.open
+
+        def refuse_marker(path, *args, **kwargs):
+            if str(path).endswith(".ingest_address_unbound"):
+                raise OSError("read-only")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(runner.os, "open", side_effect=refuse_marker):
+            result = self.run_main(self.bound_then(True, False))
+        self.assertEqual(result["code"], 1)
+        self.assertIn("ingest_address_unbound", result["report"]["reasons"])
+        self.assertIsNone(result["marker"])
+
+
+FIB_TRIE = """\
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.0/31 1 0 0
+           |-- 127.0.0.0
+              /32 link BROADCAST
+              /8 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+        |-- 127.255.255.255
+           /32 link BROADCAST
+     +-- 192.0.2.0/24 2 0 2
+        |-- 192.0.2.0
+           /32 link BROADCAST
+           /24 link UNICAST
+        |-- 192.0.2.10
+           /32 host LOCAL
+        |-- 192.0.2.255
+           /32 link BROADCAST
+     |-- 198.51.100.7
+        /32 host LOCAL
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     +-- 127.0.0.0/8 2 0 2
+        |-- 127.0.0.1
+           /32 host LOCAL
+     |-- 192.0.2.10
+        /32 host LOCAL
+     |-- 198.51.100.8
+        /32 link UNICAST
+"""
+
+
+class FibTrieParserTests(unittest.TestCase):
+    def parse(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fib_trie"
+            path.write_text(text)
+            return runner.local_ipv4_addresses(path)
+
+    def test_returns_host_local_entries_deduplicated_across_tables(self):
+        self.assertEqual(
+            self.parse(FIB_TRIE),
+            frozenset({"127.0.0.1", "192.0.2.10", "198.51.100.7"}),
+        )
+
+    def test_excludes_broadcast_network_and_non_host_entries(self):
+        found = self.parse(FIB_TRIE)
+        for absent in (
+            "0.0.0.0",
+            "127.0.0.0",
+            "127.255.255.255",
+            "192.0.2.0",
+            "192.0.2.255",
+            "198.51.100.8",
+        ):
+            self.assertNotIn(absent, found)
+
+    def test_empty_text_yields_no_addresses(self):
+        self.assertEqual(self.parse(""), frozenset())
+
+    def test_missing_file_raises_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(OSError):
+                runner.local_ipv4_addresses(Path(tmp) / "absent")
 
 
 if __name__ == "__main__":

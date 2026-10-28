@@ -437,17 +437,47 @@ def collect(config):
 INGEST_UNBOUND = "ingest_address_unbound"
 
 
-def local_ipv4_addresses() -> frozenset[str]:
-    """IPv4 addresses currently assigned to this host (Linux fib_trie LOCAL entries)."""
+FIB_TRIE = Path("/proc/net/fib_trie")
+INGEST_MARKER_SUFFIX = ".ingest_address_unbound"
+
+
+def local_ipv4_addresses(path: Path = FIB_TRIE) -> frozenset[str]:
+    """IPv4 addresses currently assigned to this host (Linux fib_trie /32 host LOCAL)."""
     found = set()
     current = None
-    for line in Path("/proc/net/fib_trie").read_text().splitlines():
+    for line in path.read_text().splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == "|--":
             current = parts[1]
-        elif current and parts[-2:] == ["host", "LOCAL"]:
+        elif current and parts == ["/32", "host", "LOCAL"]:
             found.add(current)
     return frozenset(found)
+
+
+def ingest_marker(journal: Path) -> Path:
+    return journal.with_name(journal.name + INGEST_MARKER_SUFFIX)
+
+
+def write_ingest_marker(journal: Path) -> None:
+    """Record the failure beside the journal so a later resume cannot turn it into a pass.
+
+    soak.py never reads this file; the runner refuses to start while it exists.
+    """
+    marker = ingest_marker(journal)
+    body = json.dumps({"reason": INGEST_UNBOUND, "wall": time.time()}).encode()
+    try:
+        if not marker.parent.exists():
+            marker.parent.mkdir(mode=0o700)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        pass
+    except OSError as error:
+        # The fail report must still be printed; tell the operator the verdict is not sticky.
+        print(f"warning: could not write {marker.name}: {error}", file=sys.stderr)
 
 
 def ingest_address_issue(address: str | None, lookup=None) -> str | None:
@@ -456,7 +486,7 @@ def ingest_address_issue(address: str | None, lookup=None) -> str | None:
         return None
     try:
         present = (lookup or local_ipv4_addresses)()
-    except OSError:
+    except (OSError, ValueError):
         # Fail closed: an unreadable interface table cannot prove the address is bound.
         return INGEST_UNBOUND
     return None if address in present else INGEST_UNBOUND
@@ -527,11 +557,16 @@ def main():
             or bound.is_multicast
             or bound.is_reserved
             or bound.is_link_local
-            or bound == ipaddress.IPv4Address("255.255.255.255")
         ):
             raise ValueError("invalid ingest address")
+    if ingest is not None and ingest_marker(args.journal).exists():
+        # A recorded ingest failure is sticky until the operator deletes the marker.
+        print(json.dumps(unbound_report([])))
+        return 1
     if ingest_address_issue(ingest):
         print(json.dumps(unbound_report([])))
+        if not args.preflight:
+            write_ingest_marker(args.journal)
         return 1
     first = collect(config)
     failures, missing, quality = sample_issues(first)
@@ -561,6 +596,7 @@ def main():
                 time.sleep(max(0, next_time - time.monotonic()))
                 if ingest_address_issue(ingest):
                     report = unbound_report(journal.samples)
+                    write_ingest_marker(args.journal)
                     break
                 journal.append(collect(config))
         except KeyboardInterrupt:
