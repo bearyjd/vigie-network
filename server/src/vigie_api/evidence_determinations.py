@@ -26,7 +26,11 @@ from vigie_api.evidence_types import (
 )
 
 DETERMINISTIC = "deterministic-services"
-REASON_CODES = ("large_upload_threshold", "two_qualified_upload_hours")
+REASON_CODES = (
+    "large_upload_threshold",
+    "two_qualified_upload_hours",
+    "two_qualified_upload_hours_in_cohort",
+)
 DETECTORS = ("large_upload", "upload_deviation")
 INCIDENT_STATES = ("open", "resolved", "superseded")
 REVIEW_STATUSES = ("acknowledged", "snoozed", "expected")

@@ -352,7 +352,7 @@ class ActivityHour(CoverageHour):
 class BaselineView(BaseModel):
     state: Literal["learning", "mature", "rebuilding", "rebuilding_quality", "lineage_unavailable"]
     baseline_id: str | None
-    algorithm: str
+    algorithm: str | None
     config_version: str | None
     sample_hours: int
     distinct_days: int
@@ -374,7 +374,11 @@ class ActivityResponse(_Envelope):
 
 
 class IncidentEvidence(BaseModel):
-    reason_code: Literal["large_upload_threshold", "two_qualified_upload_hours"]
+    reason_code: Literal[
+        "large_upload_threshold",
+        "two_qualified_upload_hours",
+        "two_qualified_upload_hours_in_cohort",
+    ]
     hour: int
     previous_hour: int | None
     observed_bytes: int

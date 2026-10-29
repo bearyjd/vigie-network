@@ -92,6 +92,18 @@ class RendererTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 render.render(config(**{key: invalid}))
 
+    def test_monitoring_baseline_selector_default_override_and_strict_values(self):
+        key = "monitoring_baseline"
+        default = render.render(config())["vigie_test-pipeline.container"]
+        self.assertIn("Environment=VIGIE_MONITORING_BASELINE=pooled", default)
+        custom = render.render(config(**{key: "tod"}))
+        self.assertIn("Environment=VIGIE_MONITORING_BASELINE=tod", custom["vigie_test-pipeline.container"])
+        for role in ("ingest", "api"):
+            self.assertNotIn("VIGIE_MONITORING_BASELINE", custom[f"vigie_test-{role}.container"])
+        for invalid in ("", "TOD", " tod", "pooled-median-v1", None, True, ["tod"]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                render.render(config(**{key: invalid}))
+
     def test_invalid_or_injected_config_rejected(self):
         for updates in [
             {"namespace": "dev"},

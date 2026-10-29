@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import sqlite3
@@ -43,18 +44,13 @@ def _pick(flag: int | None, fallback: int) -> int:
 
 def _config(args: argparse.Namespace) -> PipelineConfig:
     base = PipelineConfig.from_env()
-    return PipelineConfig(
+    return dataclasses.replace(
+        base,
         data_dir=args.data_dir or base.data_dir,
         transient_window_s=_pick(args.transient_window_s, base.transient_window_s),
         transient_min_dwell_s=_pick(args.min_dwell_s, base.transient_min_dwell_s),
         promotion_cap_per_hour=_pick(args.promotion_cap, base.promotion_cap_per_hour),
         migrate=args.migrate,
-        inventory_db=base.inventory_db,
-        overrides_db=base.overrides_db,
-        suggest_threshold=base.suggest_threshold,
-        overlap_grace_s=base.overlap_grace_s,
-        activity_gap_s=base.activity_gap_s,
-        delivery=base.delivery,
     )
 
 

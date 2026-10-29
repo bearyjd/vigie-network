@@ -11,6 +11,7 @@ from vigie_pipeline.delivery_types import DeliveryConfig
 TRANSIENT_WINDOW_DEFAULT_S = 24 * 3600
 TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
 PROMOTION_CAP_DEFAULT = 20
+MONITORING_BASELINES = ("pooled", "tod")
 
 # Identity stitching (docs/stitching.md). Weights sum to 1.0; a candidate additionally REQUIRES
 # opt55 AND opt60 AND (hostname OR mdns_name) equal, so with these weights every structurally
@@ -163,6 +164,7 @@ class PipelineConfig:
     inventory_db: Path | None = None
     overrides_db: Path | None = None
     monitoring_large_upload_bytes: int = 1024 * 1024 * 1024
+    monitoring_baseline: str = "pooled"  # VIGIE_MONITORING_BASELINE: pooled | tod
     # Identity stitching
     suggest_threshold: float = SUGGEST_THRESHOLD_DEFAULT
     overlap_grace_s: int = OVERLAP_GRACE_DEFAULT_S
@@ -174,6 +176,8 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
             raise ValueError("monitoring_large_upload_bytes outside supported bounds")
+        if self.monitoring_baseline not in MONITORING_BASELINES:
+            raise ValueError("monitoring_baseline must be one of: pooled, tod")
         if self.transient_window_s < 1:
             raise ValueError("transient_window_s must be positive")
         if self.transient_min_dwell_s < 0 or self.promotion_cap_per_hour < 0:
@@ -201,6 +205,7 @@ class PipelineConfig:
             monitoring_large_upload_bytes=int(
                 source.get("VIGIE_MONITORING_LARGE_UPLOAD_BYTES", 1024**3)
             ),
+            monitoring_baseline=source.get("VIGIE_MONITORING_BASELINE", "pooled"),
             transient_window_s=int(
                 source.get("VIGIE_TRANSIENT_WINDOW_S", TRANSIENT_WINDOW_DEFAULT_S)
             ),

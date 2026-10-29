@@ -199,7 +199,9 @@ def check_compose_config() -> None:
         envfile.write_text((ROOT / "deploy" / ".env.example").read_text())
         base = [tool, "--env-file", str(envfile), "-f", str(ROOT / "deploy" / "compose.yaml")]
         setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
+        selector = "VIGIE_MONITORING_BASELINE"
         clean_env = {k: v for k, v in os.environ.items() if k != setting}
+        clean_baseline = {k: v for k, v in os.environ.items() if k != selector}
         for expected, config_env in (("1073741824", clean_env),
                                      ("2097152", {**clean_env, setting: "2097152"})):
             ok = subprocess.run([*base, "config"], capture_output=True, text=True,
@@ -214,6 +216,18 @@ def check_compose_config() -> None:
                     err(f"rendered pipeline monitoring threshold differs from {expected}")
                 elif role != "pipeline" and actual is not None:
                     err(f"rendered {role} unexpectedly receives monitoring threshold")
+        for expected, config_env in (("pooled", clean_baseline), ("tod", {**clean_baseline, selector: "tod"})):
+            ok = subprocess.run([*base, "config"], capture_output=True, text=True,
+                                env=config_env, check=False)
+            if ok.returncode != 0:
+                err(f"podman-compose config failed: {ok.stderr[-300:]}")
+                continue
+            for role, svc in yaml.safe_load(ok.stdout)["services"].items():
+                actual = svc["environment"].get(selector)
+                if role == "pipeline" and actual != expected:
+                    err(f"rendered pipeline monitoring baseline differs from {expected}")
+                elif role != "pipeline" and actual is not None:
+                    err(f"rendered {role} unexpectedly receives the monitoring baseline selector")
         env = {k: v for k, v in os.environ.items() if k != "VIGIE_LAN_ADDR"}
         bare = Path(tmp) / "empty"
         bare.write_text("")
@@ -236,6 +250,14 @@ def check_monitoring_config(doc: dict, example: str) -> None:
     for service in ("ingest", "api"):
         if setting in doc["services"][service]["environment"]:
             err(f"monitoring upload threshold belongs only to pipeline, not {service}")
+    selector = "VIGIE_MONITORING_BASELINE"
+    if not re.search(r"(?m)^VIGIE_MONITORING_BASELINE=pooled(?:\s|$)", example):
+        err("monitoring baseline selector must be documented with the pooled default")
+    if doc["services"]["pipeline"]["environment"].get(selector) != "${VIGIE_MONITORING_BASELINE:-pooled}":
+        err("pipeline must forward the monitoring baseline selector with its pooled default")
+    for service in ("ingest", "api"):
+        if selector in doc["services"][service]["environment"]:
+            err(f"monitoring baseline selector belongs only to pipeline, not {service}")
 
 
 def check_env_names() -> None:
@@ -373,8 +395,18 @@ def self_test() -> None:
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
-    example = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824\n"
+    contract["services"]["pipeline"]["environment"]["VIGIE_MONITORING_BASELINE"] = "${VIGIE_MONITORING_BASELINE:-pooled}"
+    example = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824\nVIGIE_MONITORING_BASELINE=pooled\n"
     check_monitoring_config(contract, example)
+    _fails("baseline selector default not documented", check_monitoring_config, contract, example.replace("=pooled", "=tod"))
+    api_env = contract["services"]["api"]["environment"]
+    api_env["VIGIE_MONITORING_BASELINE"] = "tod"
+    _fails("baseline selector forwarded to wrong role", check_monitoring_config, contract, example)
+    del api_env["VIGIE_MONITORING_BASELINE"]
+    pipeline_env = contract["services"]["pipeline"]["environment"]
+    kept = pipeline_env.pop("VIGIE_MONITORING_BASELINE")
+    _fails("baseline selector not forwarded", check_monitoring_config, contract, example)
+    pipeline_env["VIGIE_MONITORING_BASELINE"] = kept
     _fails("missing monitoring default documentation", check_monitoring_config, contract, "")
     _fails("incorrect monitoring default documentation", check_monitoring_config, contract, example.replace("1073741824", "1"))
     contract["services"]["api"]["environment"][setting] = "1"

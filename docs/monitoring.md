@@ -66,7 +66,8 @@ unrecognized contamination still require real-data evaluation and feedback desig
 The learned detector requires TWO consecutive eligible post-reference hours each strictly above
 `max(50MiB,4*median)`. Equality does not fire. A missing or degraded intervening hour breaks the
 pair. The cold-start fixed detector fires at or above1GiB upload/hour. Configure the fixed threshold
-with `VIGIE_MONITORING_LARGE_UPLOAD_BYTES` (default1073741824; integer1..2**50). Algorithm and full
+with `VIGIE_MONITORING_LARGE_UPLOAD_BYTES` (default1073741824; integer1..2**50). Select the
+learned baseline family with `VIGIE_MONITORING_BASELINE` (`pooled` default, or `tod`; see below). Algorithm and full
 policy are hashed into a version. A changed configuration rebuilds rather than silently reusing
 an incompatible reference.
 
@@ -85,11 +86,14 @@ to their original lineage; stale open incidents are superseded. API labels stale
 If a retained training hour later loses quality, the active reference is withheld immediately by the API. The pipeline supersedes its open incidents and restarts future learning in `rebuilding_quality`; the historical immutable reference stays attributable. Collector-hour invalidations fan out through a durable cursor in batches of1000 MACs, and incomplete identities back off60 seconds so independent scopes progress. New entities may learn qualified history already recorded since feature activation; newly attached
 MACs cannot immediately redefine an old reference.
 
-### Time-of-day baseline (tod-median-v1, not wired)
+### Time-of-day baseline (tod-median-v1, opt-in)
 
-`vigie_pipeline/baselines_tod.py` is a pure module (no I/O, clock or database) that is NOT used by
-the engine yet: monitoring still runs `pooled-median-v1`, and no schema, migration or environment
-variable changed.
+`vigie_pipeline/baselines_tod.py` is a pure module (no I/O, clock or database). The engine runs it
+only when `VIGIE_MONITORING_BASELINE=tod`; the default `pooled` keeps `pooled-median-v1` unchanged.
+The selector is pipeline-only, exact-match (`pooled` or `tod`, anything else fails at startup) and
+is also the `monitoring_baseline` key of the persistent renderer. No schema or migration changed.
+Switching it changes the policy version, so every profile restarts in `learning` from the next UTC
+hour and open incidents are superseded (expected; flip it deliberately).
 
 - **Cohorts.** `(is_weekend, hour_of_day // bucket_hours)` read from the sample's epoch hour in
   UTC. `bucket_hours` divides 24 (1, 2, 3, 4, 6, 8, 12 or 24; default 4), so adjacent hours pool and
@@ -102,22 +106,53 @@ variable changed.
   and hours at or above the fixed large-upload line are excluded as contamination. At most 4368
   samples (26 weeks) are accepted; hours and byte counts must be exact integers.
 - **Threshold.** Twice the cohort median is kept exactly; the line is
-  `max(minimum_bytes, median * multiplier)`, the same constants as `pooled-median-v1`.
+  `min(large_upload_bytes, max(minimum_bytes, median * multiplier))`: the same constants as
+  `pooled-median-v1`, plus a cap at the fixed large-upload line. `pooled-median-v1` is not capped.
 - **The caller freezes the baseline.** `fit_tod(samples, config, trained_until)` learns only from
   hours up to `trained_until` and records it, plus each cohort's last trained hour. `findings_tod`
   scores an hour only if it is strictly after both; otherwise it abstains with
-  `leaks_evaluated_hours`. The engine wiring unit will choose and persist `trained_until`; appending
-  later history never redefines normality, so slow drift is judged against the frozen window.
+  `leaks_evaluated_hours`. Appending later history never redefines normality, so slow drift is
+  judged against the frozen window.
+- **Engine freeze rule.** `trained_until` is the first qualified hour at which EVERY cohort is mature
+  (so a weekday-only history never freezes; a device with no eligible data in some bucket stays in
+  `learning` and only the fixed large-upload detector runs). It is then fixed and never advances.
+  Any quality reset (a used hour became ineligible, suspicious or large) drops the reference and the
+  profile goes `rebuilding_quality`, as for pooled.
+- **Reason code and threshold.** A tod deviation reports `reason_code=two_qualified_upload_hours_in_cohort`
+  (the read API and `api/openapi.yaml` accept it). When an incident continues into a cohort with a
+  different line, its `threshold_bytes` follows the latest observation, as `observed_bytes` does.
+- **API label.** `baseline.algorithm` in the activity view is now null whenever there is no stored
+  baseline (learning, rebuilding or after a lineage change), under the default `pooled` mode too; it
+  used to read `pooled-median-v1` in those states. For tod, `median_upload_bytes` is null (thresholds
+  are per cohort), and the UI says so.
+- **Intermittent devices and incidents.** Because the freeze needs every cohort mature, a device with
+  intermittent data stays in `learning` and only the fixed detector runs. A fixed `large_upload` and an
+  `upload_deviation` can both open for the same hours; duplicate incidents are by design. tod evidence
+  also carries `bucket_hours`, the cohort and `cap_applied` (the read API's allowlist drops them today).
+- **Persistence, no schema change.** The baseline row stores `algorithm=tod-median-v1`,
+  `trained_until`, the used `training_hours`, and in `config_json` the policy (including
+  `bucket_hours`) plus `training_bytes` (the byte value of each used hour). Every pass refits
+  deterministically from those stored inputs, so pruning of raw measurements after 90 days or a
+  rewritten `bytes_up` cannot move a frozen reference. Unreadable or inconsistent stored inputs are
+  treated as a quality reset. `median_twice`, `sample_hours` and `distinct_days` hold OVERALL figures
+  over the used hours (median of all used values, their count, their distinct UTC days) to satisfy the
+  table and the API; thresholds never use them, only the per-cohort refit. Incident evidence keeps the
+  pooled key set: `baseline_median_upload_bytes`, `sample_hours` and `distinct_days` describe the
+  cohort of the evaluated hour (null when it has no fitted cohort).
+- **One threshold, two sites.** The suspicious-hour marker in the engine and the deviation detector
+  use the same `deviation_threshold`, so an hour is marked only when its own cohort is mature and
+  leak-free.
 - **Detection.** The fixed large-upload candidate is always evaluated first, even in cold start or
   with an immature cohort. The learned deviation needs TWO consecutive eligible hours, each strictly
   above the line of its OWN mature cohort. An immature current cohort abstains with its reason; an
   immature previous cohort abstains with `previous_<reason>`. A nightly backup that is high every
   night is learned, not flagged.
-- **Known blind band.** A baseline poisoned by sustained high traffic before `trained_until` can
-  raise a cohort threshold up to `multiplier` times its median-twice, so sustained exfiltration just
-  under the fixed large-upload line (1 GiB/h) may not yield an `upload_deviation` candidate. The
-  fixed detector remains the backstop; the engine wiring unit must freeze `trained_until` before
-  suspected incidents and may cap the threshold. This is the same limit as `pooled-median-v1`.
+- **Known blind band.** A baseline poisoned by sustained high traffic before `trained_until` raises
+  a cohort line up to `multiplier` times its median. The cap bounds the learned line at the fixed
+  large-upload line (1 GiB/h by default), so sustained upload above that now also yields an
+  `upload_deviation` candidate. It does NOT detect sustained traffic just below the fixed line: such a
+  cohort is learned as normal and only the fixed detector remains as the backstop. `pooled-median-v1`
+  has the uncapped limit.
 - **Versioning.** `TodConfig.version` hashes the algorithm id and every parameter, including
   `bucket_hours`. Results are deterministic for any input order, and backfilled history fits by its
   own cohort.

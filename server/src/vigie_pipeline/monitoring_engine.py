@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
-from dataclasses import asdict
 
 from vigie_ingest.db import immediate, iso_utc
-from vigie_pipeline.baselines import ALGORITHM, BaselineConfig, Sample, findings, fit_reference
+from vigie_pipeline.baselines import BaselineConfig, InvalidInput, Sample
+from vigie_pipeline.baselines_tod import TodConfig
+from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
+from vigie_pipeline.monitoring_strategy import strategy_for
 
+logger = logging.getLogger(__name__)
 MAX_ENTITIES = 20
 AGGREGATE_DAYS = 90
 DETAIL_DAYS = 7
@@ -58,6 +62,7 @@ def samples_for(inv, collector, identity, now):
 
 
 def analyze_entity(inv, ov, collector, device, policy, now):
+    strategy = strategy_for(policy)
     deadline = time.monotonic() + 0.5
     inv.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
     try:
@@ -81,16 +86,21 @@ def analyze_entity(inv, ov, collector, device, policy, now):
             old["training_since"] if old else (series[0].hour if series else current_hour + 3600)
         )
     reference = None
+    unusable_inputs = False
     if old is not None and not changed and old["baseline_id"]:
         reference_row = inv.execute(
             "SELECT * FROM monitoring_baselines WHERE id=?", (old["baseline_id"],)
         ).fetchone()
         if reference_row is not None:
-            reference = dict(reference_row)
+            reference = strategy.hydrate(dict(reference_row))
+            unusable_inputs = reference is None
     quality_reset = False
-    if reference is not None:
-        used = set(json.loads(reference["training_hours"]))
-        if any(
+    if unusable_inputs or reference is not None:
+        try:
+            used = set(json.loads(reference["training_hours"])) if reference else set()
+        except (TypeError, ValueError) as exc:
+            raise InvalidInput("stored training_hours is not a JSON list") from exc
+        if unusable_inputs or any(
             s.hour in used
             and (not s.eligible or s.suspicious or s.bytes_up >= policy.large_upload_bytes)
             for s in series
@@ -101,7 +111,7 @@ def analyze_entity(inv, ov, collector, device, policy, now):
             training_since = (int(now) // 3600 + 1) * 3600
     training = [s for s in series if s.hour >= training_since]
     if reference is None and identity.versioned:
-        reference = fit_reference(training, policy)
+        reference = strategy.fit(training)
     qualified_training = [
         sample
         for sample in training
@@ -135,7 +145,7 @@ def analyze_entity(inv, ov, collector, device, policy, now):
     by_hour = {sample.hour: sample for sample in training}
     current = by_hour.get(current_hour)
     previous = by_hour.get(current_hour - 3600)
-    found = findings(current, previous, reference, policy) if identity.versioned else []
+    found = strategy.findings(current, previous, reference) if identity.versioned else []
     with immediate(inv):
         # The two DBs cannot form one atomic snapshot. Recheck versioned lineage before publishing;
         # API readers independently label stale-lineage profiles as rebuilding.
@@ -155,9 +165,9 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                     collector,
                     identity.device_id,
                     identity.key,
-                    ALGORITHM,
+                    strategy.algorithm,
                     policy.version,
-                    json.dumps(asdict(policy), sort_keys=True),
+                    strategy.config_json(reference),
                     reference["median_twice"],
                     reference["sample_hours"],
                     reference["distinct_days"],
@@ -187,11 +197,7 @@ def analyze_entity(inv, ov, collector, device, policy, now):
             ),
         )
         if current is not None and current.eligible:
-            threshold = (
-                max(policy.minimum_bytes, reference["median_twice"] * policy.multiplier // 2)
-                if reference
-                else None
-            )
+            threshold = strategy.threshold(current, reference)
             if current.bytes_up >= policy.large_upload_bytes or (
                 threshold is not None and current.bytes_up > threshold
             ):
@@ -226,18 +232,14 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                 "observed_bytes": finding["observed_bytes"],
                 "threshold_bytes": finding["threshold_bytes"],
                 "baseline_id": baseline_id,
-                "algorithm": ALGORITHM,
+                "algorithm": strategy.algorithm,
                 "config_version": policy.version,
                 "coverage_required_seconds": 3420,
                 "lineage": identity.key,
                 "unusual_is_not_malicious": True,
-                "baseline_median_upload_bytes": reference["median_twice"] / 2
-                if reference
-                else None,
                 "multiplier": policy.multiplier,
                 "minimum_bytes": policy.minimum_bytes,
-                "sample_hours": reference["sample_hours"] if reference else None,
-                "distinct_days": reference["distinct_days"] if reference else None,
+                **strategy.evidence(current, reference),
             }
             inv.execute(
                 "INSERT INTO monitoring_incidents(id,collector_id,device_id,lineage,de"
@@ -245,7 +247,8 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                 "detected_at,baseline_id,observed_bytes,threshold_bytes,evidence) VALU"
                 "ES (?,?,?,?,?,'open',?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET last_hour=excluded.last_hour,observed_b"
-                "ytes=excluded.observed_bytes,evidence=excluded.evidence",
+                "ytes=excluded.observed_bytes,threshold_bytes=excluded.threshold_bytes,"
+                "evidence=excluded.evidence",
                 (
                     ident,
                     collector,
@@ -291,7 +294,7 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                 )
 
 
-def analyze_monitoring(inv, ov, policy: BaselineConfig, now):
+def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
     drain_quality_work(inv, now)
     queue = inv.execute(
         "SELECT collector_id,mac FROM monitoring_dirty WHERE queued_at<=? "
@@ -319,7 +322,16 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig, now):
                     "DELETE FROM monitoring_unavailable WHERE collector_id=? AND device_id=?",
                     (collector, row[0]),
                 )
-        except (LineageUnavailable, sqlite3.OperationalError) as exc:
+        except (LineageUnavailable, sqlite3.OperationalError, InvalidInput) as exc:
+            if isinstance(exc, InvalidInput):
+                log(
+                    logger,
+                    logging.ERROR,
+                    "monitoring_invalid_input",
+                    collector=collector,
+                    device=row[0],
+                    error=str(exc),
+                )
             # Back off failed subjects so an incomplete component cannot monopolize the queue.
             with immediate(inv):
                 inv.execute(
@@ -335,6 +347,8 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig, now):
                         row[0],
                         "lineage_unavailable"
                         if isinstance(exc, LineageUnavailable)
+                        else "invalid_input"
+                        if isinstance(exc, InvalidInput)
                         else "read_budget_or_database_unavailable",
                         int(now) + 60,
                     ),
