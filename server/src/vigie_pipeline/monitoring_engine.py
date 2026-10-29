@@ -247,7 +247,8 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                 "detected_at,baseline_id,observed_bytes,threshold_bytes,evidence) VALU"
                 "ES (?,?,?,?,?,'open',?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET last_hour=excluded.last_hour,observed_b"
-                "ytes=excluded.observed_bytes,evidence=excluded.evidence",
+                "ytes=excluded.observed_bytes,threshold_bytes=excluded.threshold_bytes,"
+                "evidence=excluded.evidence",
                 (
                     ident,
                     collector,

@@ -337,3 +337,36 @@ def test_baseline_view_algorithm_is_null_without_a_stored_model_and_tod_hides_th
         "UPDATE coverage_hourly SET qualified_seconds=0,reasons=?", ('["raw_missing"]',)
     )
     assert baseline_view(env.inv, "c1", "d1", key)["algorithm"] is None
+
+
+def test_tod_deviation_incident_is_served_by_list_and_detail_endpoints(env: Env):
+    from vigie_pipeline.baselines_tod import TodConfig
+    from vigie_pipeline.monitoring_engine import analyze_monitoring
+
+    seed(env)
+    env.inv.execute("DELETE FROM measurements_hourly")
+    env.inv.execute("DELETE FROM coverage_hourly")
+    stamps = [HOUR - k * 86400 for k in range(2, 17)] + [HOUR - 3600, HOUR]
+    for stamp in stamps:
+        value = 60 * 1048576 if stamp >= HOUR - 3600 else 10 * 1048576
+        env.inv.execute(
+            "INSERT INTO measurements_hourly VALUES ('c1',?,?,?,4,2,0)", (MAC, stamp, value)
+        )
+        env.inv.execute("INSERT INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')", (stamp,))
+    env.inv.execute("INSERT OR REPLACE INTO monitoring_dirty VALUES ('c1',?,?)", (MAC, HOUR))
+    tod = TodConfig(min_samples_per_cohort=3, min_days_per_cohort=3, bucket_hours=24)
+    analyze_monitoring(env.inv, env.ov, tod, NOW)
+    stored = env.inv.execute("SELECT id,detector,evidence FROM monitoring_incidents").fetchall()
+    assert [r["detector"] for r in stored] == ["upload_deviation"]
+    listed = env.get("/incidents", collector_id="c1")
+    assert listed.status_code == 200, listed.text
+    detail = env.get(f"/incidents/{stored[0]['id']}", collector_id="c1")
+    assert detail.status_code == 200, detail.text
+    for evidence in (
+        listed.json()["data"][0]["evidence"]
+        if isinstance(listed.json()["data"], list)
+        else listed.json()["data"]["incidents"][0]["evidence"],
+        detail.json()["data"]["evidence"],
+    ):
+        assert evidence["reason_code"] == "two_qualified_upload_hours_in_cohort"
+        assert evidence["algorithm"] == "tod-median-v1"

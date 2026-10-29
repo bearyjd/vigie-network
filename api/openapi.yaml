@@ -1655,7 +1655,8 @@
           "reason_code": {
             "enum": [
               "large_upload_threshold",
-              "two_qualified_upload_hours"
+              "two_qualified_upload_hours",
+              "two_qualified_upload_hours_in_cohort"
             ],
             "title": "Reason Code",
             "type": "string"

@@ -360,7 +360,16 @@ def test_plain_value_error_is_a_bug_and_still_escapes(tmp_path, monkeypatch):
         ov.close()
 
 
-def test_invalid_input_is_logged_backed_off_and_does_not_block_other_entities(tmp_path, caplog):
+def test_invalid_input_is_logged_backed_off_and_does_not_block_other_entities(tmp_path):
+    import logging
+
+    from vigie_pipeline import monitoring_engine
+
+    records = []
+    handler = logging.Handler(logging.ERROR)
+    handler.emit = records.append  # own handler: immune to propagation state of other tests
+    monitoring_engine.logger.addHandler(handler)
+    monitoring_engine.logger.disabled = False
     inv, ov = seeded(tmp_path)
     try:
         other = "aa:bb:cc:00:00:02"
@@ -384,15 +393,15 @@ def test_invalid_input_is_logged_backed_off_and_does_not_block_other_entities(tm
         )
         inv.execute("INSERT INTO monitoring_dirty VALUES ('c1',?,?)", (other, HOUR + 5 * DAY))
         now = HOUR + 5 * DAY + 3610
-        with caplog.at_level("ERROR"):
-            run(inv, ov, now, pooled)
-        record = next(r for r in caplog.records if r.getMessage() == "monitoring_invalid_input")
+        run(inv, ov, now, pooled)
+        record = next(r for r in records if r.getMessage() == "monitoring_invalid_input")
         assert record.fields["device"] == "d1" and "training_hours" in record.fields["error"]
         row = inv.execute("SELECT reason,retry_at FROM monitoring_unavailable").fetchone()
         assert tuple(row) == ("invalid_input", now + 60)
         found = inv.execute("SELECT device_id,detector FROM monitoring_incidents").fetchall()
         assert [tuple(r) for r in found] == [("d2", "large_upload")]
     finally:
+        monitoring_engine.logger.removeHandler(handler)
         inv.close()
         ov.close()
 
@@ -479,6 +488,51 @@ def test_stored_json_over_the_length_cap_is_rejected_even_when_valid(tmp_path):
         run(inv, ov, CURRENT + 3610)
         row = inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
         assert tuple(row) == ("rebuilding_quality", None)
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_continued_incident_threshold_follows_the_latest_cohort(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        for d in range(14):
+            hour(inv, HOUR + d * DAY, 25 * MIB if (d + 2) % 7 >= 5 else 10 * MIB)
+        friday_22 = HOUR + 16 * DAY + 5 * 3600
+        hour(inv, friday_22, 70 * MIB)
+        hour(inv, friday_22 + 3600, 70 * MIB)
+        run(inv, ov, friday_22 + 7210)
+        thresholds = inv.execute("SELECT threshold_bytes,state FROM monitoring_incidents")
+        assert [tuple(r) for r in thresholds] == [(50 * MIB, "open")]
+        hour(inv, friday_22 + 7200, 110 * MIB)  # Saturday 00:00: weekend line is 100 MiB
+        run(inv, ov, friday_22 + 7200 + 3610)
+        row = inv.execute(
+            "SELECT threshold_bytes,observed_bytes,evidence FROM monitoring_incidents"
+        )
+        [only] = row.fetchall()
+        assert (only["threshold_bytes"], only["observed_bytes"]) == (100 * MIB, 110 * MIB)
+        assert json.loads(only["evidence"])["threshold_bytes"] == 100 * MIB
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_pooled_continued_incident_threshold_is_unchanged(tmp_path):
+    from test_monitoring_engine import history
+
+    inv, ov = seeded(tmp_path)
+    try:
+        history(inv)
+        cur = HOUR + 20 * DAY
+        hour(inv, cur - 3600, 51 * MIB)
+        hour(inv, cur, 51 * MIB)
+        run(inv, ov, cur + 3610, BaselineConfig())
+        hour(inv, cur + 3600, 52 * MIB)
+        run(inv, ov, cur + 7210, BaselineConfig())
+        row = inv.execute(
+            "SELECT threshold_bytes,observed_bytes FROM monitoring_incidents"
+        ).fetchall()
+        assert [tuple(r) for r in row] == [(50 * MIB, 52 * MIB)]
     finally:
         inv.close()
         ov.close()

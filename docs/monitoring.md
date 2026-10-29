@@ -118,6 +118,9 @@ hour and open incidents are superseded (expected; flip it deliberately).
   `learning` and only the fixed large-upload detector runs). It is then fixed and never advances.
   Any quality reset (a used hour became ineligible, suspicious or large) drops the reference and the
   profile goes `rebuilding_quality`, as for pooled.
+- **Reason code and threshold.** A tod deviation reports `reason_code=two_qualified_upload_hours_in_cohort`
+  (the read API and `api/openapi.yaml` accept it). When an incident continues into a cohort with a
+  different line, its `threshold_bytes` follows the latest observation, as `observed_bytes` does.
 - **API label.** `baseline.algorithm` in the activity view is now null whenever there is no stored
   baseline (learning, rebuilding or after a lineage change), under the default `pooled` mode too; it
   used to read `pooled-median-v1` in those states. For tod, `median_upload_bytes` is null (thresholds

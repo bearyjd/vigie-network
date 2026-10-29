@@ -374,7 +374,11 @@ class ActivityResponse(_Envelope):
 
 
 class IncidentEvidence(BaseModel):
-    reason_code: Literal["large_upload_threshold", "two_qualified_upload_hours"]
+    reason_code: Literal[
+        "large_upload_threshold",
+        "two_qualified_upload_hours",
+        "two_qualified_upload_hours_in_cohort",
+    ]
     hour: int
     previous_hour: int | None
     observed_bytes: int
