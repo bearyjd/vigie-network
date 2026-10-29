@@ -248,7 +248,7 @@ def baseline_view(inv, collector, device, key):
     return {
         "state": state,
         "baseline_id": model["id"] if model else None,
-        "algorithm": ALGORITHM,
+        "algorithm": model["algorithm"] if model else ALGORITHM,
         "config_version": row["config_version"] if row else None,
         "sample_hours": row["sample_hours"] if row else 0,
         "distinct_days": row["distinct_days"] if row else 0,

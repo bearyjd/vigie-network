@@ -767,7 +767,10 @@ def test_deviation_threshold_is_none_when_abstaining_leaking_or_mismatched():
     assert deviation_threshold(at(MONDAY + 15, 3), ref, SMALL) == 120 * MIB
     assert deviation_threshold(at(MONDAY + 15, 9), ref, SMALL) is None  # cohort abstains
     assert deviation_threshold(Sample(ref.trained_until, 1, True), ref, SMALL) is None
-    assert deviation_threshold(at(MONDAY + 15, 3), ref, dataclasses.replace(SMALL, multiplier=5)) is None
+    assert (
+        deviation_threshold(at(MONDAY + 15, 3), ref, dataclasses.replace(SMALL, multiplier=5))
+        is None
+    )
 
 
 def test_ineligible_adjacent_previous_hour_inside_the_training_window_cannot_fire_or_leak():

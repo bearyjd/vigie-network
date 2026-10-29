@@ -14,6 +14,7 @@ from datetime import datetime
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
 from vigie_pipeline.baselines import BaselineConfig
+from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.characterization_store import (
     read_services,
     refresh_characterization,
@@ -68,12 +69,7 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
         promoted, retired = sweep_transients(inv, clock, config)
         purge_activity(inv, clock, config.activity_retention_s)
         if usable:
-            analyze_monitoring(
-                inv,
-                overrides,
-                BaselineConfig(large_upload_bytes=config.monitoring_large_upload_bytes),
-                clock,
-            )
+            analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
             run_delivery_stage(inv, overrides, config, live or (lambda: clock))
             refresh_characterization(inv, overrides, clock)
         prune_monitoring(inv, clock)
@@ -92,6 +88,12 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
     if failures:
         raise failures[0]
     return stats
+
+
+def monitoring_policy(config: PipelineConfig) -> BaselineConfig | TodConfig:
+    "The baseline family is an explicit opt-in; the default stays pooled-median-v1."
+    family = TodConfig if config.monitoring_baseline == "tod" else BaselineConfig
+    return family(large_upload_bytes=config.monitoring_large_upload_bytes)
 
 
 def _overrides_readable(
