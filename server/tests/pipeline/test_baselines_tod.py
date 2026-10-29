@@ -743,3 +743,40 @@ def test_property_cohort_matures_exactly_at_the_boundary(seed):
         assert flips[-1] == (samples >= n and ndays >= d)
     first = flips.index(True)
     assert all(flips[first:]) and not any(flips[:first])
+
+
+def test_deviation_threshold_is_capped_at_the_fixed_large_upload_line():
+    from vigie_pipeline.baselines_tod import deviation_threshold
+
+    cfg = dataclasses.replace(SMALL, large_upload_bytes=1024 * MIB)
+    poisoned = fit(series(span_days(5), 2, 900 * MIB) + series(span_days(5), 3, 900 * MIB), cfg)
+    c, p = at(MONDAY + 15, 3, 1100 * MIB), at(MONDAY + 15, 2, 1100 * MIB)
+    assert deviation_threshold(c, poisoned, cfg) == 1024 * MIB  # 4 * 900 MiB would be 3600 MiB
+    both = findings_tod(c, p, poisoned, cfg)
+    assert {x.detector for x in both.candidates} == {"large_upload", "upload_deviation"}
+    assert all(x.threshold_bytes <= cfg.large_upload_bytes for x in both.candidates)
+    floor = dataclasses.replace(SMALL, minimum_bytes=200 * MIB, large_upload_bytes=100 * MIB)
+    clean = fit(series(span_days(5), 3, 10 * MIB), floor)
+    assert deviation_threshold(at(MONDAY + 15, 3), clean, floor) == 100 * MIB
+
+
+def test_deviation_threshold_is_none_when_abstaining_leaking_or_mismatched():
+    from vigie_pipeline.baselines_tod import deviation_threshold
+
+    ref = fit(history())
+    assert deviation_threshold(at(MONDAY + 15, 3), ref, SMALL) == 120 * MIB
+    assert deviation_threshold(at(MONDAY + 15, 9), ref, SMALL) is None  # cohort abstains
+    assert deviation_threshold(Sample(ref.trained_until, 1, True), ref, SMALL) is None
+    assert deviation_threshold(at(MONDAY + 15, 3), ref, dataclasses.replace(SMALL, multiplier=5)) is None
+
+
+def test_ineligible_adjacent_previous_hour_inside_the_training_window_cannot_fire_or_leak():
+    samples = history()
+    ref = fit(samples, SMALL, max(s.hour for s in samples) - 3600)
+    c = Sample(ref.trained_until + 3600, 130 * MIB, True)
+    p = Sample(ref.trained_until, 130 * MIB, False)
+    out = findings_tod(c, p, ref, SMALL)
+    assert out.candidates == () and out.abstain_reason is None
+    assert findings_tod(c, dataclasses.replace(p, eligible=True), ref, SMALL).abstain_reason == (
+        "leaks_evaluated_hours"
+    )

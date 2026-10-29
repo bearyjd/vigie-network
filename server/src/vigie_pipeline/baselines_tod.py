@@ -152,9 +152,15 @@ def fit_tod(samples: Iterable[Sample], config: TodConfig, trained_until: int) ->
     return TodReference(ALGORITHM, config.version, trained_until, used, MappingProxyType(cohorts))
 
 
+def _threshold(fit: CohortFit, config: TodConfig):
+    "The cohort line, capped at the fixed large-upload line so a poisoned cohort cannot lift it."
+    line = max(config.minimum_bytes, fit.median_twice * config.multiplier // 2)
+    return min(config.large_upload_bytes, line)
+
+
 def _exceeds(sample: Sample, fit: CohortFit, config: TodConfig):
     "Threshold of the sample's own cohort when the hour is strictly above it, else None."
-    threshold = max(config.minimum_bytes, fit.median_twice * config.multiplier // 2)
+    threshold = _threshold(fit, config)
     return threshold if sample.bytes_up > threshold else None
 
 
@@ -166,6 +172,14 @@ def _scorable(sample: Sample, reference: TodReference, config: TodConfig):
     if sample.hour <= max(reference.trained_until, fit.last_trained_hour):
         return None, "leaks_evaluated_hours"
     return fit, None
+
+
+def deviation_threshold(sample: Sample, reference: TodReference, config: TodConfig):
+    "Capped line of the sample's own mature, leak-free cohort; None when it would abstain."
+    if reference.config_version != config.version or sample.hour <= reference.trained_until:
+        return None
+    fit, _ = _scorable(sample, reference, config)
+    return None if fit is None else _threshold(fit, config)
 
 
 def findings_tod(
