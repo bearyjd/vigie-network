@@ -182,8 +182,15 @@
       "BaselineView": {
         "properties": {
           "algorithm": {
-            "title": "Algorithm",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Algorithm"
           },
           "baseline_id": {
             "anyOf": [

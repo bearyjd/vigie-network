@@ -160,9 +160,14 @@ class TodStrategy:
         if reference is None:
             if current is None or not current.eligible:
                 return []
+            if not isinstance(current.bytes_up, int | float):
+                return []
             large = large_upload_finding(current, self.policy.large_upload_bytes)
             return [large] if large else []
-        if any(s is not None and not 0 <= s.bytes_up <= MAX_INT for s in (current, previous)):
+        if any(
+            s is not None and (type(s.bytes_up) is not int or not 0 <= s.bytes_up <= MAX_INT)
+            for s in (current, previous)
+        ):
             # findings_tod rejects such input; the fixed detector must still report the hour.
             return self.findings(current, None, None)
         out = findings_tod(current, previous, reference["tod"], self.policy)

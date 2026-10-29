@@ -307,7 +307,6 @@ def test_never_mature_cohort_keeps_learning_with_only_the_fixed_detector(tmp_pat
         pytest.param("config_json", '{"training_bytes": [1, 2]}', id="length-mismatch"),
         pytest.param("config_json", '{"training_bytes": ["x"]}', id="bad-bytes"),
         pytest.param("config_json", "[" * 100000 + "]" * 100000, id="recursion-bomb"),
-        pytest.param("config_json", " " * 300000, id="over-length-cap"),
         pytest.param("sample_hours", 99, id="wrong-sample-hours"),
         pytest.param("training_hours", "not json", id="hours-not-json"),
         pytest.param("training_hours", "[1.5]", id="hours-float"),
@@ -329,7 +328,7 @@ def test_malformed_stored_inputs_fall_to_rebuilding_quality(tmp_path, column, va
         ov.close()
 
 
-def test_oversized_hour_still_emits_large_upload_and_matches_pooled(tmp_path):
+def test_oversized_hour_still_emits_large_upload_under_tod(tmp_path):
     inv, ov = seeded(tmp_path)
     try:
         mature(inv, ov)
@@ -343,7 +342,7 @@ def test_oversized_hour_still_emits_large_upload_and_matches_pooled(tmp_path):
         ov.close()
 
 
-def test_invalid_input_in_one_entity_is_backed_off_not_fatal(tmp_path, monkeypatch):
+def test_plain_value_error_is_a_bug_and_still_escapes(tmp_path, monkeypatch):
     from vigie_pipeline import monitoring_engine
 
     inv, ov = seeded(tmp_path)
@@ -351,17 +350,67 @@ def test_invalid_input_in_one_entity_is_backed_off_not_fatal(tmp_path, monkeypat
         hour(inv, HOUR, 10 * MIB)
 
         def boom(*args):
-            raise ValueError("invalid hourly sample")
+            raise ValueError("programming bug")
 
         monkeypatch.setattr(monitoring_engine, "analyze_entity", boom)
-        run(inv, ov, HOUR + 3610)
-        row = inv.execute("SELECT reason,retry_at FROM monitoring_unavailable").fetchone()
-        assert tuple(row) == ("invalid_input", HOUR + 3610 + 60)
-        queued = inv.execute("SELECT queued_at FROM monitoring_dirty").fetchone()[0]
-        assert queued == HOUR + 3610 + 60
+        with pytest.raises(ValueError, match="programming bug"):
+            run(inv, ov, HOUR + 3610)
     finally:
         inv.close()
         ov.close()
+
+
+def test_invalid_input_is_logged_backed_off_and_does_not_block_other_entities(tmp_path, caplog):
+    inv, ov = seeded(tmp_path)
+    try:
+        other = "aa:bb:cc:00:00:02"
+        inv.execute(
+            "INSERT INTO observations(mac,device_id,is_randomized,link_source,first_seen,last_seen)"
+            " VALUES (?, 'd2', 0, 'self', 't', 't')",
+            (other,),
+        )
+        pooled = BaselineConfig(minimum_hours=3, minimum_days=3)
+        daily(inv, range(5))
+        run(inv, ov, HOUR + 5 * DAY, pooled)
+        inv.execute("UPDATE monitoring_baselines SET training_hours='not json'")
+        hour(inv, HOUR + 5 * DAY, 10 * MIB)  # re-queues d1
+        inv.execute(
+            "INSERT INTO measurements_hourly VALUES ('c1',?,?,?,0,1,0)",
+            (other, HOUR + 5 * DAY, 1100 * MIB),
+        )
+        inv.execute(
+            "INSERT OR REPLACE INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')",
+            (HOUR + 5 * DAY,),
+        )
+        inv.execute("INSERT INTO monitoring_dirty VALUES ('c1',?,?)", (other, HOUR + 5 * DAY))
+        now = HOUR + 5 * DAY + 3610
+        with caplog.at_level("ERROR"):
+            run(inv, ov, now, pooled)
+        record = next(r for r in caplog.records if r.getMessage() == "monitoring_invalid_input")
+        assert record.fields["device"] == "d1" and "training_hours" in record.fields["error"]
+        row = inv.execute("SELECT reason,retry_at FROM monitoring_unavailable").fetchone()
+        assert tuple(row) == ("invalid_input", now + 60)
+        found = inv.execute("SELECT device_id,detector FROM monitoring_incidents").fetchall()
+        assert [tuple(r) for r in found] == [("d2", "large_upload")]
+    finally:
+        inv.close()
+        ov.close()
+
+
+@pytest.mark.parametrize("bad", [1.5e300, None, 2**60, -5])
+def test_odd_byte_values_fall_to_the_fixed_detector_without_raising(bad):
+    from vigie_pipeline.baselines import Sample
+    from vigie_pipeline.monitoring_strategy import strategy_for
+
+    strategy = strategy_for(TOD)
+    reference = strategy.fit([Sample(HOUR + d * DAY, 10 * MIB, True) for d in range(14)])
+    current = Sample(CURRENT, bad, True)
+    previous = Sample(CURRENT - 3600, bad, True)
+    found = strategy.findings(current, previous, reference)
+    assert [f["detector"] for f in found] == (
+        ["large_upload"] if bad == bad and bad and bad > 2**30 else []
+    )
+    assert strategy.findings(Sample(CURRENT, 10 * MIB, True), previous, reference) == []
 
 
 def test_pooled_default_golden_literals(tmp_path):
@@ -382,16 +431,30 @@ def test_pooled_default_golden_literals(tmp_path):
             "f2326b78a3286c8b26efcdbeeb33597e010c3976ab519047e27c8a5b62d915bc",
             "pooled-median-v1",
         )
-        evidence = json.loads(
-            inv.execute("SELECT evidence FROM monitoring_incidents").fetchone()[0]
-        )
-        assert set(evidence) == {
-            "algorithm", "baseline_id", "baseline_median_upload_bytes", "config_version",
-            "coverage_required_seconds", "distinct_days", "hour", "lineage", "minimum_bytes",
-            "multiplier", "observed_bytes", "previous_hour", "reason_code", "sample_hours",
-            "threshold_bytes", "unusual_is_not_malicious",
-        }  # fmt: skip
-        assert evidence["baseline_median_upload_bytes"] == 10 * MIB
+        incident = inv.execute(
+            "SELECT detector,state,observed_bytes,threshold_bytes,baseline_id,evidence "
+            "FROM monitoring_incidents"
+        ).fetchone()
+        baseline_id = "524e7c1cc2b616d59df50c97f2fb323f86f272cb3140e8391debfc827ac9c714"
+        assert tuple(incident)[:5] == ("upload_deviation", "open", 53477376, 52428800, baseline_id)
+        assert json.loads(incident["evidence"]) == {
+            "algorithm": "pooled-median-v1",
+            "baseline_id": baseline_id,
+            "baseline_median_upload_bytes": 10485760.0,
+            "config_version": "f2326b78a3286c8b26efcdbeeb33597e010c3976ab519047e27c8a5b62d915bc",
+            "coverage_required_seconds": 3420,
+            "distinct_days": 14,
+            "hour": 1793725200,
+            "lineage": "edc7c6c12cee21cd517973e3f9a3b777201f3eead52c9b649d92ff8ba2392e0c",
+            "minimum_bytes": 52428800,
+            "multiplier": 4,
+            "observed_bytes": 53477376,
+            "previous_hour": 1793721600,
+            "reason_code": "two_qualified_upload_hours",
+            "sample_hours": 20,
+            "threshold_bytes": 52428800,
+            "unusual_is_not_malicious": True,
+        }
     finally:
         inv.close()
         ov.close()

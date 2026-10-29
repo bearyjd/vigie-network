@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 
 from vigie_ingest.db import immediate, iso_utc
-from vigie_pipeline.baselines import BaselineConfig, Sample
+from vigie_pipeline.baselines import BaselineConfig, InvalidInput, Sample
 from vigie_pipeline.baselines_tod import TodConfig
+from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 from vigie_pipeline.monitoring_strategy import strategy_for
 
+logger = logging.getLogger(__name__)
 MAX_ENTITIES = 20
 AGGREGATE_DAYS = 90
 DETAIL_DAYS = 7
@@ -93,7 +96,10 @@ def analyze_entity(inv, ov, collector, device, policy, now):
             unusable_inputs = reference is None
     quality_reset = False
     if unusable_inputs or reference is not None:
-        used = set(json.loads(reference["training_hours"])) if reference else set()
+        try:
+            used = set(json.loads(reference["training_hours"])) if reference else set()
+        except (TypeError, ValueError) as exc:
+            raise InvalidInput("stored training_hours is not a JSON list") from exc
         if unusable_inputs or any(
             s.hour in used
             and (not s.eligible or s.suspicious or s.bytes_up >= policy.large_upload_bytes)
@@ -315,7 +321,16 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
                     "DELETE FROM monitoring_unavailable WHERE collector_id=? AND device_id=?",
                     (collector, row[0]),
                 )
-        except (LineageUnavailable, sqlite3.OperationalError, ValueError) as exc:
+        except (LineageUnavailable, sqlite3.OperationalError, InvalidInput) as exc:
+            if isinstance(exc, InvalidInput):
+                log(
+                    logger,
+                    logging.ERROR,
+                    "monitoring_invalid_input",
+                    collector=collector,
+                    device=row[0],
+                    error=str(exc),
+                )
             # Back off failed subjects so an incomplete component cannot monopolize the queue.
             with immediate(inv):
                 inv.execute(
@@ -332,7 +347,7 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
                         "lineage_unavailable"
                         if isinstance(exc, LineageUnavailable)
                         else "invalid_input"
-                        if isinstance(exc, ValueError)
+                        if isinstance(exc, InvalidInput)
                         else "read_budget_or_database_unavailable",
                         int(now) + 60,
                     ),

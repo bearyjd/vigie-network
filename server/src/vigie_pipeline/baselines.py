@@ -10,6 +10,10 @@ ALGORITHM = "pooled-median-v1"
 MIB = 1024 * 1024
 
 
+class InvalidInput(ValueError):
+    "Stored or measured data the baseline code refuses; the engine backs the entity off."
+
+
 @dataclass(frozen=True)
 class BaselineConfig:
     minimum_hours: int = 20
@@ -48,13 +52,13 @@ def fit_reference(samples, config: BaselineConfig):
     "ater data."
     ordered = sorted(samples, key=lambda s: s.hour)
     if len(ordered) > 2160 or len({s.hour for s in ordered}) != len(ordered):
-        raise ValueError("baseline input bound/duplicate hour")
+        raise InvalidInput("baseline input bound/duplicate hour")
     values = []
     days = set()
     hours = []
     for sample in ordered:
         if sample.hour % 3600 or sample.bytes_up < 0:
-            raise ValueError("invalid hourly sample")
+            raise InvalidInput("invalid hourly sample")
         if not sample.eligible or sample.suspicious or sample.bytes_up >= config.large_upload_bytes:
             continue
         values.append(sample.bytes_up)

@@ -18,7 +18,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
 
-from vigie_pipeline.baselines import Sample, large_upload_finding
+from vigie_pipeline.baselines import InvalidInput, Sample, large_upload_finding
 
 ALGORITHM = "tod-median-v1"
 MIB = 1024 * 1024
@@ -106,13 +106,13 @@ def cohort_key(hour: int, bucket_hours: int) -> Cohort:
 
 def _check_hour(hour):
     if type(hour) is not int or hour % 3600 or not 0 <= hour <= MAX_INT:
-        raise ValueError("invalid hour")
+        raise InvalidInput("invalid hour")
 
 
 def _check_sample(sample: Sample):
     _check_hour(sample.hour)
     if type(sample.bytes_up) is not int or not 0 <= sample.bytes_up <= MAX_INT:
-        raise ValueError("invalid hourly sample")
+        raise InvalidInput("invalid hourly sample")
 
 
 def _fit_cohort(values, days, last, config: TodConfig):
@@ -131,11 +131,11 @@ def fit_tod(samples: Iterable[Sample], config: TodConfig, trained_until: int) ->
     ordered = list(samples)
     _check_hour(trained_until)
     if len(ordered) > MAX_TRAINING_HOURS:
-        raise ValueError("too many training samples")
+        raise InvalidInput("too many training samples")
     for sample in ordered:
         _check_sample(sample)
     if len({s.hour for s in ordered}) != len(ordered):
-        raise ValueError("baseline input duplicate hour")
+        raise InvalidInput("baseline input duplicate hour")
     keys = [(w, b) for w in (False, True) for b in range(24 // config.bucket_hours)]
     values, days, last = {k: [] for k in keys}, {k: set() for k in keys}, dict.fromkeys(keys, 0)
     for sample in ordered:
