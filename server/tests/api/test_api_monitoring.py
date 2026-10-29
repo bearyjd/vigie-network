@@ -315,3 +315,25 @@ def test_pending_oldest_survives_detail_cap_and_reordered_batch_ids(env: Env):
     assert value["backlog_batches"] == 10000
     assert value["backlog_capped"] is True
     assert value["oldest_pending_received_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_baseline_view_algorithm_is_null_without_a_stored_model_and_tod_hides_the_median(env: Env):
+    from vigie_api.monitoring import baseline_view
+    from vigie_pipeline.baselines import BaselineConfig
+    from vigie_pipeline.monitoring_engine import analyze_monitoring
+
+    seed(env)
+    lineage = "no-profile"
+    assert baseline_view(env.inv, "c1", "d1", lineage)["algorithm"] is None
+    env.inv.execute("INSERT INTO monitoring_dirty VALUES ('c1',?,?)", (MAC, HOUR))
+    analyze_monitoring(env.inv, env.ov, BaselineConfig(minimum_hours=1, minimum_days=1), NOW)
+    key = env.inv.execute("SELECT lineage FROM monitoring_profiles").fetchone()[0]
+    pooled = baseline_view(env.inv, "c1", "d1", key)
+    assert pooled["algorithm"] == "pooled-median-v1" and pooled["median_upload_bytes"] is not None
+    env.inv.execute("UPDATE monitoring_baselines SET algorithm='tod-median-v1'")
+    tod = baseline_view(env.inv, "c1", "d1", key)
+    assert tod["algorithm"] == "tod-median-v1" and tod["median_upload_bytes"] is None
+    env.inv.execute(
+        "UPDATE coverage_hourly SET qualified_seconds=0,reasons=?", ('["raw_missing"]',)
+    )
+    assert baseline_view(env.inv, "c1", "d1", key)["algorithm"] is None

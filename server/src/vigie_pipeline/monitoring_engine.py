@@ -315,7 +315,7 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
                     "DELETE FROM monitoring_unavailable WHERE collector_id=? AND device_id=?",
                     (collector, row[0]),
                 )
-        except (LineageUnavailable, sqlite3.OperationalError) as exc:
+        except (LineageUnavailable, sqlite3.OperationalError, ValueError) as exc:
             # Back off failed subjects so an incomplete component cannot monopolize the queue.
             with immediate(inv):
                 inv.execute(
@@ -331,6 +331,8 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
                         row[0],
                         "lineage_unavailable"
                         if isinstance(exc, LineageUnavailable)
+                        else "invalid_input"
+                        if isinstance(exc, ValueError)
                         else "read_budget_or_database_unavailable",
                         int(now) + 60,
                     ),

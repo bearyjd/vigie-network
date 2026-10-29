@@ -248,13 +248,15 @@ def baseline_view(inv, collector, device, key):
     return {
         "state": state,
         "baseline_id": model["id"] if model else None,
-        "algorithm": model["algorithm"] if model else ALGORITHM,
+        "algorithm": model["algorithm"] if model else None,
         "config_version": row["config_version"] if row else None,
         "sample_hours": row["sample_hours"] if row else 0,
         "distinct_days": row["distinct_days"] if row else 0,
         "training_since": row["training_since"] if row else None,
         "trained_until": model["trained_until"] if model else None,
-        "median_upload_bytes": model["median_twice"] / 2 if model else None,
+        "median_upload_bytes": model["median_twice"] / 2
+        if model and model["algorithm"] == ALGORITHM
+        else None,  # tod stores an overall median only; thresholds are per cohort
     }
 
 

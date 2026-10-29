@@ -26,6 +26,7 @@ from vigie_pipeline.baselines_tod import (
     ALGORITHM as TOD_ALGORITHM,
 )
 from vigie_pipeline.baselines_tod import (
+    MAX_INT,
     CohortFit,
     TodConfig,
     cohort_key,
@@ -33,6 +34,8 @@ from vigie_pipeline.baselines_tod import (
     findings_tod,
     fit_tod,
 )
+
+MAX_STORED_JSON = 1 << 18  # a full 26-week window stores well under 100 KiB
 
 
 def _median_twice(values):
@@ -128,13 +131,15 @@ class TodStrategy:
     def hydrate(self, row):
         "Refit from the stored inputs; None when they are missing, malformed or inconsistent."
         try:
+            if max(len(row["training_hours"]), len(row["config_json"])) > MAX_STORED_JSON:
+                return None
             hours = json.loads(row["training_hours"])
             values = json.loads(row["config_json"])["training_bytes"]
             if len(hours) != len(values) or len(hours) != row["sample_hours"]:
                 return None
             used = [Sample(h, v, True) for h, v in zip(hours, values, strict=True)]
             model = fit_tod(used, self.policy, row["trained_until"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, RecursionError):
             return None
         if model.training_hours != len(hours) or model.config_version != row["config_version"]:
             return None
@@ -157,6 +162,9 @@ class TodStrategy:
                 return []
             large = large_upload_finding(current, self.policy.large_upload_bytes)
             return [large] if large else []
+        if any(s is not None and not 0 <= s.bytes_up <= MAX_INT for s in (current, previous)):
+            # findings_tod rejects such input; the fixed detector must still report the hour.
+            return self.findings(current, None, None)
         out = findings_tod(current, previous, reference["tod"], self.policy)
         return [
             {
@@ -174,19 +182,28 @@ class TodStrategy:
         return deviation_threshold(current, reference["tod"], self.policy)
 
     def evidence(self, current, reference):
-        fit = None
-        if reference and current is not None:
-            fit = reference["tod"].cohorts[cohort_key(current.hour, self.policy.bucket_hours)]
+        none = {"baseline_median_upload_bytes": None, "sample_hours": None, "distinct_days": None}
+        if current is None:
+            return none
+        weekend, bucket = cohort_key(current.hour, self.policy.bucket_hours)
+        out = {
+            **none,
+            "bucket_hours": self.policy.bucket_hours,
+            "cohort_is_weekend": weekend,
+            "cohort_bucket": bucket,
+            "cap_applied": False,
+        }
+        fit = reference["tod"].cohorts[(weekend, bucket)] if reference else None
         if not isinstance(fit, CohortFit):
-            return {
-                "baseline_median_upload_bytes": None,
-                "sample_hours": None,
-                "distinct_days": None,
-            }
+            return out
+        policy = self.policy
+        line = max(policy.minimum_bytes, fit.median_twice * policy.multiplier // 2)
         return {
+            **out,
             "baseline_median_upload_bytes": fit.median_twice / 2,
             "sample_hours": fit.samples,
             "distinct_days": fit.days,
+            "cap_applied": line > policy.large_upload_bytes,
         }
 
 

@@ -10,6 +10,9 @@ uv run python -m vigie_pipeline run --loop 30       # repeat every 30 s; failure
 Settings (flag / env): `--transient-window-s` / `VIGIE_TRANSIENT_WINDOW_S` (24 h),
 `--min-dwell-s` / `VIGIE_TRANSIENT_MIN_DWELL_S` (2 h), `--promotion-cap` /
 `VIGIE_PROMOTION_CAP_PER_HOUR` (20). `0` for the window is an error.
+Monitoring: `VIGIE_MONITORING_LARGE_UPLOAD_BYTES` (1 GiB) and `VIGIE_MONITORING_BASELINE` (`pooled`
+default, or `tod`; exact match, anything else fails at startup; a change relearns every profile;
+see `docs/monitoring.md`).
 
 ## Trust model
 - A hostname never promotes a device. A transient device is promoted only after it was received

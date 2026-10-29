@@ -352,7 +352,7 @@ class ActivityHour(CoverageHour):
 class BaselineView(BaseModel):
     state: Literal["learning", "mature", "rebuilding", "rebuilding_quality", "lineage_unavailable"]
     baseline_id: str | None
-    algorithm: str
+    algorithm: str | None
     config_version: str | None
     sample_hours: int
     distinct_days: int

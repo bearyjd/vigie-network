@@ -118,6 +118,10 @@ hour and open incidents are superseded (expected; flip it deliberately).
   `learning` and only the fixed large-upload detector runs). It is then fixed and never advances.
   Any quality reset (a used hour became ineligible, suspicious or large) drops the reference and the
   profile goes `rebuilding_quality`, as for pooled.
+- **Intermittent devices and incidents.** Because the freeze needs every cohort mature, a device with
+  intermittent data stays in `learning` and only the fixed detector runs. A fixed `large_upload` and an
+  `upload_deviation` can both open for the same hours; duplicate incidents are by design. tod evidence
+  also carries `bucket_hours`, the cohort and `cap_applied` (the read API's allowlist drops them today).
 - **Persistence, no schema change.** The baseline row stores `algorithm=tod-median-v1`,
   `trained_until`, the used `training_hours`, and in `config_json` the policy (including
   `bucket_hours`) plus `training_bytes` (the byte value of each used hour). Every pass refits

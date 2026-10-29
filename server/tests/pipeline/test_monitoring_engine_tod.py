@@ -164,7 +164,7 @@ def test_selector_change_changes_policy_version_and_resets_to_learning(tmp_path)
         ov.close()
 
 
-def test_refit_is_deterministic_and_independent_of_pruned_measurements(tmp_path):
+def test_frozen_reference_survives_pruned_and_rewritten_measurements(tmp_path):
     from vigie_pipeline.monitoring_strategy import strategy_for
 
     inv, ov = seeded(tmp_path)
@@ -172,14 +172,21 @@ def test_refit_is_deterministic_and_independent_of_pruned_measurements(tmp_path)
         mature(inv, ov)
         [row] = baseline_rows(inv)
         strategy = strategy_for(TOD)
-        first = strategy.hydrate(dict(row))
-        assert first == strategy.hydrate(dict(row)) and first["tod"].trained_until == FROZEN
+        assert strategy.hydrate(dict(row)) == strategy.hydrate(dict(row))
         inv.execute("DELETE FROM measurements_hourly WHERE hour<?", (FROZEN - 5 * DAY,))
-        hour(inv, CURRENT, 10 * MIB)
+        hour(inv, HOUR + 7 * DAY, 900 * MIB)  # a used training hour rewritten, still below the line
+        hour(inv, CURRENT - 3600, 45 * MIB)
+        hour(inv, CURRENT, 45 * MIB)
         run(inv, ov, CURRENT + 3610)
+        assert inv.execute("SELECT COUNT(*) FROM monitoring_incidents").fetchone()[0] == 0
+        wednesday = HOUR + 21 * DAY
+        hour(inv, wednesday - 3600, 60 * MIB)
+        hour(inv, wednesday, 60 * MIB)
+        run(inv, ov, wednesday + 3610)
+        found = inv.execute("SELECT detector,threshold_bytes FROM monitoring_incidents").fetchall()
+        assert [tuple(r) for r in found] == [("upload_deviation", 50 * MIB)]
         state = inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
         assert tuple(state) == ("mature", row["id"])
-        assert baseline_rows(inv) == [row]
     finally:
         inv.close()
         ov.close()
@@ -227,7 +234,7 @@ def test_api_baseline_view_reports_the_stored_algorithm(tmp_path):
             inv, "c1", "d1", inv.execute("SELECT lineage FROM monitoring_profiles").fetchone()[0]
         )
         assert view["state"] == "mature" and view["algorithm"] == "tod-median-v1"
-        assert view["median_upload_bytes"] == 10 * MIB and view["trained_until"] == FROZEN
+        assert view["median_upload_bytes"] is None and view["trained_until"] == FROZEN
     finally:
         inv.close()
         ov.close()
@@ -248,3 +255,167 @@ def test_selector_defaults_to_pooled_and_rejects_unknown_values():
         {"VIGIE_MONITORING_BASELINE": "tod", "VIGIE_MONITORING_LARGE_UPLOAD_BYTES": "2097152"}
     )
     assert monitoring_policy(custom).large_upload_bytes == 2097152
+
+
+def test_default_bucket_hours_engine_learns_and_fires(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        for i in range(28 * 24):
+            hour(inv, HOUR + i * 3600, 10 * MIB)
+        run(inv, ov, HOUR + 28 * DAY + 3610, TodConfig())
+        assert inv.execute("SELECT state FROM monitoring_profiles").fetchone()[0] == "mature"
+        hour(inv, HOUR + 28 * DAY, 60 * MIB)
+        hour(inv, HOUR + 28 * DAY + 3600, 60 * MIB)
+        run(inv, ov, HOUR + 28 * DAY + 7210, TodConfig())
+        evidence = json.loads(
+            inv.execute("SELECT evidence FROM monitoring_incidents").fetchone()[0]
+        )
+        assert evidence["bucket_hours"] == 4 and evidence["cohort_bucket"] == 4
+        assert evidence["cohort_is_weekend"] is False and evidence["cap_applied"] is False
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_never_mature_cohort_keeps_learning_with_only_the_fixed_detector(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        daily(inv, [d for d in range(14) if (d + 2) % 7 < 5 and d not in (3, 4, 10, 11)])
+        daily(inv, [3, 4])  # weekend: only two days, below the 3-day floor
+        hour(inv, CURRENT - 3600, 60 * MIB)
+        hour(inv, CURRENT, 60 * MIB)
+        run(inv, ov, CURRENT + 3610)
+        assert tuple(
+            inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
+        ) == (
+            "learning",
+            None,
+        )
+        assert inv.execute("SELECT COUNT(*) FROM monitoring_incidents").fetchone()[0] == 0
+        hour(inv, CURRENT + 3600, 1100 * MIB)
+        run(inv, ov, CURRENT + 7210)
+        found = [r[0] for r in inv.execute("SELECT detector FROM monitoring_incidents")]
+        assert found == ["large_upload"]
+    finally:
+        inv.close()
+        ov.close()
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        pytest.param("config_json", '{"training_bytes": [1, 2]}', id="length-mismatch"),
+        pytest.param("config_json", '{"training_bytes": ["x"]}', id="bad-bytes"),
+        pytest.param("config_json", "[" * 100000 + "]" * 100000, id="recursion-bomb"),
+        pytest.param("config_json", " " * 300000, id="over-length-cap"),
+        pytest.param("sample_hours", 99, id="wrong-sample-hours"),
+        pytest.param("training_hours", "not json", id="hours-not-json"),
+        pytest.param("training_hours", "[1.5]", id="hours-float"),
+        pytest.param("training_hours", '{"a": 1}', id="hours-object"),
+        pytest.param("training_hours", "5", id="hours-scalar"),
+    ],
+)
+def test_malformed_stored_inputs_fall_to_rebuilding_quality(tmp_path, column, value):
+    inv, ov = seeded(tmp_path)
+    try:
+        mature(inv, ov)
+        inv.execute(f"UPDATE monitoring_baselines SET {column}=?", (value,))  # noqa: S608
+        hour(inv, CURRENT, 10 * MIB)
+        run(inv, ov, CURRENT + 3610)
+        row = inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
+        assert tuple(row) == ("rebuilding_quality", None)
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_oversized_hour_still_emits_large_upload_and_matches_pooled(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        mature(inv, ov)
+        hour(inv, CURRENT - 3600, 2**60)
+        hour(inv, CURRENT, 2**60)
+        run(inv, ov, CURRENT + 3610)
+        found = [r[0] for r in inv.execute("SELECT detector FROM monitoring_incidents")]
+        assert found == ["large_upload"]
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_invalid_input_in_one_entity_is_backed_off_not_fatal(tmp_path, monkeypatch):
+    from vigie_pipeline import monitoring_engine
+
+    inv, ov = seeded(tmp_path)
+    try:
+        hour(inv, HOUR, 10 * MIB)
+
+        def boom(*args):
+            raise ValueError("invalid hourly sample")
+
+        monkeypatch.setattr(monitoring_engine, "analyze_entity", boom)
+        run(inv, ov, HOUR + 3610)
+        row = inv.execute("SELECT reason,retry_at FROM monitoring_unavailable").fetchone()
+        assert tuple(row) == ("invalid_input", HOUR + 3610 + 60)
+        queued = inv.execute("SELECT queued_at FROM monitoring_dirty").fetchone()[0]
+        assert queued == HOUR + 3610 + 60
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_pooled_default_golden_literals(tmp_path):
+    "Captured from origin/main (242fa6c): the default path must stay byte-for-byte identical."
+    from test_monitoring_engine import history
+
+    inv, ov = seeded(tmp_path)
+    try:
+        history(inv)
+        cur = HOUR + 20 * DAY
+        hour(inv, cur - 3600, 51 * MIB)
+        hour(inv, cur, 51 * MIB)
+        run(inv, ov, cur + 3610, BaselineConfig())
+        row = inv.execute("SELECT config_json,config_version,algorithm FROM monitoring_baselines")
+        assert tuple(row.fetchone()) == (
+            '{"large_upload_bytes": 1073741824, "minimum_bytes": 52428800, "minimum_days": 14, '
+            '"minimum_hours": 20, "multiplier": 4}',
+            "f2326b78a3286c8b26efcdbeeb33597e010c3976ab519047e27c8a5b62d915bc",
+            "pooled-median-v1",
+        )
+        evidence = json.loads(
+            inv.execute("SELECT evidence FROM monitoring_incidents").fetchone()[0]
+        )
+        assert set(evidence) == {
+            "algorithm", "baseline_id", "baseline_median_upload_bytes", "config_version",
+            "coverage_required_seconds", "distinct_days", "hour", "lineage", "minimum_bytes",
+            "multiplier", "observed_bytes", "previous_hour", "reason_code", "sample_hours",
+            "threshold_bytes", "unusual_is_not_malicious",
+        }  # fmt: skip
+        assert evidence["baseline_median_upload_bytes"] == 10 * MIB
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_cli_config_carries_the_monitoring_settings(monkeypatch):
+    from vigie_pipeline.cli import _config, _parser
+
+    monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "tod")
+    monkeypatch.setenv("VIGIE_MONITORING_LARGE_UPLOAD_BYTES", "2097152")
+    config = _config(_parser().parse_args(["run", "--once"]))
+    assert config.monitoring_baseline == "tod"
+    assert config.monitoring_large_upload_bytes == 2097152
+
+
+def test_stored_json_over_the_length_cap_is_rejected_even_when_valid(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        mature(inv, ov)
+        inv.execute("UPDATE monitoring_baselines SET config_json=config_json||?", (" " * 300000,))
+        hour(inv, CURRENT, 10 * MIB)
+        run(inv, ov, CURRENT + 3610)
+        row = inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
+        assert tuple(row) == ("rebuilding_quality", None)
+    finally:
+        inv.close()
+        ov.close()
