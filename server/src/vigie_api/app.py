@@ -265,14 +265,16 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         to_hour: Annotated[int | None, Query(ge=0)] = None,
         cursor: Annotated[str | None, Query(max_length=1024)] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        dropped_since: Annotated[str | None, Query(max_length=32)] = None,
     ) -> dict[str, Any]:
         monitoring.required(inv)
+        since = monitoring.parse_dropped_since(dropped_since, clock())
         start, stop, nxt = monitoring.page(
             "coverage", collector_id, None, from_hour, to_hour, limit, cursor, clock()
         )
         return envelope(
             {
-                "collector": monitoring.collector_summary(inv, collector_id),
+                "collector": monitoring.collector_summary(inv, collector_id, since),
                 "hours": monitoring.coverage(inv, collector_id, start, stop, clock()),
             },
             page={"next_cursor": nxt},

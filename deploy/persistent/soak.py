@@ -141,7 +141,7 @@ def sample_issues(sample):
         "log_capacity_kib": lambda x: 0 < x <= 20480,
         "freshness_s": lambda x: x <= 180,
         "processing_backlog_age_s": lambda x: x <= 180,
-        "dropped_batches": lambda x: x == 0,
+        "dropped_batches": lambda x: type(x) is int and x == 0,
         "source_flags": lambda x: x == 0,
         "logical_cpus": lambda x: x >= 1 and int(x) == x,
     }

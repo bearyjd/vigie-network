@@ -110,6 +110,32 @@ class SoakTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 self.assertEqual(soak.assess(values)["status"], "fail")
 
+    def test_drops_since_run_start_must_be_an_integer_zero_on_every_sample(self):
+        for index in (0, 1, 7):
+            values = full()
+            values[index]["dropped_batches"] = 1
+            with self.subTest(index=index):
+                result = soak.assess(values)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("dropped_batches_limit", result["reasons"])
+
+    def test_unknown_or_malformed_drop_count_never_passes(self):
+        for bad in (None, True, False, "0", 0.0, -1, float("inf")):
+            values = full()
+            values[3]["dropped_batches"] = bad
+            with self.subTest(bad=bad):
+                result = soak.assess(values)
+                self.assertNotEqual(result["status"], "pass")
+                self.assertTrue(
+                    {"missing_metrics", "invalid_metrics", "dropped_batches_limit"}
+                    & set(result["reasons"])
+                )
+        values = full()
+        del values[3]["dropped_batches"]
+        result = soak.assess(values)
+        self.assertNotEqual(result["status"], "pass")
+        self.assertIn("missing_metrics", result["reasons"])
+
     def test_cpu_uses_counter_ratio_per_logical_cpu(self):
         values = full()
         for value in values:
