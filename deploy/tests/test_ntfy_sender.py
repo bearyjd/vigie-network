@@ -321,6 +321,12 @@ def test_bad_records_are_skipped_not_sent(env: Env, bad: bytes) -> None:
     assert env.cursor_offset() == env.delivery.stat().st_size
 
 
+def test_trailing_bad_line_advances_cursor(env: Env) -> None:
+    env.write(line(record(1)), b"garbage\n")
+    env.run()
+    assert env.cursor_offset() == env.delivery.stat().st_size
+
+
 def test_header_injection_never_reaches_the_wire(env: Env) -> None:
     env.write(line(record(1, title="ok\r\nX-Evil: 1")))
     env.run()
@@ -561,7 +567,7 @@ def test_corrupt_cursor_is_a_config_error(env: Env) -> None:
 def test_logs_never_contain_secrets(
     env: Env, caplog: pytest.LogCaptureFixture, script: list[dict]
 ) -> None:
-    env.write(line(record(1)), b"junk " + TOKEN.encode() + b"\n")
+    env.write(b"junk " + TOKEN.encode() + b"\n", line(record(1)))
     env.server.script = list(script)
     with caplog.at_level(logging.DEBUG):
         env.run(token_file=str(env.token), click_base="https://vigie.example.invalid")
