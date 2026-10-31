@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import http.server
 import importlib.util
+import inspect
+import io
 import json
 import logging
 import os
@@ -13,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -1185,3 +1189,74 @@ def test_stale_temp_cleanup_never_follows_symlinks_or_foreign_files(
     monkeypatch.setattr(ns.os, "geteuid", lambda: me + 1)
     ns.clean_stale_temps(str(env.cursor), max_age=3600)
     assert mine.exists()
+
+
+# --- fix round 4 --------------------------------------------------------------------------
+
+
+def test_split_lines_is_a_lazy_generator() -> None:
+    chunk = ns.Chunk(b"\n" * 1000, 0, 1, 1, "", False)
+    assert inspect.isgenerator(ns.split_lines(chunk, 10**9))
+    assert next(ns.split_lines(chunk, 10**9)) == (b"", 1)
+
+
+def test_a_chunk_of_hundreds_of_thousands_of_short_lines_uses_bounded_memory(env: Env) -> None:
+    env.write(b"\n" * 400_000)
+    tracemalloc.start()
+    try:
+        result = env.run()  # default max_batch 50: only 50 lines are taken
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert result.skipped == 50 and result.code == 0
+    assert peak < 8 * 1024 * 1024, peak
+
+
+def test_held_scan_over_a_huge_run_of_blank_lines_stays_bounded(env: Env) -> None:
+    env.write(line(record(1)), b"\n" * 300_000, line(record(2)))
+    env.server.script = [{"status": 400}, {}]
+    tracemalloc.start()
+    try:
+        result = env.run(max_batch=50)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert result.code == 5 and peak < 8 * 1024 * 1024, peak
+
+
+def _timed_opener(clock: list[float], spend: float, status: int, retry_after: str):
+    class Opener:
+        def open(self, _req: object, timeout: float):
+            clock[0] += spend
+            raise urllib.error.HTTPError(
+                "https://x.invalid", status, "x", {"Retry-After": retry_after}, io.BytesIO(b"")
+            )
+
+    return Opener()
+
+
+def test_backoff_uses_the_budget_left_after_the_request_not_before() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+    out = ns.send_with_retry(
+        _timed_opener(now, 4.0, 429, "4"),
+        object(),
+        8.0,
+        sleeps.append,
+        lambda: 5.0 - now[0],
+    )
+    assert sleeps == [] and out.kind == "retry"
+
+
+def test_backoff_still_sleeps_when_it_fits_in_the_budget_left() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    ns.send_with_retry(
+        _timed_opener(now, 1.0, 429, "4"), object(), 8.0, sleep, lambda: 12.0 - now[0]
+    )
+    assert sleeps[0] == 4.0

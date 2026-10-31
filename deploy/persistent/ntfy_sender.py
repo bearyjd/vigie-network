@@ -50,6 +50,7 @@ MAX_TIMEOUT = 20.0
 MAX_BATCH_LIMIT = 1000
 MIN_BATCH = 2  # a rejected record needs a successor in the same read to be probed
 STALE_TEMP_AGE_S = 3600.0
+MAX_SKIP_LOGS = 20  # further skipped records are counted, not logged one by one
 RETRY_AFTER_CAP = 60.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 1.0
@@ -477,29 +478,32 @@ def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
     return replace(previous, data=data, start=offset, restarted=False)
 
 
-def split_lines(chunk: Chunk, cap: int) -> list[tuple[bytes, int]]:
-    """Complete lines as (line, offset after it). A partial trailing line is left alone, except a
-    full chunk with no newline at all: that is one oversized line and is skipped by the caller."""
-    lines: list[tuple[bytes, int]] = []
+def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int]]:
+    """Complete lines as (line, offset after it), produced one at a time. A partial trailing line
+    is left alone, except a full chunk with no newline at all: that is one oversized line and is
+    skipped by the caller."""
     pos = 0
+    found = False
     while (end := chunk.data.find(b"\n", pos)) >= 0:
-        lines.append((chunk.data[pos:end], chunk.start + end + 1))
+        found = True
+        yield chunk.data[pos:end], chunk.start + end + 1
         pos = end + 1
-    if not lines and len(chunk.data) >= cap:
-        lines.append((chunk.data, chunk.start + len(chunk.data)))
-    return lines
+    if not found and len(chunk.data) >= cap:
+        yield chunk.data, chunk.start + len(chunk.data)
 
 
 def iter_lines(cfg: Config, chunk: Chunk) -> Iterator[tuple[bytes, int]]:
     """Every complete line of the file from the chunk on; later chunks are read lazily, so a
-    consumer that stops pulling never reads more."""
+    consumer that stops pulling never reads (or holds) more."""
     cap = _read_cap(cfg)
     while True:
-        lines = split_lines(chunk, cap)
-        yield from lines
-        if not lines or len(chunk.data) < cap:
+        last_end = None
+        for item in split_lines(chunk, cap):
+            last_end = item[1]
+            yield item
+        if last_end is None or len(chunk.data) < cap:
             return
-        following = read_at(cfg, chunk, lines[-1][1])
+        following = read_at(cfg, chunk, last_end)
         if following is None:
             return
         chunk = following
@@ -644,20 +648,20 @@ def send_with_retry(
     remaining: Callable[[], float],
 ) -> Outcome:
     """Send with bounded backoff. Each call gets min(timeout, remaining run budget); the budget is
-    read once per attempt. The budget is checked between operations: a single socket operation
-    may still take up to `timeout`, and TimeoutStartSec is the hard stop."""
+    read before each request and again before each sleep. The budget is checked between
+    operations: a single socket operation may still take up to `timeout`, and TimeoutStartSec is
+    the hard stop."""
     delay = BACKOFF_BASE
     outcome = Outcome("retry", None, "run budget exhausted")
     for attempt in range(MAX_ATTEMPTS):
-        left = remaining()
-        call_timeout = min(timeout, left)
+        call_timeout = min(timeout, remaining())
         if call_timeout <= 0:
             return Outcome("retry", None, "run budget exhausted")
         outcome = send_once(opener, req, call_timeout)
         if outcome.kind != "retry" or attempt == MAX_ATTEMPTS - 1:
             break
         wait = min(max(delay, outcome.retry_after or 0.0), RETRY_AFTER_CAP)
-        if wait >= left:
+        if wait >= remaining():  # re-read: the request itself consumed time
             break
         log.warning("retryable failure (%s); retrying in %.0fs", outcome.detail, wait)
         sleep(wait)
@@ -690,7 +694,8 @@ def _drain(
         try:
             record = parse_record(line)
         except ValueError as exc:
-            log.warning("skipping invalid record before offset %d: %s", end, exc)
+            if skipped < MAX_SKIP_LOGS:
+                log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
             if held is None:
                 cursor = replace(cursor, offset=end)
@@ -711,6 +716,10 @@ def _drain(
         sent += 1
         cursor = replace(cursor, offset=end)
         save_cursor(cfg.cursor_file, cursor)
+    if skipped > MAX_SKIP_LOGS:
+        log.warning(
+            "%d records skipped in this run (only the first %d were logged)", skipped, MAX_SKIP_LOGS
+        )
     if held is not None:
         log.error("rejected record has no valid successor to probe yet; cursor not advanced")
         return RunResult(sent, skipped, EXIT_PERMANENT)
