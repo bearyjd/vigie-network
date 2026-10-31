@@ -16,7 +16,7 @@ path = "src/main.rs"
 vigie-parse = { path = "../parse" }
 net-spike = { path = "../net-spike" }
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 # TLS 1.2/1.3 with the ring provider only (no aws-lc, no default features, no logging).
 # Parses the server certificate (SPKI for the pin). Same version rustls already uses; `alloc` is
 # needed for `subject_public_key_info()`.
