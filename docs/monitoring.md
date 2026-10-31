@@ -513,6 +513,111 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
   never announced.
 - Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
 
+### Incident delivery to ntfy
+
+`deploy/persistent/ntfy_sender.py` ships the delivery file (the FilePublisher output above) to the
+public ntfy server. It is **off by default**, standalone (Python standard library, no dependency)
+and **not wired into the pipeline**: the pipeline keeps `Network=none` and has no network adapter,
+no new `VIGIE_DELIVERY_*` setting and no code change. The sender is a separate process (a oneshot
+user unit fired by a timer) that only reads the file.
+
+```
+pipeline (Network=none) --FilePublisher--> delivery-messages.jsonl --read-only--> ntfy_sender.py --HTTPS--> ntfy.sh
+```
+
+**Privacy.** The public service sees the message title and body (the device ALIAS, or the
+validated name if you opted in with `VIGIE_DELIVERY_INCLUDE_LABEL`), the relative incident link or,
+if you configure `click_base`, the full click URL, and the timing of each notification. The topic is
+the only access control on ntfy.sh: anyone who learns it can read the notifications, so use 32 or
+more random characters (ntfy.sh limits topic names to 64). An optional bearer token is only useful
+with a reserved topic or a self-hosted server. Without `click_base` no `Click` header is sent and
+the link stays relative (it is already in the body). Only the five validated fields are ever read;
+unknown keys in a record are dropped.
+
+**Config** (JSON, mode 0600, owned by the running user; unknown keys are rejected). Paths are
+placeholders:
+
+```json
+{
+  "delivery_file": "/ABSOLUTE/PATH/TO/delivery-messages.jsonl",
+  "cursor_file": "/ABSOLUTE/PATH/TO/CURSOR_DIRECTORY/ntfy-cursor.json",
+  "topic_file": "/ABSOLUTE/PATH/TO/private/ntfy-topic",
+  "token_file": "/ABSOLUTE/PATH/TO/private/ntfy-token",
+  "server": "https://ntfy.sh",
+  "allowed_hosts": ["ntfy.sh"],
+  "click_base": "https://vigie.example.invalid",
+  "timeout_seconds": 8,
+  "max_batch": 50
+}
+```
+
+Required: `delivery_file`, `cursor_file`, `topic_file` (absolute paths). Optional: `token_file`;
+`server` (https only, no userinfo, query, fragment or path, host must be in `allowed_hosts`,
+default `["ntfy.sh"]`); `click_base` (https, no userinfo, query or fragment; the message link
+`/ui/#incident=<id>` is appended); `timeout_seconds` (default 8, at most 20); `max_batch` (lines
+per run, default 50). The topic file holds one topic of 8 to 64 characters `A-Za-z0-9_-`; the token
+file one bearer token. Secret files must be regular files (symlinks refused), owned by the running
+user, mode 0600 or 0400, at most 1 KiB, without control characters; one trailing newline is
+stripped. Create them without leaking through the process list or shell history:
+
+```sh
+umask 077
+head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > ntfy-topic   # 32 characters
+```
+
+Subscribe to that topic in the ntfy app yourself; nothing in the repository names it.
+
+**Behaviour.** One run reads at most `max_batch` complete lines after the cursor. A partial trailing
+line waits for its newline. A truncated or replaced file (other inode or device, shorter than the
+cursor, other first line) restarts from the beginning with a warning, which can repeat old
+notifications but never loses new ones. A line that is over 8 KiB, not valid JSON, not an object or
+fails the schema (`delivery_id`, `kind` open or recover, `title`, `body`, `link`; length caps,
+printable text, link starting with a single `/`, no whitespace) is skipped with a counted warning
+(no record text in the log) and never sent. Titles are folded to ASCII for the header; the body is
+UTF-8. The cursor (offset, device, inode and a hash of the first line) is written atomically
+(temp file, fsync, rename, mode 0600) after each successful send and after each skipped line, so
+delivery is **at least once**: a crash between a send and its cursor write repeats that one
+notification on the next run. ntfy has no publisher idempotency key, so the sender cannot prevent
+this and does not invent one. (ntfy's sequence ID, `POST /<topic>/<sequence-id>`, updates or
+replaces an earlier notification; it is not a dedupe guarantee and is not used.) The sender does
+not rotate the delivery file; truncate it when it nears the 10 MiB cap.
+
+Requests are verified TLS (system trust store), proxy environment variables are ignored, redirects
+are never followed, the response is read up to 4 KiB and discarded, and only HTTP 200 counts as
+success. Headers: `Title`, `Tags` (`warning` for open, `white_check_mark` for recover), `Priority:
+default`, `Click` (only with `click_base`) and `Authorization: Bearer` (only with `token_file`).
+
+**Exit codes.**
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Caught up (or the delivery file does not exist yet) |
+| 1 | Unexpected internal error (exception class logged, nothing else) |
+| 2 | Configuration, secret file or cursor error (a corrupt cursor is never guessed at) |
+| 3 | Permanent failure (other 4xx, a redirect, an unexpected 2xx/3xx): logged once, the cursor is NOT advanced past the record, so a wrong topic or token is neither retried in a loop nor silently skipped |
+| 4 | Retryable failure (429, 5xx, network error, timeout, TLS failure): up to 4 attempts with backoff of 1, 2 and 4 s, `Retry-After` honoured up to 60 s; the cursor is unchanged |
+
+Logs never contain the URL, topic, token, response body or record text. Exit 3 needs the owner: fix
+the topic, token or server, then run the sender again (the stuck record is retried first).
+
+**Enabling (owner actions, nothing here is installed for you).**
+
+1. Enable the pipeline side separately: `VIGIE_DELIVERY_FILE` and `VIGIE_DELIVERY_ENABLED=1`
+   (see above). The sender does nothing useful until the pipeline writes the file, and the
+   pipeline does not need the sender.
+2. Create the topic (and token) files and the config; put the cursor in a directory the sender
+   may write.
+3. Dry run by hand: `python3 -I deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once`
+   prints `ntfy_sender sent=N skipped=M exit=C`.
+4. Copy `deploy/persistent/ntfy-sender.service` and `ntfy-sender.timer` to `~/.config/systemd/user/`,
+   replace every `/ABSOLUTE/PATH/...` placeholder (`ReadWritePaths` is the cursor directory only),
+   then `systemctl --user daemon-reload` and `systemctl --user enable --now ntfy-sender.timer`.
+   The timer fires every 60 s with `Persistent=no`; the unit is hardened (`NoNewPrivileges`,
+   `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=read-only`, `RestrictAddressFamilies=AF_INET
+   AF_INET6`).
+5. To stop: `systemctl --user disable --now ntfy-sender.timer`. Pending lines stay in the file and
+   are sent when the timer is enabled again.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
