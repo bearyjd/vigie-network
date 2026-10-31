@@ -305,3 +305,15 @@ for outside analysis. It is evidence with confidence, not a verdict. The respons
 - Versioning: `schema_version` follows semver rules: additive changes are minor and consumers ignore unknown sections;
   a breaking change is a major bump. Later dataset-backed sections (phase 2 `known_issue_notes`, phase 3
   `dns_reputation`) cite a `dataset_id` with version, date and sha256 in `datasets[]`; phase 1 has no datasets.
+
+## Dropped batches since an instant
+
+`GET /coverage` takes an optional `dropped_since` query parameter: a UTC instant in the exact form
+the ingest stores in `batches.received_at`, `YYYY-MM-DDTHH:MM:SSZ` (whole seconds, `Z` suffix, a
+real date, not more than a day ahead of the server clock). Anything else is a 422
+`invalid_dropped_since`. The collector summary then carries `dropped_batches_since`: the sum of
+`dropped_batches` over that collector's batches received at or after the instant (a batch exactly at
+the instant counts), computed in one SQL query that is not limited to the 10000-batch detail
+summary. It is `null` when the parameter is absent or when SQLite reports any operational error
+(for example integer overflow); a caller must treat `null` as unknown, never as zero. The existing
+`dropped_batches_in_retained_detail` and `summary_capped` keep their meaning.

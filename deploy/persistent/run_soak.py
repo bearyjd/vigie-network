@@ -37,6 +37,9 @@ from soak import (
 )
 
 _LIMIT = 16384
+# The run start sent to the server is this much earlier than the journal's stored value, so
+# runner/server clock skew can only add drops (a false fail), never hide one (a false pass).
+RUN_START_MARGIN_S = 300
 _QUESTION = b"\x07example\x03com\x00\x00\x01\x00\x01"
 
 
@@ -362,7 +365,13 @@ def coverage_metrics(collector, now):
     return result
 
 
-def read_coverage(config, now, since_wall=None):
+def run_start(sample):
+    """Whole-second wall time of the journal's first sample; 0 (count every drop) if unusable."""
+    wall = sample.get("wall") if isinstance(sample, dict) else None
+    return int(wall) if _number(wall) else 0
+
+
+def read_coverage(config, now, since_wall):
     token = private_read(config["api_token_file"], 1024).decode("ascii").strip()
     if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
         raise ValueError("invalid token file")
@@ -372,9 +381,10 @@ def read_coverage(config, now, since_wall=None):
             "collector_id": config["collector_id"],
             "from_hour": hour - 3600,
             "to_hour": hour,
-            # Run start (first sample wall, floored to the second) in the ingest's own format.
+            # Run start (journal's first sample wall, floored) less the clock margin, in the
+            # ingest's own format. Required: a default of "now" would hide in-run drops.
             "dropped_since": datetime.fromtimestamp(
-                int(now if since_wall is None else since_wall), UTC
+                max(0, int(since_wall) - RUN_START_MARGIN_S), UTC
             ).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     )
@@ -409,7 +419,8 @@ def clock_sample():
     }
 
 
-def collect(config, since_wall=None):
+def collect(config, since_wall):
+    """since_wall is the run start; None only for the first sample or a preflight (its own wall)."""
     result = clock_sample()
     try:
         meter = read_meter(config["meter_executable"], config["meter_sha256"])
@@ -431,7 +442,8 @@ def collect(config, since_wall=None):
     except (OSError, ValueError, subprocess.SubprocessError):
         result["meter_error"] = True
     try:
-        api_metrics = read_coverage(config, result["wall"], since_wall)
+        start = result["wall"] if since_wall is None else since_wall
+        api_metrics = read_coverage(config, result["wall"], start)
         # Historical API health must never replace the independent live resource meter.
         if "collector_rss_kib" in api_metrics:
             api_metrics["api_collector_rss_kib"] = api_metrics.pop("collector_rss_kib")
@@ -582,7 +594,7 @@ def main():
         return 1
     if args.preflight:
         # No journal: the run start is the preflight sample's own wall time.
-        first = collect(config)
+        first = collect(config, None)
         report = assess([first], mode="real")
         print(json.dumps(report))
         return 1 if sample_issues(first)[0] else 2
@@ -590,13 +602,11 @@ def main():
         args.journal.parent.mkdir(mode=0o700)
     metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
     with Journal(args.journal, mode="real", metadata=metadata) as journal:
-        # The run start is the journal's first sample, never the current time; an unusable
-        # first wall counts every drop (epoch 0). A fresh run's first sample defines it.
-        since_wall = None
-        if journal.samples:
-            wall = journal.samples[0].get("wall")
-            since_wall = wall if _number(wall) else 0
-        first = collect(config, since_wall)
+        # The run start is the journal's first sample, never the current time. A fresh run's
+        # first sample defines it (None); an unusable first record counts every drop (epoch 0).
+        first = collect(
+            config, run_start(journal.samples[0]) if journal.samples else None
+        )
         failures, missing, quality = sample_issues(first)
         journal.append(first)
         # Every resumed observation, including failure or absence, is durable before gates.
@@ -618,7 +628,7 @@ def main():
                     report = unbound_report(journal.samples)
                     write_ingest_marker(args.journal)
                     break
-                journal.append(collect(config))
+                journal.append(collect(config, run_start(journal.samples[0])))
         except KeyboardInterrupt:
             report = assess(journal.samples, mode="real")
             report["interrupted"] = True

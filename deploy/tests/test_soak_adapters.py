@@ -365,9 +365,9 @@ class DropsSinceRunStartTests(unittest.TestCase):
 
     def test_coverage_request_carries_the_run_start_as_strict_utc_z(self):
         url = self.fetch(1_800_000_000.9)
-        self.assertIn("dropped_since=2027-01-15T08%3A00%3A00Z", url)
+        self.assertIn("dropped_since=2027-01-15T07%3A55%3A00Z", url)
         self.assertIn(
-            "dropped_since=2027-01-15T08%3A00%3A01Z", self.fetch(1_800_000_001)
+            "dropped_since=2027-01-15T07%3A55%3A01Z", self.fetch(1_800_000_001)
         )
 
     def test_collect_defaults_the_run_start_to_its_own_wall_for_a_first_sample(self):
@@ -385,7 +385,8 @@ class DropsSinceRunStartTests(unittest.TestCase):
                     "meter_executable": "m",
                     "meter_sha256": "0" * 64,
                     "router_address": "192.0.2.1",
-                }
+                },
+                None,
             )
             runner.collect(
                 self.CONFIG
@@ -396,17 +397,42 @@ class DropsSinceRunStartTests(unittest.TestCase):
                 },
                 1_700_000_000,
             )
-        self.assertEqual(coverage.call_args_list[0].args[1:], (1_800_000_000.5, None))
+        self.assertEqual(
+            coverage.call_args_list[0].args[1:], (1_800_000_000.5, 1_800_000_000.5)
+        )
         self.assertEqual(
             coverage.call_args_list[1].args[1:], (1_800_000_000.5, 1_700_000_000)
         )
 
-    def run_main(self, prior_wall, now_wall):
+    def test_read_coverage_requires_an_explicit_run_start(self):
+        with self.assertRaises(TypeError):
+            runner.read_coverage(self.CONFIG, 1_800_000_999)
+
+    def test_run_start_sent_to_the_server_is_early_by_the_clock_margin_and_never_negative(
+        self,
+    ):
+        self.assertEqual(runner.RUN_START_MARGIN_S, 300)
+        self.assertIn("dropped_since=1970-01-01T00%3A00%3A00Z", self.fetch(0))
+        self.assertIn("dropped_since=1970-01-01T00%3A00%3A00Z", self.fetch(299))
+        self.assertIn("dropped_since=1970-01-01T00%3A00%3A01Z", self.fetch(301))
+
+    # main() loop: drive real samples through the runner with a fake collector ------------
+    T_FIRST = 1_800_000_000
+
+    def drive(
+        self, *, prior=False, samples=6, drop_after=None, argv_extra=(), raw_first=None
+    ):
+        """Run main() with healthy fake samples one minute apart.
+
+        The fake models the server: a drop received at wall `drop_after` is counted only for a
+        coverage fetch whose run start is at or before it and that happens after it.
+        """
         import hashlib
         import io
         import json
         from contextlib import redirect_stdout
 
+        calls = []
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             config = dict(
@@ -421,83 +447,90 @@ class DropsSinceRunStartTests(unittest.TestCase):
             config_path.chmod(0o600)
             journal_path = base / "journal"
             metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
-            if prior_wall is not None:
+            if prior or raw_first is not None:
                 with runner.Journal(journal_path, mode="real", metadata=metadata) as j:
-                    j.append(dict(HEALTHY_SAMPLE, wall=prior_wall))
-            seen = []
+                    if raw_first is not None:
+                        j._write(raw_first)
+                    else:
+                        j.append(dict(HEALTHY_SAMPLE, wall=self.T_FIRST))
 
-            def fake(cfg, since_wall=None):
-                seen.append(since_wall)
+            def fake(cfg, since_wall):
+                index = len(calls)
+                calls.append(since_wall)
+                if index >= samples:
+                    raise KeyboardInterrupt
+                step = 60 * (index + 1)
+                wall = self.T_FIRST + step
+                since = wall if since_wall is None else since_wall
+                dropped = (
+                    1 if drop_after is not None and since <= drop_after <= wall else 0
+                )
                 return dict(
                     HEALTHY_SAMPLE,
-                    wall=now_wall,
-                    monotonic=1060,
-                    boottime=2060,
-                    total_cpu_ticks=12100,
-                    source_flags=1,
+                    wall=wall,
+                    monotonic=1000 + step,
+                    boottime=2000 + step,
+                    collector_cpu_ticks=60 * (index + 1),
+                    total_cpu_ticks=100 + 12000 * (index + 1),
+                    processing_backlog_reference_wall=wall,
+                    dropped_batches=dropped,
                 )
 
-            with (
-                patch.object(
-                    sys, "argv", ["run_soak", str(config_path), str(journal_path)]
-                ),
-                patch.object(runner, "collect", side_effect=fake),
-                redirect_stdout(io.StringIO()),
-            ):
-                runner.main()
-        return seen
-
-    def test_fresh_run_lets_the_first_sample_define_the_run_start(self):
-        self.assertEqual(self.run_main(None, 1_800_000_500), [None])
-
-    def test_resume_reuses_the_journals_first_wall_not_the_current_time(self):
-        for now in (1_800_000_500, 1_900_000_000):
-            with self.subTest(now=now):
-                self.assertEqual(self.run_main(1_800_000_000, now), [1_800_000_000])
-
-    def test_unusable_first_wall_counts_every_drop_from_the_epoch(self):
-        self.assertEqual(self.run_main(float("nan"), 1_800_000_500), [0])
-
-    def test_preflight_has_no_journal_and_uses_its_own_wall(self):
-        import io
-        import json
-        from contextlib import redirect_stdout
-
-        with tempfile.TemporaryDirectory() as tmp:
-            config = dict(
-                self.CONFIG,
-                meter_executable="/unused",
-                meter_sha256="a" * 64,
-                router_address="192.0.2.1",
-            )
-            config_path = Path(tmp) / "config"
-            config_path.write_bytes(json.dumps(config).encode())
-            config_path.chmod(0o600)
             out = io.StringIO()
-            seen = []
-
-            def fake(cfg, since_wall=None):
-                seen.append(since_wall)
-                return dict(HEALTHY_SAMPLE)
-
             with (
                 patch.object(
                     sys,
                     "argv",
-                    [
-                        "run_soak",
-                        str(config_path),
-                        str(Path(tmp) / "journal"),
-                        "--preflight",
-                    ],
+                    ["run_soak", str(config_path), str(journal_path), *argv_extra],
                 ),
                 patch.object(runner, "collect", side_effect=fake),
+                patch.object(runner.time, "sleep"),
                 redirect_stdout(out),
             ):
                 code = runner.main()
-        self.assertEqual(seen, [None])
+        return calls, json.loads(out.getvalue()), code
+
+    def test_every_sample_of_a_fresh_run_uses_the_first_samples_wall_as_run_start(self):
+        calls, report, _ = self.drive(samples=5)
+        first_wall = self.T_FIRST + 60
+        self.assertEqual(calls, [None] + [first_wall] * 5)
+        self.assertTrue(report["interrupted"])
+        self.assertNotIn("dropped_batches_limit", report["reasons"])
+
+    def test_every_sample_of_a_resumed_run_uses_the_journals_first_wall(self):
+        calls, _, _ = self.drive(prior=True, samples=4)
+        self.assertEqual(calls, [self.T_FIRST] * 5)
+
+    def test_drop_received_during_a_fresh_run_fails_it(self):
+        # Received between samples 2 and 3 (zero-based 1 and 2).
+        drop = self.T_FIRST + 60 * 2 + 30
+        calls, report, code = self.drive(samples=8, drop_after=drop)
+        # The journal persists a limit breach as an invalid record, so the reason reads
+        # invalid_metrics here; the specific limit reason is asserted in test_soak.py.
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(code, 1)
+        self.assertEqual(set(calls[1:]), {self.T_FIRST + 60})
+
+    def test_drop_received_during_a_resumed_run_fails_it(self):
+        drop = self.T_FIRST + 60 * 2 + 30
+        _, report, _ = self.drive(prior=True, samples=8, drop_after=drop)
+        self.assertEqual(report["status"], "fail")
+
+    def test_drop_received_before_the_run_start_does_not_count(self):
+        calls, report, _ = self.drive(samples=4, drop_after=self.T_FIRST - 1)
+        self.assertNotIn("dropped_batches_limit", report["reasons"])
+        self.assertEqual(report["status"], "pending")
+
+    def test_non_dict_first_journal_record_counts_every_drop_without_a_traceback(self):
+        calls, report, _ = self.drive(raw_first=5, samples=3)
+        self.assertEqual(calls[0], 0)
+        self.assertEqual(report["status"], "fail")
+
+    def test_preflight_has_no_journal_and_uses_its_own_wall(self):
+        calls, report, code = self.drive(samples=1, argv_extra=("--preflight",))
+        self.assertEqual(calls, [None])
         self.assertEqual(code, 2)
-        self.assertEqual(json.loads(out.getvalue())["reasons"], [])
+        self.assertEqual(report["reasons"], [])
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -517,7 +550,8 @@ class ReviewRegressions(unittest.TestCase):
                     "meter_executable": "/unused",
                     "meter_sha256": "a" * 64,
                     "router_address": "192.0.2.1",
-                }
+                },
+                None,
             )
         self.assertEqual(result["collector_rss_kib"], 20000)
         self.assertEqual(result["api_collector_rss_kib"], 1700)
@@ -815,6 +849,7 @@ class ProcessingBacklogContract(unittest.TestCase):
                     "api_port": 18444,
                     "collector_id": "c1",
                 },
+                1000,
                 1000,
             )
         self.assertEqual(result["processing_backlog_age_s"], 29)
