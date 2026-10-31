@@ -533,7 +533,9 @@ can read files owned by the mapped uids. Trust boundary: the same host user who 
 containers can already enter that namespace and read these files, so nothing is widened. Inside the
 namespace the process is uid 0 and the host user's own files (config, topic, token, cursor) appear
 as owned by uid 0; the sender's secret-file check compares the owner with the EFFECTIVE uid of the
-process, so it holds both under `podman unshare` (0) and on a plain host (your uid). Check read
+process, so it holds both under `podman unshare` (0) and on a plain host (your uid). The check
+assumes that no container of the stack runs as container uid 0: files written by such a container
+would map to the host user and pass the owner check. Check read
 access once by hand (replace the placeholder):
 
 ```sh
@@ -596,10 +598,16 @@ head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > ntfy-topic   # 3
 
 Subscribe to that topic in the ntfy app yourself; nothing in the repository names it.
 
-**Behaviour.** One run reads at most `max_batch` complete lines after the cursor. A partial trailing
-line waits for its newline. A truncated or replaced file (other inode or device, shorter than the
-cursor, other first line) restarts from the beginning with a warning, which can repeat old
-notifications but never loses new ones. A line that is over 8 KiB, not valid JSON, not an object or
+**Behaviour.** One run reads at most `max_batch` (at least 2, default 50) complete lines after the
+cursor; while a rejected record waits for its probe (below) it keeps reading past that limit until
+it finds the next valid line or reaches the end of the file. A partial trailing line waits for its
+newline. A truncated or replaced file (other inode, shorter than the cursor, other first line)
+restarts from the beginning with a warning, which can repeat old notifications. The device number
+is ignored. Limits of this detection: an in-place truncate-and-rewrite that keeps the same first
+line and ends up at least as long as the old cursor offset is undetectable and the new lines
+before the offset are skipped; and FilePublisher's cut-back after a failed `fsync`, followed by a
+longer line, can leave the cursor in the middle of a line so that one alert is lost. Nothing but
+FilePublisher should rewrite the delivery file. A line that is over 8 KiB, not valid JSON, not an object or
 fails the schema is skipped with a counted warning (no record text in the log) and never sent. The
 schema is strict: `kind` open or recover, `link` exactly `/ui/#incident=` plus 1 to 186 characters
 of `A-Za-z0-9%._~-`, and `title` and `body` must equal the writer's message templates with one
@@ -613,12 +621,25 @@ delivery is **at least once**: a crash between a send and its cursor write repea
 notification on the next run. ntfy has no publisher idempotency key, so the sender cannot prevent
 this and does not invent one. (ntfy's sequence ID, `POST /<topic>/<sequence-id>`, updates or
 replaces an earlier notification; it is not a dedupe guarantee and is not used.) The sender does
-not rotate the delivery file; truncate it when it nears the 10 MiB cap.
+not rotate the delivery file. At the 10 MiB cap FilePublisher refuses further writes and the
+pipeline's deliveries run out their attempts, so the file needs attention before then:
+
+1. The file belongs to the container's subuid, so truncate it inside the namespace
+   (`podman unshare`), and stop the timer first (`systemctl --user stop ntfy-sender.timer`).
+2. Truncate ONLY when the cursor offset equals the file size, that is when the sender has
+   delivered everything. Check:
+   `podman unshare stat -c %s /ABSOLUTE/PATH/TO/delivery-messages.jsonl` prints the size; the
+   `offset` in `cat /ABSOLUTE/PATH/TO/CURSOR_DIRECTORY/ntfy-cursor.json` must be the same number.
+   Truncating while the sender is behind (for example after exit 3) drops the pending alerts.
+3. Then `podman unshare truncate -s 0 /ABSOLUTE/PATH/TO/delivery-messages.jsonl` and start the
+   timer again; the sender notices the shorter file and restarts from the beginning.
 
 Requests are verified TLS (system trust store), proxy environment variables are ignored, redirects
 are never followed, the response is read up to 4 KiB and discarded, and only HTTP 200 counts as
 success. A run has a total wall-clock budget of 120 s: every call gets the smaller of
-`timeout_seconds` and what is left, and backoff never sleeps past it. Headers: `Title`, `Tags` (`warning` for open, `white_check_mark` for recover), `Priority:
+`timeout_seconds` and what is left, and backoff never sleeps past it. The budget is checked
+between operations: one socket operation can still take up to `timeout_seconds`, so
+`TimeoutStartSec` in the unit is the hard stop. Headers: `Title`, `Tags` (`warning` for open, `white_check_mark` for recover), `Priority:
 default`, `Click` (only with `click_base`) and `Authorization: Bearer` (only with `token_file`).
 
 **Exit codes.**
@@ -651,7 +672,11 @@ example one that writes a marker or sends a desktop notification, and/or watch t
    (see above). The sender does nothing useful until the pipeline writes the file, and the
    pipeline does not need the sender.
 2. Create the topic (and token) files and the config; put the cursor in a directory the sender
-   may write.
+   owns with mode 0700 (the sender refuses a cursor directory that is foreign-owned, a symlink or
+   group/world-writable, and a lock file that is not a regular single-link file we own). The cursor
+   directory must NOT be inside any volume the pipeline mounts; the sender cannot detect that.
+   Leftover cursor temp files of the sender (`<cursor>.<pid>.<8 hex>.tmp`, older than 1 hour, our
+   own regular files only) are removed at startup.
 3. Dry run by hand: `podman unshare python3 -I deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once`
    prints `ntfy_sender sent=N skipped=M exit=C`.
 4. Copy `deploy/persistent/ntfy-sender.service` and `ntfy-sender.timer` to `~/.config/systemd/user/`,

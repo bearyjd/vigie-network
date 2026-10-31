@@ -348,7 +348,7 @@ def test_header_injection_never_reaches_the_wire(env: Env) -> None:
 def test_oversized_line_without_newline_is_skipped_in_chunks(env: Env) -> None:
     env.write(b"x" * 20000 + b"\n", line(record(2)))
     for _ in range(6):
-        env.run(max_batch=1)
+        env.run(max_batch=2)
     assert [r["body"] for r in env.server.requests] == [record(2)["body"].encode()]
 
 
@@ -539,6 +539,7 @@ def test_config_unknown_keys_rejected(env: Env) -> None:
         {"timeout_seconds": 0},
         {"timeout_seconds": True},
         {"max_batch": 0},
+        {"max_batch": 1},
         {"max_batch": 1.5},
         {"delivery_file": "relative/path"},
         {"allowed_hosts": []},
@@ -800,7 +801,7 @@ def test_changed_device_number_is_ignored_when_inode_and_head_match(
     class Stat:
         def __init__(self, r: os.stat_result) -> None:
             self.st_mode, self.st_size, self.st_ino = r.st_mode, r.st_size, r.st_ino
-            self.st_uid, self.st_dev = r.st_uid, r.st_dev + 1
+            self.st_uid, self.st_dev, self.st_nlink = r.st_uid, r.st_dev + 1, r.st_nlink
 
     monkeypatch.setattr(ns.os, "fstat", lambda fd: Stat(real(fd)))
     with caplog.at_level(logging.WARNING):
@@ -1006,3 +1007,180 @@ def test_cursor_temp_file_is_created_exclusively(env: Env, monkeypatch: pytest.M
     with pytest.raises(ns.ConfigError, match="cursor"):
         ns.save_cursor(str(env.cursor), ns.Cursor(1, 1, 1, ""))
     assert victim.read_text() == "precious"
+
+
+# --- fix round 3 --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("junk_lines", [5, 10000])
+def test_probe_scans_past_max_batch_to_the_next_valid_record(env: Env, junk_lines: int) -> None:
+    env.write(line(record(1)), b"garbage\n" * junk_lines, line(record(2)))
+    env.server.script = [{"status": 400}, {}]
+    result = env.run(max_batch=2)
+    assert (result.sent, result.skipped, result.code) == (1, junk_lines + 1, 5)
+    assert env.cursor_offset() == env.delivery.stat().st_size
+    assert len(env.server.requests) == 2
+
+
+def test_rejected_then_valid_inside_the_smallest_batch(env: Env) -> None:
+    env.write(line(record(1)), line(record(2)))
+    env.server.script = [{"status": 413}, {}]
+    assert env.run(max_batch=2).code == 5
+
+
+@pytest.mark.parametrize("junk_lines", [5, 10000])
+def test_no_valid_successor_stays_exit_3_without_advancing(env: Env, junk_lines: int) -> None:
+    env.write(line(record(1)), b"garbage\n" * junk_lines)
+    env.server.script = [{"status": 400}]
+    result = env.run(max_batch=2)
+    assert (result.sent, result.code) == (0, 3)
+    assert env.cursor_offset() == 0 and len(env.server.requests) == 1
+
+
+def test_batch_limit_still_applies_when_nothing_is_held(env: Env) -> None:
+    env.write(*[line(record(n)) for n in range(1, 6)])
+    assert env.run(max_batch=2).sent == 2
+
+
+def test_held_scan_stops_when_the_run_budget_is_spent(env: Env) -> None:
+    ticks = iter(range(10**6))
+    env.write(line(record(1)), b"garbage\n" * 100, line(record(2)))
+    env.server.script = [{"status": 400}, {}]
+    result = env.run({"clock": lambda: float(next(ticks)), "budget_seconds": 30.0}, max_batch=2)
+    assert result.code == 4 and env.cursor_offset() == 0
+
+
+def test_skipped_permanently_is_logged_even_if_the_run_later_fails(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    env.write(line(record(1)), line(record(2)), line(record(3)))
+    env.server.script = [{"status": 400}, {}] + [{"status": 503}] * 4
+    with caplog.at_level(logging.ERROR):
+        result = env.run()
+    assert result.code == 4
+    assert "record skipped permanently" in caplog.text
+    assert "Device abc" not in caplog.text
+
+
+def test_remaining_budget_is_read_once_per_attempt() -> None:
+    calls: list[int] = []
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self, _n: int = -1) -> bytes:
+            return b""
+
+    class Opener:
+        def open(self, _req: object, timeout: float) -> Resp:
+            return Resp()
+
+    def remaining() -> float:
+        calls.append(1)
+        return 50.0
+
+    assert ns.send_with_retry(Opener(), object(), 8.0, lambda _s: None, remaining).kind == "ok"
+    assert len(calls) == 1
+
+
+# L3: lock file and cursor directory
+
+
+def test_lock_file_owned_by_someone_else_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = Path(str(env.cursor) + ".lock")
+    lock.touch(mode=0o600)
+    me = os.geteuid()
+    monkeypatch.setattr(ns.os, "geteuid", lambda: me + 1)
+    with pytest.raises(ns.ConfigError, match="lock"):
+        ns.acquire_lock(str(env.cursor))
+
+
+def test_lock_file_with_extra_hard_links_is_refused(env: Env) -> None:
+    lock = Path(str(env.cursor) + ".lock")
+    lock.touch(mode=0o600)
+    os.link(lock, env.tmp / "elsewhere")
+    with pytest.raises(ns.ConfigError, match="lock"):
+        ns.acquire_lock(str(env.cursor))
+
+
+def test_lock_file_must_be_a_regular_file(env: Env) -> None:
+    os.mkfifo(str(env.cursor) + ".lock")
+    with pytest.raises(ns.ConfigError, match="lock"):
+        ns.acquire_lock(str(env.cursor))
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777, 0o720])
+def test_group_or_world_writable_cursor_directory_is_refused(env: Env, mode: int) -> None:
+    env.tmp.chmod(mode)
+    try:
+        with pytest.raises(ns.ConfigError, match="directory"):
+            env.run()
+    finally:
+        env.tmp.chmod(0o700)
+
+
+def test_foreign_owned_cursor_directory_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    me = os.geteuid()
+    monkeypatch.setattr(ns.os, "geteuid", lambda: me + 1)
+    with pytest.raises(ns.ConfigError, match="directory"):
+        ns.check_cursor_dir(str(env.cursor))
+
+
+def test_symlinked_cursor_directory_is_refused(env: Env) -> None:
+    real = env.tmp / "real"
+    real.mkdir(mode=0o700)
+    link = env.tmp / "link"
+    link.symlink_to(real)
+    with pytest.raises(ns.ConfigError, match="directory"):
+        ns.check_cursor_dir(str(link / "cursor.json"))
+
+
+# L5: stale temp files
+
+
+def _age(path: Path, seconds: float) -> None:
+    stamp = time.time() - seconds
+    os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def test_stale_cursor_temp_files_are_cleaned_at_startup(env: Env) -> None:
+    stale = env.tmp / "cursor.json.123.deadbeef.tmp"
+    fresh = env.tmp / "cursor.json.124.cafebabe.tmp"
+    other = env.tmp / "cursor.json.notours.tmp"
+    unrelated = env.tmp / "other.json.123.deadbeef.tmp"
+    for path in (stale, fresh, other, unrelated):
+        path.write_text("x")
+    for path in (stale, other, unrelated):
+        _age(path, 7200)
+    env.run()
+    assert not stale.exists()
+    assert fresh.exists() and other.exists() and unrelated.exists()
+
+
+def test_stale_temp_cleanup_never_follows_symlinks_or_foreign_files(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = env.tmp / "precious"
+    target.write_text("keep")
+    link = env.tmp / "cursor.json.1.aaaaaaaa.tmp"
+    link.symlink_to(target)
+    _age(link, 7200)
+    ns.clean_stale_temps(str(env.cursor), max_age=3600)
+    assert link.is_symlink() and target.read_text() == "keep"
+    mine = env.tmp / "cursor.json.2.bbbbbbbb.tmp"
+    mine.write_text("x")
+    _age(mine, 7200)
+    me = os.geteuid()
+    monkeypatch.setattr(ns.os, "geteuid", lambda: me + 1)
+    ns.clean_stale_temps(str(env.cursor), max_age=3600)
+    assert mine.exists()

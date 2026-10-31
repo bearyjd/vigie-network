@@ -33,7 +33,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import NoReturn
 from urllib.parse import urlsplit
@@ -48,6 +48,8 @@ MAX_CURSOR = 4096
 MAX_RESPONSE = 4096
 MAX_TIMEOUT = 20.0
 MAX_BATCH_LIMIT = 1000
+MIN_BATCH = 2  # a rejected record needs a successor in the same read to be probed
+STALE_TEMP_AGE_S = 3600.0
 RETRY_AFTER_CAP = 60.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 1.0
@@ -238,6 +240,13 @@ def _bounded_number(value: object, key: str, maximum: float, *, integer: bool) -
     return float(value)  # type: ignore[arg-type]
 
 
+def _max_batch(value: object) -> int:
+    batch = int(_bounded_number(value, "max_batch", MAX_BATCH_LIMIT, integer=True))
+    if batch < MIN_BATCH:
+        raise ConfigError(f"max_batch must be at least {MIN_BATCH}")
+    return batch
+
+
 def parse_config(raw: object) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("configuration must be a JSON object")
@@ -266,9 +275,7 @@ def parse_config(raw: object) -> Config:
                 raw.get("timeout_seconds", 8), "timeout_seconds", MAX_TIMEOUT, integer=False
             )
         ),
-        max_batch=int(
-            _bounded_number(raw.get("max_batch", 50), "max_batch", MAX_BATCH_LIMIT, integer=True)
-        ),
+        max_batch=_max_batch(raw.get("max_batch", 50)),
     )
 
 
@@ -339,13 +346,37 @@ def _fsync_directory(path: str) -> None:
         os.close(dir_fd)
 
 
+def check_cursor_dir(cursor_file: str) -> None:
+    """The cursor directory must be a real directory owned by the effective user and not
+    group/world-writable. It must also lie outside every volume the pipeline mounts (documented;
+    not detectable here)."""
+    directory = os.path.dirname(cursor_file) or "."
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise ConfigError(f"cannot open cursor directory: {exc.strerror}") from exc
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if info.st_uid != os.geteuid():
+        raise ConfigError("cursor directory is not owned by the effective user of this process")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise ConfigError("cursor directory must not be group- or world-writable (use mode 0700)")
+
+
 def acquire_lock(cursor_file: str) -> int | None:
-    """Exclusive non-blocking lock on `<cursor_file>.lock`; None when another run holds it."""
-    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    """Exclusive non-blocking lock on `<cursor_file>.lock`; None when another run holds it. The
+    lock file must be a regular file owned by us with a single link."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
         fd = os.open(cursor_file + ".lock", flags, 0o600)
     except OSError as exc:
         raise ConfigError(f"cannot open lock file: {exc.strerror}") from exc
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        os.close(fd)
+        raise ConfigError("lock file must be a regular file we own with a single link")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -355,6 +386,27 @@ def acquire_lock(cursor_file: str) -> int | None:
         os.close(fd)
         raise ConfigError(f"cannot lock the lock file: {exc.strerror}") from exc
     return fd
+
+
+def clean_stale_temps(cursor_file: str, max_age: float = STALE_TEMP_AGE_S) -> None:
+    """Remove our own leftover `<cursor>.<pid>.<8 hex>.tmp` files older than max_age. Only exact
+    name matches, regular files (lstat, never followed) owned by us."""
+    directory, base = os.path.split(cursor_file)
+    pattern = re.compile(re.escape(base) + r"\.[0-9]+\.[0-9a-f]{8}\.tmp")
+    try:
+        names = os.listdir(directory or ".")
+    except OSError as exc:
+        raise ConfigError(f"cannot list cursor directory: {exc.strerror}") from exc
+    for name in filter(pattern.fullmatch, names):
+        path = os.path.join(directory, name)
+        try:
+            info = os.lstat(path)
+            stale = time.time() - info.st_mtime > max_age
+            if stale and stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid():
+                os.unlink(path)
+                log.info("removed a stale temporary cursor file")
+        except OSError:
+            log.debug("stale temporary cursor file could not be removed")
 
 
 # --- delivery file -------------------------------------------------------------------------
@@ -376,17 +428,27 @@ def _first_line_hash(fd: int) -> str:
     return "" if end < 0 else hashlib.sha256(prefix[:end]).hexdigest()[:16]
 
 
-def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
-    """Bytes after the cursor, or None if the file does not exist yet. A replaced or truncated
-    file (other inode, shorter than the offset, other first line) restarts at 0. The device
-    number is ignored: the inode and the first-line hash identify the file."""
+def _read_cap(cfg: Config) -> int:
+    return cfg.max_batch * (MAX_LINE + 1)
+
+
+def _open_delivery(cfg: Config) -> int | None:
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
-        fd = os.open(cfg.delivery_file, flags)
+        return os.open(cfg.delivery_file, flags)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise ConfigError(f"cannot open delivery file: {exc.strerror}") from exc
+
+
+def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
+    """Bytes after the cursor, or None if the file does not exist yet. A replaced or truncated
+    file (other inode, shorter than the offset, other first line) restarts at 0. The device
+    number is ignored: the inode and the first-line hash identify the file."""
+    fd = _open_delivery(cfg)
+    if fd is None:
+        return None
     with os.fdopen(fd, "rb"):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -398,24 +460,49 @@ def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
         if cursor.offset > 0 and not replaced and cursor.dev != info.st_dev:
             log.warning("device number of the delivery file changed; treating it as the same file")
         start = 0 if replaced else cursor.offset
-        data = os.pread(fd, cfg.max_batch * (MAX_LINE + 1), start)
+        data = os.pread(fd, _read_cap(cfg), start)
     return Chunk(data, start, info.st_dev, info.st_ino, head, replaced)
 
 
-def split_lines(chunk: Chunk, max_batch: int) -> list[tuple[bytes, int]]:
+def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
+    """The next chunk of the SAME file (same inode, not shorter) at offset, else None."""
+    fd = _open_delivery(cfg)
+    if fd is None:
+        return None
+    with os.fdopen(fd, "rb"):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_ino != previous.ino or info.st_size < offset:
+            return None
+        data = os.pread(fd, _read_cap(cfg), offset)
+    return replace(previous, data=data, start=offset, restarted=False)
+
+
+def split_lines(chunk: Chunk, cap: int) -> list[tuple[bytes, int]]:
     """Complete lines as (line, offset after it). A partial trailing line is left alone, except a
     full chunk with no newline at all: that is one oversized line and is skipped by the caller."""
     lines: list[tuple[bytes, int]] = []
     pos = 0
-    while len(lines) < max_batch:
-        end = chunk.data.find(b"\n", pos)
-        if end < 0:
-            break
+    while (end := chunk.data.find(b"\n", pos)) >= 0:
         lines.append((chunk.data[pos:end], chunk.start + end + 1))
         pos = end + 1
-    if not lines and len(chunk.data) >= max_batch * (MAX_LINE + 1):
+    if not lines and len(chunk.data) >= cap:
         lines.append((chunk.data, chunk.start + len(chunk.data)))
     return lines
+
+
+def iter_lines(cfg: Config, chunk: Chunk) -> Iterator[tuple[bytes, int]]:
+    """Every complete line of the file from the chunk on; later chunks are read lazily, so a
+    consumer that stops pulling never reads more."""
+    cap = _read_cap(cfg)
+    while True:
+        lines = split_lines(chunk, cap)
+        yield from lines
+        if not lines or len(chunk.data) < cap:
+            return
+        following = read_at(cfg, chunk, lines[-1][1])
+        if following is None:
+            return
+        chunk = following
 
 
 def _template_regex(template: str) -> re.Pattern[str]:
@@ -556,17 +643,21 @@ def send_with_retry(
     sleep: Callable[[float], None],
     remaining: Callable[[], float],
 ) -> Outcome:
-    """Send with bounded backoff. Each call gets min(timeout, remaining run budget)."""
+    """Send with bounded backoff. Each call gets min(timeout, remaining run budget); the budget is
+    read once per attempt. The budget is checked between operations: a single socket operation
+    may still take up to `timeout`, and TimeoutStartSec is the hard stop."""
     delay = BACKOFF_BASE
     outcome = Outcome("retry", None, "run budget exhausted")
     for attempt in range(MAX_ATTEMPTS):
-        if remaining() <= 0:
+        left = remaining()
+        call_timeout = min(timeout, left)
+        if call_timeout <= 0:
             return Outcome("retry", None, "run budget exhausted")
-        outcome = send_once(opener, req, min(timeout, remaining()))
+        outcome = send_once(opener, req, call_timeout)
         if outcome.kind != "retry" or attempt == MAX_ATTEMPTS - 1:
             break
         wait = min(max(delay, outcome.retry_after or 0.0), RETRY_AFTER_CAP)
-        if wait >= remaining():
+        if wait >= left:
             break
         log.warning("retryable failure (%s); retrying in %.0fs", outcome.detail, wait)
         sleep(wait)
@@ -577,37 +668,51 @@ def send_with_retry(
 # --- run -----------------------------------------------------------------------------------
 
 
-def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunResult:
-    """Send the records in order. A record the server REJECTS (400/413/414/422) is held back until
-    the next record succeeds (a probe): then it is skipped for good (exit 5); if the probe is
-    rejected too, or there is none, the run stops with exit 3 and the cursor stays before it."""
+def _drain(
+    cfg: Config,
+    chunk: Chunk,
+    send: Callable[[Record], Outcome],
+    expired: Callable[[], bool],
+) -> RunResult:
+    """Send the records in order, at most max_batch lines per run. A record the server REJECTS
+    (400/413/414/422) is held back until the next valid record succeeds (a probe), however far
+    away it is: then it is skipped for good (exit 5). If the probe is rejected too, or the file
+    ends without a valid successor, the run stops with exit 3 and the cursor stays before it."""
     cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head)
-    sent = skipped = rejected = held = 0
-    for line, end in split_lines(chunk, cfg.max_batch):
+    sent = skipped = rejected = taken = 0
+    held: int | None = None  # file offset just after the rejected record
+    for line, end in iter_lines(cfg, chunk):
+        if held is None and taken >= cfg.max_batch:
+            break
+        if held is not None and expired():
+            return _stop(Outcome("retry", None, "run budget exhausted"), sent, skipped)
+        taken += 1
         try:
             record = parse_record(line)
         except ValueError as exc:
             log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
-            if not held:
+            if held is None:
                 cursor = replace(cursor, offset=end)
                 save_cursor(cfg.cursor_file, cursor)
             continue
         outcome = send(record)
-        if outcome.kind == "rejected" and not held:
+        if outcome.kind == "rejected" and held is None:
             log.error(
                 "record before offset %d rejected (%s); probing the next one", end, outcome.detail
             )
-            held = 1
+            held = end
             continue
         if outcome.kind != "ok":
             return _stop(outcome, sent, skipped)
-        sent, skipped, rejected = sent + 1, skipped + held, rejected + held
-        held = 0
+        if held is not None:
+            log.error("record skipped permanently (rejected by the server) before offset %d", held)
+            skipped, rejected, held = skipped + 1, rejected + 1, None
+        sent += 1
         cursor = replace(cursor, offset=end)
         save_cursor(cfg.cursor_file, cursor)
-    if held:
-        log.error("rejected record has no successor to probe yet; cursor not advanced")
+    if held is not None:
+        log.error("rejected record has no valid successor to probe yet; cursor not advanced")
         return RunResult(sent, skipped, EXIT_PERMANENT)
     if chunk.restarted and cursor.offset == 0:
         save_cursor(cfg.cursor_file, cursor)
@@ -630,6 +735,7 @@ def run(
     clock: Callable[[], float] = time.monotonic,
     budget_seconds: float = RUN_BUDGET_S,
 ) -> RunResult:
+    check_cursor_dir(cfg.cursor_file)
     lock = acquire_lock(cfg.cursor_file)
     if lock is None:
         log.info("another run active; exiting")
@@ -647,6 +753,7 @@ def _run_locked(
     clock: Callable[[], float],
     budget_seconds: float,
 ) -> RunResult:
+    clean_stale_temps(cfg.cursor_file)
     topic = load_topic(cfg.topic_file)
     token = load_token(cfg.token_file) if cfg.token_file else None
     opener = build_opener(ssl_context or ssl.create_default_context())
@@ -664,7 +771,7 @@ def _run_locked(
             opener, request, cfg.timeout_seconds, sleep, lambda: deadline - clock()
         )
 
-    return _drain(cfg, chunk, send)
+    return _drain(cfg, chunk, send, lambda: deadline - clock() <= 0)
 
 
 def main(argv: list[str] | None = None) -> int:
