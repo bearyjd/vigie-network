@@ -216,7 +216,8 @@ def _revalidate(ov: sqlite3.Connection, row: sqlite3.Row) -> None:
     if row["content_sha256"] is None:
         raise _conflict(
             "dataset_digest_missing",
-            "import has no content digest (staged by an older build); restage it",
+            "import has no content digest (staged by an older build); reject it to free the slot,"
+            " it can only be replaced by a different file",
         )
     seen = 0
 
@@ -253,7 +254,7 @@ def _audit_detail(row: sqlite3.Row, by: str, **extra: object) -> dict:
 
 
 def _decide(ov, import_id, principal, now_iso, action, apply):
-    """Run `apply(row)` -> (SQL updates, audit detail) on a staged import, atomically."""
+    """Run `apply(row)` (its UPDATEs, returning the audit detail) on a staged import, atomically."""
     ov.execute("BEGIN IMMEDIATE")
     try:
         row = ov.execute("SELECT * FROM dataset_imports WHERE id=?", (import_id,)).fetchone()
@@ -261,11 +262,10 @@ def _decide(ov, import_id, principal, now_iso, action, apply):
             raise ApiError(404, "dataset_import_not_found", f"no import {import_id!r}")
         if row["status"] != "staged":
             raise _conflict("dataset_not_staged", f"import is {row['status']}, not staged")
-        for sql, params in (updates := apply(row))[0]:
-            ov.execute(sql, params)
+        detail = apply(row)
         ov.execute(
             "INSERT INTO audit_log (id,ts,principal,action,target,detail) VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), now_iso, principal, action, import_id, _compact(updates[1])),
+            (str(uuid.uuid4()), now_iso, principal, action, import_id, _compact(detail)),
         )
         ov.execute("COMMIT")
     except BaseException:
@@ -294,25 +294,22 @@ def accept(
             if not force:
                 _check_churn(row, live)
         _revalidate(ov, row)
-        steps = []
         if live is not None:  # supersede first: one live accepted import per source
-            steps.append((
+            ov.execute(
                 "UPDATE dataset_imports SET superseded_by=?, superseded_at=? WHERE id=?",
                 (import_id, now_iso, live["id"]),
-            ))  # fmt: skip
-        steps.append((
-            "UPDATE dataset_imports SET status='accepted', accepted_by=?, accepted_at=?"
-            " WHERE id=?",
+            )
+        ov.execute(
+            "UPDATE dataset_imports SET status='accepted', accepted_by=?, accepted_at=? WHERE id=?",
             (by, now_iso, import_id),
-        ))  # fmt: skip
-        detail = _audit_detail(
+        )
+        return _audit_detail(
             row,
             by,
             force=force,
             allow_older=allow_older,
             superseded=None if live is None else live["id"],
         )
-        return steps, detail
 
     _decide(ov, import_id, principal, now_iso, ACCEPT_ACTION, apply)
 
@@ -330,11 +327,11 @@ def reject(
     reason = None if reason is None else _label("reason", reason, MAX_REASON_LEN)
 
     def apply(row):
-        step = (
+        ov.execute(
             "UPDATE dataset_imports SET status='rejected', rejected_by=?, rejected_at=?,"
             " reject_reason=? WHERE id=?",
             (by, now_iso, reason, import_id),
         )
-        return [step], _audit_detail(row, by, reason=reason)
+        return _audit_detail(row, by, reason=reason)
 
     _decide(ov, import_id, principal, now_iso, REJECT_ACTION, apply)

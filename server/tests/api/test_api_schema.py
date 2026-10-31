@@ -332,7 +332,7 @@ def test_migration_9_backfills_the_content_digest_with_the_stage_framing(tmp_pat
     assert got["bare"] is None  # no entries to digest: stays unacceptable
 
 
-def test_a_migrated_v8_staged_import_is_acceptable_and_a_bare_one_says_restage(
+def test_a_migrated_v8_staged_import_is_acceptable_and_a_bare_one_says_reject(
     tmp_path: Path,
 ) -> None:
     from vigie_api import dataset_writes
@@ -350,7 +350,7 @@ def test_a_migrated_v8_staged_import_is_acceptable_and_a_bare_one_says_restage(
     )
     with pytest.raises(ApiError) as exc:
         dataset_writes.accept(conn, "bare", "cli:local", "cli:local", now)
-    assert exc.value.code == "dataset_digest_missing" and "restage" in exc.value.message
+    assert exc.value.code == "dataset_digest_missing" and "reject" in exc.value.message
 
 
 def _real(tmp_path: Path) -> sqlite3.Connection:

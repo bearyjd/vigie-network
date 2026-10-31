@@ -48,7 +48,8 @@ def _parser() -> argparse.ArgumentParser:
     accept.add_argument(
         "--allow-older",
         action="store_true",
-        help="accept a version not newer than the live one (audited; not implied by --force)",
+        help="accept a version older than, or not comparable with, the live one (audited;"
+        " not implied by --force)",
     )
     reject.add_argument("--reason", default=None, help="why (max 200 characters)")
     return parser

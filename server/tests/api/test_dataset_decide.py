@@ -221,7 +221,10 @@ def test_same_version_different_bytes_is_not_older(ov):
 
 def raw_import(ov, id_, version, *, status="staged", sha="a", digest=None, source="kev"):
     """A row as an older build could have left it (bypasses stage)."""
-    drop_triggers(ov)
+    (insert_trigger,) = ov.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trg_dataset_imports_insert'"
+    ).fetchone()
+    ov.execute("DROP TRIGGER trg_dataset_imports_insert")  # only the birth rule; the rest stay
     acc = ("u", "t") if status == "accepted" else (None, None)
     ov.execute(
         "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,created_at,"
@@ -229,6 +232,7 @@ def raw_import(ov, id_, version, *, status="staged", sha="a", digest=None, sourc
         "VALUES (?,?,?,'l',?,1,'t','u',?,?,?,?)",
         (id_, source, version, sha * 64, status, *acc, digest),
     )
+    ov.execute(insert_trigger)
 
 
 @pytest.mark.parametrize("version", ["weekly-42", "2026-13-45", "v1", "2026.10", "20261001"])
@@ -435,7 +439,7 @@ def test_a_staged_import_without_a_digest_must_be_restaged(ov):
     with pytest.raises(ApiError) as exc:
         accept(ov, imp)
     assert (exc.value.status, code(exc)) == (409, "dataset_digest_missing")
-    assert "restage" in exc.value.message and status(ov, imp) == "staged"
+    assert "reject" in exc.value.message and status(ov, imp) == "staged"
 
 
 def update(ov, sql, *params):
@@ -645,8 +649,13 @@ def test_supersede_target_must_not_be_a_rejected_import(ov):
 
 
 def test_stage_and_decisions_work_with_every_trigger_in_place(ov):
-    n = ov.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'trg_dataset%'").fetchone()
-    assert n[0] >= 6
+    names = {r[0] for r in ov.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+    assert {n for n in names if n.startswith("trg_dataset")} == {
+        "trg_dataset_imports_frozen", "trg_dataset_imports_transition",
+        "trg_dataset_imports_insert", "trg_dataset_imports_nodelete",
+        "trg_dataset_entries_noupdate", "trg_dataset_entries_nodelete",
+        "trg_dataset_entries_insert",
+    }  # fmt: skip
     a, b = stage(ov, tag="a"), stage(ov, tag="b", version="2026.10.02")
     accept(ov, a)
     accept(ov, b)
@@ -660,3 +669,20 @@ def test_mixed_separators_and_sloppy_dates_are_not_versions(version):
 
 def test_matching_separators_parse():
     assert dataset_writes._version_date("2024.01.02") == dataset_writes._version_date("2024-01-02")
+
+
+def test_the_exact_bytes_of_a_superseded_or_rejected_import_can_never_be_restaged(ov):
+    data_a, data_r = kev(3, "a"), kev(3, "r")
+    a = stage(ov, data=data_a, version="2026.10.01")
+    r = stage(ov, data=data_r, version="2026.10.02")
+    b = stage(ov, tag="b", version="2026.10.03")
+    accept(ov, a)
+    accept(ov, b)  # a is superseded
+    reject(ov, r)
+    for data in (data_a, data_r):
+        with pytest.raises(ApiError) as exc:
+            stage(ov, data=data, version="2026.10.04")
+        assert code(exc) == "dataset_already_staged"
+    with pytest.raises(ApiError) as exc:  # nor can a superseded import be accepted again
+        dataset_writes.accept(ov, a, "cli:local", "cli:local", LATER, allow_older=True)
+    assert code(exc) == "dataset_not_staged"

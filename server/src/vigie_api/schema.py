@@ -6,6 +6,7 @@ overrides.db is read-write for this process only. inventory.db is opened read-on
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sqlite3
@@ -76,19 +77,27 @@ def _identity_triggers() -> tuple[str, ...]:
 
 
 # Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
+def _digest(rows) -> str:
+    """Frozen copy of dataset_writes.content_digest as of migration 9 (a test pins them equal)."""
+    digest = hashlib.sha256()
+    for key, payload in rows:
+        for part in (key, payload):
+            raw = part.encode()
+            digest.update(f"{len(raw)}:".encode() + raw)
+    return digest.hexdigest()
+
+
 def _backfill_content_digests(conn: sqlite3.Connection) -> None:
     """Digest every pre-migration import's staged entries (same framing as dataset_writes)."""
-    from vigie_api.dataset_writes import content_digest
-
     for (import_id,) in conn.execute("SELECT id FROM dataset_imports").fetchall():
         rows = conn.execute(
             "SELECT key,payload FROM dataset_entries_staging WHERE import_id=? ORDER BY key",
             (import_id,),
         )
         first = rows.fetchone()
-        if first is None:  # nothing to digest: stays NULL, and accept will say to restage
+        if first is None:  # nothing to digest: stays NULL, and accept will say to reject it
             continue
-        digest = content_digest(chain([first], rows))
+        digest = _digest(chain([first], rows))
         conn.execute("UPDATE dataset_imports SET content_sha256=? WHERE id=?", (digest, import_id))
 
 
@@ -325,6 +334,8 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], Non
                   AND n.status IN ('staged','accepted')))
           )
           BEGIN SELECT RAISE(ABORT, 'illegal dataset import transition'); END""",
+        # NOTE: a later migration that rebuilds dataset_imports or dataset_entries_staging must
+        # drop and re-create all trg_dataset_* triggers (they die with the table).
         # Rows are born staged, with a digest and no accept record (the CHECKs cover the rest).
         # Imports are never deleted; staged entries are insert-only, and only while their
         # import is still staged.

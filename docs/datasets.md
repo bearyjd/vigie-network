@@ -53,7 +53,10 @@ database error.
   a source has no ordering or churn check. `--force` does not bypass this guard.
   `--allow-older` does: it accepts a version older than (or unorderable against) the live one,
   is recorded as `allow_older` in the audit row, and still enforces the future, churn and
-  content checks. It is the deliberate way to roll back or to replace a bad live import.
+  content checks. It is the deliberate way to roll back or to replace a bad live import: stage a re-exported or
+  corrected file carrying the older date and accept it with `--allow-older`. The exact bytes of
+  any earlier import (superseded or rejected) can never be staged again (the unique
+  (source, sha256) row stays) and a superseded import cannot be accepted again.
 - **Churn guard.** If the entry count differs from the live import by more than 50% in either
   direction (`CHURN_MAX_FRACTION`; from a live count of 0 any increase) the accept is refused
   (`dataset_churn_exceeded`) unless `--force` is given. `force` is recorded in the audit row.
@@ -69,7 +72,8 @@ database error.
   and puts it in the audit detail. Accept recomputes it while streaming and refuses a mismatch
   (`dataset_digest_mismatch`), so rows changed after staging cannot be accepted. Migration 9
   backfills the digest (same framing) for every existing import that has staged entries; one with
-  no entries keeps no digest and accept refuses it (`dataset_digest_missing`): restage it. The
+  no entries keeps no digest and accept refuses it (`dataset_digest_missing`): reject it (frees its staging slot); it can
+  only be replaced by a different file, since the same bytes can never be staged again. The
   digest proves integrity since staging, not authenticity: a forged staged import with a
   self-consistent digest passes accept, so only the CLI should write these tables.
 - **What the database enforces** (CHECKs, triggers `trg_dataset_*`, a partial unique index and a
