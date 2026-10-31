@@ -550,7 +550,7 @@ def test_identity_is_frozen_even_inside_a_legal_transition(ov, assignment):
         update(
             ov,
             "UPDATE dataset_imports SET status='accepted', accepted_by='u', accepted_at='t',"
-            f" {assignment} WHERE id=?",  # noqa: S608
+            " " + assignment + " WHERE id=?",
             imp,
         )
 
