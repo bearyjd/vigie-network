@@ -13,7 +13,7 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date
 
 from vigie_api import dataset_parse
@@ -41,6 +41,16 @@ def _label(name: str, value: str, limit: int = dataset_parse.MAX_FIELD_LEN) -> s
     if not text or len(text) > limit or not text.isprintable():
         raise _invalid(f"{name} must be 1-{limit} printable characters")
     return text
+
+
+def content_digest(rows: Iterable[tuple[str, str]]) -> str:
+    """SHA-256 over (key, payload) rows in key order, length-prefixed so rows cannot blur."""
+    digest = hashlib.sha256()
+    for key, payload in rows:
+        for part in (key, payload):
+            raw = part.encode()
+            digest.update(f"{len(raw)}:".encode() + raw)
+    return digest.hexdigest()
 
 
 def _compact(value: object) -> str:
@@ -75,23 +85,27 @@ def stage(
     if parser is None:
         raise _invalid(f"unknown source {source!r}")
     version, licence = _label("version", version), _label("licence", licence)
+    if _version_date(version) is None:
+        raise _invalid("version must be a date, YYYY.MM.DD or YYYY-MM-DD")
     principal, now_iso = _label("principal", principal), _label("now_iso", now_iso)
     try:
         entries, skipped = parser(data)
     except ValueError as exc:
         raise _invalid(str(exc)) from None
     sha256 = hashlib.sha256(data).hexdigest()
+    staged_rows = sorted((e.key, _compact(e.payload)) for e in entries)
+    content_sha256 = content_digest(staged_rows)
     import_id = id_factory()
     detail = {
         "source": source, "version": version, "sha256": sha256,
-        "entry_count": len(entries), "skipped_count": skipped,
+        "entry_count": len(entries), "skipped_count": skipped, "content_sha256": content_sha256,
     }  # fmt: skip
     ov.execute("BEGIN IMMEDIATE")
     try:
         _guard(ov, source, sha256)
         ov.execute(
             "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,"
-            "skipped_count,created_at,created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+            "skipped_count,created_at,created_by,content_sha256) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 import_id,
                 source,
@@ -102,11 +116,12 @@ def stage(
                 skipped,
                 now_iso,
                 principal,
+                content_sha256,
             ),
         )
         ov.executemany(
             "INSERT INTO dataset_entries_staging (import_id,key,payload) VALUES (?,?,?)",
-            ((import_id, e.key, _compact(e.payload)) for e in entries),
+            ((import_id, key, payload) for key, payload in staged_rows),
         )
         ov.execute(
             "INSERT INTO audit_log (id,ts,principal,action,target,detail) VALUES (?,?,?,?,?,?)",
@@ -145,14 +160,15 @@ def _conflict(code: str, message: str) -> ApiError:
     return ApiError(409, code, message)
 
 
-def _check_version(new: sqlite3.Row, live: sqlite3.Row) -> None:
-    new_date, live_date = _version_date(new["version"]), _version_date(live["version"])
-    if new_date is None or live_date is None:
+def _check_version(new: sqlite3.Row, live: sqlite3.Row | None) -> None:
+    new_date = _version_date(new["version"])
+    live_date = None if live is None else _version_date(live["version"])
+    if new_date is None or (live is not None and live_date is None):
         raise _conflict(
             "dataset_version_incomparable",
-            f"cannot order version {new['version']!r} against accepted {live['version']!r}",
+            f"version {new['version']!r} or the accepted one is not a YYYY.MM.DD date",
         )
-    if new_date < live_date:
+    if live_date is not None and new_date < live_date:
         raise _conflict(
             "dataset_version_older",
             f"version {new['version']!r} is older than accepted {live['version']!r}",
@@ -170,24 +186,41 @@ def _check_churn(new: sqlite3.Row, live: sqlite3.Row) -> None:
 
 
 def _revalidate(ov: sqlite3.Connection, row: sqlite3.Row) -> None:
-    count = 0
-    for key, payload in ov.execute(
-        "SELECT key,payload FROM dataset_entries_staging WHERE import_id=?", (row["id"],)
-    ):
-        count += 1
-        if not dataset_parse.is_valid_staged(row["source"], key, payload):
-            raise _conflict("dataset_staged_invalid", "a staged entry does not match its schema")
-    if count != row["entry_count"]:
+    """Shape, count and content digest of the staged rows, streamed in key order."""
+    if row["content_sha256"] is None:
+        raise _conflict(
+            "dataset_digest_missing",
+            "import has no content digest (staged by an older build); restage it",
+        )
+    seen = []
+
+    def stream():
+        for key, payload in ov.execute(
+            "SELECT key,payload FROM dataset_entries_staging WHERE import_id=? ORDER BY key",
+            (row["id"],),
+        ):
+            if not dataset_parse.is_valid_staged(row["source"], key, payload):
+                raise _conflict(
+                    "dataset_staged_invalid", "a staged entry does not match its schema"
+                )
+            seen.append(None)
+            yield key, payload
+
+    digest = content_digest(stream())
+    if len(seen) != row["entry_count"]:
         raise _conflict(
             "dataset_staged_invalid",
-            f"{count} staged entries, import recorded {row['entry_count']}",
+            f"{len(seen)} staged entries, import recorded {row['entry_count']}",
         )
+    if digest != row["content_sha256"]:
+        raise _conflict("dataset_digest_mismatch", "staged entries changed since they were staged")
 
 
 def _audit_detail(row: sqlite3.Row, by: str, **extra: object) -> dict:
     return {
         "source": row["source"], "version": row["version"], "sha256": row["sha256"],
         "entry_count": row["entry_count"], "skipped_count": row["skipped_count"], "by": by,
+        "content_sha256": row["content_sha256"],
         **extra,
     }  # fmt: skip
 
@@ -228,8 +261,8 @@ def accept(
 
     def apply(row):
         live = latest_accepted(ov, row["source"])
+        _check_version(row, live)
         if live is not None:
-            _check_version(row, live)
             if not force:
                 _check_churn(row, live)
         _revalidate(ov, row)

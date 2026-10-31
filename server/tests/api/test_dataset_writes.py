@@ -53,6 +53,7 @@ def test_stage_records_import_entries_and_one_audit_row(ov):
         "status": "staged", "created_at": NOW, "created_by": "cli:local",
         "accepted_by": None, "accepted_at": None, "rejected_at": None, "rejected_by": None,
         "reject_reason": None, "superseded_at": None, "superseded_by": None,
+        "content_sha256": row["content_sha256"],
     }  # fmt: skip
     keys = [r[0] for r in ov.execute("SELECT key FROM dataset_entries_staging ORDER BY key")]
     assert keys == ["CVE-2021-0001", "CVE-2022-12345", "CVE-2023-0003"]
@@ -61,7 +62,9 @@ def test_stage_records_import_entries_and_one_audit_row(ov):
     assert json.loads(audit["detail"]) == {
         "source": "kev", "version": "2099.01.01", "entry_count": 3, "skipped_count": 0,
         "sha256": hashlib.sha256(KEV).hexdigest(),
+        "content_sha256": row["content_sha256"],
     }  # fmt: skip
+    assert len(row["content_sha256"]) == 64
     assert "CVE-2021" not in audit["detail"] and "Widget" not in audit["detail"]
 
 
@@ -144,7 +147,7 @@ def variant(n: int) -> bytes:
 
 def test_a_sixth_staged_import_of_one_source_is_refused(ov):
     for n in range(dataset_writes.MAX_STAGED):
-        stage(ov, data=variant(n), version=f"v{n}")
+        stage(ov, data=variant(n), version=f"2099.01.0{n + 1}")
     with pytest.raises(ApiError) as caught:
         stage(ov, data=variant(99))
     assert (caught.value.status, caught.value.code) == (409, "dataset_staging_full")

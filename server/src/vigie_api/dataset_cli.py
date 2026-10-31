@@ -101,10 +101,7 @@ def _decide(ov, args) -> int:
         return _fail(f"{err.code}: {err.message}", 2 if err.status == 422 else 1)
     except sqlite3.Error as exc:
         return _fail(f"{args.command} failed, nothing changed: {exc}", 3)
-    print(
-        f"{args.command}{'ed' if args.command == 'reject' else 'ed'} {args.import_id}",
-        file=sys.stderr,
-    )
+    print(f"{args.command}ed {args.import_id}", file=sys.stderr)
     return 0
 
 

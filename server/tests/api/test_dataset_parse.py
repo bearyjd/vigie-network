@@ -572,3 +572,53 @@ def test_streamed_comment_logic_matches_the_reference_on_random_files():
             ends[-1] = ""
         text = "".join(line + end for line, end in zip(picked, ends, strict=True))
         assert streamed_rows(text) == reference_rows(text), repr(text)
+
+
+# --- is_valid_staged: accept-time re-validation must be as strict as the parsers ---
+
+GOOD_KEV = {
+    "cveID": "CVE-2024-1000", "vendorProject": "V", "product": "P", "dateAdded": "2024-01-01",
+}  # fmt: skip
+
+
+def staged_ok(source, key, payload):
+    return dataset_parse.is_valid_staged(source, key, json.dumps(payload))
+
+
+def test_staged_validation_accepts_what_the_parsers_produce():
+    assert staged_ok("kev", "CVE-2024-1000", GOOD_KEV)
+    for host in ("evil.example.com", "1.2.3.4", "2001:db8::1", "::1", "xn--a-b.example"):
+        assert staged_ok("urlhaus", host, {"host": host, "threat": "malware_download"}), host
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.1", "a.123", "0x7f", "1.2.3", "fe80::1%eth0", "64:ff9b::102:304", "::ffff:1.2.3.4",
+     "::1.2.3.4", "EVIL.com", "evil.com.", "a/b", "a@b", "", " evil.com", "[::1]", "a..b",
+     "evil.com\n", "a" * 254, "01.2.3.4"],
+)  # fmt: skip
+def test_staged_urlhaus_hosts_must_be_canonical_parser_keys(host):
+    assert not staged_ok("urlhaus", host, {"host": host, "threat": "t"})
+
+
+BAD_STRINGS = ["a\nb", "a\x1bb", "a\u202eb", "a\x00b", "a\u200fb", "x" * 513]
+
+
+@pytest.mark.parametrize("bad", BAD_STRINGS)
+def test_staged_strings_must_be_printable_and_bounded(bad):
+    assert not staged_ok("urlhaus", "evil.com", {"host": "evil.com", "threat": bad})
+    for field in ("vendorProject", "product"):
+        assert not staged_ok("kev", "CVE-2024-1000", {**GOOD_KEV, field: bad})
+
+
+def test_staged_shape_extras_missing_and_types_are_refused():
+    assert not staged_ok("kev", "CVE-2024-1000", {**GOOD_KEV, "extra": "x"})
+    assert not staged_ok(
+        "kev", "CVE-2024-1000", {k: v for k, v in GOOD_KEV.items() if k != "product"}
+    )
+    assert not staged_ok("kev", "CVE-2024-1000", {**GOOD_KEV, "product": 1})
+    assert not staged_ok("kev", "CVE-2024-1000", {**GOOD_KEV, "dateAdded": "2024-13-01"})
+    assert not staged_ok("kev", "CVE-2024-1001", GOOD_KEV)  # key != cveID
+    assert not staged_ok("urlhaus", "evil.com", {"host": "other.com", "threat": "t"})
+    assert not dataset_parse.is_valid_staged("kev", "k", "[1]")
+    assert not dataset_parse.is_valid_staged("nope", "k", "{}")

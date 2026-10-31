@@ -207,17 +207,37 @@ def _v8_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def test_migration_9_upgrades_an_existing_v8_db_and_keeps_rows(tmp_path: Path) -> None:
+def test_migration_9_upgrades_a_v8_db_with_staged_accepted_and_rejected_rows(
+    tmp_path: Path,
+) -> None:
     raw = _v8_db(tmp_path / "o.db")
-    raw.execute(IMPORT_SQL.format(",status,accepted_by,accepted_at", ",?,?,?"),
-                ("old", "kev", SHA, 1, "accepted", "u", "t"))  # fmt: skip
+    sql = IMPORT_SQL.format(",status,accepted_by,accepted_at", ",?,?,?")
+    raw.execute(sql, ("old", "kev", SHA, 1, "accepted", "u", "t"))
+    raw.execute(sql, ("stg", "kev", "b" * 64, 1, "staged", None, None))
+    raw.execute(sql, ("rej", "kev", "c" * 64, 1, "rejected", None, None))
+    raw.execute("INSERT INTO dataset_entries_staging VALUES ('rej','k','{}')")
     raw.close()
     conn = open_overrides(tmp_path / "o.db")
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
-    row = conn.execute("SELECT * FROM dataset_imports").fetchone()
-    assert (row["id"], row["status"], row["rejected_by"], row["superseded_by"]) == (
-        "old", "accepted", None, None,
-    )  # fmt: skip
+    rows = {r["id"]: r for r in conn.execute("SELECT * FROM dataset_imports")}
+    assert (rows["old"]["status"], rows["old"]["rejected_by"]) == ("accepted", None)
+    assert (rows["stg"]["status"], rows["stg"]["content_sha256"]) == ("staged", None)
+    rej = rows["rej"]  # backfilled, not lost and not blocking startup
+    assert (rej["status"], rej["rejected_by"], rej["rejected_at"]) == (
+        "rejected",
+        "migration-9",
+        "t",
+    )
+    assert conn.execute("SELECT COUNT(*) FROM dataset_entries_staging").fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'trg_dataset%'"
+        ).fetchone()[0]
+        >= 2
+    )
+    assert not conn.execute("SELECT name FROM sqlite_temp_master").fetchall()
+    conn.close()
+    open_overrides(tmp_path / "o.db").close()  # reopening is a no-op
 
 
 def test_rejected_status_needs_a_reject_record(tmp_path: Path) -> None:
@@ -244,13 +264,16 @@ def test_rejected_status_needs_a_reject_record(tmp_path: Path) -> None:
 def test_supersede_columns_are_paired_and_only_for_accepted(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "o.db")
     acc = {"status": "accepted", "accepted_by": "u", "accepted_at": "t"}
+    _import(conn, "b0", sha="9" * 64, source="urlhaus")  # a live target for superseded_by
     with pytest.raises(sqlite3.IntegrityError):
-        _import(conn, "a", **acc, superseded_by="b")
+        _import(conn, "a", **acc, superseded_by="b0")
     with pytest.raises(sqlite3.IntegrityError):
         _import(conn, "b", sha="b" * 64, **acc, superseded_at="t")
     with pytest.raises(sqlite3.IntegrityError):
-        _import(conn, "c", sha="c" * 64, superseded_by="b", superseded_at="t")  # not accepted
-    _import(conn, "d", sha="d" * 64, **acc, superseded_by="b", superseded_at="t")
+        _import(conn, "c", sha="c" * 64, superseded_by="b0", superseded_at="t")  # not accepted
+    with pytest.raises(sqlite3.IntegrityError):  # the FK: superseded_by must exist
+        _import(conn, "e", sha="e" * 64, **acc, superseded_by="nope", superseded_at="t")
+    _import(conn, "d", sha="d" * 64, **acc, superseded_by="b0", superseded_at="t")
 
 
 def test_one_live_accepted_import_per_source(tmp_path: Path) -> None:

@@ -41,18 +41,37 @@ database error.
   `superseded_by` / `superseded_at` on the previous live one in the same transaction; its status
   stays `accepted` (no table rebuild, history kept). Rolling back to an older import is not
   supported: an older version is refused, see below.
+- **Version rule.** `stage` requires a date version (`YYYY.MM.DD` or `YYYY-MM-DD`, a real
+  date; exit 2 otherwise), so a source can never be locked by an unorderable label. Accept
+  re-checks it, including for the first accept.
 - **Version guard.** Versions are compared only as dates, `YYYY.MM.DD` or `YYYY-MM-DD` (KEV
   `catalogVersion`, URLhaus dump date). An import older than the live one is refused
   (`dataset_version_older`); the same date is allowed (a republished file). If either version is
   not such a date the accept fails closed (`dataset_version_incomparable`). The first accept for
-  a source has no version or churn check. `--force` does not bypass this guard.
+  a source has no ordering or churn check. `--force` does not bypass this guard.
 - **Churn guard.** If the entry count differs from the live import by more than 50% in either
   direction (`CHURN_MAX_FRACTION`; from a live count of 0 any increase) the accept is refused
   (`dataset_churn_exceeded`) unless `--force` is given. `force` is recorded in the audit row.
+  Known limit: the comparison is only against the live import, so a series of accepts that each
+  change the count by under 50% can walk a dataset far from its baseline without `--force`.
 - **Re-validation.** On accept every staged row of the import is re-checked against the shape the
   parser produces for that source (key and payload fields, KEV CVE id and date, URLhaus host),
   and the row count must equal `entry_count`; any mismatch refuses
-  (`dataset_staged_invalid`). Rows are streamed, never copied.
+  (`dataset_staged_invalid`). URLhaus hosts must be exactly the key the parser derives (same
+  address and canonicalisation rules); strings must be printable (no control or bidi characters).
+  Rows are streamed, never copied.
+- **Content digest.** `stage` stores `content_sha256`, a digest of the sorted (key, payload) rows,
+  and puts it in the audit detail. Accept recomputes it while streaming and refuses a mismatch
+  (`dataset_digest_mismatch`), so rows changed after staging cannot be accepted. Imports staged
+  before migration 9 have no digest and are refused with `dataset_digest_missing`: restage them.
+- **Database guards.** Triggers on `dataset_imports` allow only `staged -> accepted|rejected` and
+  a one-time supersede of an accepted row (to an existing import of the same source); identity
+  columns are frozen and `superseded_by` is a foreign key. Migration 9 restores any v8 `rejected`
+  rows with `rejected_by='migration-9'`, `rejected_at=created_at`.
+- **Deploy order.** Running this CLI against a live overrides.db migrates it to schema v9, and an
+  older API image refuses to start on a newer schema. Deploy the API image first, then use the
+  CLI. There is no downgrade.
+- **Pruning.** Staging rows of rejected and superseded imports are never pruned yet (follow-up).
 - **Licence review stays human.** Accept does not judge the licence: read the recorded licence
   before accepting.
 

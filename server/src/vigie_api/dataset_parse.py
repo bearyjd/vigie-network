@@ -253,18 +253,19 @@ def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
 
 
 def _plain(payload: Any, fields: tuple[str, ...]) -> bool:
-    return (
-        isinstance(payload, dict)
-        and set(payload) == set(fields)
-        and all(isinstance(v, str) and len(v) <= MAX_FIELD_LEN for v in payload.values())
-    )
-
-
-def _valid_host_key(key: str) -> bool:
+    """Exactly `fields`, every value a string `_field` would accept."""
+    if not (isinstance(payload, dict) and set(payload) == set(fields)):
+        return False
     try:
-        return str(ipaddress.ip_address(key)) == key
+        return all(_field(value, name) is not None for name, value in payload.items())
     except ValueError:
-        return len(key) <= _MAX_HOST_LEN and all(_LABEL.fullmatch(p) for p in key.split("."))
+        return False
+
+
+def _canonical_host_key(key: str) -> bool:
+    """True when the URLhaus parser itself would derive exactly `key` as a host key."""
+    url = f"http://[{key}]/" if ":" in key else f"http://{key}/"
+    return _urlhaus_host(url) == key
 
 
 def is_valid_staged(source: str, key: str, payload_text: str) -> bool:
@@ -286,6 +287,8 @@ def is_valid_staged(source: str, key: str, payload_text: str) -> bool:
             return False
     if source == "urlhaus":
         return (
-            _plain(payload, ("host", "threat")) and payload["host"] == key and _valid_host_key(key)
+            _plain(payload, ("host", "threat"))
+            and payload["host"] == key
+            and _canonical_host_key(key)
         )
     return False
