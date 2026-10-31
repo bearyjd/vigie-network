@@ -1,0 +1,27 @@
+# TEMPLATE, not installed or enabled by anything in this repository. Replace every
+# /ABSOLUTE/PATH/... placeholder, then see "Incident delivery to ntfy" in docs/monitoring.md.
+[Unit]
+Description=Vigie ntfy sender (standalone, one pass)
+Documentation=file:///ABSOLUTE/PATH/TO/vigie/docs/monitoring.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /ABSOLUTE/PATH/TO/vigie/deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/ABSOLUTE/PATH/TO/CURSOR_DIRECTORY
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=

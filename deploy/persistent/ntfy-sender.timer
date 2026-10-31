@@ -1,0 +1,12 @@
+# TEMPLATE, not installed or enabled by anything in this repository.
+[Unit]
+Description=Run the Vigie ntfy sender every minute
+
+[Timer]
+OnActiveSec=60s
+OnUnitActiveSec=60s
+Persistent=no
+Unit=ntfy-sender.service
+
+[Install]
+WantedBy=timers.target
