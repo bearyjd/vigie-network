@@ -436,6 +436,8 @@ def test_dropped_since_rejects_anything_but_strict_utc_seconds(env: Env):
         "2026-01-01 00:00:00Z",
         "2026-13-01T00:00:00Z",
         "2026-02-30T00:00:00Z",
+        "2026-1-1T0:0:0Z",
+        " 2026-01-01T00:00:00Z",
         "2999-01-01T00:00:00Z",
     ):
         response = _since(env, bad)

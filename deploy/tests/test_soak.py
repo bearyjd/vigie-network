@@ -1,7 +1,6 @@
 """A fake clock verifies logic; it never supplies real acceptance evidence."""
 
 import importlib.util
-import os
 import sys
 import tempfile
 import unittest
@@ -40,7 +39,6 @@ def sample(second, **overrides):
         "processing_backlog_age_s": 0,
         "processing_backlog_reference_wall": 1_800_000_000 + second,
         "dropped_batches": 0,
-        "retained_batches_since": "2026-01-01T00:00:00+00:00",
         "source_flags": 0,
         "dns_log_quiet": False,
         "ct_unmapped_flows": 0,
@@ -112,142 +110,31 @@ class SoakTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 self.assertEqual(soak.assess(values)["status"], "fail")
 
-    def drop_run(self, base, per_index=None, since="2026-01-01T00:00:00+00:00"):
-        per_index = per_index or {}
-        values = full()
-        for i, value in enumerate(values):
-            value.update(
-                dropped_batches=base,
-                dropped_baseline=base,
-                retained_batches_since=since,
-            )
-            value.update(per_index.get(i, {}))
-        return values
-
-    def test_preexisting_drops_at_baseline_do_not_fail_the_run(self):
-        for base in (0, 7):
-            with self.subTest(base=base):
-                result = soak.assess(self.drop_run(base))
-                self.assertEqual(result["status"], "pass")
-
-    def test_drop_after_baseline_fails(self):
-        for base in (0, 7):
-            with self.subTest(base=base):
-                values = self.drop_run(base, {5: {"dropped_batches": base + 1}})
+    def test_drops_since_run_start_must_be_an_integer_zero_on_every_sample(self):
+        for index in (0, 1, 7):
+            values = full()
+            values[index]["dropped_batches"] = 1
+            with self.subTest(index=index):
                 result = soak.assess(values)
                 self.assertEqual(result["status"], "fail")
                 self.assertIn("dropped_batches_limit", result["reasons"])
 
-    def test_baseline_is_the_first_sample_even_without_stamped_copies(self):
+    def test_unknown_or_malformed_drop_count_never_passes(self):
+        for bad in (None, True, False, "0", 0.0, -1, float("inf")):
+            values = full()
+            values[3]["dropped_batches"] = bad
+            with self.subTest(bad=bad):
+                result = soak.assess(values)
+                self.assertNotEqual(result["status"], "pass")
+                self.assertTrue(
+                    {"missing_metrics", "invalid_metrics", "dropped_batches_limit"}
+                    & set(result["reasons"])
+                )
         values = full()
-        values[0]["dropped_batches"] = 4
-        for value in values[1:]:
-            value["dropped_batches"] = 4
-            value["retained_batches_since"] = "2026-01-01T00:00:00+00:00"
-        self.assertEqual(soak.assess(values)["status"], "pass")
-        values[3]["dropped_batches"] = 5
-        self.assertIn("dropped_batches_limit", soak.assess(values)["reasons"])
-
-    def test_missing_or_unknown_first_baseline_fails(self):
-        for first in (None, "bad"):
-            values = self.drop_run(0)
-            values[0]["dropped_batches"] = first
-            result = soak.assess(values)
-            self.assertEqual(result["status"], "fail")
-            self.assertIn("dropped_baseline_missing", result["reasons"])
-
-    def test_tampered_or_missing_baseline_copy_fails(self):
-        for index, change in (
-            (0, {"dropped_baseline": 1}),
-            (3, {"dropped_baseline": 1}),
-            (3, {"dropped_baseline": None}),
-        ):
-            values = self.drop_run(0)
-            values[index].update(change)
-            with self.subTest(index=index, change=change):
-                result = soak.assess(values)
-                self.assertEqual(result["status"], "fail")
-                self.assertIn("dropped_baseline_mismatch", result["reasons"])
-        values = self.drop_run(0)
-        del values[3]["dropped_baseline"]
-        self.assertIn("dropped_baseline_mismatch", soak.assess(values)["reasons"])
-        values = self.drop_run(0)
-        del values[0]["dropped_baseline"]
-        self.assertIn("dropped_baseline_mismatch", soak.assess(values)["reasons"])
-
-    def test_lowered_total_with_nonzero_baseline_is_unverifiable(self):
-        # Old drops rolling out of the window could mask new ones: never a pass.
-        values = self.drop_run(7, {5: {"dropped_batches": 6}})
+        del values[3]["dropped_batches"]
         result = soak.assess(values)
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("dropped_window_unverifiable", result["reasons"])
-
-    def test_window_advance_with_nonzero_baseline_is_unverifiable(self):
-        for since in ("2026-01-02T00:00:00+00:00", None):
-            values = self.drop_run(7, {5: {"retained_batches_since": since}})
-            with self.subTest(since=since):
-                result = soak.assess(values)
-                self.assertEqual(result["status"], "fail")
-                self.assertIn("dropped_window_unverifiable", result["reasons"])
-
-    def test_rows_must_still_be_retained_from_before_the_run_for_any_baseline(self):
-        for base in (0, 7):
-            for since in (None, "garbage", "2027-06-01T00:00:00+00:00", 5):
-                values = self.drop_run(base)
-                for value in values:
-                    value["retained_batches_since"] = since
-                with self.subTest(base=base, since=since):
-                    result = soak.assess(values)
-                    self.assertEqual(result["status"], "fail")
-                    self.assertIn("dropped_window_unverifiable", result["reasons"])
-
-    def test_zero_baseline_tolerates_a_moving_window_start_before_the_run(self):
-        values = self.drop_run(
-            0, {5: {"retained_batches_since": "2026-02-01T00:00:00+00:00"}}
-        )
-        self.assertEqual(soak.assess(values)["status"], "pass")
-
-    def test_boolean_baseline_stamp_is_not_a_number(self):
-        values = self.drop_run(1)
-        for value in values:
-            value["dropped_baseline"] = True
-        result = soak.assess(values)
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("dropped_baseline_mismatch", result["reasons"])
-
-    def test_real_mode_requires_a_stamp_but_simulated_legacy_does_not(self):
-        values = self.drop_run(0)
-        for value in values:
-            del value["dropped_baseline"]
-        self.assertEqual(soak.assess(values)["status"], "pass")
-        result = soak.assess(values, mode="real")
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("dropped_baseline_mismatch", result["reasons"])
-        self.assertEqual(soak.assess(self.drop_run(0), mode="real")["status"], "pass")
-
-    def test_invalid_first_record_keeps_the_drop_baseline_evidence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            os.chmod(tmp, 0o700)
-            path = Path(tmp) / "journal"
-            first = dict(
-                sample(0),
-                dropped_batches=7,
-                dropped_baseline=7,
-                retained_batches_since="2026-01-01T00:00:00+00:00",
-                helper_rss_kib=float("nan"),
-            )
-            with soak.Journal(path, mode="real") as journal:
-                journal.append(first)
-            with soak.Journal(path, mode="real") as journal:
-                kept = journal.samples[0]
-        self.assertTrue(kept["invalid_record"])
-        self.assertEqual(kept["dropped_batches"], 7)
-        self.assertEqual(kept["dropped_baseline"], 7)
-        self.assertEqual(kept["retained_batches_since"], "2026-01-01T00:00:00+00:00")
-
-    def test_nonzero_baseline_requires_a_window_start(self):
-        values = self.drop_run(7, since=None)
-        self.assertIn("dropped_window_unverifiable", soak.assess(values)["reasons"])
+        self.assertNotEqual(result["status"], "pass")
+        self.assertIn("missing_metrics", result["reasons"])
 
     def test_cpu_uses_counter_ratio_per_logical_cpu(self):
         values = full()

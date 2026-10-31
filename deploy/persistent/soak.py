@@ -141,6 +141,7 @@ def sample_issues(sample):
         "log_capacity_kib": lambda x: 0 < x <= 20480,
         "freshness_s": lambda x: x <= 180,
         "processing_backlog_age_s": lambda x: x <= 180,
+        "dropped_batches": lambda x: type(x) is int and x == 0,
         "source_flags": lambda x: x == 0,
         "logical_cpus": lambda x: x >= 1 and int(x) == x,
     }
@@ -160,58 +161,6 @@ def sample_issues(sample):
     if "dns_parsed_age_s" not in missing and sample["dns_parsed_age_s"] > 120:
         quality.add("parsed_dns_stale")
     return failures, missing, quality
-
-
-def _epoch_utc(value):
-    if not isinstance(value, str) or len(value) > 128 or not value.isascii():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed.timestamp() if parsed.tzinfo else None
-
-
-def drop_failures(samples, mode):
-    """Judge drops that happen during the run, not the API's historical retained total.
-
-    The first sample is the durable baseline. The total is an aggregate over every retained
-    batch row, so it can fall only when rows are purged. Every sample must therefore prove that
-    all rows from before the run are still retained (retained_batches_since no later than the
-    first sample's wall time); otherwise an in-run drop could have been purged unseen. A total
-    below the baseline, or a moving window start while the baseline is nonzero, fails closed.
-    """
-    first = samples[0] if isinstance(samples[0], dict) else {}
-    base = first.get("dropped_batches")
-    if not _number(base):
-        return {"dropped_baseline_missing"}
-    failures = set()
-    dicts = [s for s in samples if isinstance(s, dict)]
-    stamped = any("dropped_baseline" in s for s in dicts)
-    if mode == "real" and not stamped:
-        failures.add("dropped_baseline_mismatch")
-    since = first.get("retained_batches_since")
-    start = _epoch_utc(since)
-    run_start = first.get("wall")
-    for sample in dicts:
-        if stamped and (
-            not _number(sample.get("dropped_baseline"))
-            or sample["dropped_baseline"] != base
-        ):
-            failures.add("dropped_baseline_mismatch")
-        total = sample.get("dropped_batches")
-        if not _number(total):
-            continue
-        if total > base:
-            failures.add("dropped_batches_limit")
-        elif total < base:
-            failures.add("dropped_window_unverifiable")
-        own = _epoch_utc(sample.get("retained_batches_since"))
-        if own is None or not _number(run_start) or own > run_start:
-            failures.add("dropped_window_unverifiable")
-        elif base > 0 and (start is None or sample["retained_batches_since"] != since):
-            failures.add("dropped_window_unverifiable")
-    return failures
 
 
 def assess(samples, *, mode="simulated"):
@@ -316,7 +265,6 @@ def assess(samples, *, mode="simulated"):
             and not quality
         ):
             result["status"] = "pass"
-    failures |= drop_failures(samples, mode)
     if failures:
         result["status"] = "fail"
     result["reasons"] = sorted(
@@ -421,15 +369,6 @@ class Journal:
                     value = sample.get(key)
                     if isinstance(value, str) and len(value) <= 128 and value.isascii():
                         safe[key] = value
-                # Keep the drop baseline evidence so a failed first record cannot unpin it.
-                since = sample.get("retained_batches_since")
-                if isinstance(since, str) and len(since) <= 128 and since.isascii():
-                    safe["retained_batches_since"] = since
-                if "dropped_baseline" in sample and (
-                    sample["dropped_baseline"] is None
-                    or _number(sample["dropped_baseline"])
-                ):
-                    safe["dropped_baseline"] = sample["dropped_baseline"]
                 # Preserve bounded raw processing evidence even for an invalid/future sample.
                 for key in _BOOLS:
                     if type(sample.get(key)) is bool:

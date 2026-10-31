@@ -300,32 +300,108 @@ class FinalCoverageContract(unittest.TestCase):
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["ct_unmapped_flows"])
         collector["summary_capped"] = False
         self.assertEqual(runner.coverage_metrics(collector, 1000)["backlog_batches"], 0)
-        # The capped total is never trusted for the soak: only the uncapped aggregate counts.
+        # The capped historical field is no longer the soak's drop source.
+        self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
+        collector.pop("summary_capped")
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
 
-    def test_soak_drop_total_uses_the_uncapped_aggregate_even_when_summary_is_capped(
+
+class DropsSinceRunStartTests(unittest.TestCase):
+    CONFIG = {
+        "api_token_file": "private",
+        "api_ca_file": "ca",
+        "api_port": 18444,
+        "collector_id": "c1",
+    }
+
+    def test_drop_total_is_the_server_count_since_run_start_even_when_summary_is_capped(
         self,
     ):
-        collector = {
-            "summary_capped": True,
-            "dropped_batches_in_retained_detail": 0,
-            "dropped_batches_all_retained": 7,
-            "retained_batches_since": "2026-01-01T00:00:00Z",
-        }
+        collector = {"summary_capped": True, "dropped_batches_since": 0}
         result = runner.coverage_metrics(collector, 1000)
-        self.assertEqual(result["dropped_batches"], 7)
-        self.assertEqual(result["retained_batches_since"], "2026-01-01T00:00:00Z")
+        self.assertEqual(result["dropped_batches"], 0)
         self.assertIsNone(result["ct_unmapped_flows"])
-        for bad in (None, True, "7", 7.0, -1):
+        collector["dropped_batches_since"] = 3
+        self.assertEqual(runner.coverage_metrics(collector, 1000)["dropped_batches"], 3)
+
+    def test_unknown_malformed_or_older_server_total_is_unknown(self):
+        for bad in (None, True, False, "0", 0.0, -1):
             with self.subTest(bad=bad):
-                collector["dropped_batches_all_retained"] = bad
+                collector = {"dropped_batches_since": bad}
                 self.assertIsNone(
                     runner.coverage_metrics(collector, 1000)["dropped_batches"]
                 )
+        # An older server only has the capped historical field: never a favorable zero.
+        old = {"summary_capped": False, "dropped_batches_in_retained_detail": 0}
+        self.assertIsNone(runner.coverage_metrics(old, 1000)["dropped_batches"])
 
+    def fetch(self, since_wall):
+        import json
 
-class DropBaselineTests(unittest.TestCase):
-    def run_main(self, prior, collected):
+        urls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def read(self, _):
+                return json.dumps({"data": {"collector": {}}}).encode()
+
+            def __exit__(self, *_):
+                return False
+
+        class Opener:
+            def open(self, request, **__):
+                urls.append(request.full_url)
+                return Response()
+
+        with (
+            patch.object(runner, "private_read", return_value=b"token"),
+            patch.object(runner.ssl, "create_default_context"),
+            patch.object(runner.urllib.request, "build_opener", return_value=Opener()),
+        ):
+            runner.read_coverage(self.CONFIG, 1_800_000_999, since_wall)
+        return urls[0]
+
+    def test_coverage_request_carries_the_run_start_as_strict_utc_z(self):
+        url = self.fetch(1_800_000_000.9)
+        self.assertIn("dropped_since=2027-01-15T08%3A00%3A00Z", url)
+        self.assertIn(
+            "dropped_since=2027-01-15T08%3A00%3A01Z", self.fetch(1_800_000_001)
+        )
+
+    def test_collect_defaults_the_run_start_to_its_own_wall_for_a_first_sample(self):
+        with (
+            patch.object(runner, "read_meter", return_value={}),
+            patch.object(runner, "dns_probe", return_value=True),
+            patch.object(runner, "read_coverage", return_value={}) as coverage,
+            patch.object(
+                runner, "clock_sample", return_value={"wall": 1_800_000_000.5}
+            ),
+        ):
+            runner.collect(
+                self.CONFIG
+                | {
+                    "meter_executable": "m",
+                    "meter_sha256": "0" * 64,
+                    "router_address": "192.0.2.1",
+                }
+            )
+            runner.collect(
+                self.CONFIG
+                | {
+                    "meter_executable": "m",
+                    "meter_sha256": "0" * 64,
+                    "router_address": "192.0.2.1",
+                },
+                1_700_000_000,
+            )
+        self.assertEqual(coverage.call_args_list[0].args[1:], (1_800_000_000.5, None))
+        self.assertEqual(
+            coverage.call_args_list[1].args[1:], (1_800_000_000.5, 1_700_000_000)
+        )
+
+    def run_main(self, prior_wall, now_wall):
         import hashlib
         import io
         import json
@@ -333,86 +409,95 @@ class DropBaselineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            config = {
-                "api_port": 18444,
-                "api_token_file": "/unused",
-                "api_ca_file": "/unused",
-                "collector_id": "test",
-                "meter_executable": "/unused",
-                "meter_sha256": "a" * 64,
-                "router_address": "192.0.2.1",
-            }
+            config = dict(
+                self.CONFIG,
+                meter_executable="/unused",
+                meter_sha256="a" * 64,
+                router_address="192.0.2.1",
+            )
             raw = json.dumps(config).encode()
             config_path = base / "config"
             config_path.write_bytes(raw)
             config_path.chmod(0o600)
             journal_path = base / "journal"
             metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
-            if prior is not None:
-                with runner.Journal(
-                    journal_path, mode="real", metadata=metadata
-                ) as journal:
-                    journal.append(prior)
-            out = io.StringIO()
+            if prior_wall is not None:
+                with runner.Journal(journal_path, mode="real", metadata=metadata) as j:
+                    j.append(dict(HEALTHY_SAMPLE, wall=prior_wall))
+            seen = []
+
+            def fake(cfg, since_wall=None):
+                seen.append(since_wall)
+                return dict(
+                    HEALTHY_SAMPLE,
+                    wall=now_wall,
+                    monotonic=1060,
+                    boottime=2060,
+                    total_cpu_ticks=12100,
+                    source_flags=1,
+                )
+
             with (
                 patch.object(
                     sys, "argv", ["run_soak", str(config_path), str(journal_path)]
                 ),
-                patch.object(runner, "collect", return_value=collected),
-                redirect_stdout(out),
+                patch.object(runner, "collect", side_effect=fake),
+                redirect_stdout(io.StringIO()),
             ):
                 runner.main()
-            with runner.Journal(
-                journal_path, mode="real", metadata=metadata
-            ) as journal:
-                return journal.samples, json.loads(out.getvalue())
+        return seen
 
-    def sample(self, **changes):
-        # source_flags=1 ends the run right after the first resumed observation.
-        value = dict(
-            HEALTHY_SAMPLE,
-            wall=1800000060,
-            monotonic=1060,
-            boottime=2060,
-            total_cpu_ticks=12100,
-            source_flags=1,
-            dropped_batches=7,
-            retained_batches_since="2026-01-01T00:00:00+00:00",
-        )
-        value.update(changes)
-        return value
+    def test_fresh_run_lets_the_first_sample_define_the_run_start(self):
+        self.assertEqual(self.run_main(None, 1_800_000_500), [None])
 
-    def test_coverage_metrics_expose_the_retained_window_start(self):
-        collector = {
-            "summary_capped": False,
-            "retained_batches_since": "2026-01-01T00:00:00+00:00",
-        }
-        self.assertEqual(
-            runner.coverage_metrics(collector, 1000)["retained_batches_since"],
-            "2026-01-01T00:00:00+00:00",
-        )
+    def test_resume_reuses_the_journals_first_wall_not_the_current_time(self):
+        for now in (1_800_000_500, 1_900_000_000):
+            with self.subTest(now=now):
+                self.assertEqual(self.run_main(1_800_000_000, now), [1_800_000_000])
 
-    def test_fresh_run_records_its_first_total_as_baseline(self):
-        samples, _ = self.run_main(None, self.sample())
-        self.assertEqual(samples[0]["dropped_baseline"], 7)
+    def test_unusable_first_wall_counts_every_drop_from_the_epoch(self):
+        self.assertEqual(self.run_main(float("nan"), 1_800_000_500), [0])
 
-    def test_resume_reuses_the_journal_baseline_not_the_current_total(self):
-        prior = dict(self.sample(), dropped_baseline=7)
-        prior.update(
-            wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100
-        )
-        samples, report = self.run_main(prior, self.sample(dropped_batches=9))
-        self.assertEqual(samples[-1]["dropped_baseline"], 7)
-        self.assertIn("dropped_batches_limit", report["reasons"])
+    def test_preflight_has_no_journal_and_uses_its_own_wall(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
 
-    def test_resume_without_a_stored_baseline_fails(self):
-        prior = self.sample()
-        prior.update(
-            wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100
-        )
-        samples, report = self.run_main(prior, self.sample())
-        self.assertIsNone(samples[-1]["dropped_baseline"])
-        self.assertIn("dropped_baseline_mismatch", report["reasons"])
+        with tempfile.TemporaryDirectory() as tmp:
+            config = dict(
+                self.CONFIG,
+                meter_executable="/unused",
+                meter_sha256="a" * 64,
+                router_address="192.0.2.1",
+            )
+            config_path = Path(tmp) / "config"
+            config_path.write_bytes(json.dumps(config).encode())
+            config_path.chmod(0o600)
+            out = io.StringIO()
+            seen = []
+
+            def fake(cfg, since_wall=None):
+                seen.append(since_wall)
+                return dict(HEALTHY_SAMPLE)
+
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "run_soak",
+                        str(config_path),
+                        str(Path(tmp) / "journal"),
+                        "--preflight",
+                    ],
+                ),
+                patch.object(runner, "collect", side_effect=fake),
+                redirect_stdout(out),
+            ):
+                code = runner.main()
+        self.assertEqual(seen, [None])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out.getvalue())["reasons"], [])
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -478,8 +563,6 @@ class ReviewRegressions(unittest.TestCase):
                     "freshness_s": 30,
                     "backlog_batches": 0,
                     "dropped_batches": 0,
-                    "dropped_baseline": 0,
-                    "retained_batches_since": "2026-01-01T00:00:00+00:00",
                     "source_flags": 0,
                     "dns_log_quiet": False,
                     "ct_unmapped_flows": 0,
@@ -757,7 +840,6 @@ HEALTHY_SAMPLE = {
     "freshness_s": 30,
     "backlog_batches": 0,
     "dropped_batches": 0,
-    "retained_batches_since": "2026-01-01T00:00:00+00:00",
     "source_flags": 0,
     "dns_log_quiet": False,
     "ct_unmapped_flows": 0,

@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +30,7 @@ from soak import (
     CADENCE_SECONDS,
     DURATION_SECONDS,
     Journal,
+    _number,
     assess,
     processing_backlog_age,
     sample_issues,
@@ -331,11 +332,10 @@ def coverage_metrics(collector, now):
     }
     for target, source in mapping.items():
         result[target] = collector.get(source)
-    # The 10000-row summary is capped at steady state (7-day retention); the soak instead uses
-    # the server's uncapped SQL aggregates. Anything but a non-negative int stays unknown.
-    total = collector.get("dropped_batches_all_retained")
+    # Drops received since the run start, counted by the server in SQL (uncapped, so the
+    # 10000-row summary cap does not apply). Unknown or an older server stays unknown.
+    total = collector.get("dropped_batches_since")
     result["dropped_batches"] = total if type(total) is int and total >= 0 else None
-    result["retained_batches_since"] = collector.get("retained_batches_since")
     for target, source in (
         ("freshness_s", "latest_window_end"),
         ("dns_parsed_age_s", "latest_dns_observation_window_end"),
@@ -362,19 +362,7 @@ def coverage_metrics(collector, now):
     return result
 
 
-def with_drop_baseline(sample, journal):
-    """Stamp the run's durable drop baseline (the journal's first total) on every sample.
-
-    A resumed journal whose first sample carries no baseline stamps None, which assess() fails.
-    """
-    if journal.samples:
-        baseline = journal.samples[0].get("dropped_baseline")
-    else:
-        baseline = sample.get("dropped_batches")
-    return {**sample, "dropped_baseline": baseline}
-
-
-def read_coverage(config, now):
+def read_coverage(config, now, since_wall=None):
     token = private_read(config["api_token_file"], 1024).decode("ascii").strip()
     if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
         raise ValueError("invalid token file")
@@ -384,6 +372,10 @@ def read_coverage(config, now):
             "collector_id": config["collector_id"],
             "from_hour": hour - 3600,
             "to_hour": hour,
+            # Run start (first sample wall, floored to the second) in the ingest's own format.
+            "dropped_since": datetime.fromtimestamp(
+                int(now if since_wall is None else since_wall), UTC
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
     )
     context = ssl.create_default_context(cafile=config["api_ca_file"])
@@ -417,7 +409,7 @@ def clock_sample():
     }
 
 
-def collect(config):
+def collect(config, since_wall=None):
     result = clock_sample()
     try:
         meter = read_meter(config["meter_executable"], config["meter_sha256"])
@@ -439,7 +431,7 @@ def collect(config):
     except (OSError, ValueError, subprocess.SubprocessError):
         result["meter_error"] = True
     try:
-        api_metrics = read_coverage(config, result["wall"])
+        api_metrics = read_coverage(config, result["wall"], since_wall)
         # Historical API health must never replace the independent live resource meter.
         if "collector_rss_kib" in api_metrics:
             api_metrics["api_collector_rss_kib"] = api_metrics.pop("collector_rss_kib")
@@ -588,17 +580,24 @@ def main():
         if not args.preflight:
             write_ingest_marker(args.journal)
         return 1
-    first = collect(config)
-    failures, missing, quality = sample_issues(first)
     if args.preflight:
+        # No journal: the run start is the preflight sample's own wall time.
+        first = collect(config)
         report = assess([first], mode="real")
         print(json.dumps(report))
-        return 1 if failures else 2
+        return 1 if sample_issues(first)[0] else 2
     if not args.journal.parent.exists():
         args.journal.parent.mkdir(mode=0o700)
     metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
     with Journal(args.journal, mode="real", metadata=metadata) as journal:
-        first = with_drop_baseline(first, journal)
+        # The run start is the journal's first sample, never the current time; an unusable
+        # first wall counts every drop (epoch 0). A fresh run's first sample defines it.
+        since_wall = None
+        if journal.samples:
+            wall = journal.samples[0].get("wall")
+            since_wall = wall if _number(wall) else 0
+        first = collect(config, since_wall)
+        failures, missing, quality = sample_issues(first)
         journal.append(first)
         # Every resumed observation, including failure or absence, is durable before gates.
         if failures or missing or quality:
@@ -619,7 +618,7 @@ def main():
                     report = unbound_report(journal.samples)
                     write_ingest_marker(args.journal)
                     break
-                journal.append(with_drop_baseline(collect(config), journal))
+                journal.append(collect(config))
         except KeyboardInterrupt:
             report = assess(journal.samples, mode="real")
             report["interrupted"] = True
