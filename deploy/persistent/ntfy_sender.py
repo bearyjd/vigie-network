@@ -309,8 +309,8 @@ def save_cursor(path: str, cursor: Cursor) -> None:
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
+        fd = os.open(tmp, flags, 0o600)  # O_EXCL: never touches a file we did not create
         try:
-            fd = os.open(tmp, flags, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(payload)
                 stream.flush()
