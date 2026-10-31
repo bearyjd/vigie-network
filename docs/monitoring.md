@@ -513,6 +513,194 @@ Rules (`vigie_pipeline.delivery_plan.plan()`; no I/O, `now` injected, a non-fini
   never announced.
 - Unknown states, statuses and non-finite or non-numeric values fail closed (`unrecognised_state`).
 
+### Incident delivery to ntfy
+
+`deploy/persistent/ntfy_sender.py` ships the delivery file (the FilePublisher output above) to the
+public ntfy server. It is **off by default**, standalone (Python standard library, no dependency)
+and **not wired into the pipeline**: the pipeline keeps `Network=none` and has no network adapter,
+no new `VIGIE_DELIVERY_*` setting and no code change. The sender is a separate process (a oneshot
+user unit fired by a timer, run inside `podman unshare`) that only reads the file.
+
+```
+pipeline (Network=none) --FilePublisher--> delivery-messages.jsonl --read-only--> ntfy_sender.py --HTTPS--> ntfy.sh
+```
+
+**Why `podman unshare`.** The pipeline container writes the delivery file as its own uid (10001
+inside the container, a host subuid outside) and FilePublisher forces mode 0600, inside a 0700
+volume directory. A process running as the plain host user gets `EACCES` on it every minute and no
+alert would ever be sent. `podman unshare` enters the rootless user namespace as its root, which
+can read files owned by the mapped uids. Trust boundary: the same host user who owns the rootless
+containers can already enter that namespace and read these files, so nothing is widened. Inside the
+namespace the process is uid 0 and the host user's own files (config, topic, token, cursor) appear
+as owned by uid 0; the sender's secret-file check compares the owner with the EFFECTIVE uid of the
+process, so it holds both under `podman unshare` (0) and on a plain host (your uid). The check
+assumes that no container of the stack runs as container uid 0: files written by such a container
+would map to the host user and pass the owner check. Check read
+access once by hand (replace the placeholder):
+
+```sh
+podman unshare test -r /ABSOLUTE/PATH/TO/delivery-messages.jsonl && echo ok
+```
+
+`delivery_file` in the config is the HOST path of the file inside the inventory volume, that is the
+volume mountpoint plus the file name. Look the mountpoint up with
+`podman volume inspect NAMESPACE_inv --format '{{.Mountpoint}}'` (placeholder namespace) and append
+`/delivery-messages.jsonl` (the name you gave `VIGIE_DELIVERY_FILE`, below `/inv`).
+
+**Privacy.** The public service sees the message title and body (the device ALIAS, or the
+validated name if you opted in with `VIGIE_DELIVERY_INCLUDE_LABEL`), the relative incident link or,
+if you configure `click_base`, the full click URL, the timing of each notification, your
+household's public IP address and the client User-Agent. The topic is the only access control on
+ntfy.sh: anyone who learns it can read the notifications, so use 32 or more random characters (the
+sender requires at least 24; ntfy.sh limits topic names to 64). ntfy.sh keeps messages for a
+limited time (about 12 hours by default; check the ntfy docs) during which anyone holding the topic
+can fetch them with `since=`. Delivery to phones may go through third-party push services: the
+Android build from the Play store is documented to relay through Google FCM (title and body would
+be visible to Google), and iOS relies on Apple push through the ntfy.sh server; check the ntfy
+docs for the current behaviour. Options to reduce that exposure, to be verified against the ntfy
+docs before relying on them: the F-Droid build with UnifiedPush or its own foreground connection,
+or a self-hosted server (set `server` and `allowed_hosts`). An optional bearer token is only
+useful with a reserved topic or a self-hosted server. Without `click_base` no `Click` header is sent and
+the link stays relative (it is already in the body). Only the five validated fields are ever read;
+unknown keys in a record are dropped.
+
+**Config** (JSON, mode 0600, owned by the running user; unknown keys are rejected). Paths are
+placeholders:
+
+```json
+{
+  "delivery_file": "/ABSOLUTE/PATH/TO/delivery-messages.jsonl",
+  "cursor_file": "/ABSOLUTE/PATH/TO/CURSOR_DIRECTORY/ntfy-cursor.json",
+  "topic_file": "/ABSOLUTE/PATH/TO/private/ntfy-topic",
+  "token_file": "/ABSOLUTE/PATH/TO/private/ntfy-token",
+  "server": "https://ntfy.sh",
+  "allowed_hosts": ["ntfy.sh"],
+  "click_base": "https://vigie.example.invalid",
+  "timeout_seconds": 8,
+  "max_batch": 50
+}
+```
+
+Required: `delivery_file`, `cursor_file`, `topic_file` (absolute paths). Optional: `token_file`;
+`server` (https only, no userinfo, query, fragment or path, host must be in `allowed_hosts`,
+default `["ntfy.sh"]`); `click_base` (https, no userinfo, query or fragment; the message link
+`/ui/#incident=<id>` is appended); `timeout_seconds` (default 8, at most 20); `max_batch` (lines
+per run, default 50). The topic file holds one topic of 24 to 64 characters `A-Za-z0-9_-`; the token
+file one bearer token of 1 to 512 characters `A-Za-z0-9._~+/=-`. Secret files must be regular
+files (symlinks refused), owned by the effective user of the process, mode 0600 or 0400, at most
+1 KiB, without control characters; one trailing newline is stripped. `server` and `click_base`
+must be ASCII. Create them without leaking through the process list or shell history:
+
+```sh
+umask 077
+head -c 24 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > ntfy-topic   # 32 characters
+```
+
+Subscribe to that topic in the ntfy app yourself; nothing in the repository names it.
+
+**Behaviour.** One run reads at most `max_batch` (at least 2, default 50) complete lines after the
+cursor; while a rejected record waits for its probe (below) it keeps reading past that limit until
+it finds the next valid line or reaches the end of the file. A partial trailing line waits for its
+newline. A truncated or replaced file (other inode, shorter than the cursor, other first line)
+restarts from the beginning with a warning, which can repeat old notifications. The device number
+is ignored. Limits of this detection: an in-place truncate-and-rewrite that keeps the same first
+line and ends up at least as long as the old cursor offset is undetectable and the new lines
+before the offset are skipped; and FilePublisher's cut-back after a failed `fsync`, followed by a
+longer line, can leave the cursor in the middle of a line so that one alert is lost. Nothing but
+FilePublisher should rewrite the delivery file. A line that is over 8 KiB, not valid JSON, not an object or
+fails the schema is skipped with a counted warning (no record text in the log) and never sent. The
+schema is strict: `kind` open or recover, `link` exactly `/ui/#incident=` plus 1 to 186 characters
+of `A-Za-z0-9%._~-`, and `title` and `body` must equal the writer's message templates with one
+label (the writer's label charset, at most 48 characters) and the record's own link; a copy of the
+templates in the sender is checked against `delivery_publish.py` by a test. Titles are folded to
+ASCII for the header (the typographic apostrophe becomes `'`, accents are dropped); the body is
+UTF-8. Runs are serialised by a lock (`<cursor_file>.lock`): a second run that finds it held exits 0
+with "another run active". The cursor (offset, device, inode and a hash of the first line) is written atomically
+(unique `O_EXCL` temp file, fsync, rename, mode 0600) after each successful send and after each skipped line, so
+delivery is **at least once**: a crash between a send and its cursor write repeats that one
+notification on the next run. ntfy has no publisher idempotency key, so the sender cannot prevent
+this and does not invent one. (ntfy's sequence ID, `POST /<topic>/<sequence-id>`, updates or
+replaces an earlier notification; it is not a dedupe guarantee and is not used.) The sender does
+not rotate the delivery file. At the 10 MiB cap FilePublisher refuses further writes and the
+pipeline's deliveries run out their attempts, so the file needs attention before then:
+
+1. The file belongs to the container's subuid, so truncate it inside the namespace
+   (`podman unshare`), and stop the timer first (`systemctl --user stop ntfy-sender.timer`).
+2. Truncate ONLY when the cursor offset equals the file size, that is when the sender has
+   delivered everything. Check:
+   `podman unshare stat -c %s /ABSOLUTE/PATH/TO/delivery-messages.jsonl` prints the size; the
+   `offset` in `cat /ABSOLUTE/PATH/TO/CURSOR_DIRECTORY/ntfy-cursor.json` must be the same number.
+   Truncating while the sender is behind (for example after exit 3) drops the pending alerts.
+3. Then `podman unshare truncate -s 0 /ABSOLUTE/PATH/TO/delivery-messages.jsonl` and start the
+   timer again; the sender notices the shorter file and restarts from the beginning.
+
+Requests are verified TLS (system trust store), proxy environment variables are ignored, redirects
+are never followed, the response is read up to 4 KiB and discarded, and only HTTP 200 counts as
+success. A run has a total wall-clock budget of 120 s: every call gets the smaller of
+`timeout_seconds` and what is left, and backoff never sleeps past it. The budget is checked
+between operations: one socket operation can still take up to `timeout_seconds`, so
+`TimeoutStartSec` in the unit is the hard stop. Headers: `Title`, `Tags` (`warning` for open, `white_check_mark` for recover), `Priority:
+default`, `Click` (only with `click_base`) and `Authorization: Bearer` (only with `token_file`).
+
+**Exit codes.**
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Caught up, the delivery file does not exist yet, or another run holds the lock |
+| 1 | Unexpected internal error (exception class logged, nothing else) |
+| 2 | Configuration, secret file, lock or cursor error (a corrupt cursor is never guessed at) |
+| 3 | Permanent failure: 401, 403, 404, other unexpected statuses, a redirect, or two rejected records in a row (or a rejected last record with no successor yet). Logged once, the cursor is NOT advanced past the record, so a wrong topic or token is neither retried in a loop nor silently skipped |
+| 4 | Retryable failure (408, 425, 429, 5xx, network error, timeout, TLS failure) after up to 4 attempts with backoff of 1, 2 and 4 s (`Retry-After` honoured up to 60 s), or the 120 s run budget ran out; the cursor is unchanged |
+| 5 | Caught up, but the server REJECTED a record (400, 413, 414, 422) and it was skipped: the next record was delivered, proving the channel works, so the rejected one is a poisoned record. An ERROR is logged with the file offset only |
+
+Logs never contain the URL, topic, token, response body or record text. A rejected record is held
+back until the next one is delivered, so one bad record cannot block the queue forever but a
+broken channel never skips anything. Exit 3 needs the owner: fix the topic, token or server. Runs
+are serialised by the lock, so starting the sender by hand while the timer is active is safe (the
+stuck record is retried first).
+
+**A stalled channel must not be silent.** The sender is the alert channel, so its own failure needs
+a second path. A non-zero exit marks the unit failed, and the next successful run clears that
+state, so do not rely on polling `systemctl --user is-failed ntfy-sender.service` alone. Set
+`OnFailure=` in the service (a commented placeholder is in the template) to a local unit, for
+example one that writes a marker or sends a desktop notification, and/or watch the journal
+(`journalctl --user -u ntfy-sender.service -p err`). A run that ends with exit code 5 fires `OnFailure` too.
+
+**Enabling (owner actions, nothing here is installed for you).**
+
+1. Enable the pipeline side separately: `VIGIE_DELIVERY_FILE` and `VIGIE_DELIVERY_ENABLED=1`
+   (see above). The sender does nothing useful until the pipeline writes the file, and the
+   pipeline does not need the sender.
+2. Create the topic (and token) files and the config; put the cursor in a directory the sender
+   owns with mode 0700 (the sender refuses a cursor directory that is foreign-owned, a symlink or
+   group/world-writable, and a lock file that is not a regular single-link file we own). The cursor
+   directory must NOT be inside any volume the pipeline mounts; the sender cannot detect that.
+   Leftover cursor temp files of the sender (`<cursor>.<pid>.<8 hex>.tmp`, older than 1 hour, our
+   own regular files only) are removed at startup.
+3. Dry run by hand: `podman unshare python3 -I deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once`
+   prints `ntfy_sender sent=N skipped=M exit=C`.
+4. Copy `deploy/persistent/ntfy-sender.service` and `ntfy-sender.timer` to `~/.config/systemd/user/`,
+   replace every `/ABSOLUTE/PATH/...` placeholder, then `systemctl --user daemon-reload` and
+   `systemctl --user enable --now ntfy-sender.timer`. The timer fires every 60 s with
+   `Persistent=no`.
+
+   **Why the unit is not mount-sandboxed (measured on the host).** `podman unshare` fails with
+   "unable to create a new pause process: cannot re-exec process to join the existing user
+   namespace" whenever the unit sets ANY mount-namespace directive: `PrivateTmp`,
+   `ProtectSystem`, `ProtectHome`, `ReadWritePaths`, `ProtectKernelModules`, `ProtectKernelLogs`,
+   `ProtectControlGroups`, `ProtectClock` or `ProtectHostname` (each tested alone). Joining the
+   rootless user namespace is incompatible with a systemd mount namespace. These work, each alone
+   and all together: `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `RestrictRealtime`,
+   `RestrictSUIDSGID`, `LockPersonality` and `SystemCallArchitectures=native`; the unit sets
+   exactly those plus `UMask=0077`. `NoNewPrivileges`, `RestrictNamespaces`, a capability bounding
+   set and `SystemCallFilter` are also left out (they can break the setuid
+   `newuidmap`/`newgidmap` helpers). Compensating controls: the sender validates every input
+   itself, secrets must be 0600 and owned by the effective user, it has no inbound surface, uses
+   only the standard library, and is off by default. A test fails if a mount-namespace directive
+   is added to the service file.
+5. To stop: `systemctl --user disable --now ntfy-sender.timer`. Pending lines stay in the file and
+   are sent when the timer is enabled again.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is

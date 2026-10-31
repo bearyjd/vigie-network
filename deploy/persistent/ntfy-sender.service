@@ -1,0 +1,30 @@
+# TEMPLATE, not installed or enabled by anything in this repository. Replace every
+# /ABSOLUTE/PATH/... placeholder, then see "Incident delivery to ntfy" in docs/monitoring.md.
+#
+# The sender runs inside `podman unshare` so that, as the root of the rootless user namespace, it
+# can read the delivery file the pipeline container wrote as its own uid (a host subuid, mode 0600,
+# inside a 0700 volume directory).
+#
+# DO NOT ADD mount-namespace directives (PrivateTmp, ProtectSystem, ProtectHome, ReadWritePaths,
+# Protect*): measured on the host, `podman unshare` then fails with "cannot re-exec process to join
+# the existing user namespace". NoNewPrivileges, RestrictNamespaces, CapabilityBoundingSet= and
+# SystemCallFilter= are left out too (they can break newuidmap/newgidmap). Only the directives
+# below were tested to work with `podman unshare`. See docs/monitoring.md, "Incident delivery to
+# ntfy"; deploy/tests/test_ntfy_sender.py enforces this.
+[Unit]
+Description=Vigie ntfy sender (standalone, one pass)
+Documentation=file:///ABSOLUTE/PATH/TO/vigie/docs/monitoring.md
+# The sender IS the alert channel: make a failure visible some other way. Placeholder, never
+# active here; point it at a local unit (journal marker, desktop notification, mail):
+# OnFailure=YOUR-LOCAL-ALERT.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman unshare /usr/bin/python3 -I /ABSOLUTE/PATH/TO/vigie/deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once
+TimeoutStartSec=300
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
