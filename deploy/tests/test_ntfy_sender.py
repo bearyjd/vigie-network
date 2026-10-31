@@ -983,3 +983,19 @@ def test_each_call_gets_the_smaller_of_timeout_and_remaining_budget() -> None:
     assert out.kind == "ok" and timeouts == [3.0]
     out = ns.send_with_retry(Opener(), object(), 8.0, lambda _s: None, lambda: 0.0)
     assert out.kind == "retry" and timeouts == [3.0]
+
+
+def test_invalid_line_after_rejected_record_does_not_advance_past_it(env: Env) -> None:
+    env.write(line(record(1)), b"garbage\n", line(record(3)))
+    env.server.script = [{"status": 400}] + [{"status": 503}] * 4
+    assert env.run().code == 4
+    assert env.cursor_offset() == 0
+
+
+def test_cursor_temp_file_is_created_exclusively(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ns.secrets, "token_hex", lambda _n: "fixed")
+    victim = env.tmp / f"cursor.json.{os.getpid()}.fixed.tmp"
+    victim.write_text("precious")
+    with pytest.raises(ns.ConfigError, match="cursor"):
+        ns.save_cursor(str(env.cursor), ns.Cursor(1, 1, 1, ""))
+    assert victim.read_text() == "precious"
