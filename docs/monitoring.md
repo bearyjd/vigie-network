@@ -655,15 +655,24 @@ example one that writes a marker or sends a desktop notification, and/or watch t
 3. Dry run by hand: `podman unshare python3 -I deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once`
    prints `ntfy_sender sent=N skipped=M exit=C`.
 4. Copy `deploy/persistent/ntfy-sender.service` and `ntfy-sender.timer` to `~/.config/systemd/user/`,
-   replace every `/ABSOLUTE/PATH/...` placeholder (`ReadWritePaths` is the cursor directory plus the
-   two directories `podman unshare` itself writes), then `systemctl --user daemon-reload` and `systemctl --user enable --now ntfy-sender.timer`.
-   The timer fires every 60 s with `Persistent=no`. The unit is hardened only as far as rootless
-   podman allows: `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernel*`,
-   `ProtectClock`, `ProtectHostname`, `RestrictSUIDSGID`, `RestrictAddressFamilies=AF_INET AF_INET6
-   AF_UNIX`. `NoNewPrivileges`, `RestrictNamespaces`, an empty capability bounding set and
-   `SystemCallFilter` are left out on purpose (they can break the setuid `newuidmap`/`newgidmap`
-   helpers or user namespaces); the unit has not been run on a host, so check it with
-   `systemctl --user start ntfy-sender.service` and `journalctl --user -u ntfy-sender.service`.
+   replace every `/ABSOLUTE/PATH/...` placeholder, then `systemctl --user daemon-reload` and
+   `systemctl --user enable --now ntfy-sender.timer`. The timer fires every 60 s with
+   `Persistent=no`.
+
+   **Why the unit is not mount-sandboxed (measured on the host).** `podman unshare` fails with
+   "unable to create a new pause process: cannot re-exec process to join the existing user
+   namespace" whenever the unit sets ANY mount-namespace directive: `PrivateTmp`,
+   `ProtectSystem`, `ProtectHome`, `ReadWritePaths`, `ProtectKernelModules`, `ProtectKernelLogs`,
+   `ProtectControlGroups`, `ProtectClock` or `ProtectHostname` (each tested alone). Joining the
+   rootless user namespace is incompatible with a systemd mount namespace. These work, each alone
+   and all together: `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `RestrictRealtime`,
+   `RestrictSUIDSGID`, `LockPersonality` and `SystemCallArchitectures=native`; the unit sets
+   exactly those plus `UMask=0077`. `NoNewPrivileges`, `RestrictNamespaces`, a capability bounding
+   set and `SystemCallFilter` are also left out (they can break the setuid
+   `newuidmap`/`newgidmap` helpers). Compensating controls: the sender validates every input
+   itself, secrets must be 0600 and owned by the effective user, it has no inbound surface, uses
+   only the standard library, and is off by default. A test fails if a mount-namespace directive
+   is added to the service file.
 5. To stop: `systemctl --user disable --now ntfy-sender.timer`. Pending lines stay in the file and
    are sent when the timer is enabled again.
 

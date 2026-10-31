@@ -615,21 +615,28 @@ def test_unit_templates_run_under_podman_unshare_and_are_compatible() -> None:
     assert exec_line.startswith("ExecStart=/usr/bin/podman unshare /usr/bin/python3 -I ")
     assert exec_line.endswith(" --once")
     keys = {ln.split("=", 1)[0] for ln in active}
-    # these break rootless podman (setuid newuidmap, user namespaces) and must stay absent
-    assert not keys & {"NoNewPrivileges", "RestrictNamespaces", "CapabilityBoundingSet"}
-    assert not keys & {"SystemCallFilter", "PrivateDevices", "MemoryDenyWriteExecute"}
+    forbidden = {
+        "PrivateTmp", "ProtectSystem", "ProtectHome", "ReadWritePaths", "ReadOnlyPaths",
+        "InaccessiblePaths", "PrivateMounts", "MountFlags", "ProtectKernelModules",
+        "ProtectKernelLogs", "ProtectKernelTunables", "ProtectControlGroups", "ProtectClock",
+        "ProtectHostname", "ProtectProc", "PrivateDevices", "NoNewPrivileges",
+        "RestrictNamespaces", "CapabilityBoundingSet", "SystemCallFilter", "MemoryDenyWriteExecute",
+    }  # fmt: skip
+    assert not keys & forbidden, (
+        f"{sorted(keys & forbidden)} break `podman unshare` (measured on the host); "
+        "see docs/monitoring.md, 'Why the unit is not mount-sandboxed'"
+    )
     for needle in (
-        "PrivateTmp=yes",
-        "ProtectSystem=strict",
-        "ProtectHome=read-only",
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
-        "ProtectKernelModules=yes",
-        "ProtectClock=yes",
-        "ProtectHostname=yes",
+        "RestrictRealtime=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "SystemCallArchitectures=native",
+        "UMask=0077",
         "Type=oneshot",
     ):
         assert needle in active
-    assert any(ln.startswith("ReadWritePaths=/ABSOLUTE/PATH/TO/CURSOR_DIRECTORY") for ln in active)
+    assert not any(ln.startswith("ReadWritePaths") for ln in active)
     assert "# OnFailure=" in service  # documented placeholder, never active
     assert not any(ln.startswith("OnFailure=") for ln in active)
     assert "OnUnitActiveSec=60s" in timer and "Persistent=no" in timer

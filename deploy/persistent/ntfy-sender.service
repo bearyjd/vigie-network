@@ -3,10 +3,14 @@
 #
 # The sender runs inside `podman unshare` so that, as the root of the rootless user namespace, it
 # can read the delivery file the pipeline container wrote as its own uid (a host subuid, mode 0600,
-# inside a 0700 volume directory). The sandboxing below is deliberately limited to what rootless
-# podman needs: NoNewPrivileges, RestrictNamespaces, CapabilityBoundingSet=, PrivateDevices,
-# MemoryDenyWriteExecute and SystemCallFilter= are NOT set because they can block the setuid
-# newuidmap/newgidmap helpers or user namespaces. This unit has not been run; verify on the host.
+# inside a 0700 volume directory).
+#
+# DO NOT ADD mount-namespace directives (PrivateTmp, ProtectSystem, ProtectHome, ReadWritePaths,
+# Protect*): measured on the host, `podman unshare` then fails with "cannot re-exec process to join
+# the existing user namespace". NoNewPrivileges, RestrictNamespaces, CapabilityBoundingSet= and
+# SystemCallFilter= are left out too (they can break newuidmap/newgidmap). Only the directives
+# below were tested to work with `podman unshare`. See docs/monitoring.md, "Incident delivery to
+# ntfy"; deploy/tests/test_ntfy_sender.py enforces this.
 [Unit]
 Description=Vigie ntfy sender (standalone, one pass)
 Documentation=file:///ABSOLUTE/PATH/TO/vigie/docs/monitoring.md
@@ -19,17 +23,6 @@ Type=oneshot
 ExecStart=/usr/bin/podman unshare /usr/bin/python3 -I /ABSOLUTE/PATH/TO/vigie/deploy/persistent/ntfy_sender.py /ABSOLUTE/PATH/TO/private/ntfy-sender.json --once
 TimeoutStartSec=300
 UMask=0077
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-# The cursor directory (cursor, lock). The two podman paths are what `podman unshare` itself
-# writes (runtime dir, storage lock); drop them if the unit works without them.
-ReadWritePaths=/ABSOLUTE/PATH/TO/CURSOR_DIRECTORY %t/containers %h/.local/share/containers
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
