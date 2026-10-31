@@ -8,20 +8,24 @@ Runs OUTSIDE the pipeline (which stays on Network=none). Reads the JSON-lines fi
 validated Message fields. Delivery is AT LEAST ONCE: a crash between a send and the cursor write
 can repeat one notification. Standard library only.
 
-Exit codes: 0 caught up, 1 unexpected internal error, 2 configuration/cursor/secret-file error,
-3 permanent publish failure (cursor NOT advanced past the record), 4 retryable failure
-(cursor unchanged). Log lines never contain the URL, topic, token, response body or record text.
+Exit codes: 0 caught up (or another run holds the lock), 1 unexpected internal error,
+2 configuration/cursor/secret-file error, 3 permanent publish failure (cursor NOT advanced past
+the record), 4 retryable failure or exhausted run budget (cursor unchanged), 5 caught up but a
+record the server rejected was skipped. Log lines never contain the URL, topic, token,
+response body or record text.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import http.client
 import json
 import logging
 import os
 import re
+import secrets
 import ssl
 import stat
 import sys
@@ -31,11 +35,12 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 log = logging.getLogger("ntfy_sender")
 
-EXIT_OK, EXIT_INTERNAL, EXIT_CONFIG, EXIT_PERMANENT, EXIT_RETRY = 0, 1, 2, 3, 4
+EXIT_OK, EXIT_INTERNAL, EXIT_CONFIG, EXIT_PERMANENT, EXIT_RETRY, EXIT_REJECTED = 0, 1, 2, 3, 4, 5
 MAX_LINE = 8192
 MAX_CONFIG = 16384
 MAX_SECRET = 1024
@@ -47,9 +52,23 @@ RETRY_AFTER_CAP = 60.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 1.0
 DEFAULT_SERVER = "https://ntfy.sh"
-TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")  # ntfy.sh allows at most 64 characters
+TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{24,64}")  # ntfy.sh allows at most 64 characters
+TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/=-]{1,512}")
+RUN_BUDGET_S = 120.0  # total wall-clock budget of one run
+RETRY_STATUS = frozenset({408, 425, 429})
+REJECT_STATUS = frozenset({400, 413, 414, 422})
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 TAGS = {"open": "warning", "recover": "white_check_mark"}
+# Copied from vigie_pipeline.delivery_publish (the writer); a test asserts they stay equal.
+TITLES = {"open": "Vigie: check {label}", "recover": "Vigie: {label} is back to normal"}
+BODIES = {
+    "open": "{label}: unusual activity detected. Review it here: {link}",
+    "recover": "{label}: the activity has returned to normal. Details: {link}",
+}
+MAX_LABEL = 48
+MAX_LINK = 200
+LABEL_CHARS = r"[A-Za-z0-9 '\u2019\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff-]"
+LINK_PATTERN = r"/ui/#incident=[A-Za-z0-9%._~-]{1," + str(MAX_LINK - 14) + "}"
 LIMITS = {"delivery_id": 128, "kind": 16, "title": 120, "body": 1000, "link": 200}
 CONFIG_KEYS = frozenset(
     {
@@ -106,7 +125,7 @@ class Cursor:
 
 @dataclass(frozen=True)
 class Outcome:
-    kind: str  # "ok" | "retry" | "permanent"
+    kind: str  # "ok" | "retry" | "permanent" | "rejected" (this one record, not the channel)
     retry_after: float | None = None
     detail: str = ""
 
@@ -116,13 +135,18 @@ class RunResult:
     sent: int
     skipped: int
     code: int
+    rejected: int = 0  # records the server refused and that were skipped after a good probe
 
 
 # --- private files -------------------------------------------------------------------------
 
 
 def read_private_bytes(path: str, what: str, limit: int) -> bytes:
-    """Bounded read of a regular file we own with mode 0600/0400; symlinks are refused."""
+    """Bounded read of a regular file with mode 0600/0400; symlinks are refused.
+
+    The owner must equal the EFFECTIVE uid of this process. Under `podman unshare` that is 0 and
+    the host user's files appear as uid 0, so the check holds there; on a plain host it is the
+    invoking user."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
@@ -132,8 +156,8 @@ def read_private_bytes(path: str, what: str, limit: int) -> bytes:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise ConfigError(f"{what} is not a regular file")
-        if info.st_uid != os.getuid():
-            raise ConfigError(f"{what} is not owned by the current user")
+        if info.st_uid != os.geteuid():
+            raise ConfigError(f"{what} is not owned by the effective user of this process")
         if stat.S_IMODE(info.st_mode) not in (0o600, 0o400):
             raise ConfigError(f"{what} must have mode 0600 or 0400")
         data = stream.read(limit + 1)
@@ -159,8 +183,15 @@ def read_secret(path: str, what: str) -> str:
 def load_topic(path: str) -> str:
     topic = read_secret(path, "topic file")
     if not TOPIC_RE.fullmatch(topic):
-        raise ConfigError("topic must be 8-64 characters of A-Z a-z 0-9 _ -")
+        raise ConfigError("topic must be 24-64 characters of A-Z a-z 0-9 _ -")
     return topic
+
+
+def load_token(path: str) -> str:
+    token = read_secret(path, "token file")
+    if not TOKEN_RE.fullmatch(token):
+        raise ConfigError("token must be 1-512 characters of A-Z a-z 0-9 . _ ~ + / = -")
+    return token
 
 
 # --- configuration -------------------------------------------------------------------------
@@ -169,6 +200,8 @@ def load_topic(path: str) -> str:
 def _https_url(value: object, key: str, *, path_ok: bool) -> str:
     if not isinstance(value, str) or any(ord(c) <= 32 or ord(c) == 127 for c in value):
         raise ConfigError(f"{key} must be a URL without whitespace or control characters")
+    if not value.isascii():
+        raise ConfigError(f"{key} must be ASCII (no internationalised host names)")
     if "?" in value or "#" in value or "\\" in value or "@" in urlsplit(value).netloc:
         raise ConfigError(f"{key} must not contain userinfo, query or fragment")
     parts = urlsplit(value)
@@ -190,17 +223,19 @@ def _abs_path(value: object, key: str) -> str:
 
 
 def _hosts(value: object) -> tuple[str, ...]:
-    ok = isinstance(value, list) and value and all(isinstance(h, str) for h in value)
-    if not ok or not all(HOST_RE.fullmatch(h) for h in value):
+    if not isinstance(value, list) or not value:
         raise ConfigError("allowed_hosts must be a non-empty list of host names")
-    return tuple(h.lower() for h in value)
+    hosts = [h for h in value if isinstance(h, str) and HOST_RE.fullmatch(h)]
+    if len(hosts) != len(value):
+        raise ConfigError("allowed_hosts must be a non-empty list of host names")
+    return tuple(h.lower() for h in hosts)
 
 
 def _bounded_number(value: object, key: str, maximum: float, *, integer: bool) -> float:
-    kinds = (int,) if integer else (int, float)
-    if isinstance(value, bool) or not isinstance(value, kinds) or not 0 < value <= maximum:
+    numeric = isinstance(value, int | float) and not isinstance(value, bool)
+    if not numeric or (integer and not isinstance(value, int)) or not 0 < value <= maximum:  # type: ignore[operator]
         raise ConfigError(f"{key} must be a number in (0, {maximum:g}]")
-    return value
+    return float(value)  # type: ignore[arg-type]
 
 
 def parse_config(raw: object) -> Config:
@@ -267,27 +302,59 @@ def load_cursor(path: str) -> Cursor:
 
 
 def save_cursor(path: str, cursor: Cursor) -> None:
-    """Atomic: tmp + fsync + rename + directory fsync. Mode 0600."""
+    """Atomic: unique temp file (O_EXCL) + fsync + rename + directory fsync. Mode 0600."""
     payload = json.dumps(
         {"offset": cursor.offset, "dev": cursor.dev, "ino": cursor.ino, "head": cursor.head}
     ).encode()
-    tmp = path + ".tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        fd = os.open(tmp, flags, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            fd = os.open(tmp, flags, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            _unlink_quietly(tmp)
+            raise
+        _fsync_directory(os.path.dirname(path) or ".")
     except OSError as exc:
         raise ConfigError(f"cannot write cursor file: {exc.strerror}") from exc
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        log.debug("temporary cursor file already gone")
+
+
+def _fsync_directory(path: str) -> None:
+    dir_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def acquire_lock(cursor_file: str) -> int | None:
+    """Exclusive non-blocking lock on `<cursor_file>.lock`; None when another run holds it."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(cursor_file + ".lock", flags, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"cannot open lock file: {exc.strerror}") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except OSError as exc:
+        os.close(fd)
+        raise ConfigError(f"cannot lock the lock file: {exc.strerror}") from exc
+    return fd
 
 
 # --- delivery file -------------------------------------------------------------------------
@@ -311,7 +378,8 @@ def _first_line_hash(fd: int) -> str:
 
 def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
     """Bytes after the cursor, or None if the file does not exist yet. A replaced or truncated
-    file (other inode/device, shorter than the offset, other first line) restarts at 0."""
+    file (other inode, shorter than the offset, other first line) restarts at 0. The device
+    number is ignored: the inode and the first-line hash identify the file."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
         fd = os.open(cfg.delivery_file, flags)
@@ -325,10 +393,10 @@ def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
             raise ConfigError("delivery file is not a regular file")
         head = _first_line_hash(fd)
         replaced = cursor.offset > 0 and (
-            (cursor.dev, cursor.ino) != (info.st_dev, info.st_ino)
-            or info.st_size < cursor.offset
-            or cursor.head != head
+            cursor.ino != info.st_ino or info.st_size < cursor.offset or cursor.head != head
         )
+        if cursor.offset > 0 and not replaced and cursor.dev != info.st_dev:
+            log.warning("device number of the delivery file changed; treating it as the same file")
         start = 0 if replaced else cursor.offset
         data = os.pread(fd, cfg.max_batch * (MAX_LINE + 1), start)
     return Chunk(data, start, info.st_dev, info.st_ino, head, replaced)
@@ -350,11 +418,40 @@ def split_lines(chunk: Chunk, max_batch: int) -> list[tuple[bytes, int]]:
     return lines
 
 
-def _text(raw: dict, key: str) -> str:
+def _template_regex(template: str) -> re.Pattern[str]:
+    out = ""
+    for index, part in enumerate(re.split(r"\{(label|link)\}", template)):
+        if index % 2 == 0:
+            out += re.escape(part)
+        else:
+            pattern = f"{LABEL_CHARS}{{1,{MAX_LABEL}}}" if part == "label" else LINK_PATTERN
+            out += f"(?P<{part}>{pattern})"
+    return re.compile(out)
+
+
+TITLE_RES = {kind: _template_regex(t) for kind, t in TITLES.items()}
+BODY_RES = {kind: _template_regex(t) for kind, t in BODIES.items()}
+
+
+def _text(raw: dict[str, object], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not 1 <= len(value) <= LIMITS[key] or not value.isprintable():
         raise ValueError(f"invalid {key}")
     return value
+
+
+def _check_shape(record: Record) -> None:
+    """Title and body must be the writer's templates with one label and the record's own link."""
+    if record.kind not in TAGS or " " in record.delivery_id:
+        raise ValueError("invalid kind or delivery_id")
+    if not re.fullmatch(LINK_PATTERN, record.link):
+        raise ValueError("invalid link")
+    title = TITLE_RES[record.kind].fullmatch(record.title)
+    body = BODY_RES[record.kind].fullmatch(record.body)
+    if not title or not body:
+        raise ValueError("title or body does not match the message templates")
+    if title["label"] != body["label"] or body["link"] != record.link:
+        raise ValueError("title, body and link disagree")
 
 
 def parse_record(line: bytes) -> Record:
@@ -370,11 +467,7 @@ def parse_record(line: bytes) -> Record:
     if not isinstance(raw, dict):
         raise ValueError("not an object")
     record = Record(*(_text(raw, k) for k in ("delivery_id", "kind", "title", "body", "link")))
-    link = record.link
-    if record.kind not in TAGS or " " in record.delivery_id:
-        raise ValueError("invalid kind or delivery_id")
-    if not link.startswith("/") or link.startswith("//") or " " in link or not link.isascii():
-        raise ValueError("invalid link")
+    _check_shape(record)
     return record
 
 
@@ -382,7 +475,7 @@ def parse_record(line: bytes) -> Record:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args: object, **kwargs: object) -> None:  # type: ignore[override]
+    def redirect_request(self, *_args: object, **_kwargs: object) -> NoReturn:  # type: ignore[override]
         raise RedirectRefused
 
 
@@ -395,7 +488,8 @@ def build_opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
 
 
 def ascii_title(title: str) -> str:
-    folded = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    plain = title.replace("\u2019", "'")
+    folded = unicodedata.normalize("NFKD", plain).encode("ascii", "ignore").decode("ascii")
     return folded.strip() or "Vigie"
 
 
@@ -426,8 +520,10 @@ def parse_retry_after(value: str | None) -> float | None:
 def classify_status(code: int, retry_after: str | None) -> Outcome:
     if code == 200:
         return Outcome("ok")
-    if code == 429 or 500 <= code < 600:
+    if code in RETRY_STATUS or 500 <= code < 600:
         return Outcome("retry", parse_retry_after(retry_after), f"HTTP {code}")
+    if code in REJECT_STATUS:
+        return Outcome("rejected", None, f"HTTP {code}")
     return Outcome("permanent", None, f"HTTP {code}")
 
 
@@ -446,6 +542,8 @@ def send_once(
         return classify_status(exc.code, exc.headers.get("Retry-After"))
     except RedirectRefused:
         return Outcome("permanent", None, "redirect refused")
+    except UnicodeEncodeError as exc:
+        raise ConfigError("request contains characters that cannot be encoded") from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         reason = getattr(exc, "reason", exc)
         return Outcome("retry", None, type(reason).__name__)
@@ -456,53 +554,68 @@ def send_with_retry(
     req: urllib.request.Request,
     timeout: float,
     sleep: Callable[[float], None],
+    remaining: Callable[[], float],
 ) -> Outcome:
+    """Send with bounded backoff. Each call gets min(timeout, remaining run budget)."""
     delay = BACKOFF_BASE
-    outcome = send_once(opener, req, timeout)
-    for _ in range(MAX_ATTEMPTS - 1):
-        if outcome.kind != "retry":
+    outcome = Outcome("retry", None, "run budget exhausted")
+    for attempt in range(MAX_ATTEMPTS):
+        if remaining() <= 0:
+            return Outcome("retry", None, "run budget exhausted")
+        outcome = send_once(opener, req, min(timeout, remaining()))
+        if outcome.kind != "retry" or attempt == MAX_ATTEMPTS - 1:
             break
         wait = min(max(delay, outcome.retry_after or 0.0), RETRY_AFTER_CAP)
+        if wait >= remaining():
+            break
         log.warning("retryable failure (%s); retrying in %.0fs", outcome.detail, wait)
         sleep(wait)
         delay *= 2
-        outcome = send_once(opener, req, timeout)
     return outcome
 
 
 # --- run -----------------------------------------------------------------------------------
 
 
-def _drain(
-    cfg: Config,
-    chunk: Chunk,
-    send: Callable[[Record], Outcome],
-) -> RunResult:
+def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunResult:
+    """Send the records in order. A record the server REJECTS (400/413/414/422) is held back until
+    the next record succeeds (a probe): then it is skipped for good (exit 5); if the probe is
+    rejected too, or there is none, the run stops with exit 3 and the cursor stays before it."""
     cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head)
-    sent = skipped = 0
+    sent = skipped = rejected = held = 0
     for line, end in split_lines(chunk, cfg.max_batch):
-        advanced = replace(cursor, offset=end)
         try:
             record = parse_record(line)
         except ValueError as exc:
             log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
-            cursor = advanced
-            save_cursor(cfg.cursor_file, cursor)
+            if not held:
+                cursor = replace(cursor, offset=end)
+                save_cursor(cfg.cursor_file, cursor)
             continue
         outcome = send(record)
+        if outcome.kind == "rejected" and not held:
+            log.error(
+                "record before offset %d rejected (%s); probing the next one", end, outcome.detail
+            )
+            held = 1
+            continue
         if outcome.kind != "ok":
             return _stop(outcome, sent, skipped)
-        sent += 1
-        cursor = advanced
+        sent, skipped, rejected = sent + 1, skipped + held, rejected + held
+        held = 0
+        cursor = replace(cursor, offset=end)
         save_cursor(cfg.cursor_file, cursor)
+    if held:
+        log.error("rejected record has no successor to probe yet; cursor not advanced")
+        return RunResult(sent, skipped, EXIT_PERMANENT)
     if chunk.restarted and cursor.offset == 0:
         save_cursor(cfg.cursor_file, cursor)
-    return RunResult(sent, skipped, EXIT_OK)
+    return RunResult(sent, skipped, EXIT_REJECTED if rejected else EXIT_OK, rejected)
 
 
 def _stop(outcome: Outcome, sent: int, skipped: int) -> RunResult:
-    if outcome.kind == "permanent":
+    if outcome.kind in ("permanent", "rejected"):
         log.error("permanent publish failure (%s); stopping, cursor not advanced", outcome.detail)
         return RunResult(sent, skipped, EXIT_PERMANENT)
     log.error("publish failed after retries (%s); cursor unchanged", outcome.detail)
@@ -514,9 +627,28 @@ def run(
     *,
     ssl_context: ssl.SSLContext | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    budget_seconds: float = RUN_BUDGET_S,
+) -> RunResult:
+    lock = acquire_lock(cfg.cursor_file)
+    if lock is None:
+        log.info("another run active; exiting")
+        return RunResult(0, 0, EXIT_OK)
+    try:
+        return _run_locked(cfg, ssl_context, sleep, clock, budget_seconds)
+    finally:
+        os.close(lock)
+
+
+def _run_locked(
+    cfg: Config,
+    ssl_context: ssl.SSLContext | None,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    budget_seconds: float,
 ) -> RunResult:
     topic = load_topic(cfg.topic_file)
-    token = read_secret(cfg.token_file, "token file") if cfg.token_file else None
+    token = load_token(cfg.token_file) if cfg.token_file else None
     opener = build_opener(ssl_context or ssl.create_default_context())
     chunk = read_chunk(cfg, load_cursor(cfg.cursor_file))
     if chunk is None:
@@ -524,10 +656,13 @@ def run(
         return RunResult(0, 0, EXIT_OK)
     if chunk.restarted:
         log.warning("delivery file was truncated or replaced; restarting from the beginning")
+    deadline = clock() + budget_seconds
 
     def send(record: Record) -> Outcome:
         request = build_request(cfg, topic, token, record)
-        return send_with_retry(opener, request, cfg.timeout_seconds, sleep)
+        return send_with_retry(
+            opener, request, cfg.timeout_seconds, sleep, lambda: deadline - clock()
+        )
 
     return _drain(cfg, chunk, send)
 
