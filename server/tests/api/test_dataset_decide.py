@@ -536,6 +536,12 @@ def test_concurrent_decisions_have_exactly_one_winner(tmp_path, first, second):
     assert actions[0] == ("dataset.reject" if final == "rejected" else "dataset.accept")
 
 
+ACCEPT_SQL = (
+    "UPDATE dataset_imports SET status='accepted', accepted_by='u', accepted_at='t', ASSIGN"
+    " WHERE id=?"
+)
+
+
 @pytest.mark.parametrize(
     "assignment",
     [
@@ -549,8 +555,7 @@ def test_identity_is_frozen_even_inside_a_legal_transition(ov, assignment):
     with pytest.raises(sqlite3.IntegrityError):
         update(
             ov,
-            "UPDATE dataset_imports SET status='accepted', accepted_by='u', accepted_at='t',"
-            " " + assignment + " WHERE id=?",
+            ACCEPT_SQL.replace("ASSIGN", assignment),
             imp,
         )
 
