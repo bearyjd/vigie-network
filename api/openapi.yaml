@@ -448,6 +448,10 @@
             ],
             "title": "Dns Log Quiet"
           },
+          "dropped_batches_all_retained": {
+            "title": "Dropped Batches All Retained",
+            "type": "integer"
+          },
           "dropped_batches_in_retained_detail": {
             "title": "Dropped Batches In Retained Detail",
             "type": "integer"
@@ -533,6 +537,17 @@
             ],
             "title": "Oldest Pending Received At"
           },
+          "retained_batches_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Batches Since"
+          },
           "retained_detail_since": {
             "anyOf": [
               {
@@ -576,6 +591,8 @@
           "oldest_pending_received_at",
           "retained_detail_since",
           "summary_capped",
+          "dropped_batches_all_retained",
+          "retained_batches_since",
           "dropped_batches_in_retained_detail",
           "ct_unmapped_bytes_in_retained_detail",
           "ct_unmapped_flows_in_retained_detail",

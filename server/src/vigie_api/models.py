@@ -324,6 +324,8 @@ class CollectorCoverage(BaseModel):
     oldest_pending_received_at: str | None
     retained_detail_since: str | None
     summary_capped: bool
+    dropped_batches_all_retained: int
+    retained_batches_since: str | None
     dropped_batches_in_retained_detail: int
     ct_unmapped_bytes_in_retained_detail: int
     ct_unmapped_flows_in_retained_detail: int

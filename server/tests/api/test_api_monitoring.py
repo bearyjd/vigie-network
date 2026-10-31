@@ -370,3 +370,41 @@ def test_tod_deviation_incident_is_served_by_list_and_detail_endpoints(env: Env)
     ):
         assert evidence["reason_code"] == "two_qualified_upload_hours_in_cohort"
         assert evidence["algorithm"] == "tod-median-v1"
+
+
+def test_uncapped_drop_aggregates_survive_the_detail_cap(env: Env):
+    seed(env)
+    # The five oldest rows hold drops and fall outside the 10000 newest rows.
+    rows = [
+        (
+            "c1",
+            f"a{i:05}",
+            f"2026-01-{1 + i // 1440:02}T{i % 1440 // 60:02}:{i % 60:02}:00Z",
+            1 if i < 5 else 0,
+        )
+        for i in range(10050)
+    ]
+    env.inv.executemany(
+        "INSERT INTO batches(collector_id,batch_id,received_at,dropped_batches) VALUES (?,?,?,?)",
+        rows,
+    )
+    env.inv.execute(
+        "INSERT INTO batches(collector_id,batch_id,received_at,dropped_batches) "
+        "VALUES ('other','o1','2025-01-01T00:00:00Z',9)"
+    )
+    result = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
+    assert result.status_code == 200, result.text
+    value = result.json()["data"]["collector"]
+    assert value["summary_capped"] is True
+    assert value["dropped_batches_in_retained_detail"] == 0
+    assert value["retained_detail_since"] == rows[50][2]
+    assert value["dropped_batches_all_retained"] == 5
+    assert value["retained_batches_since"] == rows[0][2]
+
+
+def test_uncapped_drop_aggregates_are_zero_and_null_without_batches(env: Env):
+    seed(env)
+    result = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
+    value = result.json()["data"]["collector"]
+    assert value["dropped_batches_all_retained"] == 0
+    assert value["retained_batches_since"] is None

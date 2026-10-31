@@ -106,6 +106,12 @@ def collector_summary(inv, collector):
         (collector,),
     ).fetchall()
     truncated = [json.loads(row["truncated"] or "{}") for row in rows]
+    # Uncapped SQL aggregates over every retained row; the capped fields keep their semantics.
+    retained = inv.execute(
+        "SELECT COALESCE(SUM(dropped_batches),0) AS dropped,MIN(received_at) AS since "
+        "FROM batches WHERE collector_id=?",
+        (collector,),
+    ).fetchone()
     unavailable = [
         dict(row)
         for row in inv.execute(
@@ -130,6 +136,8 @@ def collector_summary(inv, collector):
         "oldest_pending_received_at": pending[0]["received_at"] if pending else None,
         "retained_detail_since": rows[-1]["received_at"] if rows else None,
         "summary_capped": capped,
+        "dropped_batches_all_retained": retained["dropped"],
+        "retained_batches_since": retained["since"],
         "dropped_batches_in_retained_detail": sum(row["dropped_batches"] for row in rows),
         "ct_unmapped_bytes_in_retained_detail": sum(
             t.get("ct_unmapped_bytes", 0) for t in truncated
