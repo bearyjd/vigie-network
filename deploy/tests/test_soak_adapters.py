@@ -300,9 +300,28 @@ class FinalCoverageContract(unittest.TestCase):
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["ct_unmapped_flows"])
         collector["summary_capped"] = False
         self.assertEqual(runner.coverage_metrics(collector, 1000)["backlog_batches"], 0)
-        self.assertEqual(runner.coverage_metrics(collector, 1000)["dropped_batches"], 0)
-        collector.pop("summary_capped")
+        # The capped total is never trusted for the soak: only the uncapped aggregate counts.
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
+
+    def test_soak_drop_total_uses_the_uncapped_aggregate_even_when_summary_is_capped(
+        self,
+    ):
+        collector = {
+            "summary_capped": True,
+            "dropped_batches_in_retained_detail": 0,
+            "dropped_batches_all_retained": 7,
+            "retained_batches_since": "2026-01-01T00:00:00Z",
+        }
+        result = runner.coverage_metrics(collector, 1000)
+        self.assertEqual(result["dropped_batches"], 7)
+        self.assertEqual(result["retained_batches_since"], "2026-01-01T00:00:00Z")
+        self.assertIsNone(result["ct_unmapped_flows"])
+        for bad in (None, True, "7", 7.0, -1):
+            with self.subTest(bad=bad):
+                collector["dropped_batches_all_retained"] = bad
+                self.assertIsNone(
+                    runner.coverage_metrics(collector, 1000)["dropped_batches"]
+                )
 
 
 class DropBaselineTests(unittest.TestCase):
@@ -343,7 +362,9 @@ class DropBaselineTests(unittest.TestCase):
                 redirect_stdout(out),
             ):
                 runner.main()
-            with runner.Journal(journal_path, mode="real", metadata=metadata) as journal:
+            with runner.Journal(
+                journal_path, mode="real", metadata=metadata
+            ) as journal:
                 return journal.samples, json.loads(out.getvalue())
 
     def sample(self, **changes):
@@ -356,7 +377,7 @@ class DropBaselineTests(unittest.TestCase):
             total_cpu_ticks=12100,
             source_flags=1,
             dropped_batches=7,
-            retained_detail_since="2026-01-01T00:00:00+00:00",
+            retained_batches_since="2026-01-01T00:00:00+00:00",
         )
         value.update(changes)
         return value
@@ -364,10 +385,10 @@ class DropBaselineTests(unittest.TestCase):
     def test_coverage_metrics_expose_the_retained_window_start(self):
         collector = {
             "summary_capped": False,
-            "retained_detail_since": "2026-01-01T00:00:00+00:00",
+            "retained_batches_since": "2026-01-01T00:00:00+00:00",
         }
         self.assertEqual(
-            runner.coverage_metrics(collector, 1000)["retained_detail_since"],
+            runner.coverage_metrics(collector, 1000)["retained_batches_since"],
             "2026-01-01T00:00:00+00:00",
         )
 
@@ -377,14 +398,18 @@ class DropBaselineTests(unittest.TestCase):
 
     def test_resume_reuses_the_journal_baseline_not_the_current_total(self):
         prior = dict(self.sample(), dropped_baseline=7)
-        prior.update(wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100)
+        prior.update(
+            wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100
+        )
         samples, report = self.run_main(prior, self.sample(dropped_batches=9))
         self.assertEqual(samples[-1]["dropped_baseline"], 7)
         self.assertIn("dropped_batches_limit", report["reasons"])
 
     def test_resume_without_a_stored_baseline_fails(self):
         prior = self.sample()
-        prior.update(wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100)
+        prior.update(
+            wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100
+        )
         samples, report = self.run_main(prior, self.sample())
         self.assertIsNone(samples[-1]["dropped_baseline"])
         self.assertIn("dropped_baseline_mismatch", report["reasons"])
@@ -454,6 +479,7 @@ class ReviewRegressions(unittest.TestCase):
                     "backlog_batches": 0,
                     "dropped_batches": 0,
                     "dropped_baseline": 0,
+                    "retained_batches_since": "2026-01-01T00:00:00+00:00",
                     "source_flags": 0,
                     "dns_log_quiet": False,
                     "ct_unmapped_flows": 0,
@@ -731,6 +757,7 @@ HEALTHY_SAMPLE = {
     "freshness_s": 30,
     "backlog_batches": 0,
     "dropped_batches": 0,
+    "retained_batches_since": "2026-01-01T00:00:00+00:00",
     "source_flags": 0,
     "dns_log_quiet": False,
     "ct_unmapped_flows": 0,

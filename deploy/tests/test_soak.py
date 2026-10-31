@@ -1,6 +1,7 @@
 """A fake clock verifies logic; it never supplies real acceptance evidence."""
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,7 @@ def sample(second, **overrides):
         "processing_backlog_age_s": 0,
         "processing_backlog_reference_wall": 1_800_000_000 + second,
         "dropped_batches": 0,
+        "retained_batches_since": "2026-01-01T00:00:00+00:00",
         "source_flags": 0,
         "dns_log_quiet": False,
         "ct_unmapped_flows": 0,
@@ -117,7 +119,7 @@ class SoakTests(unittest.TestCase):
             value.update(
                 dropped_batches=base,
                 dropped_baseline=base,
-                retained_detail_since=since,
+                retained_batches_since=since,
             )
             value.update(per_index.get(i, {}))
         return values
@@ -141,8 +143,7 @@ class SoakTests(unittest.TestCase):
         values[0]["dropped_batches"] = 4
         for value in values[1:]:
             value["dropped_batches"] = 4
-            value["retained_detail_since"] = "x"
-        values[0]["retained_detail_since"] = "x"
+            value["retained_batches_since"] = "2026-01-01T00:00:00+00:00"
         self.assertEqual(soak.assess(values)["status"], "pass")
         values[3]["dropped_batches"] = 5
         self.assertIn("dropped_batches_limit", soak.assess(values)["reasons"])
@@ -183,17 +184,66 @@ class SoakTests(unittest.TestCase):
 
     def test_window_advance_with_nonzero_baseline_is_unverifiable(self):
         for since in ("2026-01-02T00:00:00+00:00", None):
-            values = self.drop_run(7, {5: {"retained_detail_since": since}})
+            values = self.drop_run(7, {5: {"retained_batches_since": since}})
             with self.subTest(since=since):
                 result = soak.assess(values)
                 self.assertEqual(result["status"], "fail")
                 self.assertIn("dropped_window_unverifiable", result["reasons"])
 
-    def test_window_start_is_not_required_when_baseline_is_zero(self):
+    def test_rows_must_still_be_retained_from_before_the_run_for_any_baseline(self):
+        for base in (0, 7):
+            for since in (None, "garbage", "2027-06-01T00:00:00+00:00", 5):
+                values = self.drop_run(base)
+                for value in values:
+                    value["retained_batches_since"] = since
+                with self.subTest(base=base, since=since):
+                    result = soak.assess(values)
+                    self.assertEqual(result["status"], "fail")
+                    self.assertIn("dropped_window_unverifiable", result["reasons"])
+
+    def test_zero_baseline_tolerates_a_moving_window_start_before_the_run(self):
+        values = self.drop_run(
+            0, {5: {"retained_batches_since": "2026-02-01T00:00:00+00:00"}}
+        )
+        self.assertEqual(soak.assess(values)["status"], "pass")
+
+    def test_boolean_baseline_stamp_is_not_a_number(self):
+        values = self.drop_run(1)
+        for value in values:
+            value["dropped_baseline"] = True
+        result = soak.assess(values)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("dropped_baseline_mismatch", result["reasons"])
+
+    def test_real_mode_requires_a_stamp_but_simulated_legacy_does_not(self):
         values = self.drop_run(0)
         for value in values:
-            value.pop("retained_detail_since")
+            del value["dropped_baseline"]
         self.assertEqual(soak.assess(values)["status"], "pass")
+        result = soak.assess(values, mode="real")
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("dropped_baseline_mismatch", result["reasons"])
+        self.assertEqual(soak.assess(self.drop_run(0), mode="real")["status"], "pass")
+
+    def test_invalid_first_record_keeps_the_drop_baseline_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            path = Path(tmp) / "journal"
+            first = dict(
+                sample(0),
+                dropped_batches=7,
+                dropped_baseline=7,
+                retained_batches_since="2026-01-01T00:00:00+00:00",
+                helper_rss_kib=float("nan"),
+            )
+            with soak.Journal(path, mode="real") as journal:
+                journal.append(first)
+            with soak.Journal(path, mode="real") as journal:
+                kept = journal.samples[0]
+        self.assertTrue(kept["invalid_record"])
+        self.assertEqual(kept["dropped_batches"], 7)
+        self.assertEqual(kept["dropped_baseline"], 7)
+        self.assertEqual(kept["retained_batches_since"], "2026-01-01T00:00:00+00:00")
 
     def test_nonzero_baseline_requires_a_window_start(self):
         values = self.drop_run(7, since=None)

@@ -162,25 +162,41 @@ def sample_issues(sample):
     return failures, missing, quality
 
 
-def drop_failures(samples):
+def _epoch_utc(value):
+    if not isinstance(value, str) or len(value) > 128 or not value.isascii():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.timestamp() if parsed.tzinfo else None
+
+
+def drop_failures(samples, mode):
     """Judge drops that happen during the run, not the API's historical retained total.
 
-    The first sample is the durable baseline. The API total covers a sliding window, so a total
-    that falls (or a window start that moves while the baseline is nonzero) may hide new drops:
-    that is unverifiable and fails closed, never a pass.
+    The first sample is the durable baseline. The total is an aggregate over every retained
+    batch row, so it can fall only when rows are purged. Every sample must therefore prove that
+    all rows from before the run are still retained (retained_batches_since no later than the
+    first sample's wall time); otherwise an in-run drop could have been purged unseen. A total
+    below the baseline, or a moving window start while the baseline is nonzero, fails closed.
     """
     first = samples[0] if isinstance(samples[0], dict) else {}
     base = first.get("dropped_batches")
     if not _number(base):
         return {"dropped_baseline_missing"}
     failures = set()
-    stamped = any(isinstance(s, dict) and "dropped_baseline" in s for s in samples)
-    since = first.get("retained_detail_since")
-    for sample in samples:
-        if not isinstance(sample, dict):
-            continue
+    dicts = [s for s in samples if isinstance(s, dict)]
+    stamped = any("dropped_baseline" in s for s in dicts)
+    if mode == "real" and not stamped:
+        failures.add("dropped_baseline_mismatch")
+    since = first.get("retained_batches_since")
+    start = _epoch_utc(since)
+    run_start = first.get("wall")
+    for sample in dicts:
         if stamped and (
-            "dropped_baseline" not in sample or sample["dropped_baseline"] != base
+            not _number(sample.get("dropped_baseline"))
+            or sample["dropped_baseline"] != base
         ):
             failures.add("dropped_baseline_mismatch")
         total = sample.get("dropped_batches")
@@ -190,9 +206,10 @@ def drop_failures(samples):
             failures.add("dropped_batches_limit")
         elif total < base:
             failures.add("dropped_window_unverifiable")
-        if base > 0 and (
-            not isinstance(since, str) or sample.get("retained_detail_since") != since
-        ):
+        own = _epoch_utc(sample.get("retained_batches_since"))
+        if own is None or not _number(run_start) or own > run_start:
+            failures.add("dropped_window_unverifiable")
+        elif base > 0 and (start is None or sample["retained_batches_since"] != since):
             failures.add("dropped_window_unverifiable")
     return failures
 
@@ -299,7 +316,7 @@ def assess(samples, *, mode="simulated"):
             and not quality
         ):
             result["status"] = "pass"
-    failures |= drop_failures(samples)
+    failures |= drop_failures(samples, mode)
     if failures:
         result["status"] = "fail"
     result["reasons"] = sorted(
@@ -405,9 +422,9 @@ class Journal:
                     if isinstance(value, str) and len(value) <= 128 and value.isascii():
                         safe[key] = value
                 # Keep the drop baseline evidence so a failed first record cannot unpin it.
-                since = sample.get("retained_detail_since")
+                since = sample.get("retained_batches_since")
                 if isinstance(since, str) and len(since) <= 128 and since.isascii():
-                    safe["retained_detail_since"] = since
+                    safe["retained_batches_since"] = since
                 if "dropped_baseline" in sample and (
                     sample["dropped_baseline"] is None
                     or _number(sample["dropped_baseline"])

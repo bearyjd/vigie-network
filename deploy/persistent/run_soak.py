@@ -324,7 +324,6 @@ def coverage_metrics(collector, now):
     mapping = {
         "collector_rss_kib": "agent_rss_kb",
         "backlog_batches": "backlog_batches",
-        "dropped_batches": "dropped_batches_in_retained_detail",
         "source_flags": "source_flags_latest",
         "dns_log_quiet": "dns_log_quiet",
         "ct_unmapped_flows": "ct_unmapped_flows_in_retained_detail",
@@ -332,7 +331,11 @@ def coverage_metrics(collector, now):
     }
     for target, source in mapping.items():
         result[target] = collector.get(source)
-    result["retained_detail_since"] = collector.get("retained_detail_since")
+    # The 10000-row summary is capped at steady state (7-day retention); the soak instead uses
+    # the server's uncapped SQL aggregates. Anything but a non-negative int stays unknown.
+    total = collector.get("dropped_batches_all_retained")
+    result["dropped_batches"] = total if type(total) is int and total >= 0 else None
+    result["retained_batches_since"] = collector.get("retained_batches_since")
     for target, source in (
         ("freshness_s", "latest_window_end"),
         ("dns_parsed_age_s", "latest_dns_observation_window_end"),
@@ -354,7 +357,7 @@ def coverage_metrics(collector, now):
         else None
     )
     if collector.get("summary_capped") is not False:
-        for key in ("dropped_batches", "ct_unmapped_flows", "ct_unmapped_bytes"):
+        for key in ("ct_unmapped_flows", "ct_unmapped_bytes"):
             result[key] = None
     return result
 
