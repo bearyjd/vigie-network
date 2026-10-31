@@ -250,3 +250,42 @@ def parse_urlhaus(data: bytes) -> tuple[list[Entry], int]:
     if skipped > rows * SKIP_MAX_FRACTION:
         raise ValueError(f"too many rows skipped for an unusable host ({skipped} of {rows})")
     return list(seen.values()), skipped
+
+
+def _plain(payload: Any, fields: tuple[str, ...]) -> bool:
+    return (
+        isinstance(payload, dict)
+        and set(payload) == set(fields)
+        and all(isinstance(v, str) and len(v) <= MAX_FIELD_LEN for v in payload.values())
+    )
+
+
+def _valid_host_key(key: str) -> bool:
+    try:
+        return str(ipaddress.ip_address(key)) == key
+    except ValueError:
+        return len(key) <= _MAX_HOST_LEN and all(_LABEL.fullmatch(p) for p in key.split("."))
+
+
+def is_valid_staged(source: str, key: str, payload_text: str) -> bool:
+    """True when a staged row has exactly the shape the parser of `source` would have produced."""
+    try:
+        payload = json.loads(payload_text)
+    except ValueError:
+        return False
+    if source == "kev":
+        if not (_plain(payload, _KEV_FIELDS) and payload["cveID"] == key):
+            return False
+        try:
+            return bool(
+                _CVE.fullmatch(key)
+                and _DATE.fullmatch(payload["dateAdded"])
+                and date.fromisoformat(payload["dateAdded"])
+            )
+        except ValueError:
+            return False
+    if source == "urlhaus":
+        return (
+            _plain(payload, ("host", "threat")) and payload["host"] == key and _valid_host_key(key)
+        )
+    return False

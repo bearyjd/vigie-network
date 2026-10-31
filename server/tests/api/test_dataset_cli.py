@@ -127,3 +127,78 @@ def test_the_file_is_opened_without_a_controlling_tty_and_close_on_exec(tmp_path
     assert run(tmp_path, *stage_args(KEV)) == 0
     needed = os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
     assert len(flags) == 1 and flags[0] & needed == needed
+
+
+def staged_id(root, version="2099.01.01", path=KEV) -> str:
+    assert run(root, *stage_args(path, version=version)) == 0
+    return rows(root, "SELECT id FROM dataset_imports ORDER BY created_at DESC, rowid DESC")[0][0]
+
+
+def test_accept_and_reject_exit_codes_and_output(tmp_path, capsys):
+    imp = staged_id(tmp_path)
+    capsys.readouterr()
+    assert run(tmp_path, "accept", imp, "--by", "alice") == 0
+    assert f"accepted {imp}" in capsys.readouterr().err
+    assert rows(tmp_path, "SELECT status,accepted_by FROM dataset_imports") == [
+        ("accepted", "alice")
+    ]
+    assert run(tmp_path, "accept", imp) == 1  # double accept: conflict
+    assert "dataset_not_staged" in capsys.readouterr().err
+    assert run(tmp_path, "reject", imp) == 1
+    assert run(tmp_path, "accept", "nope") == 1
+    assert "dataset_import_not_found" in capsys.readouterr().err
+    assert rows(tmp_path, "SELECT COUNT(*) FROM audit_log WHERE action='dataset.accept'") == [(1,)]
+
+
+def test_reject_with_reason_defaults_operator_to_cli_local(tmp_path, capsys):
+    imp = staged_id(tmp_path)
+    assert run(tmp_path, "reject", imp, "--reason", "bad licence") == 0
+    assert f"rejected {imp}" in capsys.readouterr().err
+    assert rows(tmp_path, "SELECT status,rejected_by,reject_reason FROM dataset_imports") == [
+        ("rejected", "cli:local", "bad licence")
+    ]
+    (audit,) = rows(
+        tmp_path, "SELECT principal,detail FROM audit_log WHERE action='dataset.reject'"
+    )
+    assert audit[0] == "cli:local" and "bad licence" in audit[1] and "CVE-2021" not in audit[1]
+
+
+def test_overlong_reason_exits_2(tmp_path, capsys):
+    imp = staged_id(tmp_path)
+    assert run(tmp_path, "reject", imp, "--reason", "x" * 201) == 2
+    assert "dataset_invalid" in capsys.readouterr().err
+    assert rows(tmp_path, "SELECT status FROM dataset_imports") == [("staged",)]
+
+
+def test_accept_refusals_exit_1_and_force_overrides_churn(tmp_path, capsys):
+    first = staged_id(tmp_path)
+    assert run(tmp_path, "accept", first) == 0
+    small = tmp_path / "small.json"
+    small.write_text(
+        '{"vulnerabilities":[{"cveID":"CVE-2024-1000","vendorProject":"V","product":"P",'
+        '"dateAdded":"2024-01-01"}]}'
+    )
+    older = staged_id(tmp_path, "2098.01.01", small)
+    capsys.readouterr()
+    assert run(tmp_path, "accept", older) == 1
+    assert "dataset_version_older" in capsys.readouterr().err
+    small2 = tmp_path / "small2.json"
+    small2.write_text(small.read_text().replace('"V"', '"W"'))
+    newer = staged_id(tmp_path, "2099.02.01", small2)
+    capsys.readouterr()
+    assert run(tmp_path, "accept", newer) == 1
+    assert "dataset_churn_exceeded" in capsys.readouterr().err
+    assert run(tmp_path, "accept", newer, "--force") == 0
+    audit = rows(
+        tmp_path,
+        "SELECT detail FROM audit_log WHERE action='dataset.accept' ORDER BY rowid DESC",
+    )[0]
+    assert '"force":true' in audit[0]
+
+
+def test_list_shows_new_statuses(tmp_path, capsys):
+    imp = staged_id(tmp_path)
+    run(tmp_path, "reject", imp)
+    capsys.readouterr()
+    assert run(tmp_path, "list") == 0
+    assert "rejected" in capsys.readouterr().out

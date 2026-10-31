@@ -254,6 +254,28 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
           PRIMARY KEY (import_id, key)
         ) WITHOUT ROWID""",
     ),
+    (
+        # Accept/reject provenance. ADD COLUMN only (no table rebuild): status keeps its three
+        # values, and a superseded accepted import stays 'accepted' with superseded_by/at set.
+        # Rejected is terminal. The partial unique index admits one live accepted import per source.
+        "ALTER TABLE dataset_imports ADD COLUMN rejected_at TEXT CHECK (rejected_at IS NULL OR"
+        " length(trim(rejected_at, ' '||char(9,10,11,12,13,160)))>0)",
+        """ALTER TABLE dataset_imports ADD COLUMN rejected_by TEXT
+          CHECK (rejected_by IS NULL OR length(trim(rejected_by, ' '||char(9,10,11,12,13,160)))>0)
+          CHECK ((rejected_by IS NULL) = (rejected_at IS NULL)
+            AND ((status='rejected') = (rejected_by IS NOT NULL)))""",
+        "ALTER TABLE dataset_imports ADD COLUMN reject_reason TEXT CHECK (reject_reason IS NULL OR"
+        " (status='rejected' AND length(reject_reason) BETWEEN 1 AND 200))",
+        "ALTER TABLE dataset_imports ADD COLUMN superseded_at TEXT CHECK (superseded_at IS NULL OR"
+        " length(trim(superseded_at, ' '||char(9,10,11,12,13,160)))>0)",
+        """ALTER TABLE dataset_imports ADD COLUMN superseded_by TEXT
+          CHECK (superseded_by IS NULL OR
+            length(trim(superseded_by, ' '||char(9,10,11,12,13,160)))>0)
+          CHECK ((superseded_by IS NULL) = (superseded_at IS NULL)
+            AND (superseded_by IS NULL OR status='accepted'))""",
+        "CREATE UNIQUE INDEX idx_dataset_imports_live_accepted ON dataset_imports(source)"
+        " WHERE status='accepted' AND superseded_at IS NULL",
+    ),
 )
 
 

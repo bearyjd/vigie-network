@@ -100,12 +100,12 @@ def test_inventory_missing_is_not_created(tmp_path: Path) -> None:
     assert not (tmp_path / "inventory.db").exists()
 
 
-def test_overrides_schema_is_at_version_8(tmp_path: Path) -> None:
+def test_overrides_schema_is_at_version_9(tmp_path: Path) -> None:
     from vigie_api.schema import OVERRIDES_MIGRATIONS
 
     conn = open_overrides(tmp_path / "o.db")
-    assert len(OVERRIDES_MIGRATIONS) == 8
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert len(OVERRIDES_MIGRATIONS) == 9
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 SHA = "a" * 64
@@ -194,3 +194,69 @@ def test_dataset_text_columns_reject_blank_values(tmp_path: Path, column, blank)
             (row["version"], row["licence"], SHA, row["created_at"], row["created_by"],
              row["accepted_by"], row["accepted_at"]),
         )  # fmt: skip
+
+
+def _v8_db(path: Path) -> sqlite3.Connection:
+    from vigie_api.schema import OVERRIDES_MIGRATIONS
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    for index in range(8):
+        for statement in OVERRIDES_MIGRATIONS[index]:
+            conn.execute(statement)
+    conn.execute("PRAGMA user_version=8")
+    return conn
+
+
+def test_migration_9_upgrades_an_existing_v8_db_and_keeps_rows(tmp_path: Path) -> None:
+    raw = _v8_db(tmp_path / "o.db")
+    raw.execute(IMPORT_SQL.format(",status,accepted_by,accepted_at", ",?,?,?"),
+                ("old", "kev", SHA, 1, "accepted", "u", "t"))  # fmt: skip
+    raw.close()
+    conn = open_overrides(tmp_path / "o.db")
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    row = conn.execute("SELECT * FROM dataset_imports").fetchone()
+    assert (row["id"], row["status"], row["rejected_by"], row["superseded_by"]) == (
+        "old", "accepted", None, None,
+    )  # fmt: skip
+
+
+def test_rejected_status_needs_a_reject_record(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    bad = [
+        {"status": "rejected"},
+        {"status": "rejected", "rejected_by": "u"},
+        {"status": "rejected", "rejected_at": "t"},
+        {"status": "rejected", "rejected_by": "", "rejected_at": "t"},
+        {"status": "rejected", "rejected_by": "u", "rejected_at": " "},
+        {"rejected_by": "u", "rejected_at": "t"},  # a reject record on a staged row
+        {"reject_reason": "r"},  # a reason without a rejection
+        {"status": "rejected", "rejected_by": "u", "rejected_at": "t", "reject_reason": ""},
+        {"status": "rejected", "rejected_by": "u", "rejected_at": "t", "reject_reason": "x" * 201},
+    ]
+    for n, extra in enumerate(bad):
+        with pytest.raises(sqlite3.IntegrityError):
+            _import(conn, f"r{n}", sha=f"{n}" * 64, **extra)
+    _import(
+        conn, "ok", status="rejected", rejected_by="u", rejected_at="t", reject_reason="x" * 200
+    )
+
+
+def test_supersede_columns_are_paired_and_only_for_accepted(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    acc = {"status": "accepted", "accepted_by": "u", "accepted_at": "t"}
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "a", **acc, superseded_by="b")
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "b", sha="b" * 64, **acc, superseded_at="t")
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "c", sha="c" * 64, superseded_by="b", superseded_at="t")  # not accepted
+    _import(conn, "d", sha="d" * 64, **acc, superseded_by="b", superseded_at="t")
+
+
+def test_one_live_accepted_import_per_source(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    acc = {"status": "accepted", "accepted_by": "u", "accepted_at": "t"}
+    _import(conn, "a", **acc)
+    with pytest.raises(sqlite3.IntegrityError):
+        _import(conn, "b", sha="b" * 64, **acc)
+    _import(conn, "c", sha="c" * 64, source="urlhaus", **acc)

@@ -51,7 +51,8 @@ def test_stage_records_import_entries_and_one_audit_row(ov):
         "id": "imp-1", "source": "kev", "version": "2099.01.01", "licence": "CC0",
         "sha256": hashlib.sha256(KEV).hexdigest(), "entry_count": 3, "skipped_count": 0,
         "status": "staged", "created_at": NOW, "created_by": "cli:local",
-        "accepted_by": None, "accepted_at": None,
+        "accepted_by": None, "accepted_at": None, "rejected_at": None, "rejected_by": None,
+        "reject_reason": None, "superseded_at": None, "superseded_by": None,
     }  # fmt: skip
     keys = [r[0] for r in ov.execute("SELECT key FROM dataset_entries_staging ORDER BY key")]
     assert keys == ["CVE-2021-0001", "CVE-2022-12345", "CVE-2023-0003"]
@@ -155,7 +156,10 @@ def test_a_sixth_staged_import_of_one_source_is_refused(ov):
 def test_a_non_staged_import_frees_a_slot(ov):
     for n in range(dataset_writes.MAX_STAGED):
         stage(ov, data=variant(n))
-    ov.execute("UPDATE dataset_imports SET status='rejected' WHERE id='imp-1'")
+    ov.execute(
+        "UPDATE dataset_imports SET status='rejected', rejected_by='u', rejected_at='t'"
+        " WHERE id='imp-1'"
+    )
     stage(ov, data=variant(99))
     assert count(ov, "dataset_imports") == 6
 
