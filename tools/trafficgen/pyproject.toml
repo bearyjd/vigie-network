@@ -2,7 +2,7 @@
 name = "vigie-trafficgen"
 version = "0.1.0"
 description = "Deterministic synthetic collector traffic for Vigie tests (archetypes + adversarial profiles)"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.15,<3.16"
 license = { text = "AGPL-3.0-or-later" }
 dependencies = [
   "vigie-ingest",
