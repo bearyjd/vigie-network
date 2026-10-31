@@ -141,7 +141,6 @@ def sample_issues(sample):
         "log_capacity_kib": lambda x: 0 < x <= 20480,
         "freshness_s": lambda x: x <= 180,
         "processing_backlog_age_s": lambda x: x <= 180,
-        "dropped_batches": lambda x: x == 0,
         "source_flags": lambda x: x == 0,
         "logical_cpus": lambda x: x >= 1 and int(x) == x,
     }
@@ -161,6 +160,41 @@ def sample_issues(sample):
     if "dns_parsed_age_s" not in missing and sample["dns_parsed_age_s"] > 120:
         quality.add("parsed_dns_stale")
     return failures, missing, quality
+
+
+def drop_failures(samples):
+    """Judge drops that happen during the run, not the API's historical retained total.
+
+    The first sample is the durable baseline. The API total covers a sliding window, so a total
+    that falls (or a window start that moves while the baseline is nonzero) may hide new drops:
+    that is unverifiable and fails closed, never a pass.
+    """
+    first = samples[0] if isinstance(samples[0], dict) else {}
+    base = first.get("dropped_batches")
+    if not _number(base):
+        return {"dropped_baseline_missing"}
+    failures = set()
+    stamped = any(isinstance(s, dict) and "dropped_baseline" in s for s in samples)
+    since = first.get("retained_detail_since")
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        if stamped and (
+            "dropped_baseline" not in sample or sample["dropped_baseline"] != base
+        ):
+            failures.add("dropped_baseline_mismatch")
+        total = sample.get("dropped_batches")
+        if not _number(total):
+            continue
+        if total > base:
+            failures.add("dropped_batches_limit")
+        elif total < base:
+            failures.add("dropped_window_unverifiable")
+        if base > 0 and (
+            not isinstance(since, str) or sample.get("retained_detail_since") != since
+        ):
+            failures.add("dropped_window_unverifiable")
+    return failures
 
 
 def assess(samples, *, mode="simulated"):
@@ -265,6 +299,7 @@ def assess(samples, *, mode="simulated"):
             and not quality
         ):
             result["status"] = "pass"
+    failures |= drop_failures(samples)
     if failures:
         result["status"] = "fail"
     result["reasons"] = sorted(
@@ -369,6 +404,15 @@ class Journal:
                     value = sample.get(key)
                     if isinstance(value, str) and len(value) <= 128 and value.isascii():
                         safe[key] = value
+                # Keep the drop baseline evidence so a failed first record cannot unpin it.
+                since = sample.get("retained_detail_since")
+                if isinstance(since, str) and len(since) <= 128 and since.isascii():
+                    safe["retained_detail_since"] = since
+                if "dropped_baseline" in sample and (
+                    sample["dropped_baseline"] is None
+                    or _number(sample["dropped_baseline"])
+                ):
+                    safe["dropped_baseline"] = sample["dropped_baseline"]
                 # Preserve bounded raw processing evidence even for an invalid/future sample.
                 for key in _BOOLS:
                     if type(sample.get(key)) is bool:

@@ -110,6 +110,95 @@ class SoakTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 self.assertEqual(soak.assess(values)["status"], "fail")
 
+    def drop_run(self, base, per_index=None, since="2026-01-01T00:00:00+00:00"):
+        per_index = per_index or {}
+        values = full()
+        for i, value in enumerate(values):
+            value.update(
+                dropped_batches=base,
+                dropped_baseline=base,
+                retained_detail_since=since,
+            )
+            value.update(per_index.get(i, {}))
+        return values
+
+    def test_preexisting_drops_at_baseline_do_not_fail_the_run(self):
+        for base in (0, 7):
+            with self.subTest(base=base):
+                result = soak.assess(self.drop_run(base))
+                self.assertEqual(result["status"], "pass")
+
+    def test_drop_after_baseline_fails(self):
+        for base in (0, 7):
+            with self.subTest(base=base):
+                values = self.drop_run(base, {5: {"dropped_batches": base + 1}})
+                result = soak.assess(values)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("dropped_batches_limit", result["reasons"])
+
+    def test_baseline_is_the_first_sample_even_without_stamped_copies(self):
+        values = full()
+        values[0]["dropped_batches"] = 4
+        for value in values[1:]:
+            value["dropped_batches"] = 4
+            value["retained_detail_since"] = "x"
+        values[0]["retained_detail_since"] = "x"
+        self.assertEqual(soak.assess(values)["status"], "pass")
+        values[3]["dropped_batches"] = 5
+        self.assertIn("dropped_batches_limit", soak.assess(values)["reasons"])
+
+    def test_missing_or_unknown_first_baseline_fails(self):
+        for first in (None, "bad"):
+            values = self.drop_run(0)
+            values[0]["dropped_batches"] = first
+            result = soak.assess(values)
+            self.assertEqual(result["status"], "fail")
+            self.assertIn("dropped_baseline_missing", result["reasons"])
+
+    def test_tampered_or_missing_baseline_copy_fails(self):
+        for index, change in (
+            (0, {"dropped_baseline": 1}),
+            (3, {"dropped_baseline": 1}),
+            (3, {"dropped_baseline": None}),
+        ):
+            values = self.drop_run(0)
+            values[index].update(change)
+            with self.subTest(index=index, change=change):
+                result = soak.assess(values)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("dropped_baseline_mismatch", result["reasons"])
+        values = self.drop_run(0)
+        del values[3]["dropped_baseline"]
+        self.assertIn("dropped_baseline_mismatch", soak.assess(values)["reasons"])
+        values = self.drop_run(0)
+        del values[0]["dropped_baseline"]
+        self.assertIn("dropped_baseline_mismatch", soak.assess(values)["reasons"])
+
+    def test_lowered_total_with_nonzero_baseline_is_unverifiable(self):
+        # Old drops rolling out of the window could mask new ones: never a pass.
+        values = self.drop_run(7, {5: {"dropped_batches": 6}})
+        result = soak.assess(values)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("dropped_window_unverifiable", result["reasons"])
+
+    def test_window_advance_with_nonzero_baseline_is_unverifiable(self):
+        for since in ("2026-01-02T00:00:00+00:00", None):
+            values = self.drop_run(7, {5: {"retained_detail_since": since}})
+            with self.subTest(since=since):
+                result = soak.assess(values)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("dropped_window_unverifiable", result["reasons"])
+
+    def test_window_start_is_not_required_when_baseline_is_zero(self):
+        values = self.drop_run(0)
+        for value in values:
+            value.pop("retained_detail_since")
+        self.assertEqual(soak.assess(values)["status"], "pass")
+
+    def test_nonzero_baseline_requires_a_window_start(self):
+        values = self.drop_run(7, since=None)
+        self.assertIn("dropped_window_unverifiable", soak.assess(values)["reasons"])
+
     def test_cpu_uses_counter_ratio_per_logical_cpu(self):
         values = full()
         for value in values:

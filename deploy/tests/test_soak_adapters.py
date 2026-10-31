@@ -305,6 +305,91 @@ class FinalCoverageContract(unittest.TestCase):
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
 
 
+class DropBaselineTests(unittest.TestCase):
+    def run_main(self, prior, collected):
+        import hashlib
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = {
+                "api_port": 18444,
+                "api_token_file": "/unused",
+                "api_ca_file": "/unused",
+                "collector_id": "test",
+                "meter_executable": "/unused",
+                "meter_sha256": "a" * 64,
+                "router_address": "192.0.2.1",
+            }
+            raw = json.dumps(config).encode()
+            config_path = base / "config"
+            config_path.write_bytes(raw)
+            config_path.chmod(0o600)
+            journal_path = base / "journal"
+            metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
+            if prior is not None:
+                with runner.Journal(
+                    journal_path, mode="real", metadata=metadata
+                ) as journal:
+                    journal.append(prior)
+            out = io.StringIO()
+            with (
+                patch.object(
+                    sys, "argv", ["run_soak", str(config_path), str(journal_path)]
+                ),
+                patch.object(runner, "collect", return_value=collected),
+                redirect_stdout(out),
+            ):
+                runner.main()
+            with runner.Journal(journal_path, mode="real", metadata=metadata) as journal:
+                return journal.samples, json.loads(out.getvalue())
+
+    def sample(self, **changes):
+        # source_flags=1 ends the run right after the first resumed observation.
+        value = dict(
+            HEALTHY_SAMPLE,
+            wall=1800000060,
+            monotonic=1060,
+            boottime=2060,
+            total_cpu_ticks=12100,
+            source_flags=1,
+            dropped_batches=7,
+            retained_detail_since="2026-01-01T00:00:00+00:00",
+        )
+        value.update(changes)
+        return value
+
+    def test_coverage_metrics_expose_the_retained_window_start(self):
+        collector = {
+            "summary_capped": False,
+            "retained_detail_since": "2026-01-01T00:00:00+00:00",
+        }
+        self.assertEqual(
+            runner.coverage_metrics(collector, 1000)["retained_detail_since"],
+            "2026-01-01T00:00:00+00:00",
+        )
+
+    def test_fresh_run_records_its_first_total_as_baseline(self):
+        samples, _ = self.run_main(None, self.sample())
+        self.assertEqual(samples[0]["dropped_baseline"], 7)
+
+    def test_resume_reuses_the_journal_baseline_not_the_current_total(self):
+        prior = dict(self.sample(), dropped_baseline=7)
+        prior.update(wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100)
+        samples, report = self.run_main(prior, self.sample(dropped_batches=9))
+        self.assertEqual(samples[-1]["dropped_baseline"], 7)
+        self.assertIn("dropped_batches_limit", report["reasons"])
+
+    def test_resume_without_a_stored_baseline_fails(self):
+        prior = self.sample()
+        prior.update(wall=1800000000, monotonic=1000, boottime=2000, total_cpu_ticks=100)
+        samples, report = self.run_main(prior, self.sample())
+        self.assertIsNone(samples[-1]["dropped_baseline"])
+        self.assertIn("dropped_baseline_mismatch", report["reasons"])
+
+
 class ReviewRegressions(unittest.TestCase):
     def test_live_rss_cannot_be_replaced_by_older_api_report(self):
         with (
@@ -368,6 +453,7 @@ class ReviewRegressions(unittest.TestCase):
                     "freshness_s": 30,
                     "backlog_batches": 0,
                     "dropped_batches": 0,
+                    "dropped_baseline": 0,
                     "source_flags": 0,
                     "dns_log_quiet": False,
                     "ct_unmapped_flows": 0,

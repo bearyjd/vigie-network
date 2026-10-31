@@ -332,6 +332,7 @@ def coverage_metrics(collector, now):
     }
     for target, source in mapping.items():
         result[target] = collector.get(source)
+    result["retained_detail_since"] = collector.get("retained_detail_since")
     for target, source in (
         ("freshness_s", "latest_window_end"),
         ("dns_parsed_age_s", "latest_dns_observation_window_end"),
@@ -356,6 +357,18 @@ def coverage_metrics(collector, now):
         for key in ("dropped_batches", "ct_unmapped_flows", "ct_unmapped_bytes"):
             result[key] = None
     return result
+
+
+def with_drop_baseline(sample, journal):
+    """Stamp the run's durable drop baseline (the journal's first total) on every sample.
+
+    A resumed journal whose first sample carries no baseline stamps None, which assess() fails.
+    """
+    if journal.samples:
+        baseline = journal.samples[0].get("dropped_baseline")
+    else:
+        baseline = sample.get("dropped_batches")
+    return {**sample, "dropped_baseline": baseline}
 
 
 def read_coverage(config, now):
@@ -582,6 +595,7 @@ def main():
         args.journal.parent.mkdir(mode=0o700)
     metadata = {"config_sha256": hashlib.sha256(raw).hexdigest()}
     with Journal(args.journal, mode="real", metadata=metadata) as journal:
+        first = with_drop_baseline(first, journal)
         journal.append(first)
         # Every resumed observation, including failure or absence, is durable before gates.
         if failures or missing or quality:
@@ -602,7 +616,7 @@ def main():
                     report = unbound_report(journal.samples)
                     write_ingest_marker(args.journal)
                     break
-                journal.append(collect(config))
+                journal.append(with_drop_baseline(collect(config), journal))
         except KeyboardInterrupt:
             report = assess(journal.samples, mode="real")
             report["interrupted"] = True
