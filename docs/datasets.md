@@ -74,7 +74,8 @@ database error.
   backfills the digest (same framing) for every existing import that has staged entries; one with
   no entries keeps no digest and accept refuses it (`dataset_digest_missing`): reject it (frees its staging slot); it can
   only be replaced by a different file, since the same bytes can never be staged again. The
-  digest proves integrity since staging, not authenticity: a forged staged import with a
+  digest proves integrity since staging (for an import staged before the upgrade, since the
+  migration that backfilled it), not authenticity: a forged staged import with a
   self-consistent digest passes accept, so only the CLI should write these tables.
 - **What the database enforces** (CHECKs, triggers `trg_dataset_*`, a partial unique index and a
   foreign key): rows are inserted `staged`, with a digest and no accept record; imports are never
