@@ -186,7 +186,7 @@ Owner decisions recorded 2026-10-26:
   queries per device; NextDNS stays the upstream and roaming filter; provider logs are read-only context only.
 - **D7 = confirmed by the owner, 2026-10-26.** A scheduled fetch of KEV and URLhaus into a staging area, a human
   accept step, and versioned, reversible imports; KEV and URLhaus first. Confirmation approves the plan, not an
-  implementation: no fetch, import or dataset exists yet, and each dataset still needs its source, version, license
+  implementation: staging and the human accept/reject step exist as CLI only ([datasets.md](datasets.md)); no fetch, reader or applied dataset exists yet, and each dataset still needs its source, version, license
   and false-positive review before import.
 
 ### Resolver role: NextDNS, AdGuard Home and Vigie

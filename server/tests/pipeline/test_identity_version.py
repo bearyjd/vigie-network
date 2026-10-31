@@ -180,6 +180,10 @@ WRITE_PATHS = {
         ("stage", "INSERT", "dataset_imports"),
         ("stage", "INSERT", "dataset_entries_staging"),
         ("stage", "INSERT", "audit_log"),
+        ("_decide", "INSERT", "audit_log"),
+        ("accept.apply", "UPDATE", "dataset_imports"),
+        ("accept.apply", "UPDATE", "dataset_imports"),
+        ("reject.apply", "UPDATE", "dataset_imports"),
     ],
     "identity_writes.py": [
         ("atomic", "INSERT", "audit_log"),

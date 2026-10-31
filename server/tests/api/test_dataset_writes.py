@@ -31,7 +31,7 @@ def ov(tmp_path):
 
 
 def stage(
-    ov, source="kev", data=KEV, *, version="2099.01.01", licence="CC0", ids=None,
+    ov, source="kev", data=KEV, *, version="2025.01.01", licence="CC0", ids=None,
     principal="cli:local", now_iso=NOW,
 ):  # fmt: skip
     return dataset_writes.stage(
@@ -48,19 +48,23 @@ def test_stage_records_import_entries_and_one_audit_row(ov):
     assert stage(ov) == "imp-1"
     row = dict(ov.execute("SELECT * FROM dataset_imports").fetchone())
     assert row == {
-        "id": "imp-1", "source": "kev", "version": "2099.01.01", "licence": "CC0",
+        "id": "imp-1", "source": "kev", "version": "2025.01.01", "licence": "CC0",
         "sha256": hashlib.sha256(KEV).hexdigest(), "entry_count": 3, "skipped_count": 0,
         "status": "staged", "created_at": NOW, "created_by": "cli:local",
-        "accepted_by": None, "accepted_at": None,
+        "accepted_by": None, "accepted_at": None, "rejected_at": None, "rejected_by": None,
+        "reject_reason": None, "superseded_at": None, "superseded_by": None,
+        "content_sha256": row["content_sha256"],
     }  # fmt: skip
     keys = [r[0] for r in ov.execute("SELECT key FROM dataset_entries_staging ORDER BY key")]
     assert keys == ["CVE-2021-0001", "CVE-2022-12345", "CVE-2023-0003"]
     (audit,) = ov.execute("SELECT * FROM audit_log WHERE action LIKE 'dataset.%'").fetchall()
     assert (audit["principal"], audit["action"], audit["ts"]) == ("cli:local", "dataset.stage", NOW)
     assert json.loads(audit["detail"]) == {
-        "source": "kev", "version": "2099.01.01", "entry_count": 3, "skipped_count": 0,
+        "source": "kev", "version": "2025.01.01", "entry_count": 3, "skipped_count": 0,
         "sha256": hashlib.sha256(KEV).hexdigest(),
+        "content_sha256": row["content_sha256"],
     }  # fmt: skip
+    assert len(row["content_sha256"]) == 64
     assert "CVE-2021" not in audit["detail"] and "Widget" not in audit["detail"]
 
 
@@ -91,7 +95,7 @@ def test_same_source_and_bytes_twice_is_refused_and_writes_nothing(ov):
 
 def test_a_new_version_of_different_bytes_is_a_second_staged_import(ov):
     stage(ov)
-    stage(ov, data=KEV.replace(b"Widget", b"Gadget"), version="2099.01.02")
+    stage(ov, data=KEV.replace(b"Widget", b"Gadget"), version="2025.01.02")
     assert count(ov, "dataset_imports") == 2
 
 
@@ -143,7 +147,7 @@ def variant(n: int) -> bytes:
 
 def test_a_sixth_staged_import_of_one_source_is_refused(ov):
     for n in range(dataset_writes.MAX_STAGED):
-        stage(ov, data=variant(n), version=f"v{n}")
+        stage(ov, data=variant(n), version=f"2025.01.0{n + 1}")
     with pytest.raises(ApiError) as caught:
         stage(ov, data=variant(99))
     assert (caught.value.status, caught.value.code) == (409, "dataset_staging_full")
@@ -155,7 +159,10 @@ def test_a_sixth_staged_import_of_one_source_is_refused(ov):
 def test_a_non_staged_import_frees_a_slot(ov):
     for n in range(dataset_writes.MAX_STAGED):
         stage(ov, data=variant(n))
-    ov.execute("UPDATE dataset_imports SET status='rejected' WHERE id='imp-1'")
+    ov.execute(
+        "UPDATE dataset_imports SET status='rejected', rejected_by='u', rejected_at='t'"
+        " WHERE id='imp-1'"
+    )
     stage(ov, data=variant(99))
     assert count(ov, "dataset_imports") == 6
 

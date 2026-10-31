@@ -6,11 +6,13 @@ overrides.db is read-write for this process only. inventory.db is opened read-on
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from itertools import chain
 from pathlib import Path
 from urllib.parse import quote
 
@@ -75,7 +77,31 @@ def _identity_triggers() -> tuple[str, ...]:
 
 
 # Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
-OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
+def _digest(rows) -> str:
+    """Frozen copy of dataset_writes.content_digest as of migration 9 (a test pins them equal)."""
+    digest = hashlib.sha256()
+    for key, payload in rows:
+        for part in (key, payload):
+            raw = part.encode()
+            digest.update(f"{len(raw)}:".encode() + raw)
+    return digest.hexdigest()
+
+
+def _backfill_content_digests(conn: sqlite3.Connection) -> None:
+    """Digest every pre-migration import's staged entries (same framing as dataset_writes)."""
+    for (import_id,) in conn.execute("SELECT id FROM dataset_imports").fetchall():
+        rows = conn.execute(
+            "SELECT key,payload FROM dataset_entries_staging WHERE import_id=? ORDER BY key",
+            (import_id,),
+        )
+        first = rows.fetchone()
+        if first is None:  # nothing to digest: stays NULL, and accept will say to reject it
+            continue
+        digest = _digest(chain([first], rows))
+        conn.execute("UPDATE dataset_imports SET content_sha256=? WHERE id=?", (digest, import_id))
+
+
+OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], None]]] = (
     (
         """CREATE TABLE groups (
           id TEXT PRIMARY KEY,
@@ -254,6 +280,79 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
           PRIMARY KEY (import_id, key)
         ) WITHOUT ROWID""",
     ),
+    (
+        # Accept/reject provenance. ADD COLUMN only (no table rebuild): status keeps its three
+        # values, and a superseded accepted import stays 'accepted' with superseded_by/at set.
+        # Rejected is terminal. The partial unique index admits one live accepted import per
+        # source; content_sha256 (NULL only for pre-migration rows) digests the staged entries.
+        # v8 rows with status 'rejected' would fail the new CHECKs on ADD COLUMN, so they are
+        # parked as 'staged' for the ALTERs and restored with a backfilled reject record.
+        "CREATE TEMP TABLE m9_rejected AS SELECT id FROM dataset_imports WHERE status='rejected'",
+        "UPDATE dataset_imports SET status='staged' WHERE status='rejected'",
+        "ALTER TABLE dataset_imports ADD COLUMN rejected_at TEXT CHECK (rejected_at IS NULL OR"
+        " length(trim(rejected_at, ' '||char(9,10,11,12,13,160)))>0)",
+        """ALTER TABLE dataset_imports ADD COLUMN rejected_by TEXT
+          CHECK (rejected_by IS NULL OR length(trim(rejected_by, ' '||char(9,10,11,12,13,160)))>0)
+          CHECK ((rejected_by IS NULL) = (rejected_at IS NULL)
+            AND ((status='rejected') = (rejected_by IS NOT NULL)))""",
+        "ALTER TABLE dataset_imports ADD COLUMN reject_reason TEXT CHECK (reject_reason IS NULL OR"
+        " (status='rejected' AND length(reject_reason) BETWEEN 1 AND 200))",
+        "ALTER TABLE dataset_imports ADD COLUMN superseded_at TEXT CHECK (superseded_at IS NULL OR"
+        " length(trim(superseded_at, ' '||char(9,10,11,12,13,160)))>0)",
+        """ALTER TABLE dataset_imports ADD COLUMN superseded_by TEXT REFERENCES dataset_imports(id)
+          CHECK (superseded_by IS NULL OR
+            length(trim(superseded_by, ' '||char(9,10,11,12,13,160)))>0)
+          CHECK ((superseded_by IS NULL) = (superseded_at IS NULL)
+            AND (superseded_by IS NULL OR status='accepted'))""",
+        "ALTER TABLE dataset_imports ADD COLUMN content_sha256 TEXT"
+        " CHECK (content_sha256 IS NULL OR length(content_sha256)=64)",
+        "UPDATE dataset_imports SET status='rejected', rejected_by='migration-9',"
+        " rejected_at=created_at WHERE id IN (SELECT id FROM m9_rejected)",
+        "DROP TABLE m9_rejected",
+        _backfill_content_digests,  # before the triggers: they freeze content_sha256
+        "CREATE UNIQUE INDEX idx_dataset_imports_live_accepted ON dataset_imports(source)"
+        " WHERE status='accepted' AND superseded_at IS NULL",
+        # The state machine, enforced below the application: identity columns are frozen and
+        # only staged -> accepted|rejected, or a one-time supersede of an accepted row, is legal.
+        """CREATE TRIGGER trg_dataset_imports_frozen BEFORE UPDATE ON dataset_imports
+          WHEN OLD.id IS NOT NEW.id OR OLD.source IS NOT NEW.source
+            OR OLD.version IS NOT NEW.version OR OLD.licence IS NOT NEW.licence
+            OR OLD.sha256 IS NOT NEW.sha256 OR OLD.entry_count IS NOT NEW.entry_count
+            OR OLD.skipped_count IS NOT NEW.skipped_count OR OLD.created_at IS NOT NEW.created_at
+            OR OLD.created_by IS NOT NEW.created_by
+            OR OLD.content_sha256 IS NOT NEW.content_sha256
+          BEGIN SELECT RAISE(ABORT, 'dataset import identity is immutable'); END""",
+        """CREATE TRIGGER trg_dataset_imports_transition BEFORE UPDATE ON dataset_imports
+          WHEN NOT (
+            (OLD.status='staged' AND NEW.status IN ('accepted','rejected')
+              AND NEW.superseded_by IS NULL)
+            OR (OLD.status='accepted' AND NEW.status='accepted' AND OLD.superseded_at IS NULL
+              AND NEW.accepted_by IS OLD.accepted_by AND NEW.accepted_at IS OLD.accepted_at
+              AND NEW.superseded_by IS NOT NEW.id
+              AND EXISTS (SELECT 1 FROM dataset_imports n
+                WHERE n.id=NEW.superseded_by AND n.source=NEW.source
+                  AND n.status IN ('staged','accepted')))
+          )
+          BEGIN SELECT RAISE(ABORT, 'illegal dataset import transition'); END""",
+        # NOTE: a later migration that rebuilds dataset_imports or dataset_entries_staging must
+        # drop and re-create all trg_dataset_* triggers (they die with the table).
+        # Rows are born staged, with a digest and no accept record (the CHECKs cover the rest).
+        # Imports are never deleted; staged entries are insert-only, and only while their
+        # import is still staged.
+        """CREATE TRIGGER trg_dataset_imports_insert BEFORE INSERT ON dataset_imports
+          WHEN NOT (NEW.status='staged' AND NEW.content_sha256 IS NOT NULL
+            AND NEW.accepted_by IS NULL AND NEW.accepted_at IS NULL)
+          BEGIN SELECT RAISE(ABORT, 'a dataset import is born staged, with a digest'); END""",
+        """CREATE TRIGGER trg_dataset_imports_nodelete BEFORE DELETE ON dataset_imports
+          BEGIN SELECT RAISE(ABORT, 'dataset imports are never deleted'); END""",
+        """CREATE TRIGGER trg_dataset_entries_noupdate BEFORE UPDATE ON dataset_entries_staging
+          BEGIN SELECT RAISE(ABORT, 'staged dataset entries are immutable'); END""",
+        """CREATE TRIGGER trg_dataset_entries_nodelete BEFORE DELETE ON dataset_entries_staging
+          BEGIN SELECT RAISE(ABORT, 'staged dataset entries are never deleted'); END""",
+        """CREATE TRIGGER trg_dataset_entries_insert BEFORE INSERT ON dataset_entries_staging
+          WHEN (SELECT status FROM dataset_imports WHERE id=NEW.import_id) IS NOT 'staged'
+          BEGIN SELECT RAISE(ABORT, 'entries can only be added to a staged import'); END""",
+    ),
 )
 
 
@@ -267,7 +366,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             seen = conn.execute("PRAGMA user_version").fetchone()[0]
             if seen == index:  # another process may have migrated while we waited
                 for statement in OVERRIDES_MIGRATIONS[index]:
-                    conn.execute(statement)
+                    if callable(statement):
+                        statement(conn)
+                    else:
+                        conn.execute(statement)
                 conn.execute(f"PRAGMA user_version={index + 1}")
             conn.execute("COMMIT")
         except BaseException:
