@@ -26,6 +26,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 [dev-dependencies]
 serde_json = "1"
 vigie-conntrack = { path = "../conntrack-helper" }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 vigie-parse = { path = "../parse" }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

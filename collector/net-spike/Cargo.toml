@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 vigie-parse = { path = "../parse" }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [lib]
 name = "net_spike"
