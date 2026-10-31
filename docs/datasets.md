@@ -14,7 +14,7 @@ python -m vigie_api dataset reject IMPORT_ID [--by WHO] [--reason TEXT] [--data-
 
 `stage` reads the file bounded (per-source input cap, regular files only, no symlinks, no
 controlling tty), parses it strictly and writes in ONE transaction an import row, its entries
-and one `dataset.stage` audit row (source, version, sha256, entry and skipped counts; never
+and one `dataset.stage` audit row (source, version, sha256, content_sha256, entry and skipped counts; never
 entry contents) as principal `cli:local`. A structurally bad file is rejected whole (exit 2).
 Staging the same bytes twice for one source is refused (exit 1, `dataset_already_staged`), and
 so is a sixth still-`staged` import of one source (`dataset_staging_full`). A new version is
@@ -33,7 +33,7 @@ database error.
 - **Statuses.** Only a `staged` import may transition (`dataset_not_staged` otherwise, nothing
   changes). `staged -> accepted` or `staged -> rejected`. **Rejected is terminal**, and
   re-staging the same bytes stays blocked by the unique (source, sha256) row; this is intended
-  (stage a corrected file instead). Rejected staging rows are not deleted yet (pruning is a
+  (stage a corrected file instead). Rejected staging rows are not deleted (pruning is a
   follow-up). Both outcomes free a staging slot, so a sixth import can be staged afterwards.
 - **Supersede rule.** The live dataset of a source is its `accepted` import with
   `superseded_at IS NULL`; `dataset_writes.latest_accepted(ov, source)` returns it and a partial
@@ -43,12 +43,17 @@ database error.
   supported: an older version is refused, see below.
 - **Version rule.** `stage` requires a date version (`YYYY.MM.DD` or `YYYY-MM-DD`, a real
   date; exit 2 otherwise), so a source can never be locked by an unorderable label. Accept
-  re-checks it, including for the first accept.
+  re-checks it, including for the first accept. A version dated later than tomorrow (relative
+  to the command's clock) is refused at stage (exit 2) and at accept (`dataset_version_future`),
+  so a typo such as 2099 cannot pin a source ahead of every real release.
 - **Version guard.** Versions are compared only as dates, `YYYY.MM.DD` or `YYYY-MM-DD` (KEV
   `catalogVersion`, URLhaus dump date). An import older than the live one is refused
   (`dataset_version_older`); the same date is allowed (a republished file). If either version is
   not such a date the accept fails closed (`dataset_version_incomparable`). The first accept for
   a source has no ordering or churn check. `--force` does not bypass this guard.
+  `--allow-older` does: it accepts a version older than (or unorderable against) the live one,
+  is recorded as `allow_older` in the audit row, and still enforces the future, churn and
+  content checks. It is the deliberate way to roll back or to replace a bad live import.
 - **Churn guard.** If the entry count differs from the live import by more than 50% in either
   direction (`CHURN_MAX_FRACTION`; from a live count of 0 any increase) the accept is refused
   (`dataset_churn_exceeded`) unless `--force` is given. `force` is recorded in the audit row.
@@ -62,16 +67,31 @@ database error.
   Rows are streamed, never copied.
 - **Content digest.** `stage` stores `content_sha256`, a digest of the sorted (key, payload) rows,
   and puts it in the audit detail. Accept recomputes it while streaming and refuses a mismatch
-  (`dataset_digest_mismatch`), so rows changed after staging cannot be accepted. Imports staged
-  before migration 9 have no digest and are refused with `dataset_digest_missing`: restage them.
-- **Database guards.** Triggers on `dataset_imports` allow only `staged -> accepted|rejected` and
-  a one-time supersede of an accepted row (to an existing import of the same source); identity
-  columns are frozen and `superseded_by` is a foreign key. Migration 9 restores any v8 `rejected`
-  rows with `rejected_by='migration-9'`, `rejected_at=created_at`.
+  (`dataset_digest_mismatch`), so rows changed after staging cannot be accepted. Migration 9
+  backfills the digest (same framing) for every existing import that has staged entries; one with
+  no entries keeps no digest and accept refuses it (`dataset_digest_missing`): restage it. The
+  digest proves integrity since staging, not authenticity: a forged staged import with a
+  self-consistent digest passes accept, so only the CLI should write these tables.
+- **What the database enforces** (CHECKs, triggers `trg_dataset_*`, a partial unique index and a
+  foreign key): rows are inserted `staged`, with a digest and no accept record; imports are never
+  deleted; identity columns (source, version, licence, hashes, counts, creator) never change;
+  the only status moves are `staged -> accepted|rejected`, plus a one-time supersede of an
+  accepted row to a `staged` or `accepted` import of the same source (never a rejected one);
+  staged entries are insert-only, and only while their import is `staged`; at most one live
+  accepted import per source; reject/supersede columns are paired with their status.
+- **What only the application enforces**: version ordering, future versions, the churn limit,
+  the shape and digest re-validation, `--force`/`--allow-older`, and the audit row (all in
+  `dataset_writes`). A direct SQL writer can bypass these, and could stage entries that match a
+  digest it computed itself.
+- **Migration 9 on a v8 database.** Existing `rejected` rows get `rejected_by='migration-9'`.
+  A hand-edited v8 database with two accepted imports of one source makes the migration fail
+  closed on the unique live-accepted index, so the API will not start: mark all but the newest
+  such import `staged` or `rejected` by hand (sqlite3, with a backup) and restart.
 - **Deploy order.** Running this CLI against a live overrides.db migrates it to schema v9, and an
   older API image refuses to start on a newer schema. Deploy the API image first, then use the
   CLI. There is no downgrade.
-- **Pruning.** Staging rows of rejected and superseded imports are never pruned yet (follow-up).
+- **Pruning.** Staging rows of rejected and superseded imports are never pruned yet (follow-up;
+  the delete triggers will need a deliberate pruning path).
 - **Licence review stays human.** Accept does not judge the licence: read the recorded licence
   before accepting.
 
@@ -81,7 +101,8 @@ database error.
   entry_count, skipped_count, status (`staged`|`accepted`|`rejected`, default `staged`),
   created_at/by, and accepted_by/at. A row cannot be `accepted` without an accept record. Migration
   9 adds rejected_by/at (required exactly when `rejected`), reject_reason (1-200 characters, only
-  when `rejected`) and superseded_by/at (paired, only on `accepted` rows).
+  when `rejected`), superseded_by/at (paired, only on `accepted` rows) and content_sha256 (digest
+  of the staged entries; NULL only for a pre-migration import without entries).
   Unique on (source, sha256). Version and licence are recorded so provenance is never lost.
 - `dataset_entries_staging`: (import_id, key, payload JSON), one row per key.
 

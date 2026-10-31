@@ -45,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     accept.add_argument(
         "--force", action="store_true", help="accept despite an entry-count change over the limit"
     )
+    accept.add_argument(
+        "--allow-older",
+        action="store_true",
+        help="accept a version not newer than the live one (audited; not implied by --force)",
+    )
     reject.add_argument("--reason", default=None, help="why (max 200 characters)")
     return parser
 
@@ -94,7 +99,15 @@ def _decide(ov, args) -> int:
     now = iso_utc(time.time())
     try:
         if args.command == "accept":
-            dataset_writes.accept(ov, args.import_id, CLI_PRINCIPAL, args.by, now, force=args.force)
+            dataset_writes.accept(
+                ov,
+                args.import_id,
+                CLI_PRINCIPAL,
+                args.by,
+                now,
+                force=args.force,
+                allow_older=args.allow_older,
+            )
         else:
             dataset_writes.reject(ov, args.import_id, CLI_PRINCIPAL, args.by, now, args.reason)
     except ApiError as err:

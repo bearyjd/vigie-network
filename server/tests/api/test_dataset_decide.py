@@ -73,7 +73,8 @@ def test_accept_flips_status_only_and_audits_once(ov):
     detail = json.loads(a["detail"])
     assert detail == {
         "source": "kev", "version": "2026.10.01", "sha256": row["sha256"], "entry_count": 3,
-        "skipped_count": 0, "by": "alice", "force": False, "superseded": None,
+        "skipped_count": 0, "by": "alice", "force": False, "allow_older": False,
+        "superseded": None,
         "content_sha256": row["content_sha256"],
     }  # fmt: skip
     assert len(row["content_sha256"]) == 64
@@ -220,6 +221,7 @@ def test_same_version_different_bytes_is_not_older(ov):
 
 def raw_import(ov, id_, version, *, status="staged", sha="a", digest=None, source="kev"):
     """A row as an older build could have left it (bypasses stage)."""
+    drop_triggers(ov)
     acc = ("u", "t") if status == "accepted" else (None, None)
     ov.execute(
         "INSERT INTO dataset_imports (id,source,version,licence,sha256,entry_count,created_at,"
@@ -296,6 +298,7 @@ def test_churn_from_an_empty_accepted_import_needs_force(ov):
 
 def test_staged_payload_is_revalidated_on_accept(ov):
     imp = stage(ov)
+    drop_triggers(ov)
     ov.execute(
         "UPDATE dataset_entries_staging SET payload='{\"cveID\":\"x\"}' WHERE key LIKE '%1000'"
     )
@@ -316,6 +319,7 @@ def test_staged_payload_is_revalidated_on_accept(ov):
 )
 def test_count_key_and_shape_mismatches_refuse_accept(ov, sql):
     imp = stage(ov)
+    drop_triggers(ov)
     ov.execute(sql)
     with pytest.raises(ApiError) as exc:
         accept(ov, imp)
@@ -328,6 +332,7 @@ def test_urlhaus_staged_payload_is_revalidated(ov):
         b'"t","l","r"\n'
     )
     imp = stage(ov, source="urlhaus", data=data)
+    drop_triggers(ov)
     ov.execute('UPDATE dataset_entries_staging SET payload=\'{"host":"other","threat":"t"}\'')
     with pytest.raises(ApiError) as exc:
         accept(ov, imp)
@@ -388,6 +393,7 @@ def drop_triggers(ov):
 
 def test_tampered_payload_with_the_same_count_is_refused(ov):
     imp = stage(ov)
+    drop_triggers(ov)
     ov.execute(
         "UPDATE dataset_entries_staging SET payload=replace(payload,'\"V\"','\"Z\"')"
         " WHERE key LIKE '%1000'"
@@ -400,6 +406,7 @@ def test_tampered_payload_with_the_same_count_is_refused(ov):
 
 def test_tampered_key_with_a_valid_shape_is_refused(ov):
     imp = stage(ov)
+    drop_triggers(ov)
     ov.execute(
         "UPDATE dataset_entries_staging SET key='CVE-2024-7777',"
         " payload=replace(payload,'CVE-2024-1000','CVE-2024-7777') WHERE key='CVE-2024-1000'"
@@ -572,3 +579,84 @@ def test_accept_record_is_frozen_when_superseding(ov, assignment):
             b,
             a,
         )
+
+
+# --- round 2: future versions, --allow-older, supersede targets, insert/delete guards ---
+
+
+@pytest.mark.parametrize("version", ["2099.01.01", "2026-11-01", "2027.01.01"])
+def test_stage_refuses_a_future_version(ov, version):
+    with pytest.raises(ApiError) as exc:
+        stage(ov, version=version)  # stage "now" is 2026-10-27
+    assert exc.value.status == 422 and "future" in exc.value.message
+    assert ov.execute("SELECT COUNT(*) FROM dataset_imports").fetchone()[0] == 0
+
+
+def test_tomorrow_is_allowed_at_stage(ov):
+    stage(ov, version="2026-10-31")
+
+
+def test_accept_refuses_a_future_version_even_with_allow_older(ov):
+    raw_import(ov, "fut", "2099.01.01")
+    for allow in (False, True):
+        with pytest.raises(ApiError) as exc:
+            dataset_writes.accept(ov, "fut", "cli:local", "cli:local", LATER, allow_older=allow)
+        assert (exc.value.status, code(exc)) == (409, "dataset_version_future")
+    assert status(ov, "fut") == "staged"
+
+
+def test_a_legacy_future_live_version_can_be_superseded_with_allow_older(ov):
+    raw_import(ov, "live", "2099.01.01", status="accepted")
+    new = stage(ov, version="2026.10.06")
+    with pytest.raises(ApiError) as exc:
+        accept(ov, new, force=True)  # --force is churn only
+    assert code(exc) == "dataset_version_older"
+    dataset_writes.accept(ov, new, "cli:local", "cli:local", LATER, allow_older=True, force=True)
+    assert dataset_writes.latest_accepted(ov, "kev")["id"] == new
+    detail = json.loads(audits(ov, "dataset.accept")[-1]["detail"])
+    assert detail["allow_older"] is True and detail["superseded"] == "live"
+
+
+def test_allow_older_also_unlocks_a_legacy_non_date_live_version(ov):
+    raw_import(ov, "live", "weekly-42", status="accepted")
+    new = stage(ov, n=1, version="2026.10.06")
+    dataset_writes.accept(ov, new, "cli:local", "cli:local", LATER, allow_older=True)
+    assert dataset_writes.latest_accepted(ov, "kev")["id"] == new
+
+
+def test_allow_older_is_audited_false_by_default_and_does_not_skip_churn(ov):
+    a = stage(ov, n=10, tag="a", version="2026.10.05")
+    accept(ov, a)
+    b = stage(ov, n=1, tag="b", version="2026.10.01")
+    with pytest.raises(ApiError) as exc:
+        dataset_writes.accept(ov, b, "cli:local", "cli:local", LATER, allow_older=True)
+    assert code(exc) == "dataset_churn_exceeded"
+    c = stage(ov, n=10, tag="c", version="2026.10.01")
+    dataset_writes.accept(ov, c, "cli:local", "cli:local", LATER, allow_older=True)
+    assert json.loads(audits(ov, "dataset.accept")[0]["detail"])["allow_older"] is False
+
+
+def test_supersede_target_must_not_be_a_rejected_import(ov):
+    a, r = stage(ov, tag="a"), stage(ov, tag="r")
+    accept(ov, a)
+    reject(ov, r)
+    with pytest.raises(sqlite3.IntegrityError):
+        update(ov, "UPDATE dataset_imports SET superseded_by=?, superseded_at='t' WHERE id=?", r, a)
+
+
+def test_stage_and_decisions_work_with_every_trigger_in_place(ov):
+    n = ov.execute("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'trg_dataset%'").fetchone()
+    assert n[0] >= 6
+    a, b = stage(ov, tag="a"), stage(ov, tag="b", version="2026.10.02")
+    accept(ov, a)
+    accept(ov, b)
+    reject(ov, stage(ov, tag="c", version="2026.10.03"))
+
+
+@pytest.mark.parametrize("version", ["2024.01-02", "2024-01.02", "2024.01.02 ", "2024.1.02"])
+def test_mixed_separators_and_sloppy_dates_are_not_versions(version):
+    assert dataset_writes._version_date(version) is None
+
+
+def test_matching_separators_parse():
+    assert dataset_writes._version_date("2024.01.02") == dataset_writes._version_date("2024-01-02")

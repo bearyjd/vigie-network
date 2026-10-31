@@ -14,7 +14,7 @@ import re
 import sqlite3
 import uuid
 from collections.abc import Callable, Iterable
-from datetime import date
+from datetime import date, timedelta
 
 from vigie_api import dataset_parse
 from vigie_api.errors import ApiError
@@ -85,9 +85,12 @@ def stage(
     if parser is None:
         raise _invalid(f"unknown source {source!r}")
     version, licence = _label("version", version), _label("licence", licence)
-    if _version_date(version) is None:
-        raise _invalid("version must be a date, YYYY.MM.DD or YYYY-MM-DD")
     principal, now_iso = _label("principal", principal), _label("now_iso", now_iso)
+    version_date = _version_date(version)
+    if version_date is None:
+        raise _invalid("version must be a date, YYYY.MM.DD or YYYY-MM-DD")
+    if _is_future(version_date, now_iso):
+        raise _invalid("version is in the future (later than tomorrow); check the date")
     try:
         entries, skipped = parser(data)
     except ValueError as exc:
@@ -135,16 +138,28 @@ def stage(
     return import_id
 
 
-_VERSION = re.compile(r"([0-9]{4})[.-]([0-9]{2})[.-]([0-9]{2})", re.ASCII)
+_VERSION = re.compile(r"([0-9]{4})([.-])([0-9]{2})\2([0-9]{2})", re.ASCII)
+FUTURE_SLACK = timedelta(days=1)  # a version dated later than tomorrow is a typo, not a release
 
 
 def _version_date(version: str) -> date | None:
     """YYYY.MM.DD or YYYY-MM-DD (KEV catalogVersion, URLhaus dump dates), else None."""
     match = _VERSION.fullmatch(version)
     try:
-        return date(*map(int, match.groups())) if match else None
+        return date(*map(int, match.group(1, 3, 4))) if match else None
     except ValueError:
         return None
+
+
+def _today(now_iso: str) -> date:
+    try:
+        return date.fromisoformat(now_iso[:10])
+    except ValueError:
+        raise _invalid("now_iso must start with a YYYY-MM-DD date") from None
+
+
+def _is_future(version_date: date, now_iso: str) -> bool:
+    return version_date > _today(now_iso) + FUTURE_SLACK
 
 
 def latest_accepted(ov: sqlite3.Connection, source: str) -> sqlite3.Row | None:
@@ -160,18 +175,29 @@ def _conflict(code: str, message: str) -> ApiError:
     return ApiError(409, code, message)
 
 
-def _check_version(new: sqlite3.Row, live: sqlite3.Row | None) -> None:
+def _check_version(
+    new: sqlite3.Row, live: sqlite3.Row | None, now_iso: str, allow_older: bool
+) -> None:
     new_date = _version_date(new["version"])
-    live_date = None if live is None else _version_date(live["version"])
-    if new_date is None or (live is not None and live_date is None):
+    if new_date is None:
+        raise _conflict(
+            "dataset_version_incomparable", f"version {new['version']!r} is not a YYYY.MM.DD date"
+        )
+    if _is_future(new_date, now_iso):
+        raise _conflict("dataset_version_future", f"version {new['version']!r} is in the future")
+    if live is None or allow_older:  # --allow-older is the deliberate way past the ordering rule
+        return
+    live_date = _version_date(live["version"])
+    if live_date is None:
         raise _conflict(
             "dataset_version_incomparable",
-            f"version {new['version']!r} or the accepted one is not a YYYY.MM.DD date",
+            f"accepted version {live['version']!r} is not a YYYY.MM.DD date; use --allow-older",
         )
-    if live_date is not None and new_date < live_date:
+    if new_date < live_date:
         raise _conflict(
             "dataset_version_older",
-            f"version {new['version']!r} is older than accepted {live['version']!r}",
+            f"version {new['version']!r} is older than accepted {live['version']!r};"
+            " use --allow-older to accept it deliberately",
         )
 
 
@@ -192,9 +218,10 @@ def _revalidate(ov: sqlite3.Connection, row: sqlite3.Row) -> None:
             "dataset_digest_missing",
             "import has no content digest (staged by an older build); restage it",
         )
-    seen = []
+    seen = 0
 
     def stream():
+        nonlocal seen
         for key, payload in ov.execute(
             "SELECT key,payload FROM dataset_entries_staging WHERE import_id=? ORDER BY key",
             (row["id"],),
@@ -203,14 +230,14 @@ def _revalidate(ov: sqlite3.Connection, row: sqlite3.Row) -> None:
                 raise _conflict(
                     "dataset_staged_invalid", "a staged entry does not match its schema"
                 )
-            seen.append(None)
+            seen += 1
             yield key, payload
 
     digest = content_digest(stream())
-    if len(seen) != row["entry_count"]:
+    if seen != row["entry_count"]:
         raise _conflict(
             "dataset_staged_invalid",
-            f"{len(seen)} staged entries, import recorded {row['entry_count']}",
+            f"{seen} staged entries, import recorded {row['entry_count']}",
         )
     if digest != row["content_sha256"]:
         raise _conflict("dataset_digest_mismatch", "staged entries changed since they were staged")
@@ -255,13 +282,14 @@ def accept(
     now_iso: str,
     *,
     force: bool = False,
+    allow_older: bool = False,
 ) -> None:
     principal, by = _label("principal", principal), _label("by", by, MAX_BY_LEN)
     now_iso = _label("now_iso", now_iso)
 
     def apply(row):
         live = latest_accepted(ov, row["source"])
-        _check_version(row, live)
+        _check_version(row, live, now_iso, allow_older)
         if live is not None:
             if not force:
                 _check_churn(row, live)
@@ -278,7 +306,11 @@ def accept(
             (by, now_iso, import_id),
         ))  # fmt: skip
         detail = _audit_detail(
-            row, by, force=force, superseded=None if live is None else live["id"]
+            row,
+            by,
+            force=force,
+            allow_older=allow_older,
+            superseded=None if live is None else live["id"],
         )
         return steps, detail
 

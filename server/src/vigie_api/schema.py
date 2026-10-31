@@ -10,7 +10,8 @@ import logging
 import os
 import sqlite3
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from itertools import chain
 from pathlib import Path
 from urllib.parse import quote
 
@@ -75,7 +76,23 @@ def _identity_triggers() -> tuple[str, ...]:
 
 
 # Each migration is a tuple of single statements (the trigger keeps its BEGIN..END intact).
-OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
+def _backfill_content_digests(conn: sqlite3.Connection) -> None:
+    """Digest every pre-migration import's staged entries (same framing as dataset_writes)."""
+    from vigie_api.dataset_writes import content_digest
+
+    for (import_id,) in conn.execute("SELECT id FROM dataset_imports").fetchall():
+        rows = conn.execute(
+            "SELECT key,payload FROM dataset_entries_staging WHERE import_id=? ORDER BY key",
+            (import_id,),
+        )
+        first = rows.fetchone()
+        if first is None:  # nothing to digest: stays NULL, and accept will say to restage
+            continue
+        digest = content_digest(chain([first], rows))
+        conn.execute("UPDATE dataset_imports SET content_sha256=? WHERE id=?", (digest, import_id))
+
+
+OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], None]]] = (
     (
         """CREATE TABLE groups (
           id TEXT PRIMARY KEY,
@@ -283,6 +300,7 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
         "UPDATE dataset_imports SET status='rejected', rejected_by='migration-9',"
         " rejected_at=created_at WHERE id IN (SELECT id FROM m9_rejected)",
         "DROP TABLE m9_rejected",
+        _backfill_content_digests,  # before the triggers: they freeze content_sha256
         "CREATE UNIQUE INDEX idx_dataset_imports_live_accepted ON dataset_imports(source)"
         " WHERE status='accepted' AND superseded_at IS NULL",
         # The state machine, enforced below the application: identity columns are frozen and
@@ -303,9 +321,26 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str]] = (
               AND NEW.accepted_by IS OLD.accepted_by AND NEW.accepted_at IS OLD.accepted_at
               AND NEW.superseded_by IS NOT NEW.id
               AND EXISTS (SELECT 1 FROM dataset_imports n
-                WHERE n.id=NEW.superseded_by AND n.source=NEW.source))
+                WHERE n.id=NEW.superseded_by AND n.source=NEW.source
+                  AND n.status IN ('staged','accepted')))
           )
           BEGIN SELECT RAISE(ABORT, 'illegal dataset import transition'); END""",
+        # Rows are born staged, with a digest and no accept record (the CHECKs cover the rest).
+        # Imports are never deleted; staged entries are insert-only, and only while their
+        # import is still staged.
+        """CREATE TRIGGER trg_dataset_imports_insert BEFORE INSERT ON dataset_imports
+          WHEN NOT (NEW.status='staged' AND NEW.content_sha256 IS NOT NULL
+            AND NEW.accepted_by IS NULL AND NEW.accepted_at IS NULL)
+          BEGIN SELECT RAISE(ABORT, 'a dataset import is born staged, with a digest'); END""",
+        """CREATE TRIGGER trg_dataset_imports_nodelete BEFORE DELETE ON dataset_imports
+          BEGIN SELECT RAISE(ABORT, 'dataset imports are never deleted'); END""",
+        """CREATE TRIGGER trg_dataset_entries_noupdate BEFORE UPDATE ON dataset_entries_staging
+          BEGIN SELECT RAISE(ABORT, 'staged dataset entries are immutable'); END""",
+        """CREATE TRIGGER trg_dataset_entries_nodelete BEFORE DELETE ON dataset_entries_staging
+          BEGIN SELECT RAISE(ABORT, 'staged dataset entries are never deleted'); END""",
+        """CREATE TRIGGER trg_dataset_entries_insert BEFORE INSERT ON dataset_entries_staging
+          WHEN (SELECT status FROM dataset_imports WHERE id=NEW.import_id) IS NOT 'staged'
+          BEGIN SELECT RAISE(ABORT, 'entries can only be added to a staged import'); END""",
     ),
 )
 
@@ -320,7 +355,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             seen = conn.execute("PRAGMA user_version").fetchone()[0]
             if seen == index:  # another process may have migrated while we waited
                 for statement in OVERRIDES_MIGRATIONS[index]:
-                    conn.execute(statement)
+                    if callable(statement):
+                        statement(conn)
+                    else:
+                        conn.execute(statement)
                 conn.execute(f"PRAGMA user_version={index + 1}")
             conn.execute("COMMIT")
         except BaseException:
