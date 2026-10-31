@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
+from datetime import UTC, datetime
 
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
@@ -11,6 +14,40 @@ from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 MAX_MACS = 64
 MAX_ALIASES = 256
+# The exact form the ingest writes to batches.received_at, so text comparison is chronological.
+_RECEIVED_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+MAX_FUTURE_S = 86400
+
+
+def parse_dropped_since(value, now):
+    """Strict UTC whole-second instant, not further than a day ahead of the server clock."""
+    if value is None:
+        return None
+    try:
+        if not _RECEIVED_AT.fullmatch(value):
+            raise ValueError
+        instant = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        if instant.timestamp() > now + MAX_FUTURE_S:
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise ApiError(
+            422, "invalid_dropped_since", "dropped_since must be UTC like 2026-01-01T00:00:00Z"
+        ) from None
+    return value
+
+
+def dropped_since(inv, collector, since):
+    """Drops received at or after `since`; unknown (None) on SQLite overflow, never an error."""
+    if since is None:
+        return None
+    try:
+        return inv.execute(
+            "SELECT COALESCE(SUM(dropped_batches),0) FROM batches "
+            "WHERE collector_id=? AND received_at>=?",
+            (collector, since),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return None
 
 
 def required(inv):
@@ -71,7 +108,7 @@ def page(scope, collector, device, start, end, limit, cursor, now):
     return after, stop, token
 
 
-def collector_summary(inv, collector):
+def collector_summary(inv, collector, since=None):
     owner = inv.execute(
         "SELECT boot_id,last_seq FROM collectors WHERE id=?", (collector,)
     ).fetchone()
@@ -106,12 +143,6 @@ def collector_summary(inv, collector):
         (collector,),
     ).fetchall()
     truncated = [json.loads(row["truncated"] or "{}") for row in rows]
-    # Uncapped SQL aggregates over every retained row; the capped fields keep their semantics.
-    retained = inv.execute(
-        "SELECT COALESCE(SUM(dropped_batches),0) AS dropped,MIN(received_at) AS since "
-        "FROM batches WHERE collector_id=?",
-        (collector,),
-    ).fetchone()
     unavailable = [
         dict(row)
         for row in inv.execute(
@@ -136,8 +167,7 @@ def collector_summary(inv, collector):
         "oldest_pending_received_at": pending[0]["received_at"] if pending else None,
         "retained_detail_since": rows[-1]["received_at"] if rows else None,
         "summary_capped": capped,
-        "dropped_batches_all_retained": retained["dropped"],
-        "retained_batches_since": retained["since"],
+        "dropped_batches_since": dropped_since(inv, collector, since),
         "dropped_batches_in_retained_detail": sum(row["dropped_batches"] for row in rows),
         "ct_unmapped_bytes_in_retained_detail": sum(
             t.get("ct_unmapped_bytes", 0) for t in truncated

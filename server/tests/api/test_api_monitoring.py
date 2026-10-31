@@ -372,39 +372,83 @@ def test_tod_deviation_incident_is_served_by_list_and_detail_endpoints(env: Env)
         assert evidence["algorithm"] == "tod-median-v1"
 
 
-def test_uncapped_drop_aggregates_survive_the_detail_cap(env: Env):
-    seed(env)
-    # The five oldest rows hold drops and fall outside the 10000 newest rows.
-    rows = [
-        (
-            "c1",
-            f"a{i:05}",
-            f"2026-01-{1 + i // 1440:02}T{i % 1440 // 60:02}:{i % 60:02}:00Z",
-            1 if i < 5 else 0,
-        )
-        for i in range(10050)
-    ]
+def _drops(env, collector, rows):
     env.inv.executemany(
         "INSERT INTO batches(collector_id,batch_id,received_at,dropped_batches) VALUES (?,?,?,?)",
-        rows,
+        [(collector, b, at, d) for b, at, d in rows],
     )
-    env.inv.execute(
-        "INSERT INTO batches(collector_id,batch_id,received_at,dropped_batches) "
-        "VALUES ('other','o1','2025-01-01T00:00:00Z',9)"
-    )
-    result = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
-    assert result.status_code == 200, result.text
-    value = result.json()["data"]["collector"]
-    assert value["summary_capped"] is True
-    assert value["dropped_batches_in_retained_detail"] == 0
-    assert value["retained_detail_since"] == rows[50][2]
-    assert value["dropped_batches_all_retained"] == 5
-    assert value["retained_batches_since"] == rows[0][2]
 
 
-def test_uncapped_drop_aggregates_are_zero_and_null_without_batches(env: Env):
+def _since(env, value=None, **extra):
+    query = {"collector_id": "c1", "from_hour": HOUR, "to_hour": HOUR + 3600, **extra}
+    if value is not None:
+        query["dropped_since"] = value
+    return env.get("/coverage", **query)
+
+
+def test_dropped_since_is_null_without_the_parameter(env: Env):
     seed(env)
-    result = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
-    value = result.json()["data"]["collector"]
-    assert value["dropped_batches_all_retained"] == 0
-    assert value["retained_batches_since"] is None
+    _drops(env, "c1", [("a", "2026-01-01T00:00:00Z", 3)])
+    value = _since(env).json()["data"]["collector"]
+    assert value["dropped_batches_since"] is None
+
+
+def test_dropped_since_counts_only_rows_at_or_after_the_boundary_and_ignores_others(env: Env):
+    seed(env)
+    _drops(
+        env,
+        "c1",
+        [
+            ("a", "2026-01-01T00:00:00Z", 5),
+            ("b", "2026-01-01T00:00:01Z", 2),
+            ("c", "2026-01-01T00:00:02Z", 1),
+        ],
+    )
+    env.inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c2','k2')")
+    _drops(env, "c2", [("z", "2026-01-01T00:00:05Z", 9)])
+    got = lambda at: _since(env, at).json()["data"]["collector"]["dropped_batches_since"]  # noqa: E731
+    assert got("2026-01-01T00:00:01Z") == 3  # a row exactly at the boundary counts
+    assert got("2026-01-01T00:00:02Z") == 1
+    assert got("2026-01-01T00:00:03Z") == 0
+    assert got("2025-01-01T00:00:00Z") == 8
+
+
+def test_dropped_since_is_uncapped_beyond_10000_rows(env: Env):
+    seed(env)
+    rows = [
+        (f"a{i:05}", f"2026-01-{1 + i // 1440:02}T{i % 1440 // 60:02}:{i % 60:02}:00Z", 1)
+        for i in range(10050)
+    ]
+    _drops(env, "c1", rows)
+    value = _since(env, "2026-01-01T00:00:00Z").json()["data"]["collector"]
+    assert value["summary_capped"] is True
+    assert value["dropped_batches_in_retained_detail"] == 10000
+    assert value["dropped_batches_since"] == 10050
+
+
+def test_dropped_since_rejects_anything_but_strict_utc_seconds(env: Env):
+    seed(env)
+    for bad in (
+        "garbage",
+        "2026-01-01T00:00:00",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00.5Z",
+        "2026-01-01 00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "2999-01-01T00:00:00Z",
+    ):
+        response = _since(env, bad)
+        assert response.status_code == 422, (bad, response.text)
+
+
+def test_dropped_since_sum_overflow_is_null_not_a_server_error(env: Env):
+    seed(env)
+    _drops(
+        env,
+        "c1",
+        [("a", "2026-01-01T00:00:00Z", 2**62), ("b", "2026-01-01T00:00:01Z", 2**62 + 2**61)],
+    )
+    response = _since(env, "2026-01-01T00:00:00Z")
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["collector"]["dropped_batches_since"] is None
