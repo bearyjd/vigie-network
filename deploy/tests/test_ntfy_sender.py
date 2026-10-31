@@ -1174,6 +1174,7 @@ def test_stale_temp_cleanup_never_follows_symlinks_or_foreign_files(
     target.write_text("keep")
     link = env.tmp / "cursor.json.1.aaaaaaaa.tmp"
     link.symlink_to(target)
+    _age(target, 7200)
     _age(link, 7200)
     ns.clean_stale_temps(str(env.cursor), max_age=3600)
     assert link.is_symlink() and target.read_text() == "keep"
