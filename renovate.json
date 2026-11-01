@@ -2,5 +2,15 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Hold Python at 3.12.x: pyproject requires-python, lockfiles, CI and the deployed images pin it. A Python upgrade is a deliberate, reviewed change, not a bot PR.",
+      "matchDepNames": [
+        "python",
+        "docker.io/library/python"
+      ],
+      "allowedVersions": "<3.13"
+    }
   ]
 }
