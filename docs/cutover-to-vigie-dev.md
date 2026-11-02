@@ -1,6 +1,6 @@
-# Cutover runbook: moving the Vigie server from Tower to the Atlas VM
+# Cutover runbook: moving the Vigie server from <old-host> to the <new-host>
 
-Status: rehearsed on 2026-11-02 against the standby (router untouched, Tower only read).
+Status: rehearsed on 2026-11-02 (UTC) against the standby (router untouched, <old-host> only read).
 Placeholders: `<tower-ingest-addr>` and `<standby-addr>` (LAN address and published port of each
 ingest), `<standby-api-addr>`, `<collector-id>`, `<key-id>` (the collector row's `key_id`; the
 HMAC secret is `collector_key_<key-id>`), `<standby-uid>` (numeric uid of the standby's service
@@ -8,7 +8,7 @@ account). No real address, name or secret belongs in this file.
 
 ## 1. Purpose and the one rule that shapes the order
 
-Move ingest, pipeline and api from the Tower rootless stack to the standby quadlets, keeping the
+Move ingest, pipeline and api from the <old-host> rootless stack to the standby quadlets, keeping the
 inventory, overrides (labels, links, API tokens) and the collector identity, with the router
 losing as little data as possible.
 
@@ -16,7 +16,7 @@ losing as little data as possible.
 default SIGTERM action). Any edit of `/etc/vigie/collector.conf` needs
 `/etc/init.d/vigie-collector restart`. A restart discards the RAM spool and the unreported
 `dropped_batches` counter (`spool.rs:1`, `sender.rs`), picks a new random `boot_id` and restarts `seq`
-at 1 (`main.rs:321-340`). So the order "stop Tower, back up, restore, start standby, change router
+at 1 (`main.rs:321-340`). So the order "stop <old-host>, back up, restore, start standby, change router
 URL" silently throws away every batch spooled during the downtime. The order below flips the
 router FIRST, while the standby is still up but not yet holding the data: the collector then
 spools into a fresh queue (the standby answers 401, which the collector treats as retryable,
@@ -30,13 +30,13 @@ the server name); the handshake signature must still verify, so the peer must ho
 host is used only for connecting (and SNI when it is a DNS name). Config takes two pins
 (`pin1`, `pin2`, must differ, `config.rs:209`).
 
-| Option | Router fields that change | Tower key leaves Tower | Rollback |
+| Option | Router fields that change | <old-host> key leaves <old-host> | Rollback |
 |---|---|---|---|
-| 1. Reuse Tower cert+key on the standby | `server_url` | yes (copy of a TLS private key) | `server_url` |
-| 2. New cert, replace `pin1` | `server_url`, `pin1` | no | `server_url` and `pin1` (Tower pin must be restored) |
-| **3. New cert, keep `pin1`, set `pin2` = standby pin** | `server_url`, `pin2` | no | `server_url` only (`pin1` still Tower) |
+| 1. Reuse <old-host> cert+key on the standby | `server_url` | yes (copy of a TLS private key) | `server_url` |
+| 2. New cert, replace `pin1` | `server_url`, `pin1` | no | `server_url` and `pin1` (<old-host> pin must be restored) |
+| **3. New cert, keep `pin1`, set `pin2` = standby pin** | `server_url`, `pin2` | no | `server_url` only (`pin1` still <old-host>) |
 
-Chosen: **option 3**. One edit and one collector restart, Tower's private key never moves, and a
+Chosen: **option 3**. One edit and one collector restart, the old host's private key never moves, and a
 rollback needs no pin change. Option 1 is the fallback if the router `pin2` slot cannot be used.
 The standby pin is computed from the certificate the standby actually serves, so a typo is
 impossible:
@@ -52,19 +52,19 @@ The old `pin2` value on the router is overwritten; note it before the edit if it
 ## 3. Prerequisites (all must hold; do not start otherwise)
 
 1. The 48-hour soak is finished or abandoned. A router edit restarts the collector and invalidates
-   a strict run; the soak monitor also fails with `ingest_address_unbound` once Tower stops
-   publishing. Stop the soak unit on Tower first.
+   a strict run; the soak monitor also fails with `ingest_address_unbound` once <old-host> stops
+   publishing. Stop the soak unit on <old-host> first.
 2. Standby is up and healthy, `delivery` off, sender timer disabled.
-3. Standby images equal Tower's api/pipeline image. Note that Tower's ingest may run an older
+3. Standby images equal the old host's api/pipeline image. Note that the old host's ingest may run an older
    image than the standby's; the standby ingest then migrates the restored inventory on open.
-   Rehearsal restored Tower's schema (user_version 5) onto the newer image without a problem.
+   Rehearsal restored the old host's schema (user_version 5) onto the newer image without a problem.
 4. Real HMAC key staged on the standby, BEFORE the window (it is moved through a pipe, never
-   printed or written to disk outside the secret store). Tower side name is
-   `<tower-namespace>_collector_key_<key-id>`:
+   printed or written to disk outside the secret store). <old-host> side name is
+   `<old-namespace>_collector_key_<key-id>`:
    ```sh
-   # run on Tower; stdin of the ssh command receives the key
-   podman secret inspect --showsecret --format '{{.SecretData}}' <tower-namespace>_collector_key_<key-id> \
-     | ssh <standby-ssh> 'sudo -n -u vigie env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/vigie \
+   # run on <old-host>; stdin of the ssh command receives the key
+   podman secret inspect --showsecret --format '{{.SecretData}}' <old-namespace>_collector_key_<key-id> \
+     | ssh <standby-ssh> 'sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user> \
          podman secret create vigie_standby_collector_key_<key-id> -'
    ```
    Check the byte count only (`... | wc -c`, rehearsal: 66 = 64 hex + newline). Then add to
@@ -99,89 +99,126 @@ as estimates, not wire sizes.
 | p95 83 KB | about 12 | about 12 |
 
 After the standby comes up the collector may still be sleeping in a backoff of up to 300 s. Budget:
-**the standby must accept batches within about 7 minutes of the router restart (p95), 5 minutes as
-the go/no-go limit.** Beyond that, the oldest windows are dropped (counted, not silent), and the
+**the standby must be ready (restored, ingest healthy) within about 7 minutes of the router restart
+(p95); plan on 5.** The first `200` can come later than readiness: retries are 5, 10, 20, 40, 80, 160 s
+(jittered, each between half and full), then 150-300 s apart, so a perfect restore may see its first
+`200` at T0+5.3 min or up to about T0+10 min. Beyond that, the oldest windows are dropped (counted, not silent), and the
 soak-style "fresh dropped batches" gate would fail. The measured technical path is under 30 s
 (section 8); the rest is operator time.
 
 ## 5. Sequence
 
-Run Tower commands on Tower, standby commands as the service account:
-`S='sudo -n -u vigie env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/vigie'`.
+Run <old-host> commands on <old-host>, standby commands as the service account:
+`S='sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user>'`.
 
 **Step 1: pre-flight (T-10 min).**
-- Tower: `podman ps` shows ingest/pipeline/api healthy; ingest log shows ~1 POST per minute.
+- Old host: `podman ps` shows ingest/pipeline/api healthy; ingest log shows ~1 POST per minute.
 - Standby: `$S podman ps` healthy; `curl -sk -o /dev/null -w '%{http_code}\n' https://<standby-addr>/v1/batch` prints 405.
-- Latest batch `health.spool_batches` is 0 (router queue empty).
-- Tower's ntfy sender has caught up: its cursor offset equals the delivery file size.
-- Check: all of the above. Stop here if any fails.
+- Standby must be INERT: its collector row has `revoked=1` (query `select revoked from collectors`
+  with a read-only one-shot container) AND a signed post for `<collector-id>` currently returns 401.
+  Why both: an idle standby answers 401 because the HMAC fails with no key (`app.py:126-127`); the
+  revoked flag only matters once a key is mounted. Ingest has `Restart=on-failure`
+  (`deploy/persistent/render.py:159-161`): if the key is mounted and the row is active, it starts
+  accepting real batches BEFORE the restore, and the Step 5 wipe would destroy batches the router
+  already had ACKed. So mount the key only in Step 5 (move the `Secret=` line and the
+  `daemon-reload` from prerequisite 4 into Step 5), or keep the row revoked until the restore.
+- Old host's ntfy sender has caught up (cursor offset equals delivery file size).
+- Stop here if any check fails.
 
-**Step 2: flip the router (T0).** On the router (edit as documented in `docs/deploy.md`,
-"Rotating the server certificates"; copy files with `scp -O`, no sftp on OpenWrt):
+**Step 2: flip the router (T0).** Immediately before the edit, re-check that the router queue is
+empty (latest batch `health.spool_batches` == 0 in the old host's inventory): anything in the spool at
+restart is discarded. On the router (edit as documented in `docs/deploy.md`, "Rotating the server
+certificates"; copy files with `scp -O`, no sftp on OpenWrt):
 ```sh
 cp /etc/vigie/collector.conf /etc/vigie/collector.conf.pre-cutover
 # edit /etc/vigie/collector.conf: server_url=https://<standby-addr>/v1/batch
-#                                 pin2=<standby pin from section 2>   (pin1 stays Tower's)
+#                                 pin2=<standby pin from section 2>   (pin1 stays the old host's)
 vigie-collector --config /etc/vigie/collector.conf --check    # syntax+credentials (unverified on this router)
 /etc/init.d/vigie-collector restart
 ```
 `collector_id`, `key_id` and `/etc/vigie/key` do not change. Record the time.
-- Check: standby ingest journal shows `POST /v1/batch 401` about once a minute (TLS and pin
-  work, no data accepted yet); Tower ingest journal shows no new POST. No `200`, no TLS error. If
-  the router logs TLS/pin failures instead, fix `pin2` or roll back now (section 9).
+- Check: the old host's ingest journal shows no new POST; the standby journal shows `401` responses,
+  sparse because of the backoff (a few in the first minutes, then one every 2.5-5 min). No `200`, no
+  TLS error. If the router logs TLS/pin failures instead, fix `pin2` or roll back now (section 9).
 
-**Step 3: drain Tower, then freeze it.** The restored inventory only carries correct pipeline
-state if Tower's pipeline has processed every received batch, because the standby has no raw shards
-(section 6). Wait until pending is 0:
-```sh
-podman run --rm --network none --user 0:0 --entrypoint python \
-  -v <tower-namespace>_inv:/inv:ro localhost/vigie-server:<tag> -c '
-import sqlite3; c=sqlite3.connect("file:/inv/inventory.db?mode=ro",uri=True)
-print(c.execute("select last_batch_rowid from pipeline_cursor").fetchone()[0],
-      c.execute("select max(rowid) from batches").fetchone()[0])'
-```
-Both numbers equal (pipeline cycle is ~60 s). Then stop, in this order:
-```sh
-systemctl --user stop vigie-ntfy-sender.timer
-systemctl --user stop <tower-namespace>-ingest.service
-systemctl --user stop <tower-namespace>-pipeline.service <tower-namespace>-api.service
-```
-Check: `podman ps` on Tower shows none of the three; ingest log silent. (Tower volumes and secrets
-stay untouched; do not remove anything.)
+**Step 3: drain and freeze the old host.** Order matters. A delivery is only a file append plus a
+`sent` mark in `inventory.db` (`delivery_runner.py:253-262`, `delivery_publish.py:163-181`); the mark
+is restored onto the standby, and Step 5 deletes the delivery file. Any line appended after the
+sender's last run would be marked sent and never delivered. The pipeline sets its cursor before the
+monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowid is NOT a full drain.
+1. Stop the old host's INGEST first (the router already moved):
+   `systemctl --user stop <old-namespace>-ingest.service`.
+2. Wait until the pipeline cursor equals max rowid AND at least one complete `run_complete` log line
+   appeared AFTER that point (pipeline interval is 30 s, so allow about 60 s):
+   ```sh
+   podman run --rm --network none --user 0:0 --entrypoint python \
+     -v <old-namespace>_inv:/inv:ro localhost/vigie-server:<tag> -c '
+   import sqlite3; c=sqlite3.connect("file:/inv/inventory.db?mode=ro",uri=True)
+   print(c.execute("select last_batch_rowid from pipeline_cursor").fetchone()[0],
+         c.execute("select max(rowid) from batches").fetchone()[0])'
+   podman logs --since 2m <old-namespace>-pipeline | grep -c run_complete
+   ```
+3. Stop the pipeline GRACEFULLY, never relying on the 10 s SIGKILL (the pipeline ignores SIGTERM as
+   PID 1, section 12): `podman kill --signal SIGINT <old-namespace>-pipeline`, then
+   `systemctl --user stop <old-namespace>-pipeline.service`. A SIGKILL mid-cycle can leave a delivery
+   row in `sending` (the standby would re-send it once its lease expires: a duplicate message) and
+   can leave a partial JSONL line at the end of the old delivery file.
+4. Run the old sender ONCE and confirm it caught up:
+   `systemctl --user start vigie-ntfy-sender.service` must exit 0 or 5, and its cursor offset must
+   equal the delivery file size (`cursor.json` offset vs `stat -c %s`).
+5. Then `systemctl --user disable --now vigie-ntfy-sender.timer` and
+   `systemctl --user stop <old-namespace>-api.service`.
+6. The units are `WantedBy=default.target` (`render.py:166`): after a reboot they would come back and
+   run in parallel with the standby (duplicate or silent-collector alerts). Disable them:
+   `systemctl --user disable <old-namespace>-ingest.service <old-namespace>-pipeline.service <old-namespace>-api.service`
+   (rollback must `enable` them again, section 9).
+7. Check no delivery row is in flight (must print 0; also add to the section 10 checklist):
+   ```sh
+   podman run --rm --network none --user 0:0 --entrypoint python \
+     -v <old-namespace>_inv:/inv:ro localhost/vigie-server:<tag> -c '
+   import sqlite3; c=sqlite3.connect("file:/inv/inventory.db?mode=ro",uri=True)
+   print(c.execute("select count(*) from incident_deliveries where state=\"sending\"").fetchone()[0])'
+   ```
+   (Column name: confirm against the `incident_deliveries` schema, `server/src/vigie_pipeline/schema.py`,
+   before the window; the rehearsal did not exercise this query.)
+Take the final backup only after all of this. Volumes and secrets stay untouched; remove nothing.
 
-**Step 4: final backup (read-only on Tower) and ship.**
+**Step 4: final backup (read-only on <old-host>) and ship.**
 ```sh
 mkdir -m 700 <scratch>
 podman run --rm --network none --user 0:0 --entrypoint python \
-  -v <tower-namespace>_inv:/inv:ro -v <tower-namespace>_overrides:/ov:ro \
+  -v <old-namespace>_inv:/inv:ro -v <old-namespace>_overrides:/ov:ro \
   -v <scratch>:/out:rw,Z localhost/vigie-server:<tag> -c '
 import sqlite3, os
 for s, d in (("/inv/inventory.db","/out/inventory.db"), ("/ov/overrides.db","/out/overrides.db")):
     a = sqlite3.connect(f"file:{s}?mode=ro", uri=True); b = sqlite3.connect(d); a.backup(b); b.close(); a.close()
     os.chmod(d, 0o600)'
+# run on the old host; the remote command is single-quoted so nothing expands locally
 for f in inventory.db overrides.db; do
-  cat <scratch>/$f | ssh <standby-ssh> "$S bash -c 'umask 077; cat > /home/vigie/deploy/restore/$f'"
+  cat <scratch>/$f | ssh <standby-ssh> "sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user> bash -c 'umask 077; cat > /home/<service-user>/deploy/restore/$f'"
 done
 ```
 Use the SQLite online backup (WAL database; never copy the file). Check: sizes plausible
 (rehearsal: about 8.0 MB and 0.18 MB, 0.5 s and 1.6 s).
 
-**Step 5: restore on the standby and start (the data critical path).**
+**Step 5: restore on the standby and start (the data critical path).** First mount the real key
+(prerequisite 4: `Secret=` line plus `daemon-reload`) while the services are stopped, so ingest never
+runs with an active row and a key before the restore.
 ```sh
 $S systemctl --user stop vigie_standby-pipeline.service vigie_standby-api.service vigie_standby-ingest.service
 $S podman unshare bash -c '
-V=/home/vigie/.local/share/containers/storage/volumes; set -e
+V=/home/<service-user>/.local/share/containers/storage/volumes; set -e
 cd $V/vigie_standby_inv/_data;       rm -f inventory.db inventory.db-wal inventory.db-shm delivery-messages.jsonl
-cp /home/vigie/deploy/restore/inventory.db .; chown 10001:10001 inventory.db; chmod 600 inventory.db
+cp /home/<service-user>/deploy/restore/inventory.db .; chown 10001:10001 inventory.db; chmod 600 inventory.db
 cd $V/vigie_standby_overrides/_data; rm -f overrides.db overrides.db-wal overrides.db-shm
-cp /home/vigie/deploy/restore/overrides.db .; chown 10001:10001 overrides.db; chmod 600 overrides.db
+cp /home/<service-user>/deploy/restore/overrides.db .; chown 10001:10001 overrides.db; chmod 600 overrides.db
 cd $V/vigie_standby_raw/_data;       rm -f raw-*.db raw-*.db-wal raw-*.db-shm .ingest.lock'
 $S systemctl --user start vigie_standby-ingest.service        # accepting about 1 s later
 $S systemctl --user start vigie_standby-api.service           # wait for /healthz 200, then:
 $S systemctl --user start vigie_standby-pipeline.service
 ```
 Delete stale `-wal`/`-shm` sidecars: a stale WAL would replay onto the new file. The restored
-collector row is active with Tower's `last_seq`/`boot_id`: do NOT run `admin provision --force`
+collector row is active with the old host's `last_seq`/`boot_id`: do NOT run `admin provision --force`
 (it zeroes `last_seq`, `boot_id` and `last_sent_ts`, section 7). Start the api before the
 pipeline: the pipeline's first pass can log `overrides_unreadable` if the api's overrides keeper is
 not open yet (harmless, one pass, but it also skips stitching once).
@@ -189,10 +226,10 @@ not open yet (harmless, one pass, but it also skips stitching once).
   ingest journal shows `POST ... 200`.
 
 **Step 6: verify (checklist in section 10).** Then remove the transfer copies:
-`rm -f /home/vigie/deploy/restore/*` and `<scratch>/*` (household data), keep nothing.
+`rm -f /home/<service-user>/deploy/restore/*` and `<scratch>/*` (household data), keep nothing.
 
-**Step 7: after the bake-in.** Tower stays stopped but intact (units not removed) until you decide
-to retire it. Do not start Tower ingest again while the router points at the standby (two ingests
+**Step 7: after the bake-in.** <old-host> stays stopped but intact (units not removed) until you decide
+to retire it. Do not start <old-host> ingest again while the router points at the standby (two ingests
 on one collector fork the sequence state).
 
 ## 6. Raw shards: copy or not
@@ -203,9 +240,9 @@ reported `backlog_batches` 0. Shard reads happen only for batches past the pipel
 (`processor.py:157`, `measurements.py`). **But**: a batch that is still pending at backup time
 and whose shard file is missing is consumed with zero MACs and the cursor advances
 (`sources.py:read_batch` skips a missing file). Test: cursor rewound by 2 in a scratch copy, empty
-raw: `batches 2, macs 0`, cursor advanced, no error. So draining Tower's pipeline (Step 3) is
+raw: `batches 2, macs 0`, cursor advanced, no error. So draining the old host's pipeline (Step 3) is
 mandatory, not cosmetic. Not copying raw also respects "never back up raw shards"
-(`docs/deploy.md`, Backups): per-client DNS history stays on Tower and expires by retention.
+(`docs/deploy.md`, Backups): per-client DNS history stays on <old-host> and expires by retention.
 
 ## 7. Collector identity on the standby
 
@@ -220,7 +257,7 @@ mandatory, not cosmetic. Not copying raw also respects "never back up raw shards
 - `admin provision <collector-id> <key-id>` without `--force` on a revoked row fails
   (`collector ... is revoked; re-provisioning needs force`). With `--force` the row becomes
   `last_seq=0`, `boot_id=NULL`, `revoked=0` (measured). Use it only for a new collector, never to
-  continue Tower's.
+  continue the old host's.
 - Sequence behaviour with the real row restored (measured with the trafficgen signer library, a
   TEST key under the real collector and key ids, standby only):
 
@@ -235,14 +272,14 @@ mandatory, not cosmetic. Not copying raw also respects "never back up raw shards
 `check_state` (`store.py`): duplicate by `batch_id` first, then `|sent_ts - now|` <= 300 s, then
 `seq > last_seq` if the boot id matches; a different boot id is accepted if `sent_ts >=
 last_sent_ts`. The collector re-stamps `sent_ts` on every attempt (`sender.rs:119`), so spooled
-batches are accepted late. Because Tower's ingest is idle before the backup, nothing the router got
+batches are accepted late. Because the old host's ingest is idle before the backup, nothing the router got
 ACKed is missing from the restored `batches` table.
 
 ## 8. Rehearsal timings (standby only; one full pass, wall clock per stage)
 
 | Stage | Seconds | Note |
 |---|---|---|
-| S1 final backup of Tower inventory+overrides (read-only) | 0.5 | no lock on Tower |
+| S1 final backup of <old-host> inventory+overrides (read-only) | 0.5 | no lock on <old-host> |
 | S2 ship both files to the standby (pipes) | 1.6 | LAN |
 | S3 stop pipeline + api + ingest | 11.7 | pipeline 10.6 (ignores SIGTERM, section 12), api 0.5, ingest 0.5 |
 | S4 replace volume contents (`podman unshare`) | 0.3 | ownership 10001, no sidecars, raw emptied |
@@ -253,54 +290,59 @@ ACKed is missing from the restored `batches` table.
 | Whole rehearsal T0 -> all healthy | 48.2 | includes 1 s of test cleanup |
 
 Data critical path (S1+S2+S4+start ingest): about 3.3 s, plus 1.2 s of stop when the SIGTERM fix
-is in place. Add the Tower drain wait (<= about 60 s) and operator time. A second full pass (after
+is in place. Add the <old-host> drain wait (<= about 60 s) and operator time. A second full pass (after
 the identity tests) reproduced stop and replace within 0.2 s. Taking the backup does not touch
-Tower's live stack.
+the old host's live stack.
 
 ## 9. Rollback
 
-Decision point: if the standby has not accepted a `200` within 5 minutes of Step 2, roll back.
+Decision point: do NOT wait for a first `200` (see section 4: it can legitimately arrive up to about
+T0+10 min). Decide at Step 5 completion + 300 s + margin, and check readiness instead: key mounted,
+collector row active (`revoked=0`), ingest healthy, TLS answering 405. If ready but no `200` after
+that, look at the router log before rolling back.
 
-Cost, stated plainly: the router restarts again, so the RAM spool is discarded a second time
-(up to about 12-20 batches), and anything the standby accepted after Step 5 is not on Tower. No
-Tower data is ever modified by the cutover, so Tower is exactly as it was at Step 3.
+Cost, stated plainly: the router restarts again, so the RAM spool is discarded a second time (up to
+about 12-20 batches). **Data accepted only by the standby is lost on rollback; there is no merge.**
+The old host's data is untouched by the cutover, so it is exactly as at Step 3.
 
-1. Tower, start in this order and check each:
+1. Standby first: stop the sender timer (`systemctl --user disable --now vigie-ntfy-sender.timer`) and
+   remove the two `VIGIE_DELIVERY_*` env lines from the pipeline quadlet (restart it), so no
+   duplicate alerts; then `admin revoke <collector-id>` and remove the key `Secret=` line.
+2. Old host, enable and start in this order, checking each:
    ```sh
-   systemctl --user start <tower-namespace>-ingest.service
-   systemctl --user start <tower-namespace>-api.service <tower-namespace>-pipeline.service
-   systemctl --user start vigie-ntfy-sender.timer
+   systemctl --user enable <old-namespace>-ingest.service <old-namespace>-pipeline.service <old-namespace>-api.service
+   systemctl --user enable --now vigie-ntfy-sender.timer
+   systemctl --user start <old-namespace>-ingest.service
+   systemctl --user start <old-namespace>-api.service <old-namespace>-pipeline.service
    ```
    Verify: `podman ps` healthy x3; `curl -sk -o /dev/null -w '%{http_code}\n' https://<tower-ingest-addr>/v1/batch` = 405.
-2. Router: restore `/etc/vigie/collector.conf.pre-cutover` (only `server_url` and `pin2` differ; `pin1`
+3. Router: restore `/etc/vigie/collector.conf.pre-cutover` (only `server_url` and `pin2` differ; `pin1`
    was never changed) and `/etc/init.d/vigie-collector restart`.
-3. Verify on Tower: ingest journal shows `POST ... 200` within 5 minutes; the collector row has a
-   new `boot_id`, small `last_seq`, `revoked=0`, rising `last_sent_ts` (the new boot is accepted
-   because `sent_ts` is newer); pipeline cursor equals max batch rowid after two cycles; delivery
-   file unchanged by the rollback; `/coverage` backlog 0.
-4. Standby: make it a stale standby again: `admin revoke <collector-id>` on its inventory (or
-   restore a fresh copy later); `delivery` stays off, timer disabled. Standby data accepted during
-   the attempt is discarded by the next restore.
+4. Verify on the old host: ingest journal shows `POST ... 200` (allow up to about 10 min for the first
+   one); the collector row has a new `boot_id`, small `last_seq`, `revoked=0`, rising `last_sent_ts`;
+   pipeline cursor equals max batch rowid after two cycles; `/coverage` backlog 0.
 
-Rehearsed: the standby side of "return to stale standby" (revoke, services healthy). The Tower
-and router steps were not run (hard rule); they are plain starts of existing units.
+Rehearsed: the standby side (revoke, services healthy). The old-host and router steps were not run
+(hard rule); they are plain enables and starts of existing units.
 
 ## 10. Verification checklist
 
-After Step 2: router accepted the config; standby shows 401s, Tower shows none.
-After Step 3: Tower pipeline cursor == max rowid; Tower units stopped.
+After Step 2: router accepted the config; standby shows 401s, <old-host> shows none.
+After Step 3: <old-host> pipeline cursor == max rowid; <old-host> units stopped.
 After Step 5, on the standby:
 - `podman ps`: ingest, api, pipeline healthy.
 - `curl -sk -o /dev/null -w '%{http_code}\n' https://<standby-api-addr>/ui/` = 200 and `/healthz` = 200.
 - Inventory (read-only one-shot container): `pragma quick_check` = ok, `user_version` = 5,
-  collector row active with Tower's final `last_seq` and `key_id`, `batches` count and `devices`
-  count equal to Tower's at the backup (the standby ingest's startup retention may purge `batches`
+  collector row active with the old host's final `last_seq` and `key_id`, `batches` count and `devices`
+  count equal to the old host's at the backup (the standby ingest's startup retention may purge `batches`
   rows older than 7 days: counts can be lower by that amount, rowids are unchanged).
-- `delivery_eligible_since` equals Tower's (rehearsal: equal, from the same backup).
+- `delivery_eligible_since` equals the old host's (rehearsal: equal, from the same backup).
 - `GET /coverage?collector_id=<collector-id>` with a temporary API token
   (`python -m vigie_api tokens create --id cutover-check`, revoke afterwards): `ok:true`,
   `backlog_batches` 0, `last_seq` rising, `dropped_batches_since` accounting as expected. Note
   that `coverage` requires `collector_id`.
+- No in-flight deliveries: `incident_deliveries` has 0 rows in state `sending` (old host before the
+  backup, and standby after the restore).
 - Pipeline journal: `run_complete` every 30 s, no `overrides_unreadable` after the first pass.
 - Collector-side: new `boot_id` in the collector row, `seq` counting from 1, spool depth falling
   to 0 in `health.spool_batches`, no further 401.
@@ -309,9 +351,9 @@ After Step 5, on the standby:
 
 ## 11. ntfy on the standby (after verification, in this order)
 
-Tower's sender timer and Tower's pipeline must already be stopped (Step 3) so no message is sent
+the old host's sender timer and the old host's pipeline must already be stopped (Step 3) so no message is sent
 twice. Incident delivery state lives in `inventory.db` (`incident_deliveries`) and the permanent
-`delivery_eligible_since` watermark came with the backup, so incidents Tower already delivered are
+`delivery_eligible_since` watermark came with the backup, so incidents <old-host> already delivered are
 not resent and older ones stay unannounced. The sender cursor file identifies the delivery file by
 inode, first line and size and restarts at 0 on a replaced file (`ntfy_sender.py read_chunk`), so a
 new `delivery-messages.jsonl` needs no cursor reset; delete a stale cursor only if the sender
@@ -346,10 +388,13 @@ the 10 s timeout, SIGKILL, exit 137, the unit ends `failed`. Measured with throw
 | `--stop-signal=SIGINT` | 0.08 s | 0, log `stopped`, `held.close()` ran |
 | `--init` | 0.07 s | 143 (killed, unit would show failed) |
 
-Proposed fix (not applied to any live unit): in the pipeline quadlet add
-`PodmanArgs=--stop-signal=SIGINT`. The generator of Podman 4.9.3 accepted it in a dry run; the
-`StopSignal=` key is NOT supported there. A code change (a SIGTERM handler in `cli.py` that raises
-`KeyboardInterrupt`) is the durable alternative.
+Proposed fix (not applied to any live unit or to the repo): the durable one is `STOPSIGNAL SIGINT`
+in `deploy/Containerfile`. Tested: a scratch image with that line keeps `Config.StopSignal=SIGINT`
+in both OCI and docker build formats, and a pipeline container from it stopped in 0.11 s with exit 0.
+Uvicorn (ingest, api) handles SIGINT as well as SIGTERM. For units on already-built images use the
+quadlet fix `PodmanArgs=--stop-signal=SIGINT` (accepted by the Podman 4.9.3 generator; the
+`StopSignal=` key is NOT supported there), emitted by `render.py`. A SIGTERM handler in
+`vigie_pipeline/cli.py` raising `KeyboardInterrupt` is a code alternative.
 
 ## 13. Risks and unknowns
 
@@ -359,14 +404,16 @@ Proposed fix (not applied to any live unit): in the pipeline quadlet add
   After a restart, `dropped_batches` history is reset to 0 on the router.
 - Batch size is an estimate (section 4); check the router's reported `spool_batches` in health
   during the window for the real depth.
-- The standby ingest image is newer than Tower's ingest; behaviour on live traffic is verified
+- The standby ingest image is newer than the old host's ingest; behaviour on live traffic is verified
   only with synthetic traffic and the signer-library tests above.
 - Control app trust anchor changes (standby API certificate differs); API clients that pin it fail
   until updated.
-- Two ingests must never run for one collector. Keep Tower's ingest stopped after the cutover.
+- The old host's TLS key stays trusted as `pin1` on the router until the old host is retired; then
+  rotate `pin1` to the standby's pin (docs/deploy.md rotation order).
+- Two ingests must never run for one collector. Keep the old host's ingest stopped after the cutover.
 - `/coverage` and the GUI show the data only from the restored backup onward for raw-derived detail
   (no shard history on the standby).
-- Rehearsed the cutover once with a fresh Tower backup and twice for the restore itself. Human time
+- Rehearsed the cutover once with a fresh <old-host> backup and twice for the restore itself. Human time
   per step is not measured.
 - Fixed wall-clock figures come from a LAN-local VM with a warm image; a cold disk or a loaded
   host would be slower.
