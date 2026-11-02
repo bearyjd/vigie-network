@@ -186,7 +186,7 @@ monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowi
      branch `fix/stopsignal-sigint`, NOT yet merged). Until then use the SIGINT-in-idle-window
      procedure above only.
 4. Run the old sender ONCE and confirm it caught up. First record the cursor offset (the `offset` in the
-   JSON file named by `cursor_file` in the sender config; needed for invalid-record recovery, section 11)
+   JSON file named by `cursor_file` in the sender config; an absent file means 0; needed for invalid-record recovery, section 11)
    and set the journal window: `start=$(date '+%Y-%m-%d %H:%M:%S')`. Then
    `systemctl --user start vigie-ntfy-sender.service`, then read the exit code with
    `systemctl --user show vigie-ntfy-sender.service -p ExecMainStatus` (the unit has no
@@ -478,7 +478,7 @@ reports it corrupt.
    Invalid-record recovery (exit 0 with `skipping invalid record before offset N`, `ntfy_sender.py:698`): the
    record was skipped, not sent. Use the `inventory.db` of the host whose sender just ran (the old host in
    section 3 step 4, before backup and restore; the standby here and in the rollback). Before each run,
-   record the pre-run `offset` from the JSON file named by `cursor_file` in the sender config. Only the
+   record the pre-run `offset` from the JSON file named by `cursor_file` in the sender config (absent file: 0). Only the
    first `MAX_SKIP_LOGS` = 20 skips are logged (`ntfy_sender.py:53`, `:697`); skipped offsets beyond 20 are
    NOT in the journal, only a count in a `records skipped` line (`:719-722`). Re-parse the delivery file
    (`podman unshare`) from the pre-run offset to list every failing line with its end offset (`ok` lines
@@ -495,17 +495,38 @@ reports it corrupt.
 
    If this run's journal shows `delivery file was truncated or replaced` (`ntfy_sender.py:774`;
    `read_chunk` restarts at 0, `:459-462`, the section 11.2 case where Step 5 deleted the file but the
-   cursor was kept), the recorded offset is stale: pass 0. (Tested on a synthetic file; a line over
-   `MAX_LINE` is skipped with its whole chunk and is not listed here.)
+   cursor was kept), the recorded offset is stale: pass 0. An absent cursor file also means offset 0
+   (`load_cursor`, `ntfy_sender.py:295-297`). A line over `MAX_LINE` is listed here as one `bad` line, but
+   the sender may log two skips with different offsets for it: a full chunk with no newline is skipped
+   whole (`split_lines`, `:491-492`) and the rest of the line up to its newline is skipped on top.
 
    Most invalid records cannot be re-sent as-is: `parse_record` (`ntfy_sender.py:548-562`) rejects lines that
    are too long, not UTF-8, not JSON, not an object or the wrong shape, and the sender logs no
-   `delivery_id`. `incident_deliveries` has no sent timestamp or file offset (`schema.py:269-283`). Rebuild by
-   elimination: rows in state `sent` whose `delivery_id` is missing from every `ok` line above are the
-   candidates. Their title and body text come from `delivery_publish.build_message` (`:103-110`,
-   `TITLES`/`BODIES` at `:35-39`) using the incident label and id. Send the rebuilt notification by hand
-   and write down that it was rebuilt. This is manual best effort, not an exact reconstruction. Do not
-   proceed until every candidate is accounted for.
+   `delivery_id`. `incident_deliveries` has no file offset, but `updated_at` (integer epoch seconds) is set when a row
+   becomes `sent` (`delivery_sql.py:115-117`; for the file publisher that is just after the append).
+   Rebuild by elimination, with the time bound that keeps already-drained history out:
+   - Candidates: `sent` rows with `updated_at` at or after the start of the last clean sender run
+     BEFORE this one on that host (on the standby: the restore time), minus a margin of a few minutes.
+     Rows restored from the old host are older than the restore, so they are never candidates on the
+     standby. `since` is epoch seconds (`date -d '<time>' +%s`).
+   - Build the `ok` set by re-parsing that host's whole file from offset 0 (not the pre-run offset).
+   - Candidates whose `delivery_id` is not in the `ok` set are the dropped ones. Cross-check: their number
+     must equal this run's skip count (the skip lines, or N in `N records skipped`). If it does not, STOP
+     and investigate; do not re-send.
+
+   ```sh
+   python3 -I -c 'import sqlite3, sys
+   c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+   for r in c.execute("SELECT delivery_id, incident_id, kind, updated_at FROM incident_deliveries"
+                      " WHERE state=? AND updated_at >= ? ORDER BY updated_at", ("sent", int(sys.argv[2]))):
+       print(*r)' <host-inventory.db> <since-epoch>
+   ```
+
+   (Run it in the read-only one-shot container below; query tested on a synthetic DB with the real
+   `incident_deliveries` schema.) The title and body text come from `delivery_publish.build_message`
+   (`:103-110`, `TITLES`/`BODIES` at `:35-39`) using the incident label and id. Send the rebuilt
+   notification by hand and write down that it was rebuilt. This is manual best effort, not an exact
+   reconstruction. Do not proceed until every candidate is accounted for.
 
    Independently require zero `incident_deliveries` rows in state `sending`. The standby services
    are live (Keeper-held db), so use a plain `mode=ro` open, NOT `immutable=1` (which ignores the
