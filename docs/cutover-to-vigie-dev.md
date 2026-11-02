@@ -162,11 +162,22 @@ monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowi
    # container names use an underscore (<old-namespace>_pipeline); service names a hyphen
    podman logs --since 2m <old-namespace>_pipeline | grep -c run_complete
    ```
-3. Stop the pipeline GRACEFULLY, never relying on the 10 s SIGKILL (the pipeline ignores SIGTERM as
-   PID 1, section 12): `podman kill --signal SIGINT <old-namespace>_pipeline`, then
-   `systemctl --user stop <old-namespace>-pipeline.service`. A SIGKILL mid-cycle can leave a delivery
-   row in `sending` (the standby would re-send it once its lease expires: a duplicate message) and
-   can leave a partial JSONL line at the end of the old delivery file.
+3. Stop the pipeline, SIGINT ONLY during its idle wait. The images running on the old host predate
+   the graceful-shutdown work: the pipeline ignores SIGTERM (PID 1, section 12), and a SIGINT that
+   arrives while a pass is running raises `KeyboardInterrupt` out of the worker join, which can
+   leave a delivery in `sending` for its 300 s lease (the standby would re-send it). So:
+   - Watch `podman logs -f --since 1m <old-namespace>_pipeline` for a fresh `run_complete` line
+     (loop interval 30 s). Right after it, the loop sleeps: send
+     `podman kill --signal SIGINT <old-namespace>_pipeline` then
+     `systemctl --user stop <old-namespace>-pipeline.service`.
+   - If a pass is in progress (no `run_complete` yet since the last start of work), wait for the next
+     `run_complete`; never signal mid-pass.
+   - Verify the log shows `stopped` (clean exit 0) and that no `sending` rows remain (query in
+     item 7). Never rely on the 10 s SIGKILL: it can also leave a partial JSONL line at the end of
+     the old delivery file.
+   - Once an image with real SIGTERM/SIGINT drain handlers is deployed on the old host (in
+     progress elsewhere, unverified here), a plain `systemctl --user stop` drains and this
+     SIGINT timing can be dropped.
 4. Run the old sender ONCE and confirm it caught up:
    `systemctl --user start vigie-ntfy-sender.service` must exit 0 or 5, and its cursor offset must
    equal the delivery file size (`cursor.json` offset vs `stat -c %s`).
@@ -229,7 +240,9 @@ for s, d in (("/inv/inventory.db","/out/inventory.db"), ("/ov/overrides.db","/ou
     c = sqlite3.connect(d); print(s, c.execute("pragma quick_check").fetchone()[0], c.execute("pragma user_version").fetchone()[0])'
 ```
 Expect `ok` and the schema versions (rehearsal on the stopped standby: inventory `ok` 5, overrides `ok` 9).
-# run on the old host; the remote command is single-quoted so nothing expands locally
+Then ship both files through a pipe:
+```sh
+# run on the old host; the local shell expands $f, the remote command runs as the service user
 for f in inventory.db overrides.db; do
   cat <scratch>/$f | ssh <standby-ssh> "sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user> bash -c 'umask 077; cat > /home/<service-user>/deploy/restore/$f'"
 done
@@ -325,8 +338,8 @@ ACKed is missing from the restored `batches` table.
 | Start pipeline -> container healthy | 31.6 | podman health interval; NOT on the critical path |
 | Whole rehearsal T0 -> all healthy | 48.2 | includes 1 s of test cleanup |
 
-Data critical path (S1+S2+S4+start ingest): about 3.3 s, plus 1.2 s of stop when the SIGTERM fix
-is in place. Add the <old-host> drain wait (<= about 60 s) and operator time. A second full pass (after
+Data critical path (S1+S2+S4+start ingest): about 3.3 s, plus a short stop once a graceful-stop fix
+is deployed. Add the <old-host> drain wait (<= about 60 s) and operator time. A second full pass (after
 the identity tests) reproduced stop and replace within 0.2 s. Taking the backup does not touch
 the old host's live stack.
 
@@ -401,17 +414,25 @@ reports it corrupt.
 1. Pipeline delivery env: add to `vigie_standby-pipeline.container`
    `Environment=VIGIE_DELIVERY_ENABLED=1` and `Environment=VIGIE_DELIVERY_FILE=/inv/delivery-messages.jsonl`,
    then `systemctl --user daemon-reload && systemctl --user restart vigie_standby-pipeline.service`.
-2. Wait two pipeline passes. The file is created only on the first publish
-   (`delivery_publish.py:138-153`) and Step 5 deleted the old one, so on a healthy standby with
-   nothing to announce it is legitimately ABSENT; do not wait for it. Decide with the database:
-   `select count(*) from incident_deliveries where state in ('pending','sending')` (a read-only
-   one-shot container; use `immutable=1` only if the services are stopped). If 0 and the file is
-   absent, proceed. If rows exist, the file must appear within a few passes
-   (`podman unshare test -r <path> && echo ok`) and `wc -l` must be small (only post-watermark
-   incidents); otherwise stop and investigate. Chosen over pre-creating an empty file because
-   pre-creating needs `podman unshare` ownership/mode surgery on a file the publisher owns, and the
-   sender already treats an absent file as caught up (verified on the standby: exit 0,
-   `delivery file does not exist yet`).
+2. Wait two pipeline passes, then decide with the delivery file and the sender cursor, not with
+   the database alone: a delivery is marked `sent` as soon as it is appended to the file
+   (`delivery_runner._complete()`), BEFORE the sender consumes it, so a healthy standby can have a
+   non-empty file and zero pending/sending rows. The file is created only on the first publish
+   (`delivery_publish.py:138-153`) and Step 5 deleted the old one. Run the sender once
+   (`systemctl --user start vigie-ntfy-sender.service`, a manual start works while the timer is
+   disabled) and read `cursor.json`:
+
+   | Delivery file | Sender cursor | Decision |
+   |---|---|---|
+   | absent | none | proceed (verified on the standby: exit 0, `delivery file does not exist yet`) |
+   | present | `offset` == file size | caught up: proceed |
+   | present | `offset` < size or run exited 4 | behind: stop; fix the sender (topic, network) before enabling the timer |
+
+   Independently require zero `incident_deliveries` rows in state `sending` (read-only one-shot
+   container; `immutable=1` only if the services are stopped). `pending` rows are acceptable only
+   while the pipeline runs with delivery on (step 1). Absent-file acceptance is chosen over
+   pre-creating an empty file, which needs `podman unshare` ownership surgery on a file the
+   publisher owns.
 3. Sender (plain unit): `systemctl --user enable --now vigie-ntfy-sender.timer`. The timer unit, config and the 0600
    topic file are already installed; the config's `delivery_file` is the host path of the file in step 2.
 4. Verify one `systemctl --user start vigie-ntfy-sender.service` pass exits 0 or 5 (caught up).
@@ -435,13 +456,12 @@ the 10 s timeout, SIGKILL, exit 137, the unit ends `failed`. Measured with throw
 | `--stop-signal=SIGINT` | 0.08 s | 0, log `stopped`, `held.close()` ran |
 | `--init` | 0.07 s | 143 (killed, unit would show failed) |
 
-Proposed fix (not applied to any live unit or to the repo): the durable one is `STOPSIGNAL SIGINT`
-in `deploy/Containerfile`. Tested: a scratch image with that line keeps `Config.StopSignal=SIGINT`
-in both OCI and docker build formats, and a pipeline container from it stopped in 0.11 s with exit 0.
-Uvicorn (ingest, api) handles SIGINT as well as SIGTERM. For units on already-built images use the
-quadlet fix `PodmanArgs=--stop-signal=SIGINT` (accepted by the Podman 4.9.3 generator; the
-`StopSignal=` key is NOT supported there), emitted by `render.py`. A SIGTERM handler in
-`vigie_pipeline/cli.py` raising `KeyboardInterrupt` is a code alternative.
+Fix: a stop-signal change is NOT the fix. `--stop-signal=SIGINT` / `STOPSIGNAL SIGINT` stop the idle
+pipeline in 0.1 s (table above), but SIGINT cuts an in-flight delivery, so that approach was rejected.
+The fix is real SIGTERM/SIGINT drain handlers in the pipeline (in progress in another change,
+unverified here). Until an image with them is deployed on the old host, use the idle-wait SIGINT
+procedure of Step 3 and avoid relying on the 10 s SIGKILL. Ingest and api (uvicorn) already stop in
+0.5 s.
 
 ## 13. Risks and unknowns
 
