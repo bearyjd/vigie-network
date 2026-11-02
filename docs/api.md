@@ -4,9 +4,13 @@ The API is the sole writer of human intent in `overrides.db`. It opens `inventor
 read-only. The pipeline opens `overrides.db` read-only and writes derived inventory state.
 These ownership boundaries also apply to accepting suggestions and clearing vetoes.
 
-All endpoints use the existing response envelope and bearer authentication. The generated
+All data endpoints use the existing response envelope and bearer authentication; `/healthz`,
+`/ui/` and the `/` and `/ui` redirects are public. The generated
 [`api/openapi.yaml`](../api/openapi.yaml) describes request bodies and error responses.
 No generated TypeScript client exists in `api/`.
+
+The read-only GUI is served at `/ui/`; `GET`/`HEAD` on `/` and `/ui` answer `307` with the
+relative `Location: /ui/` (no query or proxy headers are consulted).
 
 | Method | Endpoint | Human action |
 |---|---|---|
