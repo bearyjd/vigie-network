@@ -496,23 +496,30 @@ reports it corrupt.
    If this run's journal shows `delivery file was truncated or replaced` (`ntfy_sender.py:774`;
    `read_chunk` restarts at 0, `:459-462`, the section 11.2 case where Step 5 deleted the file but the
    cursor was kept), the recorded offset is stale: pass 0. An absent cursor file also means offset 0
-   (`load_cursor`, `ntfy_sender.py:295-297`). A line over `MAX_LINE` is listed here as one `bad` line, but
-   the sender may log two skips with different offsets for it: a full chunk with no newline is skipped
-   whole (`split_lines`, `:491-492`) and the rest of the line up to its newline is skipped on top.
+   (`load_cursor`, `ntfy_sender.py:295-297`). An over-long line is one `bad` line here but can be two or more sender skips.
 
    Most invalid records cannot be re-sent as-is: `parse_record` (`ntfy_sender.py:548-562`) rejects lines that
    are too long, not UTF-8, not JSON, not an object or the wrong shape, and the sender logs no
    `delivery_id`. `incident_deliveries` has no file offset, but `updated_at` (integer epoch seconds) is set when a row
    becomes `sent` (`delivery_sql.py:115-117`; for the file publisher that is just after the append).
-   Rebuild by elimination, with the time bound that keeps already-drained history out:
-   - Candidates: `sent` rows with `updated_at` at or after the start of the last clean sender run
-     BEFORE this one on that host (on the standby: the restore time), minus a margin of a few minutes.
-     Rows restored from the old host are older than the restore, so they are never candidates on the
-     standby. `since` is epoch seconds (`date -d '<time>' +%s`).
+   Rebuild by elimination, with the time bound that keeps already-drained history out. A "clean" sender
+   run is one with exit 0, cursor equal to the file size, and no `skipping invalid record` or
+   `records skipped` line (a `max_batch` run that exits 0 with the cursor short of the file size is not
+   clean). If several runs happened since the last clean one, use the cursor offset after that clean run as
+   `<pre-run-offset>` and count all of those runs together.
+   - Candidates: `sent` rows with `updated_at` at or after `since`, an epoch in seconds (`date -d '<time>' +%s`).
+     Old host: the start of the last clean run, minus a margin of a few minutes (rows inside the margin were
+     read clean, so they drop out below). Standby: the first start of the standby pipeline after the
+     restore, no margin; rows restored from the old host are older than that, so they are never candidates.
    - Build the `ok` set by re-parsing that host's whole file from offset 0 (not the pre-run offset).
-   - Candidates whose `delivery_id` is not in the `ok` set are the dropped ones. Cross-check: their number
-     must equal this run's skip count (the skip lines, or N in `N records skipped`). If it does not, STOP
-     and investigate; do not re-send.
+   - Candidates whose `delivery_id` is not in the `ok` set are the dropped ones; skip any you already
+     rebuilt and wrote down.
+   - Cross-check: count the `bad` lines from the re-parse above (from the pre-run offset to the current
+     cursor, or from 0 when the file was replaced). The journal skip total (N in `N records skipped`, or the
+     skip lines, minus the `record skipped permanently` lines, which are server rejections) must be at least
+     that count, and the dropped candidates must not outnumber it. Otherwise STOP and investigate; do not
+     re-send. The live publisher can append a bad line after the sender reached the end of the file, so
+     repeat this check after the next sender run.
 
    ```sh
    python3 -I -c 'import sqlite3, sys
