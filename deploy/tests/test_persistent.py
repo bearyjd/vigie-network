@@ -204,7 +204,9 @@ class QuadletCompatTests(unittest.TestCase):
             lines = text.splitlines()
             self.assertFalse([x for x in lines if x.startswith("Memory=")], name)
             args = [x for x in lines if x.startswith("PodmanArgs=")]
-            self.assertEqual(args, ["PodmanArgs=--memory=512m --cpus=1"], name)
+            self.assertEqual(
+                args, ["PodmanArgs=--memory=512m --cpus=1 --stop-signal=SIGINT"], name
+            )
 
     def test_emitted_keys_subset_of_podman_4_9_allowlist(self):
         for updates in ({}, {"monitoring_baseline": "tod"}):

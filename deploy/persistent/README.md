@@ -21,6 +21,8 @@ API and pipeline use `Wants` plus startup ordering, not a `Requires` job that ca
 
 Minimum verified Podman is 4.9.3 (Ubuntu 24.04): the generator there rejects the `Memory=` quadlet key, so the memory limit is emitted as `PodmanArgs=--memory=512m --cpus=1` (identical `podman run` flags; Podman 5.x accepts both forms). Every other emitted key was accepted by 4.9.3, and a unit test pins the emitted keys to a 4.9 allowlist.
 
+Stop behaviour: python is PID 1 and handles only SIGINT, so each unit adds `--stop-signal=SIGINT` to its single `PodmanArgs=` line (Podman 4.9 rejects a `StopSignal=` key; the image also sets `STOPSIGNAL SIGINT`). `TimeoutStopSec=45` is unchanged.
+
 Quadlet files are inert until copied to a user generator search path. Validate with `QUADLET_UNIT_DIRS=/absolute/private/output /usr/lib/systemd/user-generators/podman-user-generator --user --dryrun`; then independently inspect generated arguments and collisions. Rootless Quadlet requires cgroup v2 and user linger. `[Install] WantedBy=default.target` supplies boot activation; do not `enable` generated transient services. Source: [Podman Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html). The renderer does not apply the plan. Installation requires exact existing unit contents/modes to be snapshotted, intended writes journaled before mutation, and conflicting resources or drift refused. Rollback stops only owned units, restores only matching snapshotted files, and retains data volumes/secrets/evidence.
 
 ## Strict real-clock monitor

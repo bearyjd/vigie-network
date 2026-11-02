@@ -244,6 +244,14 @@ Healthy on a fresh stack therefore takes a couple of minutes, not seconds.
 limiter keys on the peer address, so check the rootless network mode keeps the real source address
 (`podman info --format '{{.Host.RootlessNetworkCmd}}'`).
 
+## Stopping
+
+The image sets `STOPSIGNAL SIGINT`: python is PID 1 (the entrypoint `exec`s it), the kernel does not
+deliver SIGTERM to a PID 1 without a handler, and the pipeline loop only handles SIGINT. With the
+default signal `podman stop` waited the 10 s timeout and SIGKILLed (exit 137), which can strand a
+delivery in `sending`. Measured with SIGINT: well under 1 s, exit 0, a clean `stopped` log line.
+Quadlet units also pass `--stop-signal=SIGINT` in `PodmanArgs=`.
+
 ## Reboots
 
 Containers use `restart: unless-stopped`, but nothing restarts rootless containers after a reboot by
