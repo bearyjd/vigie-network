@@ -43,7 +43,7 @@ def test_loop_repeats_waits_and_survives_db_errors(data, handlers, monkeypatch):
                 handlers[cli.signal.SIGTERM](15, None)
             return self.is_set()
 
-    def fake_run(config):
+    def fake_run(config, should_stop=lambda: False):
         calls.append(1)
         if len(calls) == 1:
             import sqlite3
@@ -89,7 +89,7 @@ def test_signal_during_idle_wait_exits_at_once_with_zero(data, handlers, monkeyp
     import threading
     import time
 
-    monkeypatch.setattr(cli, "run_once", lambda config: None)
+    monkeypatch.setattr(cli, "run_once", lambda config, should_stop=lambda: False: None)
     threading.Timer(0.2, lambda: handlers[cli.signal.SIGTERM](cli.signal.SIGTERM, None)).start()
     started = time.monotonic()
     assert cli.main(["run", "--loop", "3600", "--data-dir", str(data.root)]) == 0
@@ -99,7 +99,7 @@ def test_signal_during_idle_wait_exits_at_once_with_zero(data, handlers, monkeyp
 def test_no_new_pass_starts_after_the_first_signal(data, handlers, monkeypatch):
     calls: list[int] = []
 
-    def run(config):
+    def run(config, should_stop=lambda: False):
         calls.append(1)
         handlers[cli.signal.SIGINT](cli.signal.SIGINT, None)  # arrives mid-pass
 
@@ -109,7 +109,7 @@ def test_no_new_pass_starts_after_the_first_signal(data, handlers, monkeypatch):
 
 
 def test_second_signal_forces_exit(data, handlers, monkeypatch):
-    def run(config):
+    def run(config, should_stop=lambda: False):
         handler = handlers[cli.signal.SIGTERM]
         handler(cli.signal.SIGTERM, None)
         handler(cli.signal.SIGTERM, None)  # operator insists
@@ -131,7 +131,8 @@ def test_signal_mid_publish_lets_the_delivery_finish_as_sent(tmp_path, handlers,
 
     world = World(tmp_path)
     try:
-        world.incident(at=T0 + 2)
+        world.incident("i1", at=T0 + 2)
+        world.incident("i2", at=T0 + 2)
         pub = FakePublisher([threading.Event()])  # the publisher blocks until released
         release = pub._script[0]
         c = PipelineConfig(
@@ -140,17 +141,39 @@ def test_signal_mid_publish_lets_the_delivery_finish_as_sent(tmp_path, handlers,
         run_delivery_stage(world.inv, world.ro, c, Clock(T0 + 2.7), publisher=pub)  # watermark
         passes: list[int] = []
 
-        def run(config):
+        def run(config, should_stop=lambda: False):
             passes.append(1)
             timer = threading.Timer(
                 0.2, lambda: (handlers[cli.signal.SIGTERM](15, None), release.set())
             )
             timer.start()
-            run_delivery_stage(world.inv, world.ro, c, Clock(T0 + 4), publisher=pub)
+            run_delivery_stage(
+                world.inv, world.ro, c, Clock(T0 + 4), publisher=pub, should_stop=should_stop
+            )
 
         monkeypatch.setattr(cli, "run_once", run)
         assert cli.main(["run", "--loop", "1", "--data-dir", str(tmp_path)]) == 0
         assert passes == [1]
-        assert list(world.states().values()) == ["sent"]
+        # the in-flight row finished as sent; the stop reached the drain, so no second claim began
+        assert sorted(r["state"] for r in world.rows()) == ["pending", "sent"]
     finally:
         world.close()
+
+
+def test_failing_wakeup_install_restores_handlers_and_closes_pipe(data, monkeypatch):
+    calls: list[tuple[object, object]] = []
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, fn: calls.append((sig, fn)) or "old")
+    closed: list[bool] = []
+    real_close = cli._StopFlag.close
+    monkeypatch.setattr(
+        cli._StopFlag, "close", lambda self: (closed.append(True), real_close(self))
+    )
+
+    def boom(fd):
+        raise ValueError("set_wakeup_fd only works in main thread")
+
+    monkeypatch.setattr(cli.signal, "set_wakeup_fd", boom)
+    with pytest.raises(ValueError):
+        cli.main(["run", "--loop", "1", "--data-dir", str(data.root)])
+    assert [fn for _, fn in calls[-2:]] == ["old", "old"]  # SIGTERM, SIGINT back to previous
+    assert closed == [True]

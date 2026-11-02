@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import time
 from pathlib import Path
 
 import pytest
@@ -106,15 +105,16 @@ def test_pipeline_loop_holds_inventory_while_running(
     open_inventory(inv).close()
     seen: list[bool] = []
 
-    def fake_run_once(config) -> None:
+    def fake_run_once(config, should_stop=lambda: False) -> None:
         seen.append(_has_sidecars(inv))
 
-    def stop(_: float) -> None:
-        raise KeyboardInterrupt
+    def stop(self, _: float) -> bool:
+        self.requested = True
+        return True
 
     monkeypatch.setenv("VIGIE_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(pipeline_cli, "run_once", fake_run_once)
-    monkeypatch.setattr(time, "sleep", stop)
+    monkeypatch.setattr(pipeline_cli._StopFlag, "wait", stop)
     assert pipeline_cli.main(["run", "--loop", "5"]) == 0
     assert seen == [True]
     assert not _has_sidecars(inv)  # released on exit
@@ -125,7 +125,11 @@ def test_pipeline_once_does_not_hold(tmp_path: Path, monkeypatch: pytest.MonkeyP
     open_inventory(inv).close()
     seen: list[bool] = []
     monkeypatch.setenv("VIGIE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(pipeline_cli, "run_once", lambda c: seen.append(_has_sidecars(inv)))
+    monkeypatch.setattr(
+        pipeline_cli,
+        "run_once",
+        lambda c, should_stop=lambda: False: seen.append(_has_sidecars(inv)),
+    )
     assert pipeline_cli.main(["run", "--once"]) == 0
     assert seen == [False]
 
@@ -136,21 +140,22 @@ def test_pipeline_loop_touches_the_health_file_only_after_a_good_pass(
     health = tmp_path / "ok"
     calls: list[int] = []
 
-    def flaky_run_once(config) -> None:
+    def flaky_run_once(config, should_stop=lambda: False) -> None:
         calls.append(1)
         if len(calls) == 1:
             raise sqlite3.OperationalError("boom")
 
-    def after_tick(_: float) -> None:
+    def after_tick(self, _: float) -> bool:
         if len(calls) == 1:
             assert not health.exists()  # a failed pass is not a heartbeat
         else:
-            raise KeyboardInterrupt
+            self.requested = True
+        return self.requested
 
     monkeypatch.setenv("VIGIE_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("VIGIE_HEALTH_FILE", str(health))
     monkeypatch.setattr(pipeline_cli, "run_once", flaky_run_once)
-    monkeypatch.setattr(time, "sleep", after_tick)
+    monkeypatch.setattr(pipeline_cli._StopFlag, "wait", after_tick)
     assert pipeline_cli.main(["run", "--loop", "5"]) == 0
     assert health.exists()
 

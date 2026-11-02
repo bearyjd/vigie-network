@@ -82,13 +82,14 @@ class _StopFlag:
         for fd in (self._r, self._w):
             os.set_blocking(fd, False)
         self.requested = False
-        self._previous_wakeup = -1
+        self._previous_wakeup: int | None = None
 
     def install_wakeup(self) -> None:
         self._previous_wakeup = signal.set_wakeup_fd(self._w)
 
     def restore_wakeup(self) -> None:
-        signal.set_wakeup_fd(self._previous_wakeup)
+        if self._previous_wakeup is not None:  # install may have failed off the main thread
+            signal.set_wakeup_fd(self._previous_wakeup)
 
     def is_set(self) -> bool:
         return self.requested
@@ -144,8 +145,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     held = Keeper()
     stop = _StopFlag()
     previous = _install_stop_handlers(stop)
-    stop.install_wakeup()
     try:
+        stop.install_wakeup()
         while not stop.is_set():
             # Keep inventory.db attached for the api's read-only mount; retried every tick until
             # ingest has created the file (never created from here).
