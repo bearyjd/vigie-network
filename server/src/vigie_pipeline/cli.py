@@ -6,8 +6,9 @@ import argparse
 import dataclasses
 import logging
 import os
+import signal
 import sqlite3
-import time
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -66,6 +67,20 @@ def _touch_health_file() -> None:
         log(logger, logging.WARNING, "health_file_failed", error=str(exc))
 
 
+def _install_stop_handlers(stop: threading.Event) -> dict[int, object]:
+    """SIGTERM/SIGINT ask the loop to stop after the current pass; a second one forces exit.
+
+    The handler only sets the event (async-signal-safe enough); python as PID 1 receives SIGTERM
+    only because a handler is installed, which is why `podman stop` works without STOPSIGNAL."""
+
+    def handler(signum: int, frame: object) -> None:
+        if stop.is_set():
+            raise SystemExit(128 + signum)
+        stop.set()
+
+    return {sig: signal.signal(sig, handler) for sig in (signal.SIGTERM, signal.SIGINT)}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -84,8 +99,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     held = Keeper()
+    stop = threading.Event()
+    previous = _install_stop_handlers(stop)
     try:
-        while True:
+        while not stop.is_set():
             # Keep inventory.db attached for the api's read-only mount; retried every tick until
             # ingest has created the file (never created from here).
             held.hold(config.inventory_path)
@@ -94,9 +111,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _touch_health_file()
             except (sqlite3.Error, ShardReadError) as exc:  # log, retry next tick
                 log(logger, logging.ERROR, "run_failed", error=str(exc))
-            time.sleep(args.loop)
-    except KeyboardInterrupt:
+            stop.wait(args.loop)
         log(logger, logging.INFO, "stopped")
         return 0
     finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
         held.close()

@@ -244,6 +244,17 @@ Healthy on a fresh stack therefore takes a couple of minutes, not seconds.
 limiter keys on the peer address, so check the rootless network mode keeps the real source address
 (`podman info --format '{{.Host.RootlessNetworkCmd}}'`).
 
+## Stopping
+
+The pipeline installs SIGTERM and SIGINT handlers that only set a stop flag. It stops sleeping at
+once, starts no new pass, lets the current pass (delivery stage and any in-flight publish, bounded
+by its transmit deadline) finish, logs `stopped` and exits 0. A second signal forces exit. Python is
+PID 1 here, and the kernel drops a default-disposition SIGTERM for PID 1; an installed handler is
+delivered, so a plain `podman stop` is graceful with no custom stop signal. `TimeoutStopSec`
+is unchanged. Images built before this change still ignore SIGTERM (10 s wait, then SIGKILL, exit
+137): for those, the cutover runbook sends a timed SIGINT during the idle wait. Ingest and api
+(uvicorn) already stop gracefully on SIGTERM.
+
 ## Reboots
 
 Containers use `restart: unless-stopped`, but nothing restarts rootless containers after a reboot by
