@@ -62,10 +62,5 @@ WORKDIR /var/lib/vigie
 # Compose owns the volume matrix. Image VOLUME declarations would add anonymous
 # writable mounts for paths a service deliberately does not mount.
 # The entrypoint sets a private creation mask, guards overrides.db, then execs the command.
-# The entrypoint execs the command, so python is PID 1. The kernel does not deliver a
-# default-disposition signal (SIGTERM) to PID 1 and the pipeline loop only handles
-# KeyboardInterrupt (SIGINT), so the default stop waits out the timeout and SIGKILLs (exit 137),
-# possibly mid-delivery. SIGINT is a graceful stop for the pipeline loop and for uvicorn.
-STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "vigie_api", "--help"]

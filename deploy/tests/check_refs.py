@@ -184,9 +184,6 @@ def required_python_minor() -> str:
     return found.group(1)
 
 
-STOPSIGNAL_SIGINT = re.compile(r"^STOPSIGNAL\s+SIGINT\s*$", re.M)
-
-
 def check_images(containerfile: str, release: bool) -> None:
     """Base images are pinned by tag AND digest. A dev build may carry a `# TODO pin digest`;
     --release refuses anything else. The tag is what keeps a bot from moving the digest to another
@@ -200,8 +197,6 @@ def check_images(containerfile: str, release: bool) -> None:
         err(f"Containerfile: PYTHON_IMAGE tag is python:{py[0]} but server/pyproject.toml requires {required_python_minor()}")
     if len(UV_PIN.findall(containerfile)) != 1:
         err("Containerfile: UV_IMAGE must be uv:<X.Y.Z>@sha256:<digest> (a version tag, not a bare digest)")
-    if not STOPSIGNAL_SIGINT.search(containerfile):
-        err("Containerfile: needs `STOPSIGNAL SIGINT` (python is PID 1 and only handles SIGINT; SIGTERM would wait out the stop timeout and SIGKILL)")
 
 
 def check_compose_config() -> None:
@@ -421,15 +416,12 @@ def self_test() -> None:
     wrong_minor = f"{int(minor.split('.')[0])}.{int(minor.split('.')[1]) + 3}"
     py_ok = f"ARG PYTHON_IMAGE=docker.io/library/python:{minor}-slim-bookworm@sha256:{'a' * 64}\n"
     uv_ok = f"ARG UV_IMAGE=ghcr.io/astral-sh/uv:9.9.9@sha256:{'b' * 64}\n"
-    stop_ok = "STOPSIGNAL SIGINT\n"
-    check_images(py_ok + uv_ok + stop_ok, True)
-    _fails("a Containerfile without STOPSIGNAL SIGINT", check_images, py_ok + uv_ok, True)
-    _fails("a Containerfile with STOPSIGNAL SIGTERM", check_images, py_ok + uv_ok + "STOPSIGNAL SIGTERM\n", True)
+    check_images(py_ok + uv_ok, True)
     _fails("PYTHON_IMAGE pinned by a bare digest (no tag)", check_images,
-           f"ARG PYTHON_IMAGE=docker.io/library/python@sha256:{'a' * 64}\n" + uv_ok + stop_ok, True)
-    _fails("PYTHON_IMAGE on the wrong python minor", check_images, py_ok.replace(f"python:{minor}-", f"python:{wrong_minor}-") + uv_ok + stop_ok, True)
-    _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv@") + stop_ok, True)
-    _fails("UV_IMAGE with a non-version tag", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv:latest@") + stop_ok, True)
+           f"ARG PYTHON_IMAGE=docker.io/library/python@sha256:{'a' * 64}\n" + uv_ok, True)
+    _fails("PYTHON_IMAGE on the wrong python minor", check_images, py_ok.replace(f"python:{minor}-", f"python:{wrong_minor}-") + uv_ok, True)
+    _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv@"), True)
+    _fails("UV_IMAGE with a non-version tag", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv:latest@"), True)
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"

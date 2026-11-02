@@ -105,9 +105,8 @@ def render(config: dict) -> dict[str, str]:
             "DropCapability=all",
             "NoNewPrivileges=true",
             "PidsLimit=256",
-            # Memory= needs a newer Podman than 4.9; PodmanArgs works on both. Same for the stop
-            # signal (no StopSignal= key in 4.9): python is PID 1 and only SIGINT stops it cleanly.
-            "PodmanArgs=--memory=512m --cpus=1 --stop-signal=SIGINT",
+            # Memory= needs a newer Podman than 4.9; PodmanArgs works on both.
+            "PodmanArgs=--memory=512m --cpus=1",
             "Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
             "LogDriver=journald",
         ]
