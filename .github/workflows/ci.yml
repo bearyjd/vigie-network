@@ -37,6 +37,10 @@ jobs:
           VIGIE_E2E_BASE: ${{ runner.temp }}/vigie-e2e
           VIGIE_E2E_TMP: ${{ runner.temp }}/vigie-e2e-tmp
         run: scripts/ci.sh
+      # Builds deploy/Containerfile exactly as shipped (no push) so a re-pinned base image that
+      # breaks `uv sync` or the interpreter version cannot merge unnoticed.
+      - name: Build the server image and smoke-test it
+        run: scripts/image_smoke.sh
       - name: Upload gate and whole-chain logs
         if: always()
         uses: actions/upload-artifact@v7
