@@ -246,14 +246,20 @@ limiter keys on the peer address, so check the rootless network mode keeps the r
 
 ## Stopping
 
-The pipeline installs SIGTERM and SIGINT handlers that only set a stop flag. It stops sleeping at
-once, starts no new pass, lets the current pass (delivery stage and any in-flight publish, bounded
-by its transmit deadline) finish, logs `stopped` and exits 0. A second signal forces exit. Python is
-PID 1 here, and the kernel drops a default-disposition SIGTERM for PID 1; an installed handler is
-delivered, so a plain `podman stop` is graceful with no custom stop signal. `TimeoutStopSec`
-is unchanged. Images built before this change still ignore SIGTERM (10 s wait, then SIGKILL, exit
-137): for those, the cutover runbook sends a timed SIGINT during the idle wait. Ingest and api
-(uvicorn) already stop gracefully on SIGTERM.
+The pipeline installs SIGTERM and SIGINT handlers that only write to a self-pipe (no locks, so a
+signal landing mid-wait cannot deadlock). It stops sleeping at once, starts no new pass, lets the
+current pass finish, logs `stopped` and exits 0. A second signal forces exit. Python is PID 1 here
+and the kernel drops a default-disposition SIGTERM for PID 1; an installed handler is delivered, so
+a plain `podman stop` is graceful with no custom stop signal.
+
+Stop grace must exceed the pipeline drain bound. After the signal the delivery stage claims nothing
+new once its drain budget (60 s) is spent, and the last claim can transmit for the transmit
+deadline (30 s): 90 s worst case, so the pipeline gets a 120 s grace (compose `stop_grace_period`,
+quadlet `--stop-timeout=120` in `PodmanArgs=`, `TimeoutStopSec=150`). Raising
+`VIGIE_DELIVERY_DRAIN_BUDGET_S` or `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` means raising the grace
+too (`check_refs.py` checks the defaults). Ingest and api keep the defaults (uvicorn stops in
+under a second). Images built before this change still ignore SIGTERM (wait, then SIGKILL, exit
+137): for those, the cutover runbook sends a timed SIGINT during the idle wait.
 
 ## Reboots
 

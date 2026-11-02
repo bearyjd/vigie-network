@@ -115,6 +115,9 @@ services:
   pipeline:
     <<: [*hardening, *image]
     command: ["python", "-m", "vigie_pipeline", "run", "--loop", "${VIGIE_PIPELINE_INTERVAL_S:-30}"]
+    # SIGTERM drains the current pass: delivery drain budget 60 s + one transmit deadline 30 s,
+    # plus margin. Must exceed that bound (deploy/tests/check_refs.py) and match render.py.
+    stop_grace_period: 120s
     # Exits non-zero (SchemaVersionError) until ingest's schema exists: provision a collector
     # first (quick start) or run once with --migrate. The restart policy retries until then.
     environment:

@@ -184,6 +184,33 @@ def required_python_minor() -> str:
     return found.group(1)
 
 
+def _seconds(value: object) -> int:
+    match = re.fullmatch(r"(\d+)(s|m)?", str(value))
+    if match is None:
+        err(f"stop_grace_period {value!r} is not <N>s or <N>m")
+        return 0
+    return int(match.group(1)) * (60 if match.group(2) == "m" else 1)
+
+
+def check_stop_grace(doc: dict, render_text: str, config_text: str) -> None:
+    """The pipeline drains its current pass on SIGTERM, so compose's stop_grace_period must exceed
+    the drain bound (drain budget + one transmit deadline) and match what the quadlet renderer uses."""
+    budget = re.search(r"drain_budget_s:\s*int\s*=\s*(\d+)", config_text)
+    deadline = re.search(r"transmit_deadline_s:\s*int\s*=\s*(\d+)", config_text)
+    rendered = re.search(r"^PIPELINE_STOP_TIMEOUT_S\s*=\s*(\d+)", render_text, re.M)
+    if not (budget and deadline and rendered):
+        err("stop grace: could not read the drain budget, transmit deadline or render constant")
+        return
+    bound = int(budget.group(1)) + int(deadline.group(1))
+    grace = _seconds(doc["services"]["pipeline"].get("stop_grace_period", "10s"))
+    if grace <= bound:
+        err(f"pipeline stop_grace_period {grace}s must exceed the drain bound {bound}s")
+    if int(rendered.group(1)) <= bound:
+        err(f"render.py PIPELINE_STOP_TIMEOUT_S {rendered.group(1)} must exceed the drain bound {bound}s")
+    if grace < int(rendered.group(1)):
+        err(f"compose stop_grace_period {grace}s is below render.py PIPELINE_STOP_TIMEOUT_S")
+
+
 def check_images(containerfile: str, release: bool) -> None:
     """Base images are pinned by tag AND digest. A dev build may carry a `# TODO pin digest`;
     --release refuses anything else. The tag is what keeps a bot from moving the digest to another
@@ -422,6 +449,13 @@ def self_test() -> None:
     _fails("PYTHON_IMAGE on the wrong python minor", check_images, py_ok.replace(f"python:{minor}-", f"python:{wrong_minor}-") + uv_ok, True)
     _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv@"), True)
     _fails("UV_IMAGE with a non-version tag", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv:latest@"), True)
+    cfg_ok = "drain_budget_s: int = 60\ntransmit_deadline_s: int = 30\n"
+    stop_doc = {"services": {"pipeline": {"stop_grace_period": "120s"}}}
+    check_stop_grace(stop_doc, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok)
+    _fails("compose without stop_grace_period", check_stop_grace, {"services": {"pipeline": {}}}, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok)
+    _fails("stop_grace_period at the bound", check_stop_grace, {"services": {"pipeline": {"stop_grace_period": "90s"}}}, "PIPELINE_STOP_TIMEOUT_S = 90\n", cfg_ok)
+    _fails("render timeout above compose grace", check_stop_grace, stop_doc, "PIPELINE_STOP_TIMEOUT_S = 130\n", cfg_ok)
+    _fails("drain budget raised past the grace", check_stop_grace, stop_doc, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok.replace("= 60", "= 100"))
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
@@ -455,6 +489,11 @@ def main() -> int:
     self_test()
     check_yaml()
     check_images((ROOT / "deploy" / "Containerfile").read_text(), release)
+    check_stop_grace(
+        yaml.safe_load((ROOT / "deploy" / "compose.yaml").read_text()),
+        (ROOT / "deploy" / "persistent" / "render.py").read_text(),
+        (ROOT / "server" / "src" / "vigie_pipeline" / "config.py").read_text(),
+    )
     check_firewall((ROOT / "README.md").read_text())
     check_compose_config()
     check_env_names()

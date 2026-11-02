@@ -33,13 +33,11 @@ def test_once_and_loop_are_mutually_exclusive(data):
 
 
 def test_loop_repeats_waits_and_survives_db_errors(data, handlers, monkeypatch):
-    import threading
-
     calls: list[int] = []
     waits: list[float] = []
 
-    class FakeEvent(threading.Event):
-        def wait(self, timeout=None):
+    class FakeFlag(cli._StopFlag):
+        def wait(self, timeout):
             waits.append(timeout)
             if len(waits) == 3:
                 handlers[cli.signal.SIGTERM](15, None)
@@ -53,7 +51,7 @@ def test_loop_repeats_waits_and_survives_db_errors(data, handlers, monkeypatch):
             raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(cli, "run_once", fake_run)
-    monkeypatch.setattr(cli.threading, "Event", FakeEvent)
+    monkeypatch.setattr(cli, "_StopFlag", FakeFlag)
     assert cli.main(["run", "--loop", "7", "--data-dir", str(data.root)]) == 0
     assert len(calls) == 3 and waits == [7, 7, 7]
 

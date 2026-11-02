@@ -196,6 +196,26 @@ def emitted_keys(files):
     return found
 
 
+class StopGraceTests(unittest.TestCase):
+    def test_pipeline_stop_timeout_covers_the_drain_bound_and_systemd_waits_longer(
+        self,
+    ):
+        files = render.render(config())
+        pipeline = files["vigie_test-pipeline.container"]
+        stop = render.PIPELINE_STOP_TIMEOUT_S
+        # delivery drain budget (60) + one last transmit deadline (30), see the render.py derivation
+        self.assertGreaterEqual(stop, 60 + 30)
+        self.assertIn(f"--stop-timeout={stop}", pipeline)
+        self.assertIn(f"TimeoutStopSec={render.PIPELINE_TIMEOUT_STOP_SEC}", pipeline)
+        self.assertGreater(render.PIPELINE_TIMEOUT_STOP_SEC, stop)
+
+    def test_ingest_and_api_keep_default_stop_behaviour(self):
+        for role in ("ingest", "api"):
+            text = render.render(config())[f"vigie_test-{role}.container"]
+            self.assertNotIn("--stop-timeout", text)
+            self.assertIn("TimeoutStopSec=45", text)
+
+
 class QuadletCompatTests(unittest.TestCase):
     def test_no_memory_key_and_memory_limit_via_podmanargs(self):
         for name, text in render.render(config()).items():
@@ -204,7 +224,10 @@ class QuadletCompatTests(unittest.TestCase):
             lines = text.splitlines()
             self.assertFalse([x for x in lines if x.startswith("Memory=")], name)
             args = [x for x in lines if x.startswith("PodmanArgs=")]
-            self.assertEqual(args, ["PodmanArgs=--memory=512m --cpus=1"], name)
+            expected = "PodmanArgs=--memory=512m --cpus=1"
+            if "pipeline" in name:
+                expected += f" --stop-timeout={render.PIPELINE_STOP_TIMEOUT_S}"
+            self.assertEqual(args, [expected], name)
 
     def test_emitted_keys_subset_of_podman_4_9_allowlist(self):
         for updates in ({}, {"monitoring_baseline": "tod"}):
