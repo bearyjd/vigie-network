@@ -171,14 +171,32 @@ def check_yaml() -> None:
     print("yaml: ok")
 
 
-PINNED = re.compile(r"^ARG (PYTHON|UV)_IMAGE=\S+@sha256:[0-9a-f]{64}$", re.M)
+PYTHON_PIN = re.compile(r"^ARG PYTHON_IMAGE=\S*?/?python:(\d+\.\d+)-[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$", re.M)
+UV_PIN = re.compile(r"^ARG UV_IMAGE=\S*?/?uv:\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$", re.M)
+
+
+def required_python_minor() -> str:
+    """The minor the project requires: the lower bound of requires-python in server/pyproject.toml."""
+    text = (ROOT / "server" / "pyproject.toml").read_text()
+    found = re.search(r'^requires-python\s*=\s*"[^"]*?>=\s*(\d+\.\d+)', text, re.M)
+    if not found:
+        raise SystemExit("server/pyproject.toml: requires-python has no '>=X.Y' lower bound")
+    return found.group(1)
 
 
 def check_images(containerfile: str, release: bool) -> None:
-    """Base images are pinned by digest. A dev build may carry a `# TODO pin digest`; --release
-    refuses anything unpinned."""
-    if release and len(PINNED.findall(containerfile)) != 2:
-        err("Containerfile: PYTHON_IMAGE and UV_IMAGE must both be pinned by @sha256 digest")
+    """Base images are pinned by tag AND digest. A dev build may carry a `# TODO pin digest`;
+    --release refuses anything else. The tag is what keeps a bot from moving the digest to another
+    Python minor (Renovate once re-pinned a bare digest to 3.15 while the project requires 3.12)."""
+    if not release:
+        return
+    py = PYTHON_PIN.findall(containerfile)
+    if len(py) != 1:
+        err("Containerfile: PYTHON_IMAGE must be python:<minor>-<variant>@sha256:<digest>")
+    elif py[0] != required_python_minor():
+        err(f"Containerfile: PYTHON_IMAGE tag is python:{py[0]} but server/pyproject.toml requires {required_python_minor()}")
+    if len(UV_PIN.findall(containerfile)) != 1:
+        err("Containerfile: UV_IMAGE must be uv:<X.Y.Z>@sha256:<digest> (a version tag, not a bare digest)")
 
 
 def check_compose_config() -> None:
@@ -392,6 +410,12 @@ def self_test() -> None:
     _fails("docs table out of step with compose", check_mounts, good, deploy_md.replace("| rw |", "| ro |"))
     _fails("api sharing ingest's TLS secrets", check_services, shared_cert)
     _fails("an unpinned base image under --release", check_images, "ARG PYTHON_IMAGE=python:3.12\nARG UV_IMAGE=uv:1", True)
+    cf = (ROOT / "deploy" / "Containerfile").read_text()
+    bare_py = re.sub(r"(ARG PYTHON_IMAGE=)\S+?@sha256", r"\1@sha256", cf)
+    _fails("PYTHON_IMAGE pinned by a bare digest (no tag)", check_images, bare_py, True)
+    _fails("PYTHON_IMAGE on the wrong python minor (3.15)", check_images, cf.replace("python:3.12-", "python:3.15-"), True)
+    _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, cf.replace("uv:0.11.6@", "uv@"), True)
+    _fails("UV_IMAGE with a non-version tag", check_images, cf.replace("uv:0.11.6@", "uv:latest@"), True)
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
