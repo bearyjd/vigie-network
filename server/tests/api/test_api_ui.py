@@ -165,7 +165,8 @@ def test_root_redirect_ignores_host_forwarding_and_query(ui_client):
 @pytest.mark.parametrize("method", ["post", "put", "delete", "patch"])
 def test_root_non_get_does_not_redirect(ui_client, method):
     response = getattr(ui_client, method)("/", follow_redirects=False)
-    assert response.status_code in {404, 405}
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
     assert "location" not in response.headers
     assert response.json()["ok"] is False
 
@@ -177,3 +178,25 @@ def test_unknown_paths_keep_json_404_and_root_is_not_in_openapi(ui_client):
     from vigie_api.openapi_export import render
 
     assert '"/":' not in render() and "\n  /:" not in render()
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+def test_ui_without_slash_redirects_relative_ignoring_host_spoofs(ui_client, method):
+    response = getattr(ui_client, method)(
+        "/ui",
+        headers={
+            "Host": "evil.example",
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "http",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 307
+    assert response.headers["location"] == "/ui/"
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_ui_without_slash_post_behaviour(ui_client):
+    response = ui_client.post("/ui", follow_redirects=False)
+    assert response.status_code == 405
+    assert "location" not in response.headers

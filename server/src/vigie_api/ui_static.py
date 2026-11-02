@@ -75,6 +75,11 @@ def mount_ui(app: FastAPI) -> None:
         # Constant relative target: never built from Host/X-Forwarded-*/query, so no open redirect.
         return RedirectResponse("/ui/", status_code=307)
 
+    @app.api_route("/ui", methods=["GET", "HEAD"], include_in_schema=False)
+    def ui_slash() -> RedirectResponse:
+        # Replaces Starlette's Mount slash redirect, which echoes the Host header and scheme.
+        return RedirectResponse("/ui/", status_code=307)
+
     app.mount(
         "/ui",
         UiFiles(directory=UI_DIR, html=False, check_dir=False, follow_symlink=False),
