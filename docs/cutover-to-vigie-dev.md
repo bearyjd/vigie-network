@@ -185,12 +185,14 @@ monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowi
      only once the pipeline runs with `--stop-timeout` >= 120 (`PIPELINE_STOP_TIMEOUT_S = 120`,
      branch `fix/stopsignal-sigint`, NOT yet merged). Until then use the SIGINT-in-idle-window
      procedure above only.
-4. Run the old sender ONCE and confirm it caught up:
+4. Run the old sender ONCE and confirm it caught up. First record the cursor offset (the `offset` in the
+   JSON file named by `cursor_file` in the sender config; needed for invalid-record recovery, section 11)
+   and set the journal window: `start=$(date '+%Y-%m-%d %H:%M:%S')`. Then
    `systemctl --user start vigie-ntfy-sender.service`, then read the exit code with
    `systemctl --user show vigie-ntfy-sender.service -p ExecMainStatus` (the unit has no
    `SuccessExitStatus`, so exit 5 shows the unit as failed). Decide per the exit-code table in
    section 11 (exit 0 also needs no `skipping invalid record` / `records skipped` line in the sender
-   journal for this run: `journalctl --user -u vigie-ntfy-sender.service --since "<start>"`), and the cursor offset must equal the delivery file size (`cursor.json` offset vs
+   journal for this run: `journalctl --user -u vigie-ntfy-sender.service --since "$start"`; timer-fired runs in the same window also appear until the timer is disabled), and the cursor offset must equal the delivery file size (`cursor.json` offset vs
    `podman unshare stat -c %s <delivery-file>`; a plain host `stat` is denied).
 5. Then `systemctl --user disable --now vigie-ntfy-sender.timer` and
    `systemctl --user stop <old-namespace>-api.service`.
@@ -367,19 +369,25 @@ The old host's data is untouched by the cutover, so it is exactly as at Step 3.
 
 1. Standby first, in this order:
    (a) Check the standby `incident_deliveries` table (read-only container, section 11) for
-   `sending`=0 and `pending`=0. Any `pending` (including backoff) or `sending` row is NOT shipped by
-   the rollback: it is lost with the standby, like all standby-only data. Wait for them to reach
-   `sent`, or accept and record the loss in writing before continuing.
+   `sending`=0 and `pending`=0 while the pipeline is still running. Any `pending` (including backoff) or
+   `sending` row is NOT shipped by the rollback: it is lost with the standby, like all standby-only
+   data. Wait until both are 0, or accept and record the loss in writing before continuing. This result
+   is provisional: a row can still be planned between (a) and (b), and delivery runs only inside the
+   pipeline (`processor.py:73`), so it is lost after the stop.
    (b) Stop the pipeline so nothing can append after the sender reaches EOF: use the idle-window SIGINT
    procedure of section 3 (watch for `run_complete`, then `podman kill --signal SIGINT` and
-   `systemctl --user stop`) and confirm the log shows `stopped`. A plain stop is a 10 s SIGKILL until
+   `systemctl --user stop`) and confirm the log shows `stopped`. Then REPEAT the (a) query: this second result is the one that
+   counts. If `pending` or `sending` is not 0, write the loss down. A plain stop is a 10 s SIGKILL until
    `fix/stopsignal-sigint` is merged (section 3, item on stopping) and can leave a `sending` row and a
    partial JSONL line. Removing the two `VIGIE_DELIVERY_*` env lines is optional once it is stopped.
    (c) Partial-line check before the final sender run: `podman unshare tail -c1 <delivery-file> | od -An -tx1`
-   must print `0a`; if not, stop and investigate.
+   must print `0a`; if not, stop and investigate. Skip it when the delivery file is absent (the publisher
+   creates it only on the first publish, section 11) and the repeated (a) query shows no deliveries to drain.
    (d) Run the standby sender once (`systemctl --user start vigie-ntfy-sender.service`) against the
-   now-stable file: cursor == file size, exit per the section 11 table. Check the journal for this run
-   only (`journalctl --user -u vigie-ntfy-sender.service --since "<start>"`).
+   now-stable file: cursor == file size, exit per the section 11 table. Set
+   `start=$(date '+%Y-%m-%d %H:%M:%S')` just before the start and check the journal for this run only
+   (`journalctl --user -u vigie-ntfy-sender.service --since "$start"`; timer-fired runs in the same window
+   also appear until the timer is disabled).
    (e) Then stop the sender timer (plain unit: `systemctl --user disable --now vigie-ntfy-sender.timer`),
    so no duplicate alerts; then `admin revoke <collector-id>` and remove the key `Secret=` line.
 2. Old host: restore the saved quadlet sources (the generated units cannot be `enable`d), then start
@@ -457,7 +465,7 @@ reports it corrupt.
 
    | Exit | Meaning | Decision |
    |---|---|---|
-   | 0 | caught up, OR another run holds the lock (nothing was sent), OR invalid records were skipped with a warning only (`ntfy_sender.py:697-699`, `:728`) | proceed only if cursor == file size AND the journal for this run (`journalctl --user -u vigie-ntfy-sender.service --since "<start>"`) has no `skipping invalid record` / `records skipped` line; if the sizes differ: (1) the lock was held, rerun; (2) the run stopped early, check the journal; or (3) the file ends in a partial last line (the sender reads only complete lines, `ntfy_sender.py:495-503`): run the `podman unshare tail -c1 <delivery-file> \| od -An -tx1` check (must print `0a`); if not, stop the pipeline per section 3 and investigate before rerunning |
+   | 0 | caught up, OR another run holds the lock (nothing was sent), OR invalid records were skipped with a warning only (`ntfy_sender.py:697-699`, `:728`) | proceed only if cursor == file size AND the journal for this run (set `start=$(date '+%Y-%m-%d %H:%M:%S')` just before the start, then `journalctl --user -u vigie-ntfy-sender.service --since "$start"`; timer-fired runs in the same window also appear until the timer is disabled) has no `skipping invalid record` / `records skipped` line; if the sizes differ: (1) the lock was held, rerun; (2) more than `max_batch` (default 50, `ntfy_sender.py:279`, `:689`) records were pending: nothing is logged, rerun until cursor == size (budget exhaustion is exit 4, not 0); (3) the delivery file does not exist yet (`ntfy_sender.py:770-772`, journal `delivery file does not exist yet`): the size comparison itself fails, and an absent file means nothing to drain, which is valid; or (4) the file ends in a partial last line (the sender splits on newline only and reads only complete lines, `split_lines`, `ntfy_sender.py:487-490`): run the `podman unshare tail -c1 <delivery-file> \| od -An -tx1` check (must print `0a`). On a live file a missing `0a` can be an append in progress: re-check once after about 30 s before stopping; if still not `0a`, stop the pipeline per section 3 and investigate before rerunning |
    | 1 | unexpected internal error | stop; read the sender journal |
    | 2 | configuration, cursor or secret-file error | stop; fix config, topic file or cursor |
    | 3 | permanent publish failure, cursor NOT advanced past the record | stop; investigate the record and the server response |
@@ -466,8 +474,14 @@ reports it corrupt.
    | any other value, or a signal (`podman unshare` failure, `TimeoutStartSec=300` kill) | stop; read the journal |
 
    Invalid-record recovery (exit 0 with `skipping invalid record before offset N`, `ntfy_sender.py:698`): the
-   record was skipped, not sent. Take N from this run's journal, read the record ending at offset N from the
-   delivery file (`podman unshare`), and re-send it manually, as for exit 5. Do not proceed until done.
+   record was skipped, not sent. Before each run, record the pre-run `offset` from the JSON file named by
+   `cursor_file` in the sender config. Only the first `MAX_SKIP_LOGS` = 20 skips are logged
+   (`ntfy_sender.py:53`, `:697`); later ones are only counted in a `records skipped` line (`:719-722`). If
+   that line is present, re-parse the delivery file (`podman unshare`) from the pre-run offset to the current
+   cursor offset line by line to list every invalid record; otherwise take N from this run's journal and read
+   the record ending at offset N. Re-send each manually, as for exit 5. If a record cannot be parsed, re-send
+   the notification it stood for, reconstructed from the incident in the standby database, and write down
+   that it was rebuilt. Do not proceed until done.
 
    Independently require zero `incident_deliveries` rows in state `sending`. The standby services
    are live (Keeper-held db), so use a plain `mode=ro` open, NOT `immutable=1` (which ignores the
@@ -487,8 +501,8 @@ reports it corrupt.
    still logs `run_complete`. Record, per row, `row_id, state, attempts, next_attempt_at` from
    `incident_deliveries` (`schema.py:266-283`; same read-only container). Backoff is 60 s doubling per
    failure, capped at 3600 s, `max_attempts` 6 (`config.py:99-101`, `delivery_plan.py:104-107`), so a
-   failing row retries after 60 s, 120 s, 240 s. Wait 10 pipeline cycles (5 minutes, 30 s each) and
-   query again, and grep the pipeline journal for the failure events:
+   failing row retries after 60 s, 120 s, 240 s. Wait about 5 minutes (a cycle is the 30 s sleep plus the pass time, so
+   fewer than 10 passes may run) and query again, and grep the pipeline journal for the failure events:
    `delivery_publish_failed` (warning, `delivery_runner.py:247`), `delivery_publish_timeout`
    (error, `:244`), `delivery_transport_wedged` (error, `:205`), `delivery_incident_missing`
    (warning, `:271`) and `delivery_completion_lost` (warning, `:277`). An `aborted` attempt (the
@@ -502,7 +516,10 @@ reports it corrupt.
    (`processor.py:65-76`). `_due` takes the oldest 20 rows, ordered `next_attempt_at,row_id`
    (`delivery_runner.py:289-291`, `max_per_run` 20). So the bound is a pass count, not seconds: the row
    must be `sent` within N `run_complete` log lines after its `next_attempt_at`, with
-   N = ceil(due rows / 20) + 1. Cross-check only, conservative wall-clock ceiling:
+   N = ceil(due rows / 20) + 1, where "due rows" are those ordered before this one by `next_attempt_at,row_id`
+   (including itself). N is a lower bound for a healthy publisher: `_drain` also stops on `drain_budget_s`
+   (`delivery_runner.py:302`) and when `_reserve` returns None (`max_abandoned`, `:305-306`), so with a slow
+   ntfy only about 2 rows per pass may be sent; extend N accordingly. Cross-check only, conservative wall-clock ceiling:
    30 s + 2 x (90 s + measured non-delivery pass time), where 90 s = 60 s `drain_budget_s` + 30 s
    `transmit_deadline_s` (`config.py:98,106`): the budget is checked only before each claim
    (`delivery_runner.py:302`), so one drain can overrun it.
@@ -512,13 +529,13 @@ reports it corrupt.
    | `state=sent` | pass |
    | still `pending`, `attempts` increased, NO failure event logged | wait: pass only if `sent` within N `run_complete` lines after `next_attempt_at` (`_due()` selects it only once that time is reached); otherwise FAIL as in the last row |
    | still `pending`, `attempts` unchanged, `next_attempt_at` in the future | not yet due: wait until `max(next_attempt_at)`, and require at least one restored or new row to reach `sent` before passing; no row reaching `sent` is not a pass |
-   | still `pending`, `attempts` unchanged, row is due | FAIL: nothing was claimed, so delivery is not running. Check that both `VIGIE_DELIVERY_*` lines are in the pipeline quadlet and that `daemon-reload` plus a pipeline restart followed |
+   | still `pending`, `attempts` unchanged, row is due | FAIL: nothing was claimed, so delivery is not running. Besides the missing env lines, check for an unreadable overrides store (`if usable:`, `processor.py:70-74`, delivery is skipped) and the pipeline event `delivery_decisions_unavailable` (`delivery_runner.py:338-340`). Check that both `VIGIE_DELIVERY_*` lines are in the pipeline quadlet and that `daemon-reload` plus a pipeline restart followed |
    | still `pending` (or `failed`), `attempts` increased, and a failure event logged, or no `sent` within the pass-count bound | FAIL: do not enable the timer. Likely cause: ownership or mode of the volume or delivery file after the restore (must be `10001:10001`, directory 0700, file 0600); check the positive control and `podman unshare ls -ln` on the volume |
 
 3. Sender (plain unit): `systemctl --user enable --now vigie-ntfy-sender.timer`. The timer unit, config and the 0600
    topic file are already installed; the config's `delivery_file` is the host path of the file in step 2.
 4. Verify one `systemctl --user start vigie-ntfy-sender.service` pass exits 0 with cursor == file size
-   and no `skipping invalid record` / `records skipped` line in this run's journal (`--since "<start>"` as above; exit 5 means a dropped notification: see the section 11 exit-code table).
+   and no `skipping invalid record` / `records skipped` line in this run's journal (`start=$(date '+%Y-%m-%d %H:%M:%S')` before the start, `--since "$start"`; exit 5 means a dropped notification: see the section 11 exit-code table).
 
 To turn it off again: disable the timer first, then remove the two env lines and restart the pipeline.
 
