@@ -203,8 +203,8 @@ class StopGraceTests(unittest.TestCase):
         files = render.render(config())
         pipeline = files["vigie_test-pipeline.container"]
         stop = render.PIPELINE_STOP_TIMEOUT_S
-        # delivery drain budget (60) + one last transmit deadline (30), see the render.py derivation
-        self.assertGreaterEqual(stop, 60 + 30)
+        # claim (5) + one last transmit deadline (30) + complete (5), see the render.py derivation
+        self.assertGreaterEqual(stop, 5 + 30 + 5)
         self.assertIn(f"--stop-timeout={stop}", pipeline)
         self.assertIn(f"TimeoutStopSec={render.PIPELINE_TIMEOUT_STOP_SEC}", pipeline)
         self.assertGreater(render.PIPELINE_TIMEOUT_STOP_SEC, stop)

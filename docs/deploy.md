@@ -252,13 +252,27 @@ current pass finish, logs `stopped` and exits 0. A second signal forces exit. Py
 and the kernel drops a default-disposition SIGTERM for PID 1; an installed handler is delivered, so
 a plain `podman stop` is graceful with no custom stop signal.
 
-Stop grace must exceed the pipeline drain bound. After the signal the delivery stage claims nothing
-new once its drain budget (60 s) is spent, and the last claim can transmit for the transmit
-deadline (30 s): 90 s worst case, so the pipeline gets a 120 s grace (compose `stop_grace_period`,
-quadlet `--stop-timeout=120` in `PodmanArgs=`, `TimeoutStopSec=150`). Raising
-`VIGIE_DELIVERY_DRAIN_BUDGET_S` or `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` means raising the grace
-too (`check_refs.py` checks the defaults). Ingest and api keep the defaults (uvicorn stops in
-under a second). Images built before this change still ignore SIGTERM (wait, then SIGKILL, exit
+Stop grace must exceed the pipeline stop bound. The stop request reaches the delivery stage: after
+the signal it claims nothing new, so only the in-flight claim finishes. That claim can cost about
+40 s (claim and complete each wait up to the 5 s SQLite busy timeout, plus the 30 s transmit
+deadline). The stages before delivery (batch backlog, stitch, sweep, purge, monitoring) are NOT
+bounded by the signal and run to completion; the 120 s grace (compose `stop_grace_period`, quadlet
+`--stop-timeout=120` in `PodmanArgs=`, `TimeoutStopSec=150`) leaves about 80 s of margin for them,
+which is a margin, not a guarantee (a large backlog can exceed it and the container is then
+SIGKILLed). Raising `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` means raising the grace too
+(`check_refs.py` checks the defaults). Ingest and api keep the defaults (uvicorn stops in under a
+second).
+
+podman-compose reads `stop_grace_period` only for `down`, `stop` and `restart` (it passes it as
+`-t`); it never emits `podman run --stop-timeout`. A plain `podman stop` on a compose-created
+container, or the host-shutdown `podman-restart.service` path, therefore still gets Podman's 10 s
+default. `stop_signal` is passed through but cannot extend the time, and there is no per-service
+passthrough for the stop timeout, so on compose use `podman-compose down`/`stop` for a graceful
+stop. The quadlet install is not affected (`--stop-timeout` is set on the container).
+
+Limits: a forced second signal exits immediately and can leave a delivery row in `sending` until
+its 300 s lease expires (it is then retried). `--once` installs no signal handler (SIGTERM kills it
+at once), and neither does the early startup before the handlers are installed. Images built before this change still ignore SIGTERM (wait, then SIGKILL, exit
 137): for those, the cutover runbook sends a timed SIGINT during the idle wait.
 
 ## Reboots

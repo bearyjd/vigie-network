@@ -295,10 +295,13 @@ def _due(
 
 
 def _drain(inv, ro, publisher, rows, config, clock, limits, labels) -> Counter:
-    monotonic, max_abandoned, budget = limits
+    monotonic, max_abandoned, budget, should_stop = limits
     counts: Counter[str] = Counter()
     started = monotonic()
     for row in rows:
+        if should_stop():  # a stop request: only the in-flight claim (already finished) completes
+            log(logger, logging.INFO, "delivery_drain_stopped")
+            break
         if monotonic() - started >= budget:  # before EVERY claim attempt, skipped ones included
             log(logger, logging.WARNING, "delivery_drain_budget_spent", budget=budget)
             break  # nothing more is claimed: the pipeline pass must stay short
@@ -329,6 +332,7 @@ def run_delivery(
     drain_budget_seconds: float = DEFAULT_DRAIN_BUDGET,
     monotonic: Callable[[], float] = time.monotonic,
     include_label: bool = False,
+    should_stop: Callable[[], bool] = lambda: False,
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget."""
@@ -347,7 +351,7 @@ def run_delivery(
         rows,
         config,
         clock,
-        (monotonic, max_abandoned, drain_budget_seconds),
+        (monotonic, max_abandoned, drain_budget_seconds, should_stop),
         include_label,
     )
     return RunReport(

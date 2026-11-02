@@ -16,10 +16,12 @@ import time
 import pytest
 
 SCRIPT = """
-import sys, time
+import signal, sys, time
 from vigie_pipeline import cli
-def fake_run(config):
-    print("pass", flush=True)
+def fake_run(config, should_stop=lambda: False):
+    fd = signal.set_wakeup_fd(-1)  # read the installed wakeup fd, then put it back
+    signal.set_wakeup_fd(fd)
+    print("pass", fd, flush=True)
     time.sleep(float(sys.argv[2]))
 cli.run_once = fake_run
 sys.exit(cli.main(["run", "--loop", "3600", "--data-dir", sys.argv[1]]))
@@ -36,10 +38,25 @@ def start(tmp_path, pass_seconds: float = 0.0) -> subprocess.Popen:
     )
 
 
-def wait_for_pass(proc) -> None:
-    assert proc.stdout.readline().strip() == "pass"
+def wait_for_pass(proc) -> int:
+    """Waits for the first pass; returns the signal wakeup fd the process had installed."""
+    tag, fd = proc.stdout.readline().split()
+    assert tag == "pass"
+    return int(fd)
 
 
+def test_wakeup_fd_is_installed_so_a_signal_before_select_is_not_lost(tmp_path):
+    """Fails on code without signal.set_wakeup_fd (fd == -1): the Python-level handler runs after
+    the eval-loop check, so a signal landing just before select() waited out the loop interval."""
+    proc = start(tmp_path)
+    assert wait_for_pass(proc) != -1
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=5)
+    assert proc.returncode == 0
+
+
+# Tests that fail on the pre-fix code: the wakeup-fd test above and the mid-drain stop test in
+# test_delivery_runner.py. The idle-wait cases below pass on the old code too (regression guards).
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
 def test_signal_in_idle_wait_stops_cleanly_many_times(tmp_path, sig):
     rng = random.Random(7)  # noqa: S311 - timing jitter, not crypto

@@ -192,16 +192,20 @@ def _seconds(value: object) -> int:
     return int(match.group(1)) * (60 if match.group(2) == "m" else 1)
 
 
+SQLITE_BUSY_TIMEOUT_S = 5  # server/src/vigie_ingest/db.py BUSY_TIMEOUT_MS = 5000
+
+
 def check_stop_grace(doc: dict, render_text: str, config_text: str) -> None:
     """The pipeline drains its current pass on SIGTERM, so compose's stop_grace_period must exceed
-    the drain bound (drain budget + one transmit deadline) and match what the quadlet renderer uses."""
-    budget = re.search(r"drain_budget_s:\s*int\s*=\s*(\d+)", config_text)
+    the delivery stop bound (the in-flight claim: claim + transmit deadline + complete, each
+    SQLite step up to the busy timeout) and match what the quadlet renderer uses. Stages before
+    delivery are not bounded by the signal; the margin above this bound is for them."""
     deadline = re.search(r"transmit_deadline_s:\s*int\s*=\s*(\d+)", config_text)
     rendered = re.search(r"^PIPELINE_STOP_TIMEOUT_S\s*=\s*(\d+)", render_text, re.M)
-    if not (budget and deadline and rendered):
-        err("stop grace: could not read the drain budget, transmit deadline or render constant")
+    if not (deadline and rendered):
+        err("stop grace: could not read the transmit deadline or render constant")
         return
-    bound = int(budget.group(1)) + int(deadline.group(1))
+    bound = int(deadline.group(1)) + 2 * SQLITE_BUSY_TIMEOUT_S
     grace = _seconds(doc["services"]["pipeline"].get("stop_grace_period", "10s"))
     if grace <= bound:
         err(f"pipeline stop_grace_period {grace}s must exceed the drain bound {bound}s")
@@ -449,13 +453,13 @@ def self_test() -> None:
     _fails("PYTHON_IMAGE on the wrong python minor", check_images, py_ok.replace(f"python:{minor}-", f"python:{wrong_minor}-") + uv_ok, True)
     _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv@"), True)
     _fails("UV_IMAGE with a non-version tag", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv:latest@"), True)
-    cfg_ok = "drain_budget_s: int = 60\ntransmit_deadline_s: int = 30\n"
+    cfg_ok = "drain_budget_s: int = 60\ntransmit_deadline_s: int = 30\n"  # 30 + 2 * 5 = 40
     stop_doc = {"services": {"pipeline": {"stop_grace_period": "120s"}}}
     check_stop_grace(stop_doc, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok)
     _fails("compose without stop_grace_period", check_stop_grace, {"services": {"pipeline": {}}}, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok)
-    _fails("stop_grace_period at the bound", check_stop_grace, {"services": {"pipeline": {"stop_grace_period": "90s"}}}, "PIPELINE_STOP_TIMEOUT_S = 90\n", cfg_ok)
+    _fails("stop_grace_period at the bound", check_stop_grace, {"services": {"pipeline": {"stop_grace_period": "40s"}}}, "PIPELINE_STOP_TIMEOUT_S = 40\n", cfg_ok)
     _fails("render timeout above compose grace", check_stop_grace, stop_doc, "PIPELINE_STOP_TIMEOUT_S = 130\n", cfg_ok)
-    _fails("drain budget raised past the grace", check_stop_grace, stop_doc, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok.replace("= 60", "= 100"))
+    _fails("transmit deadline raised past the grace", check_stop_grace, stop_doc, "PIPELINE_STOP_TIMEOUT_S = 120\n", cfg_ok.replace("= 30", "= 115"))
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"

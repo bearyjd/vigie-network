@@ -72,14 +72,23 @@ class _StopFlag:
 
     threading.Event.set() takes the Event's non-reentrant lock, so a handler that interrupts the
     main thread inside Event.wait() deadlocks. os.write() on a non-blocking pipe is
-    async-signal-safe, and select() on the read end is the idle wait, so a signal can never be
-    lost between the flag check and the wait (the byte stays in the pipe)."""
+    async-signal-safe, and select() on the read end is the idle wait. The Python-level handler
+    runs only at the next eval-loop check, so a signal landing between that check and select()
+    would otherwise wait out the loop interval: signal.set_wakeup_fd(write end) makes the C-level
+    handler write the byte immediately, which closes that window (main thread only)."""
 
     def __init__(self) -> None:
         self._r, self._w = os.pipe()
         for fd in (self._r, self._w):
             os.set_blocking(fd, False)
         self.requested = False
+        self._previous_wakeup = -1
+
+    def install_wakeup(self) -> None:
+        self._previous_wakeup = signal.set_wakeup_fd(self._w)
+
+    def restore_wakeup(self) -> None:
+        signal.set_wakeup_fd(self._previous_wakeup)
 
     def is_set(self) -> bool:
         return self.requested
@@ -135,13 +144,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     held = Keeper()
     stop = _StopFlag()
     previous = _install_stop_handlers(stop)
+    stop.install_wakeup()
     try:
         while not stop.is_set():
             # Keep inventory.db attached for the api's read-only mount; retried every tick until
             # ingest has created the file (never created from here).
             held.hold(config.inventory_path)
             try:
-                run_once(config)
+                run_once(config, should_stop=stop.is_set)
                 _touch_health_file()
             except (sqlite3.Error, ShardReadError) as exc:  # log, retry next tick
                 log(logger, logging.ERROR, "run_failed", error=str(exc))
@@ -149,6 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log(logger, logging.INFO, "stopped")
         return 0
     finally:
+        stop.restore_wakeup()
         for sig, old in previous.items():
             signal.signal(sig, old)
         stop.close()

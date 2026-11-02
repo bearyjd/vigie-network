@@ -131,10 +131,14 @@ def test_wiring_passes_the_abandoned_bound_to_the_runner(world, tmp_path, monkey
         tmp_path,
         settings(tmp_path, max_abandoned=5, max_per_run=3, drain_budget_s=45, include_label=True),
     )
-    run_delivery_stage(world.inv, world.ro, c, Clock())
+    def stop():
+        return True
+
+    run_delivery_stage(world.inv, world.ro, c, Clock(), should_stop=stop)
     assert seen == {
         "max_per_run": 3,
         "max_abandoned": 5,
         "drain_budget_seconds": 45,
         "include_label": True,
+        "should_stop": stop,
     }
