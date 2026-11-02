@@ -97,9 +97,14 @@ class RendererTests(unittest.TestCase):
         default = render.render(config())["vigie_test-pipeline.container"]
         self.assertIn("Environment=VIGIE_MONITORING_BASELINE=pooled", default)
         custom = render.render(config(**{key: "tod"}))
-        self.assertIn("Environment=VIGIE_MONITORING_BASELINE=tod", custom["vigie_test-pipeline.container"])
+        self.assertIn(
+            "Environment=VIGIE_MONITORING_BASELINE=tod",
+            custom["vigie_test-pipeline.container"],
+        )
         for role in ("ingest", "api"):
-            self.assertNotIn("VIGIE_MONITORING_BASELINE", custom[f"vigie_test-{role}.container"])
+            self.assertNotIn(
+                "VIGIE_MONITORING_BASELINE", custom[f"vigie_test-{role}.container"]
+            )
         for invalid in ("", "TOD", " tod", "pooled-median-v1", None, True, ["tod"]):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 render.render(config(**{key: invalid}))
@@ -134,6 +139,78 @@ class RendererTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 render.write_bundle(config(), alias)
             self.assertTrue((output / "plan.json").is_file())
+
+
+# Keys accepted by the Podman 4.9 quadlet generator in each section. Derived from
+# podman-systemd.unit(5) for 4.9 (from memory of the 4.9 docs; confirmed empirically
+# only for the keys this renderer emits, on 4.9.3). Memory= is NOT here: it needs a newer Podman.
+ALLOWED_QUADLET_KEYS_4_9 = {
+    "Unit": {
+        "Description",
+        "After",
+        "Wants",
+        "StartLimitIntervalSec",
+        "StartLimitBurst",
+    },
+    "Container": {
+        "Image",
+        "Pull",
+        "ContainerName",
+        "User",
+        "Group",
+        "ReadOnly",
+        "DropCapability",
+        "NoNewPrivileges",
+        "PidsLimit",
+        "PodmanArgs",
+        "Tmpfs",
+        "LogDriver",
+        "Volume",
+        "Environment",
+        "Network",
+        "Exec",
+        "Secret",
+        "PublishPort",
+        "HealthCmd",
+        "HealthStartPeriod",
+        "HealthInterval",
+        "HealthTimeout",
+        "HealthRetries",
+        "HealthOnFailure",
+    },
+    "Service": {"Restart", "RestartSec", "TimeoutStartSec", "TimeoutStopSec"},
+    "Install": {"WantedBy"},
+    "Volume": {"VolumeName"},
+}
+
+
+def emitted_keys(files):
+    found = {}
+    for name, text in files.items():
+        section = None
+        for line in text.splitlines():
+            if line.startswith("["):
+                section = line.strip("[]")
+            elif line:
+                found.setdefault(section, set()).add(line.split("=", 1)[0])
+    return found
+
+
+class QuadletCompatTests(unittest.TestCase):
+    def test_no_memory_key_and_memory_limit_via_podmanargs(self):
+        for name, text in render.render(config()).items():
+            if not name.endswith(".container"):
+                continue
+            lines = text.splitlines()
+            self.assertFalse([x for x in lines if x.startswith("Memory=")], name)
+            args = [x for x in lines if x.startswith("PodmanArgs=")]
+            self.assertEqual(args, ["PodmanArgs=--memory=512m --cpus=1"], name)
+
+    def test_emitted_keys_subset_of_podman_4_9_allowlist(self):
+        for updates in ({}, {"monitoring_baseline": "tod"}):
+            found = emitted_keys(render.render(config(**updates)))
+            for section, keys in found.items():
+                self.assertLessEqual(keys, ALLOWED_QUADLET_KEYS_4_9[section], section)
 
 
 if __name__ == "__main__":

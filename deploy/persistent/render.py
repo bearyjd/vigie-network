@@ -33,7 +33,8 @@ def render(config: dict) -> dict[str, str]:
     if (
         not isinstance(config, dict)
         or not _FIELDS <= set(config)
-        or set(config) - (_FIELDS | {"monitoring_large_upload_bytes", "monitoring_baseline"})
+        or set(config)
+        - (_FIELDS | {"monitoring_large_upload_bytes", "monitoring_baseline"})
     ):
         raise ValueError("configuration must contain only the documented fields")
     threshold = config.get("monitoring_large_upload_bytes", 1073741824)
@@ -104,8 +105,8 @@ def render(config: dict) -> dict[str, str]:
             "DropCapability=all",
             "NoNewPrivileges=true",
             "PidsLimit=256",
-            "Memory=512m",
-            "PodmanArgs=--cpus=1",
+            # Memory= needs a newer Podman than 4.9; PodmanArgs works on both.
+            "PodmanArgs=--memory=512m --cpus=1",
             "Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
             "LogDriver=journald",
         ]
