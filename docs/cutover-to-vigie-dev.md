@@ -509,17 +509,21 @@ reports it corrupt.
    `<pre-run-offset>` and count all of those runs together.
    - Candidates: `sent` rows with `updated_at` at or after `since`, an epoch in seconds (`date -d '<time>' +%s`).
      Old host: the start of the last clean run, minus a margin of a few minutes (rows inside the margin were
-     read clean, so they drop out below). Standby: the first start of the standby pipeline after the
-     restore, no margin; rows restored from the old host are older than that, so they are never candidates.
+     read clean, so they drop out below). Standby: the time of the step 1 restart (ENV lines added; the publisher is only
+     enabled there), or any earlier time after the restore, no margin; an earlier value only widens the
+     window harmlessly. Do not use the latest `ActiveEnterTimestamp`: a later restart moves it past rows
+     already sent.
    - Build the `ok` set by re-parsing that host's whole file from offset 0 (not the pre-run offset).
    - Candidates whose `delivery_id` is not in the `ok` set are the dropped ones; skip any you already
      rebuilt and wrote down.
    - Cross-check: count the `bad` lines from the re-parse above (from the pre-run offset to the current
-     cursor, or from 0 when the file was replaced). The journal skip total (N in `N records skipped`, or the
-     skip lines, minus the `record skipped permanently` lines, which are server rejections) must be at least
-     that count, and the dropped candidates must not outnumber it. Otherwise STOP and investigate; do not
-     re-send. The live publisher can append a bad line after the sender reached the end of the file, so
-     repeat this check after the next sender run.
+     cursor, or from 0 when the file was replaced). The journal skip total (N in `N records skipped`, minus the
+     `record skipped permanently` lines, which are server rejections (N only); or the count of
+     `skipping invalid record` lines, which never include rejections). Across several runs, sum per run: that run's N if it
+     logged a `records skipped` line, otherwise its count of skip lines. The total must be at least
+     that count, and the dropped candidates must not outnumber it. If the only extra candidates have their
+     line past the cursor or unterminated, rerun the sender and repeat the check; otherwise STOP and
+     investigate; do not re-send.
 
    ```sh
    python3 -I -c 'import sqlite3, sys
