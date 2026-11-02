@@ -429,10 +429,32 @@ reports it corrupt.
    | present | `offset` < size or run exited 4 | behind: stop; fix the sender (topic, network) before enabling the timer |
 
    Independently require zero `incident_deliveries` rows in state `sending` (read-only one-shot
-   container; `immutable=1` only if the services are stopped). `pending` rows are acceptable only
-   while the pipeline runs with delivery on (step 1). Absent-file acceptance is chosen over
+   container; `immutable=1` only if the services are stopped). Absent-file acceptance is chosen over
    pre-creating an empty file, which needs `podman unshare` ownership surgery on a file the
    publisher owns.
+
+   Positive control, once after step 1 (the pipeline must be able to create the file):
+   `podman exec vigie_standby_pipeline sh -c 'test -w /inv && echo writable'` must print `writable`
+   (verified on the standby; the volume is `drwx------ 10001:10001`). A wrong owner or mode after the
+   restore breaks the publisher while passes still complete.
+
+   Bounded progress check for `pending` rows. A pending row only proves intent: if the publisher
+   cannot create or append the file, the row goes back to `pending` with a backoff while every pass
+   still logs `run_complete`. Record, per row, `row_id, state, attempts, next_attempt_at` from
+   `incident_deliveries` (`schema.py:266-283`; same read-only container). Backoff is 60 s doubling per
+   failure, capped at 3600 s, `max_attempts` 6 (`config.py:99-101`, `delivery_plan.py:104-107`), so a
+   failing row retries after 60 s, 120 s, 240 s. Wait 10 pipeline cycles (5 minutes, 30 s each) and
+   query again, and grep the pipeline journal for the failure events:
+   `delivery_publish_failed` (warning, `delivery_runner.py:247`), `delivery_publish_timeout`
+   (error, `:244`) and `delivery_transport_wedged` (error, `:205`).
+
+   | After 5 minutes, per eligible pending row | Decision |
+   |---|---|
+   | `state=sent` | pass |
+   | still `pending`, `attempts` increased or the row is not yet due (`next_attempt_at` in the future), and NO failure event logged | pass (retrying normally) |
+   | still `pending` (or `failed`), `attempts` increased, and a failure event logged | FAIL: do not enable the timer. Likely cause: ownership or mode of the volume or delivery file after the restore (must be `10001:10001`, directory 0700, file 0600); check the positive control and `podman unshare ls -ln` on the volume |
+   | `attempts` unchanged and the row is due | FAIL: delivery is not running (env lines missing, pipeline not restarted) |
+
 3. Sender (plain unit): `systemctl --user enable --now vigie-ntfy-sender.timer`. The timer unit, config and the 0600
    topic file are already installed; the config's `delivery_file` is the host path of the file in step 2.
 4. Verify one `systemctl --user start vigie-ntfy-sender.service` pass exits 0 or 5 (caught up).
