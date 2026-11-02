@@ -277,5 +277,8 @@ The base image and the uv image are pinned by `@sha256` digest in `deploy/Contai
 build backend (hatchling and its dependencies) by `deploy/build-constraints.txt`. The digests were
 looked up through the registries' HTTP APIs, not by pulling or building, and the first real build
 may show they need a refresh. `python3 -I deploy/tests/check_refs.py --release` fails when either
-image is unpinned. The runtime stage has pip, setuptools and wheel removed. Not covered: pinning
+image is not `tag@sha256` pinned, when the Python tag's minor differs from the `requires-python`
+lower bound in `server/pyproject.toml`, or when the uv tag is not a version. The CI `gate` job also
+builds `deploy/Containerfile` (no push) through `scripts/image_smoke.sh` and asserts Python 3.12.x,
+that `vigie_api`, `vigie_ingest` and `vigie_pipeline` import, and that the user is uid 10001. The runtime stage has pip, setuptools and wheel removed. Not covered: pinning
 build dependencies by hash, scanning the image, signing it.

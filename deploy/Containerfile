@@ -1,6 +1,6 @@
 # Vigie server image: ONE image, three services (ingest, pipeline, api) selected by command.
 # Build context is the repository root (see compose.yaml). Rootless build/runtime validated
-# on 2026-10-24; see docs/deployment-validation-2026-10-24.md. Image builds are not yet a CI gate.
+# on 2026-10-24; see docs/deployment-validation-2026-10-24.md. CI builds it via scripts/image_smoke.sh.
 #
 #   podman build -f deploy/Containerfile -t localhost/vigie-server:dev .
 #
