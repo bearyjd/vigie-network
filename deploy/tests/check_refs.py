@@ -410,12 +410,18 @@ def self_test() -> None:
     _fails("docs table out of step with compose", check_mounts, good, deploy_md.replace("| rw |", "| ro |"))
     _fails("api sharing ingest's TLS secrets", check_services, shared_cert)
     _fails("an unpinned base image under --release", check_images, "ARG PYTHON_IMAGE=python:3.12\nARG UV_IMAGE=uv:1", True)
-    cf = (ROOT / "deploy" / "Containerfile").read_text()
-    bare_py = re.sub(r"(ARG PYTHON_IMAGE=)\S+?@sha256", r"\1@sha256", cf)
-    _fails("PYTHON_IMAGE pinned by a bare digest (no tag)", check_images, bare_py, True)
-    _fails("PYTHON_IMAGE on the wrong python minor (3.15)", check_images, cf.replace("python:3.12-", "python:3.15-"), True)
-    _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, cf.replace("uv:0.11.6@", "uv@"), True)
-    _fails("UV_IMAGE with a non-version tag", check_images, cf.replace("uv:0.11.6@", "uv:latest@"), True)
+    # Fully synthetic fixtures: nothing here is derived from the real Containerfile, so a Renovate
+    # bump of a tag or digest cannot break the self-tests.
+    minor = required_python_minor()
+    wrong_minor = f"{int(minor.split('.')[0])}.{int(minor.split('.')[1]) + 3}"
+    py_ok = f"ARG PYTHON_IMAGE=docker.io/library/python:{minor}-slim-bookworm@sha256:{'a' * 64}\n"
+    uv_ok = f"ARG UV_IMAGE=ghcr.io/astral-sh/uv:9.9.9@sha256:{'b' * 64}\n"
+    check_images(py_ok + uv_ok, True)
+    _fails("PYTHON_IMAGE pinned by a bare digest (no tag)", check_images,
+           f"ARG PYTHON_IMAGE=docker.io/library/python@sha256:{'a' * 64}\n" + uv_ok, True)
+    _fails("PYTHON_IMAGE on the wrong python minor", check_images, py_ok.replace(f"python:{minor}-", f"python:{wrong_minor}-") + uv_ok, True)
+    _fails("UV_IMAGE pinned by a bare digest (no version tag)", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv@"), True)
+    _fails("UV_IMAGE with a non-version tag", check_images, py_ok + uv_ok.replace("uv:9.9.9@", "uv:latest@"), True)
     setting = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES"
     contract = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
