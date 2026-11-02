@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -35,7 +35,7 @@ class UiHeaders:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get("path", "")
-        if scope["type"] != "http" or not (path == "/ui" or path.startswith("/ui/")):
+        if scope["type"] != "http" or not (path in {"/", "/ui"} or path.startswith("/ui/")):
             await self.app(scope, receive, send)
             return
 
@@ -69,6 +69,12 @@ class UiFiles(StaticFiles):
 
 def mount_ui(app: FastAPI) -> None:
     app.add_middleware(UiHeaders)
+
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    def root() -> RedirectResponse:
+        # Constant relative target: never built from Host/X-Forwarded-*/query, so no open redirect.
+        return RedirectResponse("/ui/", status_code=307)
+
     app.mount(
         "/ui",
         UiFiles(directory=UI_DIR, html=False, check_dir=False, follow_symlink=False),

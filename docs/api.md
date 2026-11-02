@@ -8,6 +8,9 @@ All endpoints use the existing response envelope and bearer authentication. The 
 [`api/openapi.yaml`](../api/openapi.yaml) describes request bodies and error responses.
 No generated TypeScript client exists in `api/`.
 
+The read-only GUI is served unauthenticated at `/ui/`; `GET`/`HEAD /` answers `307` with the
+relative `Location: /ui/` (no query or proxy headers are consulted).
+
 | Method | Endpoint | Human action |
 |---|---|---|
 | POST | `/suggestions/{suggestion_id}/accept` | Apply a label/group decision or confirm a merge; `remember: true` also approves a rule |
