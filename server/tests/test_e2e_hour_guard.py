@@ -2,17 +2,18 @@
 PROMOTE_MIN_HOURS), so a run that straddles a UTC hour boundary flips the rolling-MAC assertion.
 hour_guard.sh must report how long to wait so the collect stage stays inside one hour."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
+BASH = shutil.which("bash") or "/bin/bash"
 GUARD = Path(__file__).resolve().parents[2] / "tests" / "e2e" / "hour_guard.sh"
 
 
 def wait_s(epoch: int, budget: int = 240) -> int:
-    out = subprocess.run(
-        ["bash", "-c", 'source "$1"; hour_guard_wait_s "$2" "$3"', "_", str(GUARD), str(epoch), str(budget)],
-        capture_output=True, text=True, check=True,
-    )  # fmt: skip
+    script = 'source "$1"; hour_guard_wait_s "$2" "$3"'
+    argv = [BASH, "-c", script, "_", str(GUARD), str(epoch), str(budget)]
+    out = subprocess.run(argv, capture_output=True, text=True, check=True)  # noqa: S603
     return int(out.stdout)
 
 
