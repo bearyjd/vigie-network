@@ -21,6 +21,8 @@ RUN="$BASE/run-$$"
 mkdir -p "$RUN"
 chmod 700 "$RUN"
 PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+# shellcheck source=tests/e2e/hour_guard.sh
+. "$HERE/hour_guard.sh"
 PIDS=()
 RESULTS=()
 FAILED=0
@@ -201,6 +203,7 @@ stage provision s_provision || exit 1
 stage ingest_up s_ingest_up || exit 1
 write_agent_inputs
 stage collector_check s_collector_check || exit 1
+sleep "$(hour_guard_wait_s "$(date -u +%s)" 240)" # keep ingest receipts inside one UTC hour
 stage collect s_collect
 stage ingest_assert s_ingest_assert
 stage ingest_down s_ingest_down
