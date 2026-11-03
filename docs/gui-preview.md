@@ -114,6 +114,21 @@ absence of incidents is not proof of health. The GUI is intentionally read-only:
 acknowledge, snooze or expected controls and issues only GET requests; decisions are made through
 the authenticated API.
 
+## Coverage gauge
+
+The Overview opens with a ring gauge that summarises the displayed coverage hours; the hour strip and
+legend below it remain the evidence. The inner ring splits the hours by state (qualified, partial,
+missing, open) in a fixed order, and an hour is never drawn as qualified unless the API said so. The
+outer ring is solid only while the source observation is current (the same check as the Observation
+metric); a stale, unknown or unparseable observation draws it broken in amber. The centre shows the
+qualified hour count and `of N h qualified`. The gauge is a summary of coverage hours and is not a
+device count: inventory pages are bounded and carry no total. With no hours returned there is no
+gauge. Its `aria-label` states the counts and whether the observation is current or stale/unknown.
+A paused snapshot or a hidden tab also draws the outer ring broken (aria suffix `not live (paused snapshot)`).
+Small states get a fixed minimum arc, so arc sizes are not strictly proportional to hours: 1 hour of 200 takes
+about 4.4% of the ring, not 0.5%. The hour strip is the exact view.
+Technique credit: Vedetta `net-gauge.js` (MIT, Sived80/vedetta), rewritten without `innerHTML` or inline styles.
+
 ## Verification and future delivery
 
 Backend tests cover public shell versus protected JSON, read-only CLI issuance and HTTP `403` write rejection, old token flags, exact assets/GET+HEAD, traversal/symlink refusal, security headers on UI redirects/errors, installed-wheel assets and isolated seed/auth/pagination/activity/incident responses. The browser review exercises real API journeys, text-only untrusted rendering, storage/network boundaries, stale requests and failure states. UI results do not prove device classification accuracy, mature baselines or completion of the real 48-hour soak.

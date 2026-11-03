@@ -30,6 +30,11 @@ export function refreshLiveLabels(root, paused, snapshotAge, now = Date.now() / 
     const observedAge = el.getAttribute('data-live-observed') === null || el.getAttribute('data-live-observed') === '' || !Number.isFinite(observed) ? null : now - observed;
     el.textContent = liveLabel(el.getAttribute('data-live-current') === 'true', paused, snapshotAge, observedAge);
   });
+  root.querySelectorAll('[data-gauge-current]').forEach(svg => {
+    const observed = Number(svg.getAttribute('data-gauge-observed'));
+    const observedAge = svg.getAttribute('data-gauge-observed') === null || svg.getAttribute('data-gauge-observed') === '' || !Number.isFinite(observed) ? null : now - observed;
+    refreshGauge(svg, liveLabel(svg.getAttribute('data-gauge-current') === 'true', paused, snapshotAge, observedAge));
+  });
 }
 /* observed: epoch seconds of the OLDEST evidence behind the label, kept so freshness is recomputed later. */
 const liveValue = (current, observed) => node('span', {'data-live-current': String(current), 'data-live-observed': Number.isFinite(observed) ? String(observed) : ''}, current ? 'Current' : 'Stale / unknown');
@@ -46,6 +51,44 @@ function validateHours(data) { if (!data || !Array.isArray(data.hours) || data.h
 function metric(label, value, note, tone = '') { return node('div', {class: 'metric'}, node('span', {class: 'label'}, label), node('strong', {}, value instanceof Node ? value : text(value)), node('small', {}, note), tone ? badge(tone, tone === 'Current' ? 'good' : 'warn') : null); }
 function hourLegend() { return node('div', {class: 'legend'}, ['eligible', 'partial', 'missing', 'open'].map(s => node('span', {}, node('i', {class: `swatch ${s}`, 'aria-hidden': 'true'}), s === 'eligible' ? 'Qualified' : s[0].toUpperCase() + s.slice(1)))); }
 const fresh = age => age !== null && age >= 0 && age <= 120;
+/* Coverage gauge. Technique credit: Vedetta net-gauge.js (MIT, Sived80/vedetta), ring segments via stroke-dasharray;
+   rewritten for Vigie. Geometry is SVG attributes only and colours are CSS classes (CSP style-src 'self'). */
+const GAUGE_STATES = ['eligible', 'partial', 'missing', 'open']; const GAUGE_R = 48; const GAUGE_OUTER_R = 58; const GAUGE_W = 10; const GAUGE_GAP = 3; const GAUGE_MIN = 0.1;
+/* Pure maths: one dash per non-empty state in fixed order. Counts that do not add up to total are refused, never guessed. */
+export function gaugeSegments(counts, total) {
+  const circumference = 2 * Math.PI * GAUGE_R;
+  if (!counts || !Number.isInteger(total) || total < 0 || Object.keys(counts).some(k => !GAUGE_STATES.includes(k)) || GAUGE_STATES.some(k => !Number.isInteger(counts[k]) || counts[k] < 0) || GAUGE_STATES.reduce((n, k) => n + counts[k], 0) !== total) throw new Error('Malformed gauge counts');
+  // Every non-empty state reserves its caps and gap plus a visible minimum; only the remainder is shared by count.
+  const live = GAUGE_STATES.filter(k => counts[k]); const minArc = GAUGE_W + GAUGE_GAP + GAUGE_MIN; const spare = circumference - minArc * live.length;
+  let used = 0; const segments = [];
+  for (const state of live) {
+    const arc = minArc + spare * counts[state] / total;
+    segments.push({state, length: arc - GAUGE_W - GAUGE_GAP, offset: used + (GAUGE_W + GAUGE_GAP) / 2}); used += arc;
+  }
+  return {circumference, segments};
+}
+/* Inner ring: the displayed hours by state. Outer ring: solid only while the source observation is fresh. Centre: qualified hours.
+   A summary of coverage hours, never a device count (inventory pages are bounded, not a count). */
+const OBS_DASH = 2 * Math.PI * GAUGE_OUTER_R / 24;
+const ringDash = isFresh => isFresh ? `${(2 * Math.PI * GAUGE_OUTER_R).toFixed(2)} 0` : `${OBS_DASH.toFixed(2)} ${OBS_DASH.toFixed(2)}`;
+const gaugeSuffix = label => label === 'Current' ? 'current' : label === 'Snapshot (paused)' ? 'not live (paused snapshot)' : 'stale or unknown';
+/* Same rule as the Observation metric: called from refreshLiveLabels so the ring and aria-label age with the data. */
+function refreshGauge(svg, label) {
+  const ring = svg.querySelector('[data-gauge-ring]'); if (!ring) return;
+  const isFresh = label === 'Current'; ring.setAttribute('class', `g-obs ${isFresh ? 'fresh' : 'stale'}`); ring.setAttribute('stroke-dasharray', ringDash(isFresh));
+  svg.setAttribute('aria-label', (svg.getAttribute('aria-label') || '').replace(/Source observation [^.]*\.$/, `Source observation ${gaugeSuffix(label)}.`));
+}
+export function coverageGauge(data, observationFresh, observed = NaN) {
+  validateHours(data); const total = data.hours.length; if (!total) return null;
+  const counts = Object.fromEntries(GAUGE_STATES.map(s => [s, data.hours.filter(h => h.state === s).length])); const {circumference, segments} = gaugeSegments(counts, total);
+  const isFresh = observationFresh === true;
+  const svg = svgNode('svg', {class: 'gauge', viewBox: '0 0 120 120', role: 'img', 'aria-label': `Coverage over ${total} ${total === 1 ? 'hour' : 'hours'}: ${counts.eligible} qualified, ${counts.partial} partial, ${counts.missing} missing, ${counts.open} open. Source observation ${gaugeSuffix(isFresh ? 'Current' : 'Stale')}.`, 'data-gauge-current': String(isFresh), 'data-gauge-observed': Number.isFinite(observed) ? String(observed) : ''});
+  svg.append(svgNode('circle', {class: 'g-track', cx: 60, cy: 60, r: GAUGE_R}));
+  for (const seg of segments) svg.append(svgNode('circle', {class: `g-seg ${seg.state}`, cx: 60, cy: 60, r: GAUGE_R, transform: 'rotate(-90 60 60)', 'stroke-dasharray': `${seg.length.toFixed(2)} ${circumference.toFixed(2)}`, 'stroke-dashoffset': (-seg.offset).toFixed(2)}));
+  svg.append(svgNode('circle', {class: `g-obs ${isFresh ? 'fresh' : 'stale'}`, cx: 60, cy: 60, r: GAUGE_OUTER_R, transform: 'rotate(-90 60 60)', 'stroke-dasharray': ringDash(isFresh), 'data-gauge-ring': ''}),
+    svgNode('text', {class: 'g-val', x: 60, y: 62, 'text-anchor': 'middle'}, counts.eligible), svgNode('text', {class: 'g-of', x: 60, y: 76, 'text-anchor': 'middle'}, `of ${total} h qualified`));
+  return svg;
+}
 const UNAVAILABLE = {tone: 'error', text: 'Unavailable · coverage unavailable, so nothing can be concluded'};
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 /* Every reason the evidence is incomplete or old. Anything missing, capped or unrecognised counts: unknown is never ok. */
@@ -93,7 +136,8 @@ export function coverageView(data) {
   const hours = node('div', {class: 'hour-strip', role: 'img', 'aria-label': `Coverage: ${counts.eligible} qualified, ${counts.partial} partial, ${counts.missing} missing, ${counts.open} open hours`}, data.hours.map(h => node('span', {class: `hour ${['eligible', 'partial', 'missing', 'open'].includes(h.state) ? h.state : 'missing'}`, title: `${utc(h.hour)} · ${text(h.state)} · ${(h.reasons || []).join(', ') || 'no reported reasons'}`})));
   const qualityRows = data.hours.filter(h => h.state !== 'eligible').map(h => node('tr', {}, node('td', {}, utc(h.hour)), node('td', {}, badge(h.state, h.state === 'partial' ? 'warn' : '')), node('td', {}, finite(h.qualified_seconds) ? `${h.qualified_seconds}s` : 'Unavailable'), node('td', {}, (h.reasons || []).join(', ') || 'Hour still open')));
   const unavailable = Array.isArray(c.monitoring_unavailable) ? c.monitoring_unavailable : [];
-  return node('div', {}, strip, node('section', {class: 'section'}, heading('Coverage over time', `${counts.eligible} qualified · ${counts.partial} partial · ${counts.missing} missing · ${counts.open} open`), hours, hourLegend(), node('p', {class: 'table-note'}, 'A quiet network and missing observations are different states. Open hours are still accumulating evidence.'), node('div', {class: 'chart-meta'}, node('span', {}, data.hours.length ? utc(data.hours[0].hour) : 'No hours'), node('span', {}, data.hours.length ? utc(data.hours.at(-1).hour + 3600) : ''))), node('section', {class: 'section'}, heading('Source record', c.collector_id), facts([['Last batch', `${count(c.last_seq)} · ${utc(c.last_received_at)}`], ['Retained drops', count(c.dropped_batches_in_retained_detail)], ['Detail begins', utc(c.retained_detail_since)], ['Summary', c.summary_capped === false ? 'Retained detail scanned' : 'Capped or unknown · totals may be incomplete'], ['Collector memory', finite(c.agent_rss_kb) ? `${c.agent_rss_kb} KiB` : 'Unavailable'], ['Monitoring', !Array.isArray(c.monitoring_unavailable) ? 'Unknown / list unavailable' : unavailable.length ? `${unavailable.length} scopes unavailable${c.monitoring_unavailable_capped ? ' (capped)' : ''}` : c.monitoring_unavailable_capped === false ? 'No unavailable scopes reported' : 'Unknown / capped']]), unavailable.length ? node('ul', {class: 'plain-list'}, unavailable.map(x => node('li', {}, `${text(x?.device_id)} · ${text(x?.reason)}`))) : null), node('section', {class: 'section'}, heading('Hours that need context', 'Historical quality is separate from current source flags'), qualityRows.length ? table(['Hour · UTC', 'Quality', 'Qualified', 'Reasons'], qualityRows) : empty('All displayed hours qualified', 'This describes the displayed coverage, not device safety or full field-test acceptance.')));
+  const gauge = coverageGauge(data, fresh(currentAge) && fresh(windowAge), oldest(c.latest_observation_received_at, c.latest_window_end));
+  return node('div', {}, gauge ? node('div', {class: 'overview-top'}, gauge, strip) : strip, node('section', {class: 'section'}, heading('Coverage over time', `${counts.eligible} qualified · ${counts.partial} partial · ${counts.missing} missing · ${counts.open} open`), hours, hourLegend(), node('p', {class: 'table-note'}, 'A quiet network and missing observations are different states. Open hours are still accumulating evidence.'), node('div', {class: 'chart-meta'}, node('span', {}, data.hours.length ? utc(data.hours[0].hour) : 'No hours'), node('span', {}, data.hours.length ? utc(data.hours.at(-1).hour + 3600) : ''))), node('section', {class: 'section'}, heading('Source record', c.collector_id), facts([['Last batch', `${count(c.last_seq)} · ${utc(c.last_received_at)}`], ['Retained drops', count(c.dropped_batches_in_retained_detail)], ['Detail begins', utc(c.retained_detail_since)], ['Summary', c.summary_capped === false ? 'Retained detail scanned' : 'Capped or unknown · totals may be incomplete'], ['Collector memory', finite(c.agent_rss_kb) ? `${c.agent_rss_kb} KiB` : 'Unavailable'], ['Monitoring', !Array.isArray(c.monitoring_unavailable) ? 'Unknown / list unavailable' : unavailable.length ? `${unavailable.length} scopes unavailable${c.monitoring_unavailable_capped ? ' (capped)' : ''}` : c.monitoring_unavailable_capped === false ? 'No unavailable scopes reported' : 'Unknown / capped']]), unavailable.length ? node('ul', {class: 'plain-list'}, unavailable.map(x => node('li', {}, `${text(x?.device_id)} · ${text(x?.reason)}`))) : null), node('section', {class: 'section'}, heading('Hours that need context', 'Historical quality is separate from current source flags'), qualityRows.length ? table(['Hour · UTC', 'Quality', 'Qualified', 'Reasons'], qualityRows) : empty('All displayed hours qualified', 'This describes the displayed coverage, not device safety or full field-test acceptance.')));
 }
 export function inventoryView(data, onSelect) {
   if (!Array.isArray(data) || data.length > 25 || data.some(d => !d || typeof d.id !== 'string')) throw new Error('Malformed inventory response');

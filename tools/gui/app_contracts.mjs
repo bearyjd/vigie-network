@@ -93,10 +93,13 @@ assert.equal(typeof intervalTick, 'function', 'a recompute timer must be started
 const content = elements.content; const refresh = elements.refresh; const notice = elements.notice;
 const labels = () => content.querySelectorAll('[data-live-current]').map(e => e.textContent);
 const status = () => elements['refresh-status'].textContent;
+const ringOf = () => content.querySelectorAll('circle').find(c => (c.getAttribute('class') || '').split(' ').includes('g-obs'));
+const ringState = () => { const r = ringOf(); return {cls: r.getAttribute('class').split(' ')[1], solid: / 0$/.test(r.getAttribute('stroke-dasharray')), aria: content.querySelectorAll('svg').find(n => n.getAttribute('class') === 'gauge').getAttribute('aria-label')}; };
 
 elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
 elements['connect-form'].fire('submit'); await flush();
 assert.deepEqual(labels(), ['Current', 'Current'], 'fresh unpaused snapshot should be current');
+{ const r = ringState(); assert.equal(r.cls, 'fresh'); assert.ok(r.solid); assert.match(r.aria, /Source observation current\.$/); }
 assert.equal(refresh.getAttribute('aria-disabled'), 'false');
 assert.match(status(), /refresh every 30s/);
 
@@ -104,20 +107,24 @@ assert.match(status(), /refresh every 30s/);
 const anchor = content.querySelector('[data-live-current]'); anchor.focus(); content.fire('focusin');
 assert.deepEqual(labels(), ['Snapshot (paused)', 'Snapshot (paused)']);
 assert.match(status(), /paused while interacting/);
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'a paused snapshot is not a current observation'); assert.ok(!r.solid); assert.match(r.aria, /paused/); assert.doesNotMatch(r.aria, /observation current/); }
 clock += 121000; intervalTick();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'a paused snapshot older than 120 s is stale');
+{ const r = ringState(); assert.equal(r.cls, 'stale'); assert.ok(!r.solid); assert.match(r.aria, /stale or unknown\.$/); }
 body.focus = () => { document.activeElement = body; }; body.focus(); content.fire('focusout'); await flush();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'age alone keeps the badge stale after focus leaves');
 
 // Snapshot refresh restores Current; hidden tabs and the timer recompute without any render.
 mode = 'ok'; refresh.fire('click'); await flush();
-assert.deepEqual(labels(), ['Current', 'Current']);
+assert.deepEqual(labels(), ['Current', 'Current']); assert.equal(ringState().cls, 'fresh');
 document.hidden = true; intervalTick();
 assert.deepEqual(labels(), ['Snapshot (paused)', 'Snapshot (paused)'], 'hidden tab is paused');
+assert.equal(ringState().cls, 'stale', 'hidden tab: ring not current'); assert.match(ringState().aria, /paused/);
 document.hidden = false; intervalTick();
-assert.deepEqual(labels(), ['Current', 'Current']);
+assert.deepEqual(labels(), ['Current', 'Current']); { const r = ringState(); assert.equal(r.cls, 'fresh', 'the ring recovers with the metric'); assert.ok(r.solid); assert.match(r.aria, /Source observation current\.$/); }
 clock += 119000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], '119 s is still current');
 clock += 2000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'recomputed by timer alone');
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'the outer ring goes stale with the metric, not only at render'); assert.ok(!r.solid); assert.match(r.aria, /stale or unknown\.$/); assert.doesNotMatch(r.aria, /observation current/); }
 
 // M2 / J9: a 100 s old observation is Current at render, but 30 s later (snapshot only 30 s old) it is not.
 lag = 100; refresh.fire('click'); await flush();
@@ -125,14 +132,21 @@ assert.deepEqual(labels(), ['Current', 'Current'], 'a 100 s old observation is s
 const observed = content.querySelectorAll('[data-live-current]').map(e => Number(e.getAttribute('data-live-observed')));
 assert.ok(observed.every(t => Math.abs(t - (clock / 1000 - 100)) < 1), 'observation epoch is stored for later recompute');
 clock += 19000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], 'observation 119 s old');
+assert.equal(ringState().cls, 'fresh', 'ring: observation 119 s old');
 clock += 2000; intervalTick();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'observation 121 s old while the snapshot is only 21 s old');
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'ring ages with the observation although the snapshot is young'); assert.match(r.aria, /stale or unknown\.$/); }
 document.hidden = true; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'pausing never revives an aged observation');
 document.hidden = false;
 // J12: the OLDEST evidence rules; a fresh receipt does not rescue a 100 s old window.
 lag = 10; windowLag = 100; refresh.fire('click'); await flush();
 assert.deepEqual(labels(), ['Current', 'Current']);
 clock += 21000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'window 121 s old although received 31 s ago');
+// ...and the reverse: a fresh window with a 100 s old receipt.
+lag = 100; windowLag = 0; refresh.fire('click'); await flush();
+assert.equal(ringState().cls, 'fresh', 'ring: receipt 100 s old, window fresh');
+clock += 21000; intervalTick();
+assert.equal(ringState().cls, 'stale', 'ring: a fresh window does not rescue an old receipt');
 windowLag = null; lag = 0; refresh.fire('click'); await flush();
 // An observation already stale at render never says Current, and the first chrome() keeps it that way.
 lag = 200; refresh.fire('click'); await flush();
@@ -166,7 +180,7 @@ assert.equal(document.activeElement, elements['view-title'], 'a cleared notice h
 // CODEX-A: a slow MANUAL refresh that lands while keyboard focus sits on a content control must
 // restore focus to the same logical control, or to Refresh when that control is gone.
 mode = 'ok';
-const region = () => content.querySelector('[aria-label]');  // stands in for any labelled control
+const region = () => content.querySelectorAll('[aria-label]').find(n => n.localName !== 'svg');  // stands in for any labelled control; the gauge svg is a non-focusable image whose label is live
 assert.ok(region(), 'the overview renders a labelled element');
 let release; gate = new Promise(resolve => { release = resolve; });
 refresh.focus(); refresh.fire('click'); await flush();   // keyboard user presses Refresh; response is slow
@@ -503,6 +517,34 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   assert.ok(overview.textContent.includes('Unavailable · Unavailable')); assert.equal(views.coverageStatus({phase: 'ready', data: {collector, hours}}, clock).tone, 'degraded');
   assert.equal(views.node('p', {}, deep).textContent, 'Unavailable', 'a deeply nested child is text, not a recursion');
 }
+// Coverage gauge: a summary of the displayed hours, never a device count; unknown or stale is never drawn as ok.
+{
+  const mk = (lagSeconds, hours) => ({collector: {collector_id: 'c1', latest_observation_received_at: oldStamp(lagSeconds), latest_window_end: (clock - lagSeconds * 1000) / 1000, latest_dns_observation_received_at: oldStamp(0), latest_dns_observation_window_end: clock / 1000, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, summary_capped: false, monitoring_unavailable: []}, hours});
+  const mix = [hour(-4, 'eligible'), hour(-3, 'eligible'), hour(-2, 'partial'), hour(-1, 'missing'), hour(0, 'open')];
+  const gaugeOf = view => view.querySelector('svg') && view.querySelectorAll('svg').find(n => (n.getAttribute('class') || '') === 'gauge');
+  const cls = (g, name) => g.querySelectorAll('circle').filter(c => (c.getAttribute('class') || '').split(' ').includes(name));
+  const fresh = views.coverageView(mk(5, mix)); const g = gaugeOf(fresh);
+  assert.ok(g, 'the Overview carries a gauge'); assert.equal(g.getAttribute('role'), 'img');
+  const label = g.getAttribute('aria-label');
+  assert.match(label, /5 hours/); assert.match(label, /2 qualified/); assert.match(label, /1 partial/); assert.match(label, /1 missing/); assert.match(label, /1 open/); assert.match(label, /current/); assert.doesNotMatch(label, /stale|unknown/i);
+  assert.ok(g.textContent.includes('of 5 h qualified')); assert.equal(g.querySelectorAll('text').find(t => t.getAttribute('class') === 'g-val').textContent, '2');
+  assert.deepEqual(cls(g, 'g-seg').map(c => c.getAttribute('class').split(' ')[1]), ['eligible', 'partial', 'missing', 'open']);
+  { const offs = cls(g, 'g-seg').map(c => Number(c.getAttribute('stroke-dashoffset'))); assert.ok(offs.every(Number.isFinite) && offs[0] <= 0, 'dashoffset is negative: segments run clockwise from the origin'); offs.slice(1).forEach((o, i) => assert.ok(o < offs[i], 'dashoffsets strictly decrease')); }
+  assert.equal(cls(g, 'g-obs').length, 1); assert.deepEqual(cls(g, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['fresh']); assert.match(cls(g, 'g-obs')[0].getAttribute('stroke-dasharray'), / 0$/, 'fresh outer ring is solid');
+  assert.doesNotMatch(g.textContent, /device|identit/i, 'the gauge is not a device count');
+  for (const section of ['Coverage over time', 'Source record']) assert.ok(fresh.textContent.includes(section), `${section} is still rendered`);
+  assert.equal(fresh.querySelectorAll('div').filter(n => n.getAttribute('class') === 'hour-strip').length, 1, 'the hour strip stays'); assert.ok(fresh.textContent.includes('Qualified'), 'the legend stays');
+  const stale = gaugeOf(views.coverageView(mk(500, mix)));
+  assert.deepEqual(cls(stale, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['stale'], 'a stale observation breaks the outer ring'); assert.doesNotMatch(cls(stale, 'g-obs')[0].getAttribute('stroke-dasharray'), / 0$/);
+  assert.match(stale.getAttribute('aria-label'), /stale or unknown/); assert.doesNotMatch(stale.getAttribute('aria-label'), /observation current/);
+  const unknown = mk(5, mix); delete unknown.collector.latest_window_end; const u = gaugeOf(views.coverageView(unknown));
+  assert.deepEqual(cls(u, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['stale'], 'a missing window end is unknown, never current');
+  assert.equal(gaugeOf(views.coverageView(mk(5, mix.slice(0, 1)))).getAttribute('aria-label').includes('1 hours'), false, 'singular is not mangled into "1 hours"');
+  assert.equal(views.coverageGauge({hours: []}, true), null, 'no hours, no gauge'); assert.ok(!gaugeOf(views.coverageView(mk(5, []))), 'an empty response renders no gauge');
+  const before = JSON.stringify(mix); views.coverageView(mk(5, mix)); assert.equal(JSON.stringify(mix), before, 'API data is not mutated');
+  for (const bad of ['surprise', null, 'ELIGIBLE']) assert.throws(() => views.coverageView(mk(5, [{hour: thisHour, state: bad, reasons: []}])), /Malformed monitoring response/);
+  assert.deepEqual(violations, []);
+}
 // Behavioural read-only (addendum B), sinks (C) and timers (D).
 await reload(); const doubleCheck = refreshTimers();
 for (const name of ['overview', 'inventory', 'activity', 'incidents', 'overview', 'incidents']) { view(name); await flush(); hashchange(); }
@@ -518,6 +560,7 @@ const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${nam
 const banned = /innerHTML|outerHTML|insertAdjacentHTML|\beval\s*\(|\bFunction\s*\(|\bimport\s*\(|document\s*\.\s*write|localStorage|sessionStorage|indexedDB|set(?:Timeout|Interval)\s*\(\s*['"`]/;
 const computed = /\b(?:globalThis|window|self|document|this)\s*\[|[\w)\]]\s*\[\s*(?:['"`][^\]\n]*['"`]\s*\+|[^\]\n]*\+\s*['"`]|`)/;
 for (const name of ['views.js', 'app.js', 'client.js']) { const code = source(name); assert.doesNotMatch(code, banned, `${name} stays inert`); assert.doesNotMatch(code, computed, `${name} has no computed member access built from strings`); }
+for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /['"`]style['"`]\s*:|\bstyle\s*:|\.style\b|setAttribute\(\s*['"`]style/, `${name} sets no inline style (CSP style-src 'self')`);
 for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /\bfetch\s*\(|XMLHttpRequest|sendBeacon|\bmethod\b/, `${name} never talks to the network itself`);
 const clientCode = source('client.js'); assert.deepEqual([...clientCode.matchAll(/\bmethod\s*:\s*(['"`])(\w+)\1/g)].map(m => m[2]), ['GET'], 'the only HTTP verb is GET'); assert.equal((clientCode.match(/\bmethod\b/g) || []).length, 1); assert.doesNotMatch(clientCode, /\bbody\s*:/);
 const page = source('index.html'); assert.match(page, /<div id="coverage-banner"[^>]*role="status"[^>]*aria-live="polite"/); assert.doesNotMatch(page, /<form[^>]*method=|<textarea/i);
