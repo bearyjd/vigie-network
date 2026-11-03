@@ -63,7 +63,11 @@ stage_contracts() {
     # Require jsonschema here: test_rust_batches otherwise treats it as optional.
     trafficgen python -c 'import jsonschema' &&
     trafficgen python "$REPO/tests/vectors/test_rust_batches.py" &&
-    server python "$REPO/tests/vectors/test_https_against_ingest.py"
+    server python "$REPO/tests/vectors/test_https_against_ingest.py" &&
+    # Offline GUI contracts (fake DOM, no browser, no network).
+    { command -v node >/dev/null || { echo 'Missing prerequisite: node' >&2; exit 2; }; } &&
+    node "$REPO/tools/gui/frontend_contracts.mjs" &&
+    node "$REPO/tools/gui/app_contracts.mjs"
 }
 stage_e2e() {
     # Explicitly reuse this checkout's server environment and cargo output, never stale binaries.
