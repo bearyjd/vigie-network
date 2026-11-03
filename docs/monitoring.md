@@ -795,7 +795,9 @@ whole file. Keep the cursor directory dedicated to this sender.
 
 **Oversized lines.** A line longer than the read window (8 KiB per line of `max_batch`) is
 skipped, and the rest of that physical line is discarded through its newline, never parsed as a
-record: the cursor file carries a `discard` flag across runs for this. If every line read in a run
+record: the cursor file carries a `discard` flag across runs for this, and the discarded bytes
+are saved as progress (each discarded read window counts against `max_batch`), so a long line is
+worked off over several runs and the cursor ends at the file size. If every line read in a run
 was invalid, the run logs one ERROR line (no record text) and still exits 0, so `OnFailure=` does
 not fire for it; watch the journal at error level.
 
@@ -822,8 +824,9 @@ recommendation), so exit 5 does not exist.
 | 3 | Permanent failure (4xx other than 408/425/429, redirect, unexpected status, or a TLS certificate verification failure); cursor NOT advanced |
 | 4 | Retryable failure after retries, or the run budget ran out; cursor unchanged |
 
-**TLS notes.** A certificate that fails verification (unknown CA, wrong host name, expired) is
-permanent (exit 3), not retried. Python 3.13 and later also enable strict X.509 checking in the
+**TLS notes.** A certificate that fails verification (unknown CA, wrong host name) is
+permanent (exit 3), not retried. "Not yet valid" and "expired" are retryable (exit 4): they are
+usually clock skew right after boot. Python 3.13 and later also enable strict X.509 checking in the
 default context (`VERIFY_X509_STRICT`), which rejects some older self-signed or private-CA
 certificates (for example without a Subject Key Identifier, or a CA certificate without
 `basicConstraints CA:TRUE`) even when `ca_file` names them. The sender never relaxes verification:

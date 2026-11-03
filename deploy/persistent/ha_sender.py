@@ -66,6 +66,7 @@ RETRY_AFTER_CAP = 60.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 1.0
 RUN_BUDGET_S = 120.0  # total wall-clock budget of one run
+CLOCK_VERIFY_CODES = frozenset({9, 10})  # X509 not yet valid / expired: clock skew at boot
 RETRY_STATUS = frozenset({408, 425, 429})  # 425 kept for parity with the ntfy sender
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 WEBHOOK_PATH_RE = re.compile(r"/api/webhook/[A-Za-z0-9_-]{1,128}")
@@ -97,6 +98,10 @@ CONFIG_KEYS = frozenset(
         "max_batch",
     }
 )
+
+
+# Kinds of item produced by iter_lines (third element).
+LINE, OVERSIZED, DISCARDING, DISCARDED = range(4)
 
 
 class ConfigError(Exception):
@@ -593,19 +598,18 @@ def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
     return replace(previous, data=data, start=offset, restarted=False)
 
 
-def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int, bool]]:
-    """Complete lines as (line, offset after it, False), produced one at a time. A partial
+def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int, int]]:
+    """Complete lines as (line, offset after it, LINE), produced one at a time. A partial
     trailing line is left alone, except a full chunk with no newline at all: that is the start of
-    an oversized line, yielded once as (bytes, offset after them, True). The caller must then
-    discard everything through that line's newline."""
+    an oversized line, yielded once as (bytes, offset after them, OVERSIZED)."""
     pos = 0
     found = False
     while (end := chunk.data.find(b"\n", pos)) >= 0:
         found = True
-        yield chunk.data[pos:end], chunk.start + end + 1, False
+        yield chunk.data[pos:end], chunk.start + end + 1, LINE
         pos = end + 1
     if not found and len(chunk.data) >= cap:
-        yield chunk.data, chunk.start + len(chunk.data), True
+        yield chunk.data, chunk.start + len(chunk.data), OVERSIZED
 
 
 def _past_newline(chunk: Chunk) -> tuple[Chunk, bool]:
@@ -619,19 +623,26 @@ def _past_newline(chunk: Chunk) -> tuple[Chunk, bool]:
 
 def iter_lines(
     cfg: Config, chunk: Chunk, discard: bool = False
-) -> Iterator[tuple[bytes, int, bool]]:
+) -> Iterator[tuple[bytes, int, int]]:
     """Every complete line of the file from the chunk on; later chunks are read lazily, so a
-    consumer that stops pulling never reads (or holds) more. After an oversized-line item
-    (third element True) the rest of that line is dropped here, never parsed as a record. With
-    `discard` the chunk starts inside such a line."""
+    consumer that stops pulling never reads (or holds) more. After an OVERSIZED item the rest of
+    that line is dropped here, never parsed as a record, and the progress is REPORTED so that the
+    consumer can persist it: DISCARDING (b"", offset, bytes dropped, still inside the line) and
+    DISCARDED (b"", offset just after the line's newline). With `discard` the chunk starts inside
+    such a line."""
     cap = _read_cap(cfg)
     while True:
         more = len(chunk.data) >= cap
         if discard:
+            had_data = bool(chunk.data)
             chunk, discard = _past_newline(chunk)
+            if discard and had_data:
+                yield b"", chunk.start, DISCARDING
+            elif not discard:
+                yield b"", chunk.start, DISCARDED
         last_end = None
         for item in split_lines(chunk, cap):
-            last_end, discard = item[1], item[2]
+            last_end, discard = item[1], item[2] == OVERSIZED
             yield item
         if not more:
             return
@@ -797,7 +808,10 @@ def send_once(
     except RedirectRefused:
         return Outcome("permanent", None, "redirect refused")
     except urllib.error.URLError as exc:
-        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+        reason = exc.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            if getattr(reason, "verify_code", None) in CLOCK_VERIFY_CODES:
+                return Outcome("retry", None, "certificate not valid at this time")
             return Outcome("permanent", None, "certificate verification failed")
         return Outcome("retry", None, type(exc.reason).__name__)
     except (OSError, http.client.HTTPException, ValueError) as exc:
@@ -836,32 +850,48 @@ def send_with_retry(
 # --- run -----------------------------------------------------------------------------------
 
 
-def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunResult:
-    """Send the records in order, at most max_batch lines per run. Any outcome other than ok
-    stops the run with the cursor before that record (there is no per-record skip: PRP-004 D6)."""
+def _drain(
+    cfg: Config,
+    chunk: Chunk,
+    send: Callable[[Record], Outcome],
+    established: Callable[[], None] = lambda: None,
+) -> RunResult:
+    """Send the records in order, at most max_batch lines per run (discarded chunks of an
+    oversized line count too). Any outcome other than ok stops the run with the cursor before
+    that record (there is no per-record skip: PRP-004 D6)."""
     cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head, chunk.discard)
     sent = skipped = taken = 0
-    for line, end, oversized in iter_lines(cfg, chunk, chunk.discard):
+
+    def persist(new: Cursor) -> Cursor:
+        save_cursor(cfg.cursor_file, new)
+        established()
+        return new
+
+    for line, end, kind in iter_lines(cfg, chunk, chunk.discard):
+        if kind == DISCARDED:  # free: the oversized line is over, remember it
+            cursor = persist(replace(cursor, offset=end, discard=False))
+            continue
         if taken >= cfg.max_batch:
             break
         taken += 1
+        if kind == DISCARDING:
+            cursor = persist(replace(cursor, offset=end, discard=True))
+            continue
         try:
-            if oversized:
+            if kind == OVERSIZED:
                 raise ValueError("line too long")
             record = parse_record(line)
         except ValueError as exc:
             if skipped < MAX_SKIP_LOGS:
                 log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
-            cursor = replace(cursor, offset=end, discard=oversized)
-            save_cursor(cfg.cursor_file, cursor)
+            cursor = persist(replace(cursor, offset=end, discard=kind == OVERSIZED))
             continue
         outcome = send(record)
         if outcome.kind != "ok":
             return _stop(outcome, sent, skipped)
         sent += 1
-        cursor = replace(cursor, offset=end, discard=False)
-        save_cursor(cfg.cursor_file, cursor)
+        cursor = persist(replace(cursor, offset=end, discard=False))
     if skipped > MAX_SKIP_LOGS:
         log.warning(
             "%d records skipped in this run (only the first %d were logged)",
@@ -871,7 +901,7 @@ def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunR
     if skipped and not sent:
         log.error("every record read in this run was invalid and skipped; nothing was sent")
     if chunk.restarted and cursor.offset == 0:
-        save_cursor(cfg.cursor_file, cursor)
+        persist(cursor)
     return RunResult(sent, skipped, EXIT_OK)
 
 
@@ -910,11 +940,16 @@ def run(
     try:
         fresh = _is_fresh(cfg.cursor_file, fd)  # decided by the lock winner alone
         cursor = _initial_cursor(cfg, fresh=fresh, seed_at_end=seed_at_end)
+        marked = False
+
+        def established() -> None:
+            nonlocal marked
+            if not marked:
+                marked = _mark_established(cfg.cursor_file, fd)
+
+        established()  # before any network work; an existing cursor counts as established
         clean_stale_temps(cfg.cursor_file)
-        try:
-            return _run_locked(cfg, url, context, cursor, sleep, clock, budget_seconds)
-        finally:
-            _mark_established(cfg.cursor_file, fd)
+        return _run_locked(cfg, url, context, cursor, sleep, clock, budget_seconds, established)
     finally:
         os.close(fd)
 
@@ -932,18 +967,20 @@ def _is_fresh(cursor_file: str, lock_fd: int) -> bool:
         raise ConfigError(f"cannot inspect cursor directory: {exc.strerror}") from exc
 
 
-def _mark_established(cursor_file: str, lock_fd: int) -> None:
+def _mark_established(cursor_file: str, lock_fd: int) -> bool:
     """Once a cursor exists, mark the lock so that a LATER missing cursor is recognised as lost
-    (exit 2) rather than as a first run."""
+    (exit 2) rather than as a first run. True when the lock is marked (or marking was given up)."""
     if not os.path.lexists(cursor_file):
-        return
+        return False
     try:
-        os.pwrite(lock_fd, b"1", 0)
-        os.fsync(lock_fd)
+        if os.pread(lock_fd, 1, 0) != b"1":
+            os.pwrite(lock_fd, b"1", 0)
+            os.fsync(lock_fd)
     except OSError as exc:
         log.warning(
             "cannot mark the lock file (%s); a lost cursor would be re-seeded", exc.strerror
         )
+    return True
 
 
 def _initial_cursor(cfg: Config, *, fresh: bool, seed_at_end: bool) -> Cursor:
@@ -973,6 +1010,7 @@ def _run_locked(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     budget_seconds: float,
+    established: Callable[[], None],
 ) -> RunResult:
     opener = build_opener(context)
     chunk = read_chunk(cfg, cursor)
@@ -989,7 +1027,7 @@ def _run_locked(
             opener, request, cfg.timeout_seconds, sleep, lambda: deadline - clock()
         )
 
-    return _drain(cfg, chunk, send)
+    return _drain(cfg, chunk, send, established)
 
 
 def main(argv: list[str] | None = None) -> int:

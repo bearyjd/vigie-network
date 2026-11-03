@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -1282,3 +1283,101 @@ def test_non_private_http_host_logs_a_warning_without_the_host(
                          "http_hosts": ["203.0.113.9", "ha.example.invalid"]})  # fmt: skip
     assert caplog.text.count("http_hosts") == 2
     assert "203.0.113" not in caplog.text and "example" not in caplog.text
+
+
+# --- fix round 2 ---------------------------------------------------------------------------
+
+
+def _cursor_state(env: Env) -> tuple[int, bool]:
+    raw = json.loads(env.cursor.read_text())
+    return raw["offset"], raw["discard"]
+
+
+def test_discarded_tail_with_no_following_record_still_reaches_caught_up(env: Env) -> None:
+    env.write(b"x" * (ha.MAX_LINE + 500) + b"\n")
+    size = env.delivery.stat().st_size
+    for _ in range(3):
+        assert env.run(max_batch=1).code == 0
+        assert _cursor_state(env) == (size, False)
+    assert env.server.requests == []
+
+
+def test_long_discard_is_bounded_per_run_but_always_progresses(env: Env) -> None:
+    cap = 2 * (ha.MAX_LINE + 1)
+    env.write(b"x" * (cap * 4 + 7) + b"\n", line(record(2)))
+    size = env.delivery.stat().st_size
+    env.run(max_batch=2)
+    offset, discarding = _cursor_state(env)
+    assert discarding and 0 < offset < size  # bounded: stopped part-way, progress saved
+    seen = [offset]
+    for _ in range(10):
+        env.run(max_batch=2)
+        seen.append(_cursor_state(env)[0])
+    assert seen == sorted(seen) and _cursor_state(env) == (size, False)
+    assert _bodies(env) == ["/ui/#incident=i2"]
+
+
+def _lock_marked(env: Env) -> bool:
+    return Path(str(env.cursor) + ".lock").read_bytes() == b"1"
+
+
+def test_lock_is_marked_before_any_network_work(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    env.write(line(record(1)))
+
+    seen: list[bool] = []
+
+    def killed(*_a: object, **_k: object) -> None:
+        seen.append(_lock_marked(env))  # at the moment network work would start
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ha, "_run_locked", killed)
+    with pytest.raises(KeyboardInterrupt):
+        env.run(start_at_end=True)
+    assert seen == [True]
+
+
+def test_lock_is_marked_after_the_first_cursor_save_of_a_run(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.write(line(record(1)), line(record(2)))
+    calls: list[int] = []
+    marked: list[bool] = []
+
+    def flaky(*_a: object, **_k: object) -> ha.Outcome:
+        calls.append(1)
+        if len(calls) == 2:
+            marked.append(_lock_marked(env))  # state a SIGKILL here would leave behind
+            raise KeyboardInterrupt
+        return ha.Outcome("ok")
+
+    monkeypatch.setattr(ha, "send_with_retry", flaky)
+    with pytest.raises(KeyboardInterrupt):
+        env.run()
+    assert marked == [True]
+
+
+def test_existing_cursor_with_unmarked_lock_is_marked_so_loss_is_detected(env: Env) -> None:
+    env.write(line(record(1)))
+    env.run()
+    Path(str(env.cursor) + ".lock").write_bytes(b"")  # round-1-style leftover
+    env.run()
+    assert _lock_marked(env)
+    env.cursor.unlink()
+    with pytest.raises(ha.ConfigError, match="seed-at-end"):
+        env.run(start_at_end=True)
+
+
+def _cert_error(code: int) -> Exception:
+    err = ssl.SSLCertVerificationError(1, "verify failed")
+    err.verify_code = code
+    return urllib.error.URLError(err)
+
+
+@pytest.mark.parametrize(("code", "kind"), [(9, "retry"), (10, "retry"), (18, "permanent"),
+                                            (19, "permanent"), (62, "permanent")])  # fmt: skip
+def test_certificate_clock_errors_are_retryable_others_permanent(code: int, kind: str) -> None:
+    class Opener:
+        def open(self, _req: object, timeout: float) -> None:
+            raise _cert_error(code)
+
+    assert ha.send_once(Opener(), object(), 1.0).kind == kind
