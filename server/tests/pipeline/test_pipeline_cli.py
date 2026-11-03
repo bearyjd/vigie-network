@@ -32,27 +32,28 @@ def test_once_and_loop_are_mutually_exclusive(data):
         cli.main(["run", "--data-dir", str(data.root)])
 
 
-def test_loop_repeats_sleeps_and_survives_db_errors(data, monkeypatch):
+def test_loop_repeats_waits_and_survives_db_errors(data, handlers, monkeypatch):
     calls: list[int] = []
-    sleeps: list[float] = []
+    waits: list[float] = []
 
-    def fake_run(config):
+    class FakeFlag(cli._StopFlag):
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 3:
+                handlers[cli.signal.SIGTERM](15, None)
+            return self.is_set()
+
+    def fake_run(config, should_stop=lambda: False):
         calls.append(1)
         if len(calls) == 1:
             import sqlite3
 
             raise sqlite3.OperationalError("database is locked")
-        return None
-
-    def fake_sleep(s):
-        sleeps.append(s)
-        if len(sleeps) == 3:
-            raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "run_once", fake_run)
-    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli, "_StopFlag", FakeFlag)
     assert cli.main(["run", "--loop", "7", "--data-dir", str(data.root)]) == 0
-    assert len(calls) == 3 and sleeps == [7, 7, 7]
+    assert len(calls) == 3 and waits == [7, 7, 7]
 
 
 def test_loop_interval_must_be_positive(data):
@@ -71,3 +72,108 @@ def test_cli_logs_have_no_qnames(data, capsys):
     data.add_batch(neigh=[NIC], dns=[(NIC, T0)])
     cli.main(["run", "--once", "--data-dir", str(data.root)])
     assert "secret-qname" not in capsys.readouterr().err
+
+
+# --- graceful stop: SIGTERM/SIGINT drain the current pass, then exit 0 -------------------------
+
+
+@pytest.fixture
+def handlers(monkeypatch):
+    """Record the handlers cli.main installs instead of touching the real process signals."""
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, fn: installed.setdefault(sig, fn))
+    return installed
+
+
+def test_signal_during_idle_wait_exits_at_once_with_zero(data, handlers, monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(cli, "run_once", lambda config, should_stop=lambda: False: None)
+    threading.Timer(0.2, lambda: handlers[cli.signal.SIGTERM](cli.signal.SIGTERM, None)).start()
+    started = time.monotonic()
+    assert cli.main(["run", "--loop", "3600", "--data-dir", str(data.root)]) == 0
+    assert time.monotonic() - started < 5
+
+
+def test_no_new_pass_starts_after_the_first_signal(data, handlers, monkeypatch):
+    calls: list[int] = []
+
+    def run(config, should_stop=lambda: False):
+        calls.append(1)
+        handlers[cli.signal.SIGINT](cli.signal.SIGINT, None)  # arrives mid-pass
+
+    monkeypatch.setattr(cli, "run_once", run)
+    assert cli.main(["run", "--loop", "1", "--data-dir", str(data.root)]) == 0
+    assert calls == [1]
+
+
+def test_second_signal_forces_exit(data, handlers, monkeypatch):
+    def run(config, should_stop=lambda: False):
+        handler = handlers[cli.signal.SIGTERM]
+        handler(cli.signal.SIGTERM, None)
+        handler(cli.signal.SIGTERM, None)  # operator insists
+
+    monkeypatch.setattr(cli, "run_once", run)
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["run", "--loop", "1", "--data-dir", str(data.root)])
+    assert raised.value.code != 0
+
+
+def test_signal_mid_publish_lets_the_delivery_finish_as_sent(tmp_path, handlers, monkeypatch):
+    import threading
+
+    from delivery_runner_helpers import T0, Clock, World
+
+    from vigie_pipeline.config import DeliverySettings, PipelineConfig
+    from vigie_pipeline.delivery_publish import FakePublisher
+    from vigie_pipeline.delivery_wiring import run_delivery_stage
+
+    world = World(tmp_path)
+    try:
+        world.incident("i1", at=T0 + 2)
+        world.incident("i2", at=T0 + 2)
+        pub = FakePublisher([threading.Event()])  # the publisher blocks until released
+        release = pub._script[0]
+        c = PipelineConfig(
+            data_dir=tmp_path, delivery=DeliverySettings(enabled=True, file=tmp_path / "out.jsonl")
+        )
+        run_delivery_stage(world.inv, world.ro, c, Clock(T0 + 2.7), publisher=pub)  # watermark
+        passes: list[int] = []
+
+        def run(config, should_stop=lambda: False):
+            passes.append(1)
+            timer = threading.Timer(
+                0.2, lambda: (handlers[cli.signal.SIGTERM](15, None), release.set())
+            )
+            timer.start()
+            run_delivery_stage(
+                world.inv, world.ro, c, Clock(T0 + 4), publisher=pub, should_stop=should_stop
+            )
+
+        monkeypatch.setattr(cli, "run_once", run)
+        assert cli.main(["run", "--loop", "1", "--data-dir", str(tmp_path)]) == 0
+        assert passes == [1]
+        # the in-flight row finished as sent; the stop reached the drain, so no second claim began
+        assert sorted(r["state"] for r in world.rows()) == ["pending", "sent"]
+    finally:
+        world.close()
+
+
+def test_failing_wakeup_install_restores_handlers_and_closes_pipe(data, monkeypatch):
+    calls: list[tuple[object, object]] = []
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, fn: calls.append((sig, fn)) or "old")
+    closed: list[bool] = []
+    real_close = cli._StopFlag.close
+    monkeypatch.setattr(
+        cli._StopFlag, "close", lambda self: (closed.append(True), real_close(self))
+    )
+
+    def boom(fd):
+        raise ValueError("set_wakeup_fd only works in main thread")
+
+    monkeypatch.setattr(cli.signal, "set_wakeup_fd", boom)
+    with pytest.raises(ValueError):
+        cli.main(["run", "--loop", "1", "--data-dir", str(data.root)])
+    assert [fn for _, fn in calls[-2:]] == ["old", "old"]  # SIGTERM, SIGINT back to previous
+    assert closed == [True]
