@@ -69,6 +69,7 @@ RUN_BUDGET_S = 120.0  # total wall-clock budget of one run
 RETRY_STATUS = frozenset({408, 425, 429})  # 425 kept for parity with the ntfy sender
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 WEBHOOK_PATH_RE = re.compile(r"/api/webhook/[A-Za-z0-9_-]{1,128}")
+KEY_NAME_RE = re.compile(r"[a-z_]{1,32}")  # unknown keys are echoed only when they look like this
 DELIVERY_ID_RE = re.compile(r"[0-9a-f]{32}")
 ALIAS_RE = re.compile(r"Device [a-z]{6}")  # the writer's stable alias; anything else fails closed
 # Copied from vigie_pipeline.delivery_publish (the writer); a test asserts they stay equal.
@@ -135,6 +136,7 @@ class Cursor:
     dev: int = 0
     ino: int = 0
     head: str = ""
+    discard: bool = False  # inside an oversized line: skip bytes through its next newline
 
 
 @dataclass(frozen=True)
@@ -248,7 +250,7 @@ def validate_webhook_url(
 
 
 def build_ssl_context(ca_file: str | None) -> ssl.SSLContext:
-    """System trust store, plus the optional private CA bundle or pinned certificate. Hostname
+    """System trust store, plus the optional additional trusted CA bundle (or certificate). Hostname
     checking and verification stay on; there is no way to turn them off."""
     context = ssl.create_default_context()
     if ca_file is None:
@@ -291,6 +293,21 @@ def _abs_path(value: object, key: str) -> str:
     return value
 
 
+_PRIVATE_NETS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")
+)
+
+
+def _is_private_literal(host: str) -> bool:
+    """RFC 1918 / loopback IPv4 or ULA / loopback IPv6 literal (a host name is never one)."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in net for net in _PRIVATE_NETS if net.version == address.version)
+
+
 def _hosts(value: object, key: str, *, required: bool) -> tuple[str, ...]:
     if not isinstance(value, list) or (required and not value):
         raise ConfigError(f"{key} must be a {'non-empty ' if required else ''}list of hosts")
@@ -310,9 +327,12 @@ def _bounded_number(value: object, key: str, maximum: float, *, integer: bool) -
 def parse_config(raw: object) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("configuration must be a JSON object")
-    unknown = sorted(set(raw) - CONFIG_KEYS)
+    unknown = sorted(set(raw) - CONFIG_KEYS, key=str)
     if unknown:
-        raise ConfigError("unknown configuration keys: " + ", ".join(map(str, unknown)))
+        shown = [k for k in unknown if isinstance(k, str) and KEY_NAME_RE.fullmatch(k)]
+        hidden = len(unknown) - len(shown)
+        extra = f" (and {hidden} with unprintable or oversized names)" if hidden else ""
+        raise ConfigError("unknown configuration keys: " + ", ".join(shown) + extra)
     for key in ("delivery_file", "cursor_file", "url_file", "allowed_hosts"):
         if key not in raw:
             raise ConfigError(f"missing configuration key: {key}")
@@ -320,6 +340,12 @@ def parse_config(raw: object) -> Config:
     plain = _hosts(raw.get("http_hosts", []), "http_hosts", required=False)
     if not set(plain) <= set(allowed):
         raise ConfigError("http_hosts must be a subset of allowed_hosts")
+    for host in plain:
+        if not _is_private_literal(host):
+            log.warning(
+                "an http_hosts entry is not a private-network address literal; plain HTTP to it "
+                "exposes the secret URL and payload to anyone on the path"
+            )
     start_at_end = raw.get("start_at_end", True)
     if not isinstance(start_at_end, bool):
         raise ConfigError("start_at_end must be true or false")
@@ -358,12 +384,16 @@ def load_cursor(path: str) -> Cursor:
     data = read_private_bytes(path, "cursor file", MAX_CURSOR)
     try:
         raw = json.loads(data.decode("utf-8"))
-        cursor = Cursor(raw["offset"], raw["dev"], raw["ino"], raw["head"])
+        cursor = Cursor(
+            raw["offset"], raw["dev"], raw["ino"], raw["head"], raw.get("discard", False)
+        )
     except (UnicodeDecodeError, ValueError, KeyError, TypeError, RecursionError) as exc:
         raise ConfigError("cursor file is corrupt; inspect or remove it deliberately") from exc
     ints = (cursor.offset, cursor.dev, cursor.ino)
-    if not all(type(n) is int and n >= 0 for n in ints) or not re.fullmatch(
-        r"[0-9a-f]{0,16}", str(cursor.head)
+    if (
+        not all(type(n) is int and n >= 0 for n in ints)
+        or type(cursor.discard) is not bool
+        or not re.fullmatch(r"[0-9a-f]{0,16}", str(cursor.head))
     ):
         raise ConfigError("cursor file is corrupt; inspect or remove it deliberately")
     return cursor
@@ -377,6 +407,7 @@ def save_cursor(path: str, cursor: Cursor) -> None:
             "dev": cursor.dev,
             "ino": cursor.ino,
             "head": cursor.head,
+            "discard": cursor.discard,
         }
     ).encode()
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
@@ -412,16 +443,15 @@ def _fsync_directory(path: str) -> None:
         os.close(dir_fd)
 
 
-def ensure_cursor_dir(cursor_file: str) -> bool:
-    """Create the cursor directory (mode 0700, parent must exist) if missing; True if created."""
+def ensure_cursor_dir(cursor_file: str) -> None:
+    """Create the cursor directory (mode 0700, parent must exist) if it is missing."""
     directory = os.path.dirname(cursor_file) or "."
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
-        return False
+        return
     except OSError as exc:
         raise ConfigError(f"cannot create cursor directory: {exc.strerror}") from exc
-    return True
 
 
 def check_cursor_dir(cursor_file: str) -> None:
@@ -443,16 +473,12 @@ def check_cursor_dir(cursor_file: str) -> None:
         raise ConfigError("cursor directory must not be group- or world-writable (use mode 0700)")
 
 
-def acquire_lock(cursor_file: str) -> tuple[int, bool] | None:
-    """Exclusive non-blocking lock on `<cursor_file>.lock`: (fd, created_by_this_run), or None
-    when another run holds it. The lock file must be a regular file owned by us, single link."""
-    path = cursor_file + ".lock"
+def acquire_lock(cursor_file: str) -> int | None:
+    """Exclusive non-blocking lock on `<cursor_file>.lock`; None when another run holds it. The
+    lock file must be a regular file owned by us with a single link."""
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
-        try:
-            fd, created = os.open(path, flags | os.O_EXCL, 0o600), True
-        except FileExistsError:
-            fd, created = os.open(path, flags, 0o600), False
+        fd = os.open(cursor_file + ".lock", flags, 0o600)
     except OSError as exc:
         raise ConfigError(f"cannot open lock file: {exc.strerror}") from exc
     info = os.fstat(fd)
@@ -467,7 +493,7 @@ def acquire_lock(cursor_file: str) -> tuple[int, bool] | None:
     except OSError as exc:
         os.close(fd)
         raise ConfigError(f"cannot lock the lock file: {exc.strerror}") from exc
-    return fd, created
+    return fd
 
 
 def clean_stale_temps(cursor_file: str, max_age: float = STALE_TEMP_AGE_S) -> None:
@@ -502,12 +528,17 @@ class Chunk:
     ino: int
     head: str
     restarted: bool
+    discard: bool = False  # the chunk starts inside an oversized line
+
+
+def _head_of(prefix: bytes) -> str:
+    """Hash of the first line, from at most MAX_LINE + 1 bytes of the file start."""
+    end = prefix[: MAX_LINE + 1].find(b"\n")
+    return "" if end < 0 else hashlib.sha256(prefix[:end]).hexdigest()[:16]
 
 
 def _first_line_hash(fd: int) -> str:
-    prefix = os.pread(fd, MAX_LINE + 1, 0)
-    end = prefix.find(b"\n")
-    return "" if end < 0 else hashlib.sha256(prefix[:end]).hexdigest()[:16]
+    return _head_of(os.pread(fd, MAX_LINE + 1, 0))
 
 
 def _read_cap(cfg: Config) -> int:
@@ -543,7 +574,10 @@ def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
             log.warning("device number of the delivery file changed; treating it as the same file")
         start = 0 if replaced else cursor.offset
         data = os.pread(fd, _read_cap(cfg), start)
-    return Chunk(data, start, info.st_dev, info.st_ino, head, replaced)
+    if start == 0:  # the file may have changed since the hash above: trust the bytes we read
+        head = _head_of(data)
+    discard = cursor.discard and not replaced
+    return Chunk(data, start, info.st_dev, info.st_ino, head, replaced, discard)
 
 
 def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
@@ -559,32 +593,49 @@ def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
     return replace(previous, data=data, start=offset, restarted=False)
 
 
-def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int]]:
-    """Complete lines as (line, offset after it), produced one at a time. A partial trailing line
-    is left alone, except a full chunk with no newline at all: that is one oversized line and is
-    skipped by the caller."""
+def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int, bool]]:
+    """Complete lines as (line, offset after it, False), produced one at a time. A partial
+    trailing line is left alone, except a full chunk with no newline at all: that is the start of
+    an oversized line, yielded once as (bytes, offset after them, True). The caller must then
+    discard everything through that line's newline."""
     pos = 0
     found = False
     while (end := chunk.data.find(b"\n", pos)) >= 0:
         found = True
-        yield chunk.data[pos:end], chunk.start + end + 1
+        yield chunk.data[pos:end], chunk.start + end + 1, False
         pos = end + 1
     if not found and len(chunk.data) >= cap:
-        yield chunk.data, chunk.start + len(chunk.data)
+        yield chunk.data, chunk.start + len(chunk.data), True
 
 
-def iter_lines(cfg: Config, chunk: Chunk) -> Iterator[tuple[bytes, int]]:
+def _past_newline(chunk: Chunk) -> tuple[Chunk, bool]:
+    """Drop the tail of an oversized line: bytes through the first newline. Returns the rest and
+    whether we are still inside the line (no newline in this chunk)."""
+    index = chunk.data.find(b"\n")
+    if index < 0:
+        return replace(chunk, data=b"", start=chunk.start + len(chunk.data)), True
+    return replace(chunk, data=chunk.data[index + 1 :], start=chunk.start + index + 1), False
+
+
+def iter_lines(
+    cfg: Config, chunk: Chunk, discard: bool = False
+) -> Iterator[tuple[bytes, int, bool]]:
     """Every complete line of the file from the chunk on; later chunks are read lazily, so a
-    consumer that stops pulling never reads (or holds) more."""
+    consumer that stops pulling never reads (or holds) more. After an oversized-line item
+    (third element True) the rest of that line is dropped here, never parsed as a record. With
+    `discard` the chunk starts inside such a line."""
     cap = _read_cap(cfg)
     while True:
+        more = len(chunk.data) >= cap
+        if discard:
+            chunk, discard = _past_newline(chunk)
         last_end = None
         for item in split_lines(chunk, cap):
-            last_end = item[1]
+            last_end, discard = item[1], item[2]
             yield item
-        if last_end is None or len(chunk.data) < cap:
+        if not more:
             return
-        following = read_at(cfg, chunk, last_end)
+        following = read_at(cfg, chunk, chunk.start if last_end is None else last_end)
         if following is None:
             return
         chunk = following
@@ -731,8 +782,12 @@ def send_once(
 ) -> Outcome:
     try:
         with opener.open(req, timeout=timeout) as response:  # noqa: S310 -- validated URL
-            response.read(MAX_RESPONSE)
-            return classify_status(response.status, None)
+            status = response.status
+            try:
+                response.read(MAX_RESPONSE)
+            except (OSError, http.client.HTTPException):
+                log.debug("response body unreadable after the status line")  # status decides
+            return classify_status(status, None)
     except urllib.error.HTTPError as exc:
         try:
             exc.read(MAX_RESPONSE)
@@ -741,9 +796,12 @@ def send_once(
         return classify_status(exc.code, exc.headers.get("Retry-After"))
     except RedirectRefused:
         return Outcome("permanent", None, "redirect refused")
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            return Outcome("permanent", None, "certificate verification failed")
+        return Outcome("retry", None, type(exc.reason).__name__)
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        reason = getattr(exc, "reason", exc)
-        return Outcome("retry", None, type(reason).__name__)
+        return Outcome("retry", None, type(exc).__name__)
 
 
 def send_with_retry(
@@ -781,26 +839,28 @@ def send_with_retry(
 def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunResult:
     """Send the records in order, at most max_batch lines per run. Any outcome other than ok
     stops the run with the cursor before that record (there is no per-record skip: PRP-004 D6)."""
-    cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head)
+    cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head, chunk.discard)
     sent = skipped = taken = 0
-    for line, end in iter_lines(cfg, chunk):
+    for line, end, oversized in iter_lines(cfg, chunk, chunk.discard):
         if taken >= cfg.max_batch:
             break
         taken += 1
         try:
+            if oversized:
+                raise ValueError("line too long")
             record = parse_record(line)
         except ValueError as exc:
             if skipped < MAX_SKIP_LOGS:
                 log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
-            cursor = replace(cursor, offset=end)
+            cursor = replace(cursor, offset=end, discard=oversized)
             save_cursor(cfg.cursor_file, cursor)
             continue
         outcome = send(record)
         if outcome.kind != "ok":
             return _stop(outcome, sent, skipped)
         sent += 1
-        cursor = replace(cursor, offset=end)
+        cursor = replace(cursor, offset=end, discard=False)
         save_cursor(cfg.cursor_file, cursor)
     if skipped > MAX_SKIP_LOGS:
         log.warning(
@@ -808,6 +868,8 @@ def _drain(cfg: Config, chunk: Chunk, send: Callable[[Record], Outcome]) -> RunR
             skipped,
             MAX_SKIP_LOGS,
         )
+    if skipped and not sent:
+        log.error("every record read in this run was invalid and skipped; nothing was sent")
     if chunk.restarted and cursor.offset == 0:
         save_cursor(cfg.cursor_file, cursor)
     return RunResult(sent, skipped, EXIT_OK)
@@ -833,38 +895,55 @@ def run(
     clock: Callable[[], float] = time.monotonic,
     budget_seconds: float = RUN_BUDGET_S,
 ) -> RunResult:
-    created_dir = ensure_cursor_dir(cfg.cursor_file)
+    # Pure reads and validation first: a broken configuration must not leave a cursor directory
+    # or lock file behind, nor consume the one-time seed.
+    url = validate_webhook_url(
+        read_secret(cfg.url_file, "webhook URL file"), cfg.allowed_hosts, cfg.http_hosts
+    )
+    context = ssl_context or build_ssl_context(cfg.ca_file)
+    ensure_cursor_dir(cfg.cursor_file)
     check_cursor_dir(cfg.cursor_file)
-    lock = acquire_lock(cfg.cursor_file)
-    if lock is None:
+    fd = acquire_lock(cfg.cursor_file)
+    if fd is None:
         log.info("another run active; exiting")
         return RunResult(0, 0, EXIT_OK)
-    fd, created_lock = lock
     try:
-        # Validate every secret and the TLS setup BEFORE the cursor can be seeded, so a broken
-        # configuration never consumes the one-time seed.
-        url = validate_webhook_url(
-            read_secret(cfg.url_file, "webhook URL file"),
-            cfg.allowed_hosts,
-            cfg.http_hosts,
-        )
-        context = ssl_context or build_ssl_context(cfg.ca_file)
-        fresh = created_dir or _only_our_lock(cfg.cursor_file, created_lock)
+        fresh = _is_fresh(cfg.cursor_file, fd)  # decided by the lock winner alone
         cursor = _initial_cursor(cfg, fresh=fresh, seed_at_end=seed_at_end)
         clean_stale_temps(cfg.cursor_file)
-        return _run_locked(cfg, url, context, cursor, sleep, clock, budget_seconds)
+        try:
+            return _run_locked(cfg, url, context, cursor, sleep, clock, budget_seconds)
+        finally:
+            _mark_established(cfg.cursor_file, fd)
     finally:
         os.close(fd)
 
 
-def _only_our_lock(cursor_file: str, created_lock: bool) -> bool:
-    """True when the cursor directory holds no sender state apart from the lock file THIS run
-    created (the lock is taken first so that two first runs cannot both seed)."""
-    ours = {os.path.basename(cursor_file) + ".lock"} if created_lock else set()
+def _is_fresh(cursor_file: str, lock_fd: int) -> bool:
+    """True when no run ever established a cursor here: the directory holds nothing but the lock
+    file and the lock is unmarked. A lock left by a run that never got a cursor (failed first
+    run, or a peer that lost the race) does not count as sender state."""
     try:
-        return not set(os.listdir(os.path.dirname(cursor_file) or ".")) - ours
+        others = set(os.listdir(os.path.dirname(cursor_file) or ".")) - {
+            os.path.basename(cursor_file) + ".lock"
+        }
+        return not others and os.pread(lock_fd, 1, 0) == b""
     except OSError as exc:
-        raise ConfigError(f"cannot list cursor directory: {exc.strerror}") from exc
+        raise ConfigError(f"cannot inspect cursor directory: {exc.strerror}") from exc
+
+
+def _mark_established(cursor_file: str, lock_fd: int) -> None:
+    """Once a cursor exists, mark the lock so that a LATER missing cursor is recognised as lost
+    (exit 2) rather than as a first run."""
+    if not os.path.lexists(cursor_file):
+        return
+    try:
+        os.pwrite(lock_fd, b"1", 0)
+        os.fsync(lock_fd)
+    except OSError as exc:
+        log.warning(
+            "cannot mark the lock file (%s); a lost cursor would be re-seeded", exc.strerror
+        )
 
 
 def _initial_cursor(cfg: Config, *, fresh: bool, seed_at_end: bool) -> Cursor:

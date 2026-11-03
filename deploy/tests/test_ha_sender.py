@@ -846,14 +846,14 @@ def test_ca_file_verifies_a_private_ca(env: Env, certs) -> None:
 def test_private_ca_is_not_trusted_without_ca_file(env: Env) -> None:
     env.write(line(record(1)))
     result = env.run(_run={"ssl_context": None})
-    assert result.code == 4 and env.server.requests == [] and env.cursor_offset() == 0
+    assert result.code == 3 and env.server.requests == [] and env.cursor_offset() == 0
 
 
 def test_wrong_certificate_fails_verification(env: Env, certs) -> None:
     env.write(line(record(1)))
     ca = private(env.tmp / "ca.pem", certs["other"][0].read_bytes())
     result = env.run(_run={"ssl_context": None}, ca_file=str(ca))
-    assert result.code == 4 and env.server.requests == []
+    assert result.code == 3 and env.server.requests == []
 
 
 @pytest.mark.parametrize("content", [b"not a pem", b"", b"-----BEGIN CERTIFICATE-----\nAAAA\n"])
@@ -1054,3 +1054,231 @@ def test_docs_have_the_home_assistant_delivery_section() -> None:
         assert needle in section, needle
     assert "/ABSOLUTE/PATH" in section
     assert not re.search(r"https?://(?!vigie\.example\.invalid|ha\.example\.invalid)\S+", section)
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+EMBEDDED = record(9)
+
+
+def _oversized(size: int) -> bytes:
+    """One physical line: filler of `size` bytes followed by a VALID record, then the newline."""
+    return b"x" * size + json.dumps(EMBEDDED, separators=(",", ":")).encode() + b"\n"
+
+
+def _bodies(env: Env) -> list[str]:
+    return [json.loads(r["body"])["link"] for r in env.server.requests]
+
+
+def test_oversized_line_is_discarded_through_its_newline_across_runs(env: Env) -> None:
+    env.write(_oversized(ha.MAX_LINE + 1), line(record(2)))
+    first = env.run(max_batch=1)
+    assert (first.sent, first.skipped) == (0, 1)
+    while env.run(max_batch=1).sent == 0 and env.cursor_offset() < env.delivery.stat().st_size:
+        pass
+    assert _bodies(env) == ["/ui/#incident=i2"]  # the embedded record was never sent
+
+
+def test_oversized_line_is_discarded_within_one_run_across_chunks(env: Env) -> None:
+    cap = 2 * (ha.MAX_LINE + 1)
+    env.write(_oversized(cap + 5000), line(record(2)))
+    result = env.run(max_batch=2)
+    assert (result.sent, result.skipped) == (1, 1)
+    assert _bodies(env) == ["/ui/#incident=i2"]
+
+
+def test_oversized_line_still_being_written_keeps_discarding(env: Env) -> None:
+    cap = ha.MAX_LINE + 1
+    env.write(b"x" * cap)  # no newline yet
+    assert env.run(max_batch=1).skipped == 1
+    env.write(b"y" * 100)  # still no newline
+    env.run(max_batch=1)
+    env.write(json.dumps(EMBEDDED).encode() + b"\n", line(record(2)))
+    for _ in range(5):
+        env.run(max_batch=1)
+    assert _bodies(env) == ["/ui/#incident=i2"]
+
+
+def test_cursor_discard_flag_survives_in_the_cursor_file(env: Env) -> None:
+    env.write(b"x" * (ha.MAX_LINE + 1))
+    env.run(max_batch=1)
+    assert json.loads(env.cursor.read_text())["discard"] is True
+    private(env.cursor, json.dumps({"offset": 0, "dev": 0, "ino": 0, "head": "", "discard": 1}))
+    with pytest.raises(ha.ConfigError, match="cursor"):
+        env.run(max_batch=1)
+
+
+def test_failed_first_run_leaves_nothing_so_the_corrected_run_seeds(env: Env) -> None:
+    env.write(line(record(1)))
+    fresh = env.tmp / "fresh-state"
+    env.cursor = fresh / "cursor.json"
+    good = env.url_file.read_text()
+    private(env.url_file, f"{env.server.url}/not/a/webhook\n")
+    with pytest.raises(ha.ConfigError):
+        env.run(start_at_end=True)
+    assert not fresh.exists()
+    private(env.url_file, good)
+    assert env.run(start_at_end=True).code == 0
+    assert env.cursor_offset() == env.delivery.stat().st_size and not env.server.requests
+
+
+def test_failed_run_in_existing_empty_dir_leaves_no_lock(env: Env) -> None:
+    env.write(line(record(1)))
+    private(env.url_file, "https://nope.example.invalid/api/webhook/x\n")
+    with pytest.raises(ha.ConfigError):
+        env.run(start_at_end=True)
+    assert list(env.state.iterdir()) == []
+
+
+def test_unmarked_leftover_lock_does_not_block_seeding(env: Env) -> None:
+    env.write(line(record(1)))
+    private(Path(str(env.cursor) + ".lock"), b"")  # a peer or crashed run that never got a cursor
+    assert env.run(start_at_end=True).code == 0
+    assert env.cursor_offset() == env.delivery.stat().st_size
+
+
+def test_two_concurrent_first_runs_seed_exactly_once(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.write(line(record(1)))
+    calls: list[int] = []
+    entered, release = threading.Event(), threading.Event()
+    real = ha.seed_cursor
+
+    def slow_seed(cfg: ha.Config) -> ha.Cursor:
+        calls.append(1)
+        entered.set()
+        assert release.wait(20)
+        return real(cfg)
+
+    monkeypatch.setattr(ha, "seed_cursor", slow_seed)
+    results: dict[str, object] = {}
+    winner = threading.Thread(
+        target=lambda: results.update(a=env.run(start_at_end=True)), daemon=True
+    )
+    winner.start()
+    assert entered.wait(20)
+    second = env.run(start_at_end=True)  # the lock is held: exits 0, never exit 2, never seeds
+    release.set()
+    winner.join(20)
+    assert second.code == 0 and results["a"].code == 0 and calls == [1]
+    assert env.cursor_offset() == env.delivery.stat().st_size
+
+
+def test_proxy_environment_is_ignored(henv: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    henv.write(line(record(1)))
+    assert henv.run().sent == 1 and len(henv.server.requests) == 1
+
+
+def test_in_place_truncate_and_regrow_with_other_first_line_restarts(env: Env) -> None:
+    env.write(line(record(1)), line(record(2)))
+    env.run()
+    inode = env.delivery.stat().st_ino
+    with env.delivery.open("r+b") as f:
+        f.truncate(0)
+        f.write(line(record(5)) + line(record(6)) + line(record(7)))
+    assert env.delivery.stat().st_ino == inode
+    assert env.run().sent == 3
+
+
+def test_lock_file_must_be_a_regular_single_link_file_we_own(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = Path(str(env.cursor) + ".lock")
+    other = private(env.tmp / "other", b"")
+    os.link(other, lock)
+    with pytest.raises(ha.ConfigError, match="single link"):
+        ha.acquire_lock(str(env.cursor))
+    lock.unlink()
+    lock.symlink_to(other)
+    with pytest.raises(ha.ConfigError, match="lock"):
+        ha.acquire_lock(str(env.cursor))
+    lock.unlink()
+    os.mkfifo(lock)
+    with pytest.raises(ha.ConfigError, match="regular"):
+        ha.acquire_lock(str(env.cursor))
+    lock.unlink()
+    private(lock, b"")
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(ha.ConfigError, match="we own"):
+        ha.acquire_lock(str(env.cursor))
+
+
+def test_cursor_directory_owner_is_checked(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(ha.ConfigError, match="owned"):
+        ha.check_cursor_dir(str(env.cursor))
+
+
+@pytest.mark.parametrize("start_at_end", [False, True])
+def test_delivery_file_must_be_a_regular_file(env: Env, start_at_end: bool) -> None:
+    os.mkfifo(env.delivery)
+    with pytest.raises(ha.ConfigError, match="regular"):
+        env.run(start_at_end=start_at_end)
+
+
+def test_unknown_config_keys_are_not_echoed(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    url_key = "https://ha.example.invalid/api/webhook/SECRETID"
+    raw = env.raw_config()
+    raw.update({url_key: 1, "good_name": 1, "Bad Key": 2})
+    with pytest.raises(ha.ConfigError) as info:
+        ha.parse_config(raw)
+    assert "SECRETID" not in str(info.value) and "good_name" in str(info.value)
+    cfg_path = private(env.tmp / "cfg.json", json.dumps(raw))
+    assert ha.main([str(cfg_path)]) == 2
+    assert "SECRETID" not in capsys.readouterr().out
+
+
+def test_all_invalid_run_logs_one_error_and_keeps_the_exit_table(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    env.write(b"junk\n", b"[1]\n", line(record(1, label="Bob")))
+    with caplog.at_level(logging.ERROR):
+        result = env.run()
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert (result.sent, result.skipped, result.code) == (0, 3, 0) and len(errors) == 1
+    assert "Bob" not in caplog.text
+
+
+def test_body_read_error_after_2xx_is_still_success() -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def read(self, _n: int) -> bytes:
+            raise TimeoutError
+
+    class Opener:
+        def open(self, _req: object, timeout: float) -> Response:
+            return Response()
+
+    assert ha.send_once(Opener(), object(), 1.0).kind == "ok"
+
+
+def test_certificate_verification_failure_is_permanent(env: Env) -> None:
+    env.write(line(record(1)))
+    result = env.run(_run={"ssl_context": None})  # private CA, no ca_file
+    assert (result.code, env.server.requests) == (3, []) and env.sleeps == []
+
+
+def test_non_private_http_host_logs_a_warning_without_the_host(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = {"delivery_file": "/a", "cursor_file": "/b", "url_file": "/c"}
+    with caplog.at_level(logging.WARNING):
+        ha.parse_config({**base, "allowed_hosts": ["127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "fd12::1", "::1"],
+                         "http_hosts": ["127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1",
+                                        "fd12::1", "::1"]})  # fmt: skip
+    assert caplog.text == ""
+    with caplog.at_level(logging.WARNING):
+        ha.parse_config({**base, "allowed_hosts": ["203.0.113.9", "ha.example.invalid"],
+                         "http_hosts": ["203.0.113.9", "ha.example.invalid"]})  # fmt: skip
+    assert caplog.text.count("http_hosts") == 2
+    assert "203.0.113" not in caplog.text and "example" not in caplog.text
