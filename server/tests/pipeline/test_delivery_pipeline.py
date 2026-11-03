@@ -131,6 +131,7 @@ def test_wiring_passes_the_abandoned_bound_to_the_runner(world, tmp_path, monkey
         tmp_path,
         settings(tmp_path, max_abandoned=5, max_per_run=3, drain_budget_s=45, include_label=True),
     )
+
     def stop():
         return True
 
