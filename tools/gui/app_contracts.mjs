@@ -503,6 +503,33 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   assert.ok(overview.textContent.includes('Unavailable · Unavailable')); assert.equal(views.coverageStatus({phase: 'ready', data: {collector, hours}}, clock).tone, 'degraded');
   assert.equal(views.node('p', {}, deep).textContent, 'Unavailable', 'a deeply nested child is text, not a recursion');
 }
+// Coverage gauge: a summary of the displayed hours, never a device count; unknown or stale is never drawn as ok.
+{
+  const mk = (lagSeconds, hours) => ({collector: {collector_id: 'c1', latest_observation_received_at: oldStamp(lagSeconds), latest_window_end: (clock - lagSeconds * 1000) / 1000, latest_dns_observation_received_at: oldStamp(0), latest_dns_observation_window_end: clock / 1000, backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, summary_capped: false, monitoring_unavailable: []}, hours});
+  const mix = [hour(-4, 'eligible'), hour(-3, 'eligible'), hour(-2, 'partial'), hour(-1, 'missing'), hour(0, 'open')];
+  const gaugeOf = view => view.querySelector('svg') && view.querySelectorAll('svg').find(n => (n.getAttribute('class') || '') === 'gauge');
+  const cls = (g, name) => g.querySelectorAll('circle').filter(c => (c.getAttribute('class') || '').split(' ').includes(name));
+  const fresh = views.coverageView(mk(5, mix)); const g = gaugeOf(fresh);
+  assert.ok(g, 'the Overview carries a gauge'); assert.equal(g.getAttribute('role'), 'img');
+  const label = g.getAttribute('aria-label');
+  assert.match(label, /5 hours/); assert.match(label, /2 qualified/); assert.match(label, /1 partial/); assert.match(label, /1 missing/); assert.match(label, /1 open/); assert.match(label, /current/); assert.doesNotMatch(label, /stale|unknown/i);
+  assert.ok(g.textContent.includes('of 5 h qualified')); assert.equal(g.querySelectorAll('text').find(t => t.getAttribute('class') === 'g-val').textContent, '2');
+  assert.deepEqual(cls(g, 'g-seg').map(c => c.getAttribute('class').split(' ')[1]), ['eligible', 'partial', 'missing', 'open']);
+  assert.equal(cls(g, 'g-obs').length, 1); assert.deepEqual(cls(g, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['fresh']); assert.match(cls(g, 'g-obs')[0].getAttribute('stroke-dasharray'), / 0$/, 'fresh outer ring is solid');
+  assert.doesNotMatch(g.textContent, /device|identit/i, 'the gauge is not a device count');
+  for (const section of ['Coverage over time', 'Source record']) assert.ok(fresh.textContent.includes(section), `${section} is still rendered`);
+  assert.equal(fresh.querySelectorAll('div').filter(n => n.getAttribute('class') === 'hour-strip').length, 1, 'the hour strip stays'); assert.ok(fresh.textContent.includes('Qualified'), 'the legend stays');
+  const stale = gaugeOf(views.coverageView(mk(500, mix)));
+  assert.deepEqual(cls(stale, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['stale'], 'a stale observation breaks the outer ring'); assert.doesNotMatch(cls(stale, 'g-obs')[0].getAttribute('stroke-dasharray'), / 0$/);
+  assert.match(stale.getAttribute('aria-label'), /stale or unknown/); assert.doesNotMatch(stale.getAttribute('aria-label'), /observation current/);
+  const unknown = mk(5, mix); delete unknown.collector.latest_window_end; const u = gaugeOf(views.coverageView(unknown));
+  assert.deepEqual(cls(u, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['stale'], 'a missing window end is unknown, never current');
+  assert.equal(gaugeOf(views.coverageView(mk(5, mix.slice(0, 1)))).getAttribute('aria-label').includes('1 hours'), false, 'singular is not mangled into "1 hours"');
+  assert.equal(views.coverageGauge({hours: []}, true), null, 'no hours, no gauge'); assert.ok(!gaugeOf(views.coverageView(mk(5, []))), 'an empty response renders no gauge');
+  const before = JSON.stringify(mix); views.coverageView(mk(5, mix)); assert.equal(JSON.stringify(mix), before, 'API data is not mutated');
+  for (const bad of ['surprise', null, 'ELIGIBLE']) assert.throws(() => views.coverageView(mk(5, [{hour: thisHour, state: bad, reasons: []}])), /Malformed monitoring response/);
+  assert.deepEqual(violations, []);
+}
 // Behavioural read-only (addendum B), sinks (C) and timers (D).
 await reload(); const doubleCheck = refreshTimers();
 for (const name of ['overview', 'inventory', 'activity', 'incidents', 'overview', 'incidents']) { view(name); await flush(); hashchange(); }
@@ -518,6 +545,7 @@ const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${nam
 const banned = /innerHTML|outerHTML|insertAdjacentHTML|\beval\s*\(|\bFunction\s*\(|\bimport\s*\(|document\s*\.\s*write|localStorage|sessionStorage|indexedDB|set(?:Timeout|Interval)\s*\(\s*['"`]/;
 const computed = /\b(?:globalThis|window|self|document|this)\s*\[|[\w)\]]\s*\[\s*(?:['"`][^\]\n]*['"`]\s*\+|[^\]\n]*\+\s*['"`]|`)/;
 for (const name of ['views.js', 'app.js', 'client.js']) { const code = source(name); assert.doesNotMatch(code, banned, `${name} stays inert`); assert.doesNotMatch(code, computed, `${name} has no computed member access built from strings`); }
+for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /['"`]style['"`]\s*:|\bstyle\s*:|\.style\b|setAttribute\(\s*['"`]style/, `${name} sets no inline style (CSP style-src 'self')`);
 for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /\bfetch\s*\(|XMLHttpRequest|sendBeacon|\bmethod\b/, `${name} never talks to the network itself`);
 const clientCode = source('client.js'); assert.deepEqual([...clientCode.matchAll(/\bmethod\s*:\s*(['"`])(\w+)\1/g)].map(m => m[2]), ['GET'], 'the only HTTP verb is GET'); assert.equal((clientCode.match(/\bmethod\b/g) || []).length, 1); assert.doesNotMatch(clientCode, /\bbody\s*:/);
 const page = source('index.html'); assert.match(page, /<div id="coverage-banner"[^>]*role="status"[^>]*aria-live="polite"/); assert.doesNotMatch(page, /<form[^>]*method=|<textarea/i);

@@ -2,7 +2,7 @@
 // Run from any directory: node /path/to/repository/tools/gui/frontend_contracts.mjs
 import assert from 'node:assert/strict';
 import {ApiClient,ApiError,StaleResult,retryTime} from '../../server/src/vigie_api/ui/client.js';
-import {processingState,coverageView,liveLabel,refreshLiveLabels} from '../../server/src/vigie_api/ui/views.js';
+import {processingState,coverageView,gaugeSegments,liveLabel,refreshLiveLabels} from '../../server/src/vigie_api/ui/views.js';
 globalThis.location={origin:'http://127.0.0.1:18745'};
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const now=Date.parse('2026-10-25T12:00:00Z');
@@ -76,6 +76,21 @@ for (const kind of ['coverage', 'activity']) {
 }
 // The view layer re-validates the UTC grid itself: a numeric string passes `% 3600`, so the integer check is not dead.
 for(const hour of ['7200',7200.5,3601,-3600,null])assert.throws(()=>coverageView({collector:{},hours:[{hour,state:'missing',reasons:[]}]}),/Malformed monitoring response/,`hour ${String(hour)} accepted`);
+// Coverage gauge maths: pure numbers, no DOM. Segments follow the fixed state order and never overlap the ring's end.
+{
+  const order=['eligible','partial','missing','open']; const zero={eligible:0,partial:0,missing:0,open:0};
+  const check=(counts,total)=>{const g=gaugeSegments(counts,total);let prev=-1;
+    for(const s of g.segments){assert.ok(order.includes(s.state));assert.ok(Number.isFinite(s.length)&&s.length>0,'visible length');assert.ok(s.offset>=prev,'offsets monotonic');assert.ok(s.offset+s.length<=g.circumference+1e-9,'fits the ring');prev=s.offset;}
+    assert.deepEqual(g.segments.map(s=>s.state),order.filter(k=>counts[k]>0),'fixed order, empty states skipped');return g;};
+  assert.deepEqual(gaugeSegments(zero,0).segments,[],'no hours, no segments');
+  assert.ok(gaugeSegments(zero,0).circumference>0);
+  const one=check({...zero,eligible:1,missing:199},200); assert.ok(one.segments[0].length>0,'1 of 200 hours stays visible');
+  check({...zero,eligible:200},200); check({...zero,open:1},1); check({...zero,partial:2,open:1},3);
+  check({eligible:50,partial:50,missing:50,open:50},200); check({...zero,eligible:1,partial:1,missing:1,open:197},200);
+  assert.equal(check({...zero,missing:7},7).segments.length,1);
+  for(const bad of [[{...zero,eligible:2},3],[{...zero,eligible:-1,missing:2},1],[{...zero,eligible:1.5},1.5],[{...zero,eligible:'1'},1],[null,1],[{...zero,eligible:1,bogus:1},2]])assert.throws(()=>gaugeSegments(...bad),/Malformed/,`counts ${JSON.stringify(bad)} accepted`);
+  assert.throws(()=>coverageView({collector:{},hours:[{hour:3600,state:'surprise',reasons:[]}]}),/Malformed monitoring response/,'an unknown state never reaches the gauge');
+}
 // 'Current' is only claimed for a fresh, live, unpaused snapshot.
 assert.equal(liveLabel(true,false,5),'Current');
 assert.equal(liveLabel(true,true,5),'Snapshot (paused)');
