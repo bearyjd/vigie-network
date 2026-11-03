@@ -701,6 +701,133 @@ example one that writes a marker or sends a desktop notification, and/or watch t
 5. To stop: `systemctl --user disable --now ntfy-sender.timer`. Pending lines stay in the file and
    are sent when the timer is enabled again.
 
+### Home Assistant delivery
+
+`deploy/persistent/ha_sender.py` ships the same delivery file to a Home Assistant (HA) webhook, as
+designed in [PRP-004](prp/004-home-assistant-integration.md). It is **off by default**, standalone
+(Python standard library), **not wired into the pipeline** (no code change, no new
+`VIGIE_DELIVERY_*` setting, the pipeline keeps `Network=none`) and independent of the ntfy sender:
+own config, own cursor, own units. **ntfy remains the counted alert channel.** An HTTP 2xx from an
+HA webhook does not prove that an automation ran (HA likely answers 2xx for a wrong id or a
+disabled automation, per HA docs, unverified), so HA delivery is best-effort convenience. Keep an
+end-to-end canary on the HA side: let the automation stamp an `input_datetime` helper on every
+message and watch for it going stale.
+
+```
+pipeline (Network=none) --FilePublisher--> delivery-messages.jsonl --read-only--> ha_sender.py --HTTP(S) POST--> HA webhook
+```
+
+Why `podman unshare`, the unit hardening limits and the "stalled channel" advice are the same as
+for ntfy above; the units are `ha-sender.service` and `ha-sender.timer` (templates, not installed
+by anything here). Set `OnFailure=` to a local unit so that a failed run is visible.
+
+**Payload.** One JSON object per record (`Content-Type: application/json`), built only from the
+validated record fields:
+
+| Field | Content |
+| --- | --- |
+| `delivery_id` | The record's id, exactly 32 lowercase hex characters. The automation's dedupe key; `open` and `recover` of one incident differ |
+| `sent_at` | The sender's UTC time when it sends (ISO 8601). Helps spot a replayed capture; it cannot flag a stale backlog |
+| `kind` | `open` or `recover` |
+| `title`, `body` | The validated text from the delivery file |
+| `link` | Relative `/ui/#incident=<id>`. Not a dedupe key (`open` and `recover` share it) |
+| `url` | Only with `vigie_base_url`: that base plus `link` |
+
+The automation must treat the payload as untrusted display text and never as a command. HA may keep
+it in its logbook, recorder and traces. Only the alias form is sent: a record whose label is not
+exactly `Device` plus six lowercase letters (for example when `VIGIE_DELIVERY_INCLUDE_LABEL` is on
+for another reason) is skipped with a counted warning and never sent.
+
+**Secret webhook URL.** The full URL `https://ha.example.invalid:8123/api/webhook/WEBHOOK_ID` is the
+only access control, so it lives in `url_file` (mode 0600 or 0400, owned by the effective user,
+regular file, no symlink, at most 1 KiB, outside git) and is never printed or logged. The sender
+validates it before use: scheme `https` (or `http` only for a host in `http_hosts`), host in
+`allowed_hosts`, no userinfo, query or fragment, path exactly `/api/webhook/<id>` with `<id>` of 1
+to 128 characters `A-Za-z0-9_-`. An error names only the failed rule (for example
+`webhook URL invalid: path`). Rotate by changing the id in the HA automation and the file.
+
+**Config** (JSON, mode 0600, unknown keys rejected, paths are placeholders):
+
+```json
+{
+  "delivery_file": "/ABSOLUTE/PATH/TO/delivery-messages.jsonl",
+  "cursor_file": "/ABSOLUTE/PATH/TO/HA_CURSOR_DIRECTORY/ha-cursor.json",
+  "url_file": "/ABSOLUTE/PATH/TO/private/ha-webhook-url",
+  "allowed_hosts": ["ha.example.invalid"],
+  "http_hosts": [],
+  "ca_file": "/ABSOLUTE/PATH/TO/private/ha-ca.pem",
+  "start_at_end": true,
+  "vigie_base_url": "https://vigie.example.invalid",
+  "timeout_seconds": 8,
+  "max_batch": 50
+}
+```
+
+Required: `delivery_file`, `cursor_file`, `url_file`, `allowed_hosts` (host names, IPv4 or IPv6
+literals; the NAME in the URL is pinned, not what it resolves to). Optional: `http_hosts` (default
+empty; must be a subset of `allowed_hosts`, otherwise exit 2; a host listed here may be reached over
+plain HTTP, every other host requires HTTPS. List only an RFC 1918 IPv4, an IPv6 ULA or a name you
+trust DNS for: the sender does not classify addresses, and plain HTTP exposes the secret URL and
+payload to a LAN observer who can replay them); `ca_file` (PEM CA bundle or pinned server
+certificate for a private CA, a private file like the others; it is added to the system trust store,
+and verification and host-name checking are never disabled); `start_at_end` (boolean, default
+`true`, see "First run"); `vigie_base_url` (https, no userinfo, query or fragment); `timeout_seconds`
+(default 8, at most 20); `max_batch` (lines per run, default 50, at least 1). The only command-line
+flags are the config path, `--once` and `--seed-at-end`.
+
+**First run.** A new cursor would replay every old message into HA, so with `start_at_end: true`
+the first run seeds the cursor just after the last complete line of the delivery file and sends
+nothing (a partial trailing line stays unread and is sent when it completes; the warning logs the
+skipped byte count). Whatever was written before the first enable is dropped: an incident already
+open appears in HA only as an orphan `recover`. Seeding happens only when the cursor directory is
+new or empty (the sender creates the directory with mode 0700 if its parent exists; the lock file
+created by this very run is ignored). If the directory exists and holds anything else (a lock file,
+a temp file) but no cursor, the cursor was probably deleted: the sender exits 2 instead of silently
+dropping the backlog. Confirm once with the one-shot flag
+`podman unshare python3 -I deploy/persistent/ha_sender.py /ABSOLUTE/PATH/TO/private/ha-sender.json --once --seed-at-end`,
+which seeds and proceeds. The flag is not a config key and must never be written into the unit; it
+is ignored when a cursor exists. `start_at_end: false` is the owner's explicit choice to replay the
+whole file. Keep the cursor directory dedicated to this sender.
+
+**Behaviour.** Everything else mirrors the ntfy sender: strict per-line validation against the
+writer's templates (invalid lines are skipped with a counted warning and never sent), atomic
+0600 cursor, a lock beside the cursor (a second run exits 0), restart from the beginning with a
+warning on a truncated or replaced file, at most `max_batch` lines per run, **at-least-once**
+delivery (a crash between a send and the cursor write can repeat one message; dedupe on
+`delivery_id`), a 120 s run budget, no proxy use, redirects never followed, the response read up to
+4 KiB and discarded. Differences: any 2xx is success; 408, 425, 429, 5xx, timeouts and connection
+or TLS errors are retryable (up to 4 attempts, 1, 2 and 4 s backoff, `Retry-After` honoured up to
+60 s); every other status, including every other 4xx and any redirect, is permanent and stops the
+run with the cursor before that record. There is no "rejected record" probe (PRP-004 D6
+recommendation), so exit 5 does not exist.
+
+**Exit codes.**
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Caught up, the delivery file does not exist yet, or another run holds the lock |
+| 1 | Unexpected internal error (exception class logged, nothing else) |
+| 2 | Configuration, secret URL, CA file, lock or cursor error, including a missing cursor in a non-empty cursor directory without `--seed-at-end` |
+| 3 | Permanent failure (4xx other than 408/425/429, redirect, unexpected status); cursor NOT advanced |
+| 4 | Retryable failure after retries, or the run budget ran out; cursor unchanged |
+
+Logs and the summary line (`ha_sender sent=N skipped=M exit=C`) never contain the URL, the
+webhook id, the host, the response body or record text.
+
+**Two senders, one delivery file.** With ntfy and HA both enabled, the truncate procedure in the
+ntfy section changes: stop BOTH timers, and truncate only when the cursor `offset` of EVERY enabled
+sender equals the delivery file size; truncating while either is behind drops its pending
+messages. (The read-only helper check proposed in PRP-004 H4 is not built yet; compare the numbers
+by hand.)
+
+**Enabling (owner actions, nothing here is installed for you).** Create the URL file with
+`umask 077`, write the config and the dedicated cursor directory, dry-run by hand with the command
+above (without `--seed-at-end` the first run seeds a new directory by itself), then copy
+`ha-sender.service` and `ha-sender.timer` to `~/.config/systemd/user/`, replace every
+`/ABSOLUTE/PATH/...` placeholder, run `systemctl --user daemon-reload` and
+`systemctl --user enable --now ha-sender.timer`. Stop with
+`systemctl --user disable --now ha-sender.timer`.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
