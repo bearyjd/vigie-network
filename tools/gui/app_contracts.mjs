@@ -93,10 +93,13 @@ assert.equal(typeof intervalTick, 'function', 'a recompute timer must be started
 const content = elements.content; const refresh = elements.refresh; const notice = elements.notice;
 const labels = () => content.querySelectorAll('[data-live-current]').map(e => e.textContent);
 const status = () => elements['refresh-status'].textContent;
+const ringOf = () => content.querySelectorAll('circle').find(c => (c.getAttribute('class') || '').split(' ').includes('g-obs'));
+const ringState = () => { const r = ringOf(); return {cls: r.getAttribute('class').split(' ')[1], solid: / 0$/.test(r.getAttribute('stroke-dasharray')), aria: content.querySelectorAll('svg').find(n => n.getAttribute('class') === 'gauge').getAttribute('aria-label')}; };
 
 elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
 elements['connect-form'].fire('submit'); await flush();
 assert.deepEqual(labels(), ['Current', 'Current'], 'fresh unpaused snapshot should be current');
+{ const r = ringState(); assert.equal(r.cls, 'fresh'); assert.ok(r.solid); assert.match(r.aria, /Source observation current\.$/); }
 assert.equal(refresh.getAttribute('aria-disabled'), 'false');
 assert.match(status(), /refresh every 30s/);
 
@@ -104,20 +107,24 @@ assert.match(status(), /refresh every 30s/);
 const anchor = content.querySelector('[data-live-current]'); anchor.focus(); content.fire('focusin');
 assert.deepEqual(labels(), ['Snapshot (paused)', 'Snapshot (paused)']);
 assert.match(status(), /paused while interacting/);
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'a paused snapshot is not a current observation'); assert.ok(!r.solid); assert.match(r.aria, /paused/); assert.doesNotMatch(r.aria, /observation current/); }
 clock += 121000; intervalTick();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'a paused snapshot older than 120 s is stale');
+{ const r = ringState(); assert.equal(r.cls, 'stale'); assert.ok(!r.solid); assert.match(r.aria, /stale or unknown\.$/); }
 body.focus = () => { document.activeElement = body; }; body.focus(); content.fire('focusout'); await flush();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'age alone keeps the badge stale after focus leaves');
 
 // Snapshot refresh restores Current; hidden tabs and the timer recompute without any render.
 mode = 'ok'; refresh.fire('click'); await flush();
-assert.deepEqual(labels(), ['Current', 'Current']);
+assert.deepEqual(labels(), ['Current', 'Current']); assert.equal(ringState().cls, 'fresh');
 document.hidden = true; intervalTick();
 assert.deepEqual(labels(), ['Snapshot (paused)', 'Snapshot (paused)'], 'hidden tab is paused');
+assert.equal(ringState().cls, 'stale', 'hidden tab: ring not current'); assert.match(ringState().aria, /paused/);
 document.hidden = false; intervalTick();
-assert.deepEqual(labels(), ['Current', 'Current']);
+assert.deepEqual(labels(), ['Current', 'Current']); { const r = ringState(); assert.equal(r.cls, 'fresh', 'the ring recovers with the metric'); assert.ok(r.solid); assert.match(r.aria, /Source observation current\.$/); }
 clock += 119000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], '119 s is still current');
 clock += 2000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'recomputed by timer alone');
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'the outer ring goes stale with the metric, not only at render'); assert.ok(!r.solid); assert.match(r.aria, /stale or unknown\.$/); assert.doesNotMatch(r.aria, /observation current/); }
 
 // M2 / J9: a 100 s old observation is Current at render, but 30 s later (snapshot only 30 s old) it is not.
 lag = 100; refresh.fire('click'); await flush();
@@ -125,8 +132,10 @@ assert.deepEqual(labels(), ['Current', 'Current'], 'a 100 s old observation is s
 const observed = content.querySelectorAll('[data-live-current]').map(e => Number(e.getAttribute('data-live-observed')));
 assert.ok(observed.every(t => Math.abs(t - (clock / 1000 - 100)) < 1), 'observation epoch is stored for later recompute');
 clock += 19000; intervalTick(); assert.deepEqual(labels(), ['Current', 'Current'], 'observation 119 s old');
+assert.equal(ringState().cls, 'fresh', 'ring: observation 119 s old');
 clock += 2000; intervalTick();
 assert.deepEqual(labels(), ['Stale', 'Stale'], 'observation 121 s old while the snapshot is only 21 s old');
+{ const r = ringState(); assert.equal(r.cls, 'stale', 'ring ages with the observation although the snapshot is young'); assert.match(r.aria, /stale or unknown\.$/); }
 document.hidden = true; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'pausing never revives an aged observation');
 document.hidden = false;
 // J12: the OLDEST evidence rules; a fresh receipt does not rescue a 100 s old window.
@@ -166,7 +175,7 @@ assert.equal(document.activeElement, elements['view-title'], 'a cleared notice h
 // CODEX-A: a slow MANUAL refresh that lands while keyboard focus sits on a content control must
 // restore focus to the same logical control, or to Refresh when that control is gone.
 mode = 'ok';
-const region = () => content.querySelector('[aria-label]');  // stands in for any labelled control
+const region = () => content.querySelectorAll('[aria-label]').find(n => n.localName !== 'svg');  // stands in for any labelled control; the gauge svg is a non-focusable image whose label is live
 assert.ok(region(), 'the overview renders a labelled element');
 let release; gate = new Promise(resolve => { release = resolve; });
 refresh.focus(); refresh.fire('click'); await flush();   // keyboard user presses Refresh; response is slow
@@ -515,6 +524,7 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   assert.match(label, /5 hours/); assert.match(label, /2 qualified/); assert.match(label, /1 partial/); assert.match(label, /1 missing/); assert.match(label, /1 open/); assert.match(label, /current/); assert.doesNotMatch(label, /stale|unknown/i);
   assert.ok(g.textContent.includes('of 5 h qualified')); assert.equal(g.querySelectorAll('text').find(t => t.getAttribute('class') === 'g-val').textContent, '2');
   assert.deepEqual(cls(g, 'g-seg').map(c => c.getAttribute('class').split(' ')[1]), ['eligible', 'partial', 'missing', 'open']);
+  { const offs = cls(g, 'g-seg').map(c => Number(c.getAttribute('stroke-dashoffset'))); assert.ok(offs.every(Number.isFinite) && offs[0] <= 0, 'dashoffset is negative: segments run clockwise from the origin'); offs.slice(1).forEach((o, i) => assert.ok(o < offs[i], 'dashoffsets strictly decrease')); }
   assert.equal(cls(g, 'g-obs').length, 1); assert.deepEqual(cls(g, 'g-obs')[0].getAttribute('class').split(' ').slice(1), ['fresh']); assert.match(cls(g, 'g-obs')[0].getAttribute('stroke-dasharray'), / 0$/, 'fresh outer ring is solid');
   assert.doesNotMatch(g.textContent, /device|identit/i, 'the gauge is not a device count');
   for (const section of ['Coverage over time', 'Source record']) assert.ok(fresh.textContent.includes(section), `${section} is still rendered`);

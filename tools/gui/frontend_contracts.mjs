@@ -88,6 +88,16 @@ for(const hour of ['7200',7200.5,3601,-3600,null])assert.throws(()=>coverageView
   check({...zero,eligible:200},200); check({...zero,open:1},1); check({...zero,partial:2,open:1},3);
   check({eligible:50,partial:50,missing:50,open:50},200); check({...zero,eligible:1,partial:1,missing:1,open:197},200);
   assert.equal(check({...zero,missing:7},7).segments.length,1);
+  // Round caps add W/2 each end: drawn extents must be pairwise disjoint and inside [0, C] (small states must not vanish under neighbours).
+  const W=10;
+  const extents=(counts,total)=>{const g=gaugeSegments(counts,total);const ex=g.segments.map(s=>[s.offset-W/2,s.offset+s.length+W/2]);
+    ex.forEach(([a,b],i)=>{assert.ok(a>=-1e-9&&b<=g.circumference+1e-9,`extent ${i} inside the ring for ${JSON.stringify(counts)}`);if(i)assert.ok(a>ex[i-1][1],`extents ${i-1}/${i} disjoint for ${JSON.stringify(counts)}`);});return g;};
+  extents({eligible:198,partial:1,missing:0,open:1},200);extents({eligible:1,partial:1,missing:1,open:197},200);
+  extents({...zero,eligible:199,open:1},200);extents({...zero,eligible:1,missing:199},200);extents({...zero,partial:200},200);extents({...zero,open:1},1);
+  for(let total=1;total<=200;total+=7)for(let a=0;a<=Math.min(total,6);a++)for(let b=0;a+b<=total&&b<=6;b++)for(let c=0;a+b+c<=total&&c<=6;c++)extents({eligible:a,partial:b,missing:c,open:total-a-b-c},total);
+  // Offsets run clockwise: the first segment starts at the ring origin (dashoffset is the negated offset) and later ones start further round.
+  const mono=check({eligible:50,partial:50,missing:50,open:50},200).segments;assert.ok(mono[0].offset>=0&&mono[0].offset<W,'first segment starts at the origin');
+  for(let i=1;i<mono.length;i++)assert.ok(mono[i].offset>mono[i-1].offset+mono[i-1].length,'strictly past the previous segment');
   for(const bad of [[{...zero,eligible:2},3],[{...zero,eligible:-1,missing:2},1],[{...zero,eligible:1.5},1.5],[{...zero,eligible:'1'},1],[null,1],[{...zero,eligible:1,bogus:1},2]])assert.throws(()=>gaugeSegments(...bad),/Malformed/,`counts ${JSON.stringify(bad)} accepted`);
   assert.throws(()=>coverageView({collector:{},hours:[{hour:3600,state:'surprise',reasons:[]}]}),/Malformed monitoring response/,'an unknown state never reaches the gauge');
 }
@@ -109,7 +119,7 @@ assert.equal(liveLabel(true,false,5,-1),'Stale');assert.equal(liveLabel(true,tru
 assert.equal(liveLabel(true,false,0,0),'Current');assert.equal(liveLabel(false,false,-1,-1),'Stale / unknown');
 {
   const label = (observed, snapshotAge = 5) => {
-    const el = {textContent: '', getAttribute: name => ({'data-live-current': 'true', 'data-live-observed': observed})[name]};
+    const el = {textContent: '', querySelector: () => null, getAttribute: name => ({'data-live-current': 'true', 'data-live-observed': observed})[name]};
     refreshLiveLabels({querySelectorAll: () => [el]}, false, snapshotAge, 1000);
     return el.textContent;
   };
