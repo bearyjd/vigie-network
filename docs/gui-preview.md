@@ -124,6 +124,9 @@ metric); a stale, unknown or unparseable observation draws it broken in amber. T
 qualified hour count and `of N h qualified`. The gauge is a summary of coverage hours and is not a
 device count: inventory pages are bounded and carry no total. With no hours returned there is no
 gauge. Its `aria-label` states the counts and whether the observation is current or stale/unknown.
+A paused snapshot or a hidden tab also draws the outer ring broken (aria suffix `not live (paused snapshot)`).
+Small states get a fixed minimum arc, so arc sizes are not strictly proportional to hours: 1 hour of 200 takes
+about 4.4% of the ring, not 0.5%. The hour strip is the exact view.
 Technique credit: Vedetta `net-gauge.js` (MIT, Sived80/vedetta), rewritten without `innerHTML` or inline styles.
 
 ## Verification and future delivery

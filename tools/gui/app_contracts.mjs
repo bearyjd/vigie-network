@@ -142,6 +142,11 @@ document.hidden = false;
 lag = 10; windowLag = 100; refresh.fire('click'); await flush();
 assert.deepEqual(labels(), ['Current', 'Current']);
 clock += 21000; intervalTick(); assert.deepEqual(labels(), ['Stale', 'Stale'], 'window 121 s old although received 31 s ago');
+// ...and the reverse: a fresh window with a 100 s old receipt.
+lag = 100; windowLag = 0; refresh.fire('click'); await flush();
+assert.equal(ringState().cls, 'fresh', 'ring: receipt 100 s old, window fresh');
+clock += 21000; intervalTick();
+assert.equal(ringState().cls, 'stale', 'ring: a fresh window does not rescue an old receipt');
 windowLag = null; lag = 0; refresh.fire('click'); await flush();
 // An observation already stale at render never says Current, and the first chrome() keeps it that way.
 lag = 200; refresh.fire('click'); await flush();
