@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
@@ -152,6 +153,16 @@ def _cleanup_meter(child):
         child.stdout.close()
 
 
+class MeterError(ValueError):
+    """Meter failure with a bounded class and exit code/signal; never carries meter output."""
+
+    def __init__(self, error_class, *, exit_code=None, signal_number=None):
+        super().__init__(f"meter {error_class}")
+        self.error_class = error_class
+        self.exit_code = exit_code
+        self.signal_number = signal_number
+
+
 def read_meter(path, expected_digest):
     """Execute one sealed Linux snapshot, supervise its process group, never use an agent."""
     if (
@@ -182,13 +193,13 @@ def read_meter(path, expected_digest):
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not selector.select(remaining):
-                    raise ValueError("meter timeout")
+                    raise MeterError("timeout")
                 chunk = os.read(child.stdout.fileno(), 4096)
                 if not chunk:
                     break
                 data.extend(chunk)
                 if len(data) > _LIMIT:
-                    raise ValueError("meter output exceeds bound")
+                    raise MeterError("oversized")
         while True:
             status = os.waitid(
                 os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
@@ -196,13 +207,21 @@ def read_meter(path, expected_digest):
             if status is not None:
                 break
             if time.monotonic() >= deadline:
-                raise ValueError("meter timeout")
+                raise MeterError("timeout")
             time.sleep(0.01)
         if status.si_code != os.CLD_EXITED or status.si_status != 0:
-            raise ValueError("meter failed")
-        result = json.loads(data)
+            exited = status.si_code == os.CLD_EXITED
+            raise MeterError(
+                "nonzero_exit",
+                exit_code=status.si_status if exited else None,
+                signal_number=None if exited else status.si_status,
+            )
+        try:
+            result = json.loads(data)
+        except ValueError as error:
+            raise MeterError("not_json") from error
         if not isinstance(result, dict):
-            raise ValueError("meter must return one object")  # noqa: TRY004 -- adapter contract
+            raise MeterError("not_json")
         return result
     finally:
         try:
@@ -249,8 +268,17 @@ def _dns_name(packet, offset, starts, wire_end=None):
     raise ValueError("DNS name traversal bound")
 
 
-def dns_probe(router_address):
-    """One fixed query; success requires a direct IN/A answer owned by example.com."""
+def _dns_fail(diag, error_class):
+    if diag is not None:
+        diag["error"] = error_class
+    return False
+
+
+def dns_probe(router_address, diag=None):
+    """One fixed query; success requires a direct IN/A answer owned by example.com.
+
+    diag, when given, receives only a failure class under "error" (informational).
+    """
     address = ipaddress.IPv4Address(router_address)
     if address.is_unspecified or address.is_loopback or address.is_multicast:
         raise ValueError("invalid router probe address")
@@ -262,8 +290,10 @@ def dns_probe(router_address):
             connection.connect((str(address), 53))
             connection.send(packet)
             reply = connection.recv(4097)
-        if not 12 <= len(reply) <= 4096 or reply[:2] != query_id:
-            return False
+        if not 12 <= len(reply) <= 4096:
+            return _dns_fail(diag, "malformed")
+        if reply[:2] != query_id:
+            return _dns_fail(diag, "bad_id")
         flags, questions, answers, authority, additional = struct.unpack(
             "!5H", reply[2:12]
         )
@@ -274,30 +304,36 @@ def dns_probe(router_address):
             and 0 < answers <= 64
             and answers + authority + additional <= 128
         ):
-            return False
+            if not flags & 0x8000:
+                return _dns_fail(diag, "malformed")
+            if flags & 0xF:
+                return _dns_fail(diag, "rcode")
+            if questions == 1 and answers == 0:
+                return _dns_fail(diag, "no_answer")
+            return _dns_fail(diag, "malformed")
         starts = set()
         expected = (b"example", b"com")
         question, offset = _dns_name(reply, 12, starts)
         if question != expected or reply[offset : offset + 4] != b"\0\1\0\1":
-            return False
+            return _dns_fail(diag, "malformed")
         offset += 4
         found = False
         for index in range(answers + authority + additional):
             owner, offset = _dns_name(reply, offset, starts)
             if offset + 10 > len(reply):
-                return False
+                return _dns_fail(diag, "malformed")
             kind, dns_class, _ttl, length = struct.unpack(
                 "!HHIH", reply[offset : offset + 10]
             )
             offset += 10
             if offset + length > len(reply):
-                return False
+                return _dns_fail(diag, "malformed")
             if kind == 2 and dns_class == 1:
                 # Register NS names for subsequent glue compression, without
                 # resolving them or treating glue addresses as the probe answer.
                 _, ns_end = _dns_name(reply, offset, starts, offset + length)
                 if ns_end != offset + length:
-                    return False
+                    return _dns_fail(diag, "malformed")
             found |= (
                 index < answers
                 and owner == expected
@@ -306,9 +342,15 @@ def dns_probe(router_address):
                 and length == 4
             )
             offset += length
-        return found and offset == len(reply)
-    except (OSError, ValueError):
-        return False
+        if found and offset == len(reply):
+            return True
+        return _dns_fail(diag, "malformed" if found else "no_answer")
+    except TimeoutError:
+        return _dns_fail(diag, "timeout")
+    except OSError:
+        return _dns_fail(diag, "oserror")
+    except ValueError:
+        return _dns_fail(diag, "malformed")
 
 
 def _epoch(value):
@@ -410,6 +452,56 @@ def read_coverage(config, now, since_wall):
     return coverage_metrics(collector, time.time())
 
 
+def coverage_error_class(error):
+    """Bounded class of a coverage failure; the exception text may hold URLs/paths."""
+    reason = getattr(error, "reason", None)
+    if isinstance(error, TimeoutError) or isinstance(reason, TimeoutError):
+        return "timeout"
+    if isinstance(error, urllib.error.HTTPError):
+        return "http_error"
+    if isinstance(error, OSError):
+        return "network_error"
+    return "bad_response"
+
+
+def dns_probe_diagnosed(router_address, result):
+    """Primary probe decides; on failure record its class and one informational retry.
+
+    Worst case is two 3 s probes (6 s) on top of the 10 s meter and 10 s coverage timeouts,
+    26 s inside the 60 s cadence. The retry outcome is never read by the assessment rules.
+    """
+    diag = {}
+    ok = dns_probe(router_address, diag)
+    if not ok:
+        if "error" in diag:
+            result["dns_probe_error"] = diag["error"]
+        result["dns_probe_retry_ok"] = bool(dns_probe(router_address))
+    return ok
+
+
+def host_load(loadavg="/proc/loadavg", psi="/proc/pressure/cpu"):
+    """Informational host load; any unreadable or odd value is simply omitted."""
+    result = {}
+    try:
+        value = float(Path(loadavg).read_text().split()[0])
+        if _number(value):
+            result["host_load1"] = value
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        for line in Path(psi).read_text().splitlines():
+            fields = line.split()
+            if fields[:1] == ["some"]:
+                for field in fields[1:]:
+                    if field.startswith("avg10="):
+                        value = float(field[6:])
+                        if _number(value):
+                            result["host_psi_cpu_avg10"] = value
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
 def clock_sample():
     return {
         "wall": time.time(),
@@ -439,8 +531,16 @@ def collect(config, since_wall):
             "logical_cpus",
         }
         result.update({key: value for key, value in meter.items() if key in allowed})
+    except MeterError as error:
+        result["meter_error"] = True
+        result["meter_error_class"] = error.error_class
+        if error.exit_code is not None:
+            result["meter_exit_code"] = error.exit_code
+        if error.signal_number is not None:
+            result["meter_signal"] = error.signal_number
     except (OSError, ValueError, subprocess.SubprocessError):
         result["meter_error"] = True
+        result["meter_error_class"] = "setup_error"
     try:
         start = result["wall"] if since_wall is None else since_wall
         api_metrics = read_coverage(config, result["wall"], start)
@@ -448,9 +548,11 @@ def collect(config, since_wall):
         if "collector_rss_kib" in api_metrics:
             api_metrics["api_collector_rss_kib"] = api_metrics.pop("collector_rss_kib")
         result.update(api_metrics)
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError) as error:
         result["coverage_error"] = True
-    result["dns_probe_ok"] = dns_probe(config["router_address"])
+        result["coverage_error_class"] = coverage_error_class(error)
+    result.update(host_load())
+    result["dns_probe_ok"] = dns_probe_diagnosed(config["router_address"], result)
     return result
 
 
