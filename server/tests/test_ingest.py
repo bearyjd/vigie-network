@@ -786,3 +786,82 @@ def test_non_lock_failure_never_deletes_a_recorded_batch(
 def test_max_shard_days_has_an_upper_bound(tmp_path) -> None:
     with pytest.raises(ValueError, match="max_shard_days"):
         Settings(data_dir=tmp_path, secrets_dir=tmp_path, max_shard_days=31)
+
+
+# --- fix round 4 ---------------------------------------------------------------------------------
+
+
+class _FailingWal:
+    """Connection stand-in: reports a non-WAL journal and fails the switch with `error`."""
+
+    def __init__(self, error: sqlite3.OperationalError) -> None:
+        self.error = error
+
+    def execute(self, sql: str):
+        if sql == "PRAGMA journal_mode":
+            return type("R", (), {"fetchone": lambda _s: ("delete",)})()
+        raise self.error
+
+
+def _coded(message: str, code: int) -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = code
+    return exc
+
+
+def test_wal_switch_on_read_only_db_propagates_the_real_error(tmp_path) -> None:
+    from vigie_ingest import db
+
+    path = tmp_path / "ro.db"
+    seed = sqlite3.connect(path)
+    seed.execute("PRAGMA journal_mode=DELETE")
+    seed.execute("CREATE TABLE t (x)")
+    seed.commit()
+    seed.close()
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            db._enable_wal(ro, time.monotonic() + 0.25)
+    finally:
+        ro.close()
+    assert not isinstance(info.value, db.LockBudgetExhausted)
+
+
+def test_wal_switch_non_lock_error_is_raised_unretried(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vigie_ingest import db
+
+    def no_sleep(_s: float) -> None:
+        raise AssertionError("a non-lock error must not be retried")
+
+    monkeypatch.setattr(db.time, "sleep", no_sleep)
+    error = _coded("attempt to write a readonly database", sqlite3.SQLITE_READONLY)
+    with pytest.raises(sqlite3.OperationalError) as info:
+        db._enable_wal(_FailingWal(error), time.monotonic() + 0.25)
+    assert info.value is error
+
+
+def test_wal_switch_lock_error_with_expired_budget_is_budget_exhausted() -> None:
+    from vigie_ingest import db
+
+    with pytest.raises(db.LockBudgetExhausted):
+        db._enable_wal(
+            _FailingWal(_coded("database is locked", sqlite3.SQLITE_BUSY)), time.monotonic() - 1
+        )
+
+
+@pytest.mark.parametrize("error", [sqlite3.OperationalError("database is locked"), OSError("x")])
+def test_revoked_branch_cleanup_failure_keeps_the_real_outcome(
+    env: Env, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def revoke() -> None:
+        conn = env.inventory()
+        store.revoke_collector(conn, COLLECTOR)
+        conn.close()
+
+    def bad_cleanup(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_after_shard_commit", revoke)
+    monkeypatch.setattr(store, "_remove_shard_rows", bad_cleanup)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 401 and resp.json() == UNAUTH

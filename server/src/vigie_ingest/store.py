@@ -279,7 +279,12 @@ def apply_batch(
             raise
         if result not in ("applied", "duplicate"):
             # State changed after the pre-check (e.g. revoked by another process): undo our rows.
-            _remove_shard_rows(data_dir, list(by_day), batch, time.monotonic() + CLEANUP_BUDGET_S)
+            try:
+                _remove_shard_rows(
+                    data_dir, list(by_day), batch, time.monotonic() + CLEANUP_BUDGET_S
+                )
+            except Exception as exc:  # noqa: BLE001 -- the real outcome (e.g. 401) must stand
+                log.warning("ingest_cleanup_failed: %s", type(exc).__name__)
         return result
     finally:
         SHARD_LOCK.release()

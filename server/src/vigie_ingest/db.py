@@ -133,6 +133,17 @@ class LockBudgetExhausted(sqlite3.OperationalError):
     """The request's lock-retry deadline passed before a lock could be taken (nothing stored)."""
 
 
+def is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED (incl. extended codes) by error code; message as a fallback."""
+    if isinstance(exc, LockBudgetExhausted):
+        return True
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
 def connect(
     path: Path | str, busy_timeout_ms: int = BUSY_TIMEOUT_MS, deadline: float | None = None
 ) -> sqlite3.Connection:
@@ -155,9 +166,9 @@ def _enable_wal(conn: sqlite3.Connection, deadline: float | None = None) -> None
             return
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
-            if attempt == WAL_RETRIES - 1:
-                raise
+        except sqlite3.OperationalError as exc:
+            if attempt == WAL_RETRIES - 1 or not is_lock_error(exc):
+                raise  # persistent failures (e.g. read-only) surface as themselves
             pause = 0.05 * (attempt + 1)
             if deadline is not None:
                 remaining = deadline - time.monotonic()

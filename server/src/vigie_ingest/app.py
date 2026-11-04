@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from vigie_ingest import auth, keeper, store
 from vigie_ingest.config import Settings
-from vigie_ingest.db import BUSY_TIMEOUT_MS, SHARD_RE, connect, open_inventory
+from vigie_ingest.db import BUSY_TIMEOUT_MS, SHARD_RE, connect, is_lock_error, open_inventory
 from vigie_ingest.lock import exclusive_data_dir
 from vigie_ingest.models import Batch
 from vigie_ingest.ratelimit import RateLimiter
@@ -147,7 +147,7 @@ def process_batch(
         try:
             return _verify_and_store(settings, env, body, now, attempt_deadline)
         except sqlite3.OperationalError as exc:
-            if not _is_lock_error(exc):
+            if not is_lock_error(exc):
                 raise
             remaining = deadline - time.monotonic()
             if remaining <= delay + store.MIN_ATTEMPT_S or isinstance(
@@ -158,17 +158,6 @@ def process_batch(
             time.sleep(delay)  # no database lock is held here
             delay = min(delay * 2, LOCK_RETRY_MAX_DELAY_S)
             attempt_deadline = deadline
-
-
-def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
-    """SQLITE_BUSY / SQLITE_LOCKED (incl. extended codes) by error code; message as a fallback."""
-    if isinstance(exc, store.LockBudgetExhausted):
-        return True
-    code = getattr(exc, "sqlite_errorcode", None)
-    if isinstance(code, int):
-        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
-    text = str(exc).lower()
-    return "locked" in text or "busy" in text
 
 
 def _verify_and_store(
