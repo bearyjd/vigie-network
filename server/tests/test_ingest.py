@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -11,7 +12,8 @@ from conftest import BOOT, COLLECTOR, KEY, NOW, Env, encode, make_batch, signed_
 
 from vigie_ingest import app as app_module
 from vigie_ingest import auth, store
-from vigie_ingest.db import connect, shard_name
+from vigie_ingest.config import Settings
+from vigie_ingest.db import SHARD_LOCK, connect, shard_name
 
 UNAUTH = {"error": "unauthorized"}
 
@@ -398,3 +400,468 @@ def test_unique_batch_ids_distinguish_batches(env: Env) -> None:
     assert env.post(make_batch(seq=1)).json() == {"duplicate": False}
     assert env.post(make_batch(seq=2, batch_id=uuid7(99))).json() == {"duplicate": False}
     assert batch_count(env) == 2
+
+
+# --- transient SQLite lock contention (host stalls) ---------------------------------------------
+
+
+@pytest.fixture
+def short_locks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store, "LOCKED_BUSY_TIMEOUT_MS", 100)
+
+
+def hold_inventory_write_lock(env: Env, seconds: float) -> threading.Thread:
+    """Hold the inventory write lock from a second connection, as a stalled writer would."""
+    ready = threading.Event()
+
+    def hold() -> None:
+        conn = connect(env.settings.inventory_path)
+        conn.execute("BEGIN IMMEDIATE")
+        ready.set()
+        threading.Event().wait(seconds)
+        conn.execute("ROLLBACK")
+        conn.close()
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert ready.wait(5)
+    return thread
+
+
+def test_lock_released_within_budget_applies_once(env: Env, short_locks: None) -> None:
+    batch = make_batch(seq=1)
+    holder = hold_inventory_write_lock(env, 1.0)
+    resp = env.post(batch)
+    holder.join()
+    assert resp.status_code == 200 and resp.json() == {"duplicate": False}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+    again = env.post(batch)  # lost-ACK retry after success
+    assert again.json() == {"duplicate": True}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+def test_lock_budget_exhausted_is_503_and_unacknowledged(
+    make_env: Callable[..., Env], short_locks: None
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.5)
+    batch = make_batch(seq=1)
+    holder = hold_inventory_write_lock(env, 2.0)
+    resp = env.post(batch)
+    holder.join()
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "busy"}
+    assert resp.headers["retry-after"] == "5"
+    assert "locked" not in resp.text
+    assert batch_count(env) == 0  # never acknowledged, never recorded as received
+    retry = env.post(batch)  # collector retry once the stall is over
+    assert retry.status_code == 200 and retry.json() == {"duplicate": False}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1  # no duplicate rows
+
+
+def test_non_lock_operational_error_is_not_masked(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_a, **_k):
+        raise sqlite3.OperationalError("no such table: batches")
+
+    monkeypatch.setattr(store, "apply_batch", broken)
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        env.post(make_batch(seq=1))
+
+
+# --- the retry budget truly bounds the request ---------------------------------------------------
+
+
+def test_budget_bounds_request_with_inventory_lock_held(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.2)  # default 1.5 s timeouts
+    holder = hold_inventory_write_lock(env, 4.0)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert resp.status_code == 503
+    assert elapsed < 0.2 + 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_request_queued_behind_shard_lock_gets_503_within_budget(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with SHARD_LOCK:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(5)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    release.set()
+    thread.join()
+    assert resp.status_code == 503 and elapsed < 0.3 + 1.0, elapsed
+    assert batch_count(env) == 0
+    assert env.post(make_batch(seq=1)).status_code == 200  # unaffected once the lock is free
+
+
+def test_backoff_schedule_is_capped(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=20)
+    sleeps: list[float] = []
+    calls = [0]
+
+    def locked(*_a, **_k):
+        calls[0] += 1
+        if calls[0] <= 7:
+            raise sqlite3.OperationalError("database is locked")
+        return "applied"
+
+    monkeypatch.setattr(app_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(store, "apply_batch", locked)
+    assert env.post(make_batch(seq=1)).status_code == 200
+    assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0])
+
+
+def test_lookalike_non_lock_error_is_not_retried(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*_a, **_k):
+        exc = sqlite3.OperationalError("unable to open database file (device busy)")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CANTOPEN
+        raise exc
+
+    monkeypatch.setattr(store, "apply_batch", broken)
+    with pytest.raises(sqlite3.OperationalError, match="device busy"):
+        env.post(make_batch(seq=1))
+
+
+def test_extended_busy_errorcode_is_retried(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    exc = sqlite3.OperationalError("odd message")
+    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY | (2 << 8)  # SQLITE_BUSY_SNAPSHOT-style extended
+    monkeypatch.setattr(store, "apply_batch", lambda *_a, **_k: (_ for _ in ()).throw(exc))
+    assert env.post(make_batch(seq=1)).status_code == 503
+
+
+def test_failed_attempt_leaves_no_orphan_shard_rows(
+    make_env: Callable[..., Env], short_locks: None
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    holder = hold_inventory_write_lock(env, 2.0)
+    assert env.post(make_batch(seq=1)).status_code == 503
+    holder.join()
+    assert batch_count(env) == 0
+    assert shard_count(env, "raw_dns") == 0  # written, then compensated
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "20.5", "25", "-inf"])
+def test_lock_retry_budget_rejects_bad_values(value: str, tmp_path) -> None:
+    with pytest.raises(ValueError, match="lock_retry_budget_s"):
+        Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_LOCK_RETRY_BUDGET_S": value})
+    with pytest.raises(ValueError, match="lock_retry_budget_s"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=float(value))
+
+
+@pytest.mark.parametrize("value", [0.0, 15.0, 20.0])
+def test_lock_retry_budget_accepts_range(value: float, tmp_path) -> None:
+    assert Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=value)
+
+
+def test_body_timeout_rejects_nan(tmp_path) -> None:
+    with pytest.raises(ValueError, match="body_timeout_s"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, body_timeout_s=float("nan"))
+
+
+# --- fix round 2 ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("budget", [0.0, -0.0])
+def test_zero_budget_still_makes_one_attempt(make_env: Callable[..., Env], budget: float) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=budget)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 200 and resp.json() == {"duplicate": False}
+
+
+def test_zero_budget_with_held_lock_is_503_quickly(make_env: Callable[..., Env]) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0)
+    holder = hold_inventory_write_lock(env, 4.0)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert resp.status_code == 503 and elapsed < 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_cleanup_never_deletes_a_recorded_batch(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COMMIT reported failure but persisted: the retry sees a duplicate and the rows survive."""
+    from contextlib import contextmanager
+
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=5)
+    real, calls = store.immediate, [0]
+
+    @contextmanager
+    def flaky(conn):
+        calls[0] += 1
+        with real(conn):
+            yield
+        if calls[0] == 2:  # the inventory commit, after it persisted
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "immediate", flaky)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _s: None)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 200 and resp.json() == {"duplicate": True}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+@pytest.mark.parametrize("error", [sqlite3.DatabaseError("boom"), OSError("disk")])
+def test_cleanup_failure_does_not_mask_busy(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0)
+
+    def raising(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    def bad_cleanup(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_commit_inventory", raising)
+    monkeypatch.setattr(store, "_remove_shard_rows", bad_cleanup)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 503 and resp.json() == {"error": "busy"}
+
+
+def test_deadline_passing_before_lock_acquire_is_budget_exhaustion_not_valueerror(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vigie_ingest.models import Batch
+
+    batch = Batch.model_validate(make_batch(seq=1), context={"max_spool_age_s": 10**9})
+    clock = [1000.0]
+    monkeypatch.setattr(store.time, "monotonic", lambda: clock[0])
+
+    def duplicate_check_passes_deadline(*_a, **_k) -> bool:
+        clock[0] += 50  # deadline (clock+10) is now in the past
+        return False
+
+    monkeypatch.setattr(store, "_is_duplicate", duplicate_check_passes_deadline)
+    with pytest.raises(store.LockBudgetExhausted):
+        store.apply_batch(
+            env.settings.inventory_path, env.settings.data_dir, batch, NOW, 300, deadline=1010.0
+        )
+
+
+def test_budget_exhaustion_error_is_never_retried(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=20)
+
+    def no_sleep(_s: float) -> None:
+        raise AssertionError("must not retry after LockBudgetExhausted")
+
+    def exhausted(*_a, **_k):
+        raise store.LockBudgetExhausted("shard lock wait exceeded the budget")
+
+    monkeypatch.setattr(app_module.time, "sleep", no_sleep)
+    monkeypatch.setattr(store, "apply_batch", exhausted)
+    assert env.post(make_batch(seq=1)).status_code == 503
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "301"])
+def test_body_timeout_env_rejects_bad_values(value: str, tmp_path) -> None:
+    with pytest.raises(ValueError, match="body_timeout_s"):
+        Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_BODY_TIMEOUT_S": value})
+
+
+# --- fix round 3 ---------------------------------------------------------------------------------
+
+
+def test_wal_switch_respects_budget_and_releases_shard_lock(
+    make_env: Callable[..., Env],
+) -> None:
+    """Shard still in rollback-journal mode + a reader: the WAL switch cannot spin for seconds."""
+    from vigie_ingest.db import SHARD_MIGRATIONS, migrate
+
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.25)
+    path = shard_path(env)
+    plain = sqlite3.connect(path, isolation_level=None)
+    plain.execute("PRAGMA journal_mode=DELETE")
+    migrate(plain, SHARD_MIGRATIONS)
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM raw_dns").fetchall()
+    start = time.monotonic()
+    try:
+        resp = env.post(make_batch(seq=1))
+        elapsed = time.monotonic() - start
+        assert SHARD_LOCK.acquire(timeout=0)  # not left held by the failed request
+        SHARD_LOCK.release()
+    finally:
+        reader.close()
+        plain.close()
+    assert resp.status_code == 503 and elapsed < 0.25 + 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_budget_counts_from_request_arrival(make_env: Callable[..., Env]) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=5)
+    batch = make_batch(seq=1)
+    body = encode(batch)
+    headers = {k.lower(): v for k, v in signed_headers(body, batch).items()}
+    envelope = app_module._parse_envelope(headers)
+    holder = hold_inventory_write_lock(env, 3.0)
+    start = time.monotonic()
+    status, _ = app_module.process_batch(
+        env.settings, envelope, body, NOW, arrived=time.monotonic() - 100
+    )
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert status == 503 and elapsed < 1.5, elapsed  # waited at most the first-attempt floor
+
+
+def test_no_retry_starts_with_less_than_min_attempt_left(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=1.6)
+    clock = [1000.0]
+    starts: list[float] = []
+
+    def locked(*_a, **_k):
+        starts.append(clock[0])
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(store, "apply_batch", locked)
+    assert env.post(make_batch(seq=1)).status_code == 503
+    assert len(starts) > 1
+    assert all(1000.0 + 1.6 - t >= store.MIN_ATTEMPT_S for t in starts[1:])
+
+
+@pytest.mark.parametrize("error", [sqlite3.DatabaseError("malformed"), OSError("disk")])
+def test_non_lock_failure_after_shard_write_leaves_no_orphans(
+    env: Env, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def boom(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_commit_inventory", boom)
+    with pytest.raises(type(error)):
+        env.post(make_batch(seq=1))
+    assert batch_count(env) == 0 and shard_count(env, "raw_dns") == 0
+
+
+def test_non_lock_failure_never_deletes_a_recorded_batch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import contextmanager
+
+    real, calls = store.immediate, [0]
+
+    @contextmanager
+    def flaky(conn):
+        calls[0] += 1
+        with real(conn):
+            yield
+        if calls[0] == 2:
+            raise sqlite3.DatabaseError("malformed")
+
+    monkeypatch.setattr(store, "immediate", flaky)
+    with pytest.raises(sqlite3.DatabaseError):
+        env.post(make_batch(seq=1))
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+def test_max_shard_days_has_an_upper_bound(tmp_path) -> None:
+    with pytest.raises(ValueError, match="max_shard_days"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, max_shard_days=31)
+
+
+# --- fix round 4 ---------------------------------------------------------------------------------
+
+
+class _FailingWal:
+    """Connection stand-in: reports a non-WAL journal and fails the switch with `error`."""
+
+    def __init__(self, error: sqlite3.OperationalError) -> None:
+        self.error = error
+
+    def execute(self, sql: str):
+        if sql == "PRAGMA journal_mode":
+            return type("R", (), {"fetchone": lambda _s: ("delete",)})()
+        raise self.error
+
+
+def _coded(message: str, code: int) -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = code
+    return exc
+
+
+def test_wal_switch_on_read_only_db_propagates_the_real_error(tmp_path) -> None:
+    from vigie_ingest import db
+
+    path = tmp_path / "ro.db"
+    seed = sqlite3.connect(path)
+    seed.execute("PRAGMA journal_mode=DELETE")
+    seed.execute("CREATE TABLE t (x)")
+    seed.commit()
+    seed.close()
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            db._enable_wal(ro, time.monotonic() + 0.25)
+    finally:
+        ro.close()
+    assert not isinstance(info.value, db.LockBudgetExhausted)
+
+
+def test_wal_switch_non_lock_error_is_raised_unretried(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vigie_ingest import db
+
+    def no_sleep(_s: float) -> None:
+        raise AssertionError("a non-lock error must not be retried")
+
+    monkeypatch.setattr(db.time, "sleep", no_sleep)
+    error = _coded("attempt to write a readonly database", sqlite3.SQLITE_READONLY)
+    with pytest.raises(sqlite3.OperationalError) as info:
+        db._enable_wal(_FailingWal(error), time.monotonic() + 0.25)
+    assert info.value is error
+
+
+def test_wal_switch_lock_error_with_expired_budget_is_budget_exhausted() -> None:
+    from vigie_ingest import db
+
+    with pytest.raises(db.LockBudgetExhausted):
+        db._enable_wal(
+            _FailingWal(_coded("database is locked", sqlite3.SQLITE_BUSY)), time.monotonic() - 1
+        )
+
+
+@pytest.mark.parametrize("error", [sqlite3.OperationalError("database is locked"), OSError("x")])
+def test_revoked_branch_cleanup_failure_keeps_the_real_outcome(
+    env: Env, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def revoke() -> None:
+        conn = env.inventory()
+        store.revoke_collector(conn, COLLECTOR)
+        conn.close()
+
+    def bad_cleanup(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_after_shard_commit", revoke)
+    monkeypatch.setattr(store, "_remove_shard_rows", bad_cleanup)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 401 and resp.json() == UNAUTH

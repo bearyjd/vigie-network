@@ -15,6 +15,11 @@ import time
 
 import pytest
 
+# Upper bound for a child to stop after a signal. Stop latency is normally milliseconds but was
+# measured up to ~2.3 s on a starved host (load ~220); the generous bound only absorbs load. A
+# genuinely hung stop still fails, just later. Kept under the 20 s per-test pytest timeout.
+STOP_TIMEOUT_S = 15
+
 SCRIPT = """
 import signal, sys, time
 from vigie_pipeline import cli
@@ -51,7 +56,7 @@ def test_wakeup_fd_is_installed_so_a_signal_before_select_is_not_lost(tmp_path):
     proc = start(tmp_path)
     assert wait_for_pass(proc) != -1
     proc.send_signal(signal.SIGTERM)
-    proc.communicate(timeout=5)
+    proc.communicate(timeout=STOP_TIMEOUT_S)
     assert proc.returncode == 0
 
 
@@ -66,7 +71,7 @@ def test_signal_in_idle_wait_stops_cleanly_many_times(tmp_path, sig):
         time.sleep(rng.uniform(0, 0.03))  # land at varied points around entering the wait
         proc.send_signal(sig)
         try:
-            _, err = proc.communicate(timeout=5)
+            _, err = proc.communicate(timeout=STOP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             proc.kill()
             pytest.fail("stop hung: signal did not wake the idle wait")
@@ -91,5 +96,5 @@ def test_second_signal_forces_exit(tmp_path):
     time.sleep(0.3)
     assert proc.poll() is None  # first signal: still draining
     proc.send_signal(signal.SIGINT)
-    proc.communicate(timeout=5)
+    proc.communicate(timeout=STOP_TIMEOUT_S)
     assert proc.returncode not in (0, None)
