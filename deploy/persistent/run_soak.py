@@ -218,7 +218,7 @@ def read_meter(path, expected_digest):
             )
         try:
             result = json.loads(data)
-        except ValueError as error:
+        except (ValueError, RecursionError) as error:
             raise MeterError("not_json") from error
         if not isinstance(result, dict):
             raise MeterError("not_json")
@@ -464,19 +464,23 @@ def coverage_error_class(error):
     return "bad_response"
 
 
-def dns_probe_diagnosed(router_address, result):
-    """Primary probe decides; on failure record its class and one informational retry.
+def dns_probe_diagnosed(router_address):
+    """Return (primary_ok, diagnostics); the primary probe alone decides.
 
-    Worst case is two 3 s probes (6 s) on top of the 10 s meter and 10 s coverage timeouts,
-    26 s inside the 60 s cadence. The retry outcome is never read by the assessment rules.
+    On failure the diagnostics hold its class and one informational retry. Collection takes
+    at least 26 s in the worst case (10 s meter + 10 s coverage + 2 x 3 s DNS), but the
+    urlopen timeout is per socket operation, not total, so it can run longer. A slow
+    sample never shifts the schedule: the next is due at the last monotonic + 60 s. The
+    retry outcome is never read by the assessment rules.
     """
     diag = {}
     ok = dns_probe(router_address, diag)
+    extra = {}
     if not ok:
         if "error" in diag:
-            result["dns_probe_error"] = diag["error"]
-        result["dns_probe_retry_ok"] = bool(dns_probe(router_address))
-    return ok
+            extra["dns_probe_error"] = diag["error"]
+        extra["dns_probe_retry_ok"] = bool(dns_probe(router_address))
+    return ok, extra
 
 
 def host_load(loadavg="/proc/loadavg", psi="/proc/pressure/cpu"):
@@ -552,7 +556,8 @@ def collect(config, since_wall):
         result["coverage_error"] = True
         result["coverage_error_class"] = coverage_error_class(error)
     result.update(host_load())
-    result["dns_probe_ok"] = dns_probe_diagnosed(config["router_address"], result)
+    result["dns_probe_ok"], dns_extra = dns_probe_diagnosed(config["router_address"])
+    result.update(dns_extra)
     return result
 
 

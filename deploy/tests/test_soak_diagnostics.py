@@ -34,6 +34,7 @@ NEW_FIELDS = {
     "dns_probe_retry_ok": True,
     "meter_error_class": "timeout",
     "meter_exit_code": 3,
+    "meter_signal": 9,
     "coverage_error_class": "timeout",
     "host_load1": 0.5,
     "host_psi_cpu_avg10": 1.25,
@@ -123,6 +124,24 @@ class DnsClassTests(unittest.TestCase):
             classify(header(0x8180, 1) + QUESTION + good_tail), (True, None)
         )
 
+    def test_boolean_result_matches_origin_main_for_every_path(self):
+        # Expected booleans were verified by running origin/main's dns_probe on each reply.
+        a_rec = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x14"
+        cname = a_rec[:3] + b"\x05" + a_rec[4:]
+        head = lambda flags, n: struct.pack("!5H", flags, 1, n, 0, 0)  # noqa: E731
+        table = [
+            (head(0x8180, 1) + QUESTION + a_rec, None, True),
+            (None, TimeoutError(), False),
+            (None, ConnectionRefusedError(), False),
+            (b"\x81", None, False),
+            (head(0x8183, 0) + QUESTION, None, False),
+            (head(0x8180, 0) + QUESTION, None, False),
+            (head(0x8180, 1) + QUESTION + cname, None, False),
+        ]
+        for reply, error, expected in table:
+            ok, _ = classify(reply, error)
+            self.assertIs(ok, expected, (reply, error))
+
     def test_wrong_id_is_bad_id(self):
         class Wrong(FakeSocket):
             def recv(self, size):
@@ -171,6 +190,12 @@ class CollectDiagnosticsTests(unittest.TestCase):
         self.assertIs(result["dns_probe_ok"], False)
         self.assertIs(result["dns_probe_retry_ok"], False)
         self.assertEqual(len(calls), 2)
+
+    def test_diagnosed_probe_does_not_take_or_mutate_a_result_dict(self):
+        with patch.object(runner, "dns_probe", return_value=False):
+            ok, extra = runner.dns_probe_diagnosed("192.0.2.1")
+        self.assertIs(ok, False)
+        self.assertEqual(extra, {"dns_probe_retry_ok": False})
 
     def test_success_has_no_dns_diagnostics_and_no_retry(self):
         result, calls = self.collect([True])
@@ -248,6 +273,8 @@ class MeterProcessTests(unittest.TestCase):
         error = self.run_meter("#!/bin/sh\necho nope\n")
         self.assertEqual(error.error_class, "not_json")
         error = self.run_meter("#!/bin/sh\necho '[1]'\n")
+        self.assertEqual(error.error_class, "not_json")
+        error = self.run_meter("#!/bin/sh\nhead -c 12000 /dev/zero | tr '\\0' '['\n")
         self.assertEqual(error.error_class, "not_json")
 
 
@@ -347,6 +374,22 @@ class JournalCompatTests(unittest.TestCase):
             self.assertFalse(set(bad) & set(stored))
             self.assertNotIn("invalid_record", stored)
             self.assertLess(len(path.read_text()), 2000)
+
+    def test_bad_exit_code_and_signal_values_are_dropped(self):
+        bad = [
+            ("meter_exit_code", True),
+            ("meter_exit_code", 256),
+            ("meter_signal", False),
+            ("meter_signal", 0),
+            ("meter_signal", 65),
+        ]
+        for key, value in bad:
+            self.assertFalse(soak.diagnostics_valid(key, value), (key, value))
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "journal.jsonl"
+                with soak.Journal(path, mode="simulated") as journal:
+                    journal.append(sample(0, **{key: value}))
+                    self.assertNotIn(key, journal.samples[0])
 
     def test_valid_values_survive_and_fit_record_bound(self):
         for key, value in NEW_FIELDS.items():
