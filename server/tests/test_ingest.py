@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -11,7 +12,8 @@ from conftest import BOOT, COLLECTOR, KEY, NOW, Env, encode, make_batch, signed_
 
 from vigie_ingest import app as app_module
 from vigie_ingest import auth, store
-from vigie_ingest.db import connect, shard_name
+from vigie_ingest.config import Settings
+from vigie_ingest.db import SHARD_LOCK, connect, shard_name
 
 UNAUTH = {"error": "unauthorized"}
 
@@ -465,3 +467,113 @@ def test_non_lock_operational_error_is_not_masked(
     monkeypatch.setattr(store, "apply_batch", broken)
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         env.post(make_batch(seq=1))
+
+
+# --- the retry budget truly bounds the request ---------------------------------------------------
+
+
+def test_budget_bounds_request_with_inventory_lock_held(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.2)  # default 1.5 s timeouts
+    holder = hold_inventory_write_lock(env, 4.0)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert resp.status_code == 503
+    assert elapsed < 0.2 + 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_request_queued_behind_shard_lock_gets_503_within_budget(
+    make_env: Callable[..., Env],
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with SHARD_LOCK:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert held.wait(5)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    release.set()
+    thread.join()
+    assert resp.status_code == 503 and elapsed < 0.3 + 1.0, elapsed
+    assert batch_count(env) == 0
+    assert env.post(make_batch(seq=1)).status_code == 200  # unaffected once the lock is free
+
+
+def test_backoff_schedule_is_capped(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=25)
+    sleeps: list[float] = []
+    calls = [0]
+
+    def locked(*_a, **_k):
+        calls[0] += 1
+        if calls[0] <= 7:
+            raise sqlite3.OperationalError("database is locked")
+        return "applied"
+
+    monkeypatch.setattr(app_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(store, "apply_batch", locked)
+    assert env.post(make_batch(seq=1)).status_code == 200
+    assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0])
+
+
+def test_lookalike_non_lock_error_is_not_retried(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*_a, **_k):
+        exc = sqlite3.OperationalError("unable to open database file (device busy)")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CANTOPEN
+        raise exc
+
+    monkeypatch.setattr(store, "apply_batch", broken)
+    with pytest.raises(sqlite3.OperationalError, match="device busy"):
+        env.post(make_batch(seq=1))
+
+
+def test_extended_busy_errorcode_is_retried(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    exc = sqlite3.OperationalError("odd message")
+    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY | (2 << 8)  # SQLITE_BUSY_SNAPSHOT-style extended
+    monkeypatch.setattr(store, "apply_batch", lambda *_a, **_k: (_ for _ in ()).throw(exc))
+    assert env.post(make_batch(seq=1)).status_code == 503
+
+
+def test_failed_attempt_leaves_no_orphan_shard_rows(
+    make_env: Callable[..., Env], short_locks: None
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.3)
+    holder = hold_inventory_write_lock(env, 2.0)
+    assert env.post(make_batch(seq=1)).status_code == 503
+    holder.join()
+    assert batch_count(env) == 0
+    assert shard_count(env, "raw_dns") == 0  # written, then compensated
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "25.5", "-inf"])
+def test_lock_retry_budget_rejects_bad_values(value: str, tmp_path) -> None:
+    with pytest.raises(ValueError, match="lock_retry_budget_s"):
+        Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_LOCK_RETRY_BUDGET_S": value})
+    with pytest.raises(ValueError, match="lock_retry_budget_s"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=float(value))
+
+
+@pytest.mark.parametrize("value", [0.0, 15.0, 25.0])
+def test_lock_retry_budget_accepts_range(value: float, tmp_path) -> None:
+    assert Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=value)
+
+
+def test_body_timeout_rejects_nan(tmp_path) -> None:
+    with pytest.raises(ValueError, match="body_timeout_s"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, body_timeout_s=float("nan"))

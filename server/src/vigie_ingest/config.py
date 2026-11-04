@@ -24,6 +24,10 @@ def _ipv6_prefix(value: str | None) -> int | None:
     return int(value)
 
 
+# The collector's HTTP timeout is 30 s; a longer retry budget would time out client-side first.
+LOCK_RETRY_BUDGET_MAX_S = 25.0
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -47,10 +51,10 @@ class Settings:
             raise ValueError(f"shard_retention_days must be 1..{SHARD_RETENTION_MAX_DAYS}")
         if self.max_shard_days < 1:
             raise ValueError("max_shard_days must be positive")
-        if self.body_timeout_s <= 0 or self.max_spool_age_s < 1:
+        if not self.body_timeout_s > 0 or self.max_spool_age_s < 1:  # `not >` also rejects NaN
             raise ValueError("body_timeout_s and max_spool_age_s must be positive")
-        if self.lock_retry_budget_s < 0:
-            raise ValueError("lock_retry_budget_s must not be negative")
+        if not 0 <= self.lock_retry_budget_s <= LOCK_RETRY_BUDGET_MAX_S:  # rejects NaN/inf too
+            raise ValueError(f"lock_retry_budget_s must be 0..{LOCK_RETRY_BUDGET_MAX_S:g}")
         if (
             self.max_body_bytes < 1
             or self.rate_limit_per_window < 1

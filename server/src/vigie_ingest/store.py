@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 from vigie_ingest.db import (
+    BUSY_TIMEOUT_MS,
     LOCKED_BUSY_TIMEOUT_MS,
     SHARD_LOCK,
     SHARD_TABLES,
@@ -164,19 +166,38 @@ def rows_by_day(batch: Batch) -> dict[date, ShardRows]:
     return out
 
 
-def _connect_locked(path: Path | str) -> sqlite3.Connection:
+CLEANUP_BUDGET_S = 0.5  # cap on best-effort compensation after a failed attempt
+
+
+class LockBudgetExhausted(sqlite3.OperationalError):
+    """The request's lock-retry deadline passed before a lock could be taken (nothing stored)."""
+
+
+def busy_ms(default_ms: int, deadline: float | None) -> int:
+    """Busy timeout for one connection: the default, capped by the time left before `deadline`."""
+    if deadline is None:
+        return default_ms
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise LockBudgetExhausted("lock budget exhausted")
+    return max(1, min(default_ms, int(remaining * 1000)))
+
+
+def _connect_locked(path: Path | str, deadline: float | None = None) -> sqlite3.Connection:
     """Connection for use while holding SHARD_LOCK (short busy timeout)."""
-    return connect(path, LOCKED_BUSY_TIMEOUT_MS)
+    return connect(path, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline))
 
 
 def _after_shard_commit() -> None:
     """Test seam: crash tests replace this to simulate dying before the inventory commit."""
 
 
-def _write_shard(data_dir: Path, day: date, tables: ShardRows, batch: Batch) -> None:
-    ensure_shard(data_dir, day, LOCKED_BUSY_TIMEOUT_MS)
+def _write_shard(
+    data_dir: Path, day: date, tables: ShardRows, batch: Batch, deadline: float | None = None
+) -> None:
+    ensure_shard(data_dir, day, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline))
     hold_active(data_dir / shard_name(day))  # keeps -wal/-shm for the pipeline's read-only mount
-    conn = _connect_locked(data_dir / shard_name(day))
+    conn = _connect_locked(data_dir / shard_name(day), deadline)
     try:
         with immediate(conn):
             _delete_batch_rows(conn, batch)
@@ -198,13 +219,15 @@ def _delete_batch_rows(conn: sqlite3.Connection, batch: Batch) -> None:
         )
 
 
-def _remove_shard_rows(data_dir: Path, days: list[date], batch: Batch) -> None:
+def _remove_shard_rows(
+    data_dir: Path, days: list[date], batch: Batch, deadline: float | None = None
+) -> None:
     with SHARD_LOCK:
         for day in days:
             path = data_dir / shard_name(day)
             if not path.exists():
                 continue
-            conn = _connect_locked(path)
+            conn = _connect_locked(path, deadline)
             try:
                 with immediate(conn):
                     _delete_batch_rows(conn, batch)
@@ -213,39 +236,66 @@ def _remove_shard_rows(data_dir: Path, days: list[date], batch: Batch) -> None:
 
 
 def apply_batch(
-    inventory_path: Path, data_dir: Path, batch: Batch, now: float, max_skew_s: int
+    inventory_path: Path,
+    data_dir: Path,
+    batch: Batch,
+    now: float,
+    max_skew_s: int,
+    deadline: float | None = None,
 ) -> Outcome:
     """Apply one validated batch; see the module docstring for the ordering guarantees.
 
     One lock spans the state pre-check, shard writes, inventory commit and any compensation, so
     a duplicate or concurrent request can neither overwrite nor delete another request's rows.
-    Connections opened under the lock use a short busy timeout.
+    Connections opened under the lock use a short busy timeout. With a `deadline` (monotonic),
+    taking SHARD_LOCK and every busy timeout are capped by the time left, and running out raises
+    LockBudgetExhausted (an OperationalError) with nothing acknowledged.
     """
     by_day = rows_by_day(batch)
-    if _is_duplicate(inventory_path, batch):  # fast read-only check; re-checked under the lock
+    if _is_duplicate(inventory_path, batch, deadline):  # fast check; re-checked under the lock
         return "duplicate"
-    with SHARD_LOCK:
-        rejected = _precheck(inventory_path, batch, now, max_skew_s)
+    if not SHARD_LOCK.acquire(
+        timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())
+    ):
+        raise LockBudgetExhausted("shard lock wait exceeded the budget")
+    try:
+        rejected = _precheck(inventory_path, batch, now, max_skew_s, deadline)
         if rejected:  # nothing is written for duplicates or rejected batches
             return rejected
-        for day, tables in by_day.items():
-            _write_shard(data_dir, day, tables, batch)
-        _after_shard_commit()
-
-        conn = _connect_locked(inventory_path)
         try:
-            with immediate(conn):
-                result = _commit_inventory(conn, batch, now, max_skew_s)
-        finally:
-            conn.close()
+            for day, tables in by_day.items():
+                _write_shard(data_dir, day, tables, batch, deadline)
+            _after_shard_commit()
+
+            conn = _connect_locked(inventory_path, deadline)
+            try:
+                with immediate(conn):
+                    result = _commit_inventory(conn, batch, now, max_skew_s)
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            # Not acknowledged (the batches row commits last): drop what this attempt wrote.
+            _discard_unacknowledged(data_dir, list(by_day), batch)
+            raise
         if result not in ("applied", "duplicate"):
             # State changed after the pre-check (e.g. revoked by another process): undo our rows.
             _remove_shard_rows(data_dir, list(by_day), batch)
         return result
+    finally:
+        SHARD_LOCK.release()
 
 
-def _is_duplicate(inventory_path: Path, batch: Batch) -> bool:
-    conn = connect(inventory_path)
+def _discard_unacknowledged(data_dir: Path, days: list[date], batch: Batch) -> None:
+    """Best-effort cleanup after a failed attempt; a failure here leaves rows the next attempt
+    for this (collector_id, batch_id) deletes before inserting anyway."""
+    try:
+        _remove_shard_rows(data_dir, days, batch, time.monotonic() + CLEANUP_BUDGET_S)
+    except sqlite3.OperationalError:
+        pass
+
+
+def _is_duplicate(inventory_path: Path, batch: Batch, deadline: float | None = None) -> bool:
+    conn = connect(inventory_path, busy_ms(BUSY_TIMEOUT_MS, deadline))
     try:
         return (
             conn.execute(
@@ -258,8 +308,10 @@ def _is_duplicate(inventory_path: Path, batch: Batch) -> bool:
         conn.close()
 
 
-def _precheck(inventory_path: Path, batch: Batch, now: float, max_skew_s: int) -> Outcome | None:
-    conn = _connect_locked(inventory_path)
+def _precheck(
+    inventory_path: Path, batch: Batch, now: float, max_skew_s: int, deadline: float | None = None
+) -> Outcome | None:
+    conn = _connect_locked(inventory_path, deadline)
     try:
         return _evaluate(conn, batch, now, max_skew_s)
     finally:

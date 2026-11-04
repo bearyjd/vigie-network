@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from vigie_ingest import auth, keeper, store
 from vigie_ingest.config import Settings
-from vigie_ingest.db import SHARD_RE, connect, open_inventory
+from vigie_ingest.db import BUSY_TIMEOUT_MS, SHARD_RE, connect, open_inventory
 from vigie_ingest.lock import exclusive_data_dir
 from vigie_ingest.models import Batch
 from vigie_ingest.ratelimit import RateLimiter
@@ -139,29 +139,38 @@ def process_batch(
     delay = LOCK_RETRY_FIRST_DELAY_S
     while True:
         try:
-            return _verify_and_store(settings, env, body, now)
+            if time.monotonic() >= deadline:
+                raise store.LockBudgetExhausted("lock budget exhausted")
+            return _verify_and_store(settings, env, body, now, deadline)
         except sqlite3.OperationalError as exc:
             if not _is_lock_error(exc):
                 raise
-            if time.monotonic() + delay > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or isinstance(exc, store.LockBudgetExhausted):
                 log.warning("ingest_busy: batch not stored, collector will retry: %s", exc)
                 return 503, {"error": "busy"}
-            time.sleep(delay)
+            time.sleep(min(delay, remaining))  # no database lock is held here
             delay = min(delay * 2, LOCK_RETRY_MAX_DELAY_S)
 
 
 def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED (incl. extended codes) by error code; message as a fallback."""
+    if isinstance(exc, store.LockBudgetExhausted):
+        return True
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     text = str(exc).lower()
     return "locked" in text or "busy" in text
 
 
 def _verify_and_store(
-    settings: Settings, env: Envelope, body: bytes, now: float
+    settings: Settings, env: Envelope, body: bytes, now: float, deadline: float
 ) -> tuple[int, dict[str, object]]:
     """Everything after auth. Safe to re-run whole: applying a batch is idempotent by batch_id
     (duplicate pre-check; shard rows are deleted-by-batch before insert; the inventory `batches`
     row commits last, and only that commit acknowledges the batch)."""
-    conn = connect(settings.inventory_path)
+    conn = connect(settings.inventory_path, store.busy_ms(BUSY_TIMEOUT_MS, deadline))
     try:
         collector = store.get_collector(conn, env.collector_id)
         if collector is None or collector.key_id != env.key_id or collector.revoked:
@@ -197,7 +206,12 @@ def _verify_and_store(
         conn.close()
 
     outcome = store.apply_batch(
-        settings.inventory_path, settings.data_dir, batch, now, settings.max_clock_skew_s
+        settings.inventory_path,
+        settings.data_dir,
+        batch,
+        now,
+        settings.max_clock_skew_s,
+        deadline,
     )
     if outcome == "applied":
         return 200, {"duplicate": False}
