@@ -356,6 +356,97 @@ def test_oversized_line_without_newline_is_skipped_in_chunks(env: Env) -> None:
     assert [r["body"] for r in env.server.requests] == [record(2)["body"].encode()]
 
 
+def _cap(max_batch: int = 2) -> int:
+    return max_batch * (ns.MAX_LINE + 1)
+
+
+def _sent(env: Env) -> list[bytes]:
+    return [r["body"] for r in env.server.requests]
+
+
+def test_oversized_line_remainder_is_never_sent_as_a_record(env: Env) -> None:
+    embedded = line(record(9))  # a valid record, hidden after the window cap inside one line
+    env.write(b"x" * _cap() + embedded, line(record(2)))
+    for _ in range(4):
+        env.run(max_batch=2)
+    assert _sent(env) == [record(2)["body"].encode()]
+    assert env.cursor_offset() == env.delivery.stat().st_size
+    assert json.loads(env.cursor.read_text())["discard"] is False
+
+
+def test_oversized_line_with_8193_bytes_filler_and_max_batch_two(env: Env) -> None:
+    env.write(b"y" * (ns.MAX_LINE + 1) * 2 + line(record(9)), line(record(3)))
+    env.run(max_batch=2)
+    env.run(max_batch=2)
+    assert _sent(env) == [record(3)["body"].encode()]
+
+
+def test_discard_progress_is_persisted_between_runs(env: Env) -> None:
+    env.write(b"x" * (3 * _cap()) + line(record(9)), line(record(2)))
+    env.run(max_batch=2)
+    state = json.loads(env.cursor.read_text())
+    assert state["discard"] is True and state["offset"] > 0 and _sent(env) == []
+    for _ in range(6):
+        env.run(max_batch=2)
+    assert _sent(env) == [record(2)["body"].encode()]
+
+
+def test_newline_exactly_at_window_boundary(env: Env) -> None:
+    # newline is the last byte of the window: an ordinary (too long) line, then a real record
+    env.write(b"x" * (_cap() - 1) + b"\n", line(record(2)))
+    env.run(max_batch=2)
+    assert _sent(env) == [record(2)["body"].encode()]
+
+
+def test_newline_just_after_a_full_window_ends_the_discard(env: Env) -> None:
+    env.write(b"x" * _cap() + b"\n", line(record(2)))
+    for _ in range(3):
+        env.run(max_batch=2)
+    assert _sent(env) == [record(2)["body"].encode()]
+    assert env.cursor_offset() == env.delivery.stat().st_size
+
+
+def test_eof_mid_discard_waits_for_the_terminating_newline(env: Env) -> None:
+    env.write(b"x" * (_cap() + 10))
+    env.run(max_batch=2)
+    assert json.loads(env.cursor.read_text())["discard"] is True
+    env.write(line(record(9)))  # the rest of the same line, terminated now
+    env.write(line(record(2)))
+    env.run(max_batch=2)
+    env.run(max_batch=2)
+    assert _sent(env) == [record(2)["body"].encode()]
+
+
+def test_replaced_file_while_discarding_restarts_without_discard(env: Env) -> None:
+    env.write(b"x" * (_cap() + 10))
+    env.run(max_batch=2)
+    assert json.loads(env.cursor.read_text())["discard"] is True
+    env.delivery.unlink()
+    env.write(line(record(1)))
+    env.run(max_batch=2)
+    assert _sent(env) == [record(1)["body"].encode()]
+
+
+def test_old_cursor_without_discard_flag_loads(env: Env) -> None:
+    env.write(line(record(1)))
+    env.run()
+    data = json.loads(env.cursor.read_text())
+    data.pop("discard", None)
+    env.cursor.write_text(json.dumps(data))
+    assert ns.load_cursor(str(env.cursor)).discard is False
+    env.cursor.write_text(json.dumps({**data, "discard": "yes"}))
+    with pytest.raises(ns.ConfigError):
+        ns.load_cursor(str(env.cursor))
+
+
+def test_rejected_record_then_oversized_line_does_not_advance_past_held(env: Env) -> None:
+    env.write(line(record(1)), b"x" * _cap() + line(record(9)), line(record(2)))
+    env.server.script = [{"status": 400}, {}]
+    result = env.run(max_batch=2)
+    assert result.code == 5
+    assert _sent(env) == [record(1)["body"].encode(), record(2)["body"].encode()]
+
+
 # --- errors -------------------------------------------------------------------------------
 
 
@@ -1197,7 +1288,7 @@ def test_stale_temp_cleanup_never_follows_symlinks_or_foreign_files(
 def test_split_lines_is_a_lazy_generator() -> None:
     chunk = ns.Chunk(b"\n" * 1000, 0, 1, 1, "", False)
     assert inspect.isgenerator(ns.split_lines(chunk, 10**9))
-    assert next(ns.split_lines(chunk, 10**9)) == (b"", 1)
+    assert next(ns.split_lines(chunk, 10**9)) == (b"", 1, ns.LINE)
 
 
 def test_a_chunk_of_hundreds_of_thousands_of_short_lines_uses_bounded_memory(env: Env) -> None:

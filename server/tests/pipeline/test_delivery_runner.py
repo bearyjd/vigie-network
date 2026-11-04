@@ -625,3 +625,21 @@ def test_opt_in_reads_the_label_and_hostile_names_still_become_the_alias(world):
     run_delivery(world.inv, spy, pub, dconf(), Clock(), include_label=True)
     assert any("device_overrides" in q for q in spy.sql)
     assert alias("dev-1") in pub.sent[0].body and "Router" not in pub.sent[0].body
+
+
+def test_stop_request_mid_drain_finishes_the_in_flight_row_and_claims_nothing_more(world):
+    for i in range(3):
+        world.incident(f"i{i}")
+    go(world, FakePublisher(), Clock(), max_per_run=0)  # plan only
+    stop = threading.Event()
+
+    class StopsDuringPublish(FakePublisher):
+        def publish(self, message, *, timeout_seconds):
+            stop.set()  # the signal lands while the first row is in flight
+            super().publish(message, timeout_seconds=timeout_seconds)
+
+    pub = StopsDuringPublish()
+    report = go(world, pub, Clock(), should_stop=stop.is_set)
+    assert report.claimed == 1 and report.sent == 1 and len(pub.sent) == 1
+    assert sorted(r["state"] for r in world.rows()) == ["pending", "pending", "sent"]
+    assert sorted(r["attempts"] for r in world.rows()) == [0, 0, 1]  # no further claim started

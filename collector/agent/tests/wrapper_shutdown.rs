@@ -30,8 +30,8 @@ shell_argv = [shell, 'sh'] if pathlib.Path(shell).name == 'busybox' else [shell]
 def identity(pid):
     try:
         return pathlib.Path('/proc/%d/stat' % pid).read_text().rsplit(') ', 1)[1].split()[19]
-    except FileNotFoundError:
-        return None
+    except (FileNotFoundError, ProcessLookupError):
+        return None  # ESRCH: the task exited between open() and read() of /proc/<pid>/stat
 
 for mode, stop in [('ready', signal.SIGTERM), ('ready', signal.SIGINT),
                    ('early', signal.SIGTERM), ('early', signal.SIGINT),

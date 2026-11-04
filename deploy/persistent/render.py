@@ -14,6 +14,20 @@ import os
 import re
 from pathlib import Path
 
+# Pipeline stop grace. After SIGTERM the pipeline finishes its current pass, so Podman must not
+# SIGKILL it first. The stop request reaches the delivery stage (delivery_runner._drain checks it
+# before every claim), so the delivery cost after the signal is the one in-flight claim: claim
+# (<= 5 s SQLite busy timeout, vigie_ingest/db.py BUSY_TIMEOUT_MS) + transmit deadline (30 s,
+# delivery_types.py transmit_deadline_seconds) + complete (<= 5 s) = 40 s.
+# The stages BEFORE delivery (batch backlog, stitch, sweep, purge, monitoring) are NOT bounded by
+# the signal; the remaining 80 s is margin for them, not a guarantee. Keep this above the 40 s
+# bound if either default changes. deploy/compose.yaml stop_grace_period must be >= it
+# (deploy/tests/check_refs.py enforces that). systemd waits longer than Podman: the unit also
+# runs ExecStop/rm after the stop returns.
+PIPELINE_STOP_TIMEOUT_S = 120
+PIPELINE_TIMEOUT_STOP_SEC = 150
+DEFAULT_TIMEOUT_STOP_SEC = 45
+
 _FIELDS = {
     "namespace",
     "image",
@@ -33,7 +47,8 @@ def render(config: dict) -> dict[str, str]:
     if (
         not isinstance(config, dict)
         or not _FIELDS <= set(config)
-        or set(config) - (_FIELDS | {"monitoring_large_upload_bytes", "monitoring_baseline"})
+        or set(config)
+        - (_FIELDS | {"monitoring_large_upload_bytes", "monitoring_baseline"})
     ):
         raise ValueError("configuration must contain only the documented fields")
     threshold = config.get("monitoring_large_upload_bytes", 1073741824)
@@ -104,8 +119,14 @@ def render(config: dict) -> dict[str, str]:
             "DropCapability=all",
             "NoNewPrivileges=true",
             "PidsLimit=256",
-            "Memory=512m",
-            "PodmanArgs=--cpus=1",
+            # Memory= needs a newer Podman than 4.9; PodmanArgs works on both.
+            # --stop-timeout: Podman 4.9's quadlet rejects a StopTimeout= key.
+            "PodmanArgs=--memory=512m --cpus=1"
+            + (
+                f" --stop-timeout={PIPELINE_STOP_TIMEOUT_S}"
+                if role == "pipeline"
+                else ""
+            ),
             "Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
             "LogDriver=journald",
         ]
@@ -160,7 +181,7 @@ def render(config: dict) -> dict[str, str]:
             "Restart=on-failure",
             "RestartSec=5s",
             "TimeoutStartSec=180",
-            "TimeoutStopSec=45",
+            f"TimeoutStopSec={PIPELINE_TIMEOUT_STOP_SEC if role == 'pipeline' else DEFAULT_TIMEOUT_STOP_SEC}",
             "[Install]",
             "WantedBy=default.target",
         ]

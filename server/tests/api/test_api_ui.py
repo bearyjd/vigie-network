@@ -130,3 +130,73 @@ def test_cli_existing_default_and_rules_flags_keep_scope(tmp_path, capsys):
             assert tokens.verify_token(conn, token).scope == scope
         finally:
             conn.close()
+
+
+def test_root_redirects_to_ui_relative_and_public(ui_client):
+    for method in ("get", "head"):
+        response = getattr(ui_client, method)("/", follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == "/ui/"
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert "default-src 'none'" in response.headers["content-security-policy"]
+    landed = ui_client.get("/")
+    assert landed.status_code == 200
+    assert landed.headers["content-type"].startswith("text/html")
+    assert str(landed.url).endswith("/ui/")
+
+
+def test_root_redirect_ignores_host_forwarding_and_query(ui_client):
+    response = ui_client.get(
+        "/?next=https://evil.example/&x=1",
+        headers={
+            "Host": "evil.example",
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Prefix": "/x",
+            "Forwarded": "host=evil.example;proto=https",
+        },
+        follow_redirects=False,
+    )
+    assert response.headers["location"] == "/ui/"
+
+
+@pytest.mark.parametrize("method", ["post", "put", "delete", "patch"])
+def test_root_non_get_does_not_redirect(ui_client, method):
+    response = getattr(ui_client, method)("/", follow_redirects=False)
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+    assert "location" not in response.headers
+    assert response.json()["ok"] is False
+
+
+def test_unknown_paths_keep_json_404_and_root_is_not_in_openapi(ui_client):
+    response = ui_client.get("/nope")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+    from vigie_api.openapi_export import render
+
+    assert '"/":' not in render() and "\n  /:" not in render()
+
+
+@pytest.mark.parametrize("method", ["get", "head"])
+def test_ui_without_slash_redirects_relative_ignoring_host_spoofs(ui_client, method):
+    response = getattr(ui_client, method)(
+        "/ui",
+        headers={
+            "Host": "evil.example",
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "http",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 307
+    assert response.headers["location"] == "/ui/"
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_ui_without_slash_post_behaviour(ui_client):
+    response = ui_client.post("/ui", follow_redirects=False)
+    assert response.status_code == 405
+    assert "location" not in response.headers

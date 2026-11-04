@@ -51,8 +51,13 @@ class RunStats:
     attached: int = 0
 
 
-def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
-    """Process every recorded, not-yet-processed batch, then promote/retire transients."""
+def run_once(
+    config: PipelineConfig,
+    now: float | None = None,
+    should_stop: Callable[[], bool] = lambda: False,
+) -> RunStats:
+    """Process every recorded, not-yet-processed batch, then promote/retire transients.
+    `should_stop` only reaches the delivery stage (no new claim once set); earlier stages run on."""
     clock = time.time() if now is None else now
     live = time.time if now is None else None  # injected `now` pins every clock read (tests)
     inv = open_pipeline_inventory(config.inventory_path, config.migrate)
@@ -70,7 +75,9 @@ def run_once(config: PipelineConfig, now: float | None = None) -> RunStats:
         purge_activity(inv, clock, config.activity_retention_s)
         if usable:
             analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
-            run_delivery_stage(inv, overrides, config, live or (lambda: clock))
+            run_delivery_stage(
+                inv, overrides, config, live or (lambda: clock), should_stop=should_stop
+            )
             refresh_characterization(inv, overrides, clock)
         prune_monitoring(inv, clock)
     finally:

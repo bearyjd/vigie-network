@@ -244,6 +244,37 @@ Healthy on a fresh stack therefore takes a couple of minutes, not seconds.
 limiter keys on the peer address, so check the rootless network mode keeps the real source address
 (`podman info --format '{{.Host.RootlessNetworkCmd}}'`).
 
+## Stopping
+
+The pipeline installs SIGTERM and SIGINT handlers that only write to a self-pipe (no locks, so a
+signal landing mid-wait cannot deadlock). It stops sleeping at once, starts no new pass, lets the
+current pass finish, logs `stopped` and exits 0. A second signal forces exit. Python is PID 1 here
+and the kernel drops a default-disposition SIGTERM for PID 1; an installed handler is delivered, so
+a plain `podman stop` is graceful with no custom stop signal.
+
+Stop grace must exceed the pipeline stop bound. The stop request reaches the delivery stage: after
+the signal it claims nothing new, so only the in-flight claim finishes. That claim can cost about
+40 s (claim and complete each wait up to the 5 s SQLite busy timeout, plus the 30 s transmit
+deadline). The stages before delivery (batch backlog, stitch, sweep, purge, monitoring) are NOT
+bounded by the signal and run to completion; the 120 s grace (compose `stop_grace_period`, quadlet
+`--stop-timeout=120` in `PodmanArgs=`, `TimeoutStopSec=150`) leaves about 80 s of margin for them,
+which is a margin, not a guarantee (a large backlog can exceed it and the container is then
+SIGKILLed). Raising `VIGIE_DELIVERY_TRANSMIT_DEADLINE_S` means raising the grace too
+(`check_refs.py` checks the defaults). Ingest and api keep the defaults (uvicorn stops in under a
+second).
+
+podman-compose reads `stop_grace_period` only for `down`, `stop` and `restart` (it passes it as
+`-t`); it never emits `podman run --stop-timeout`. A plain `podman stop` on a compose-created
+container, or the host-shutdown `podman-restart.service` path, therefore still gets Podman's 10 s
+default. `stop_signal` is passed through but cannot extend the time, and there is no per-service
+passthrough for the stop timeout, so on compose use `podman-compose down`/`stop` for a graceful
+stop. The quadlet install is not affected (`--stop-timeout` is set on the container).
+
+Limits: a forced second signal exits immediately and can leave a delivery row in `sending` until
+its 300 s lease expires (it is then retried). `--once` installs no signal handler (SIGTERM kills it
+at once), and neither does the early startup before the handlers are installed. Images built before this change still ignore SIGTERM (wait, then SIGKILL, exit
+137): for those, the cutover runbook sends a timed SIGINT during the idle wait.
+
 ## Reboots
 
 Containers use `restart: unless-stopped`, but nothing restarts rootless containers after a reboot by
@@ -277,5 +308,8 @@ The base image and the uv image are pinned by `@sha256` digest in `deploy/Contai
 build backend (hatchling and its dependencies) by `deploy/build-constraints.txt`. The digests were
 looked up through the registries' HTTP APIs, not by pulling or building, and the first real build
 may show they need a refresh. `python3 -I deploy/tests/check_refs.py --release` fails when either
-image is unpinned. The runtime stage has pip, setuptools and wheel removed. Not covered: pinning
+image is not `tag@sha256` pinned, when the Python tag's minor differs from the `requires-python`
+lower bound in `server/pyproject.toml`, or when the uv tag is not a version. The CI `gate` job also
+builds `deploy/Containerfile` (no push) through `scripts/image_smoke.sh` and asserts Python 3.12.x,
+that `vigie_api`, `vigie_ingest` and `vigie_pipeline` import, and that the user is uid 10001. The runtime stage has pip, setuptools and wheel removed. Not covered: pinning
 build dependencies by hash, scanning the image, signing it.

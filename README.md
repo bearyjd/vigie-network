@@ -183,7 +183,7 @@ localhost test. It stops on the first failed stage and prints the retained log p
 `scripts/ci.sh --list` lists stages; names select a subset, for example `scripts/ci.sh server contracts`.
 Only the default full invocation represents the full gate.
 
-Requirements: Python 3.12, uv, a host Rust toolchain with a C compiler, OpenSSL, Bash and standard
+Requirements: Python 3.12, Node.js 22 (the CI contracts stage and the local GUI contract tests), uv, a host Rust toolchain with a C compiler, OpenSSL, Bash and standard
 Linux utilities. uv installs locked development dependencies; the deploy checker additionally uses
 PyYAML 6.0.3 as test tooling. Override `VIGIE_CI_SERVER_ENV`, `VIGIE_CI_TRAFFICGEN_ENV`,
 `CARGO_TARGET_DIR`, `UV_CACHE_DIR`, `TMPDIR` and `VIGIE_CI_LOG_DIR` for local environments/caches.
