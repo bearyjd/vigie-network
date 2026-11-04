@@ -46,6 +46,43 @@ _IDS = ("host_boot_id", "router_boot_id")
 _BOOLS = ("dns_log_quiet", "dns_probe_ok", "backlog_capped")
 
 
+_DIAG_ENUMS = {
+    "dns_probe_error": (
+        "timeout",
+        "oserror",
+        "bad_id",
+        "rcode",
+        "no_answer",
+        "malformed",
+    ),
+    "meter_error_class": (
+        "timeout",
+        "nonzero_exit",
+        "oversized",
+        "not_json",
+        "setup_error",
+    ),
+    "coverage_error_class": ("timeout", "http_error", "network_error", "bad_response"),
+}
+_DIAG_INTS = {"meter_exit_code": (0, 255), "meter_signal": (1, 64)}
+_DIAG_BOOLS = ("dns_probe_retry_ok",)
+_DIAG_NUMBERS = ("host_load1", "host_psi_cpu_avg10")
+
+
+def diagnostics_valid(key, value):
+    """Informational fields only: a bad one is dropped on append and never alters a verdict."""
+    if key in _DIAG_ENUMS:
+        return value in _DIAG_ENUMS[key]
+    if key in _DIAG_INTS:
+        low, high = _DIAG_INTS[key]
+        return type(value) is int and low <= value <= high
+    if key in _DIAG_BOOLS:
+        return type(value) is bool
+    if key in _DIAG_NUMBERS:
+        return _number(value) and value <= 1e6
+    return True
+
+
 def _number(value):
     try:
         return (
@@ -356,6 +393,12 @@ class Journal:
     def append(self, sample):
         if len(self.samples) >= MAX_SAMPLES:
             raise ValueError("sample limit")
+        if isinstance(sample, dict):
+            sample = {
+                key: value
+                for key, value in sample.items()
+                if diagnostics_valid(key, value)
+            }
         hard, _, _ = sample_issues(sample)
         if hard:
             # Persist a bounded failure marker instead of throwing away an unencodable
