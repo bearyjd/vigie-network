@@ -42,6 +42,7 @@ log = logging.getLogger("ntfy_sender")
 
 EXIT_OK, EXIT_INTERNAL, EXIT_CONFIG, EXIT_PERMANENT, EXIT_RETRY, EXIT_REJECTED = 0, 1, 2, 3, 4, 5
 MAX_LINE = 8192
+LINE, OVERSIZED, DISCARDING, DISCARDED = range(4)
 MAX_CONFIG = 16384
 MAX_SECRET = 1024
 MAX_CURSOR = 4096
@@ -124,6 +125,7 @@ class Cursor:
     dev: int = 0
     ino: int = 0
     head: str = ""
+    discard: bool = False  # inside an oversized line: skip bytes through its next newline
 
 
 @dataclass(frozen=True)
@@ -298,12 +300,16 @@ def load_cursor(path: str) -> Cursor:
     data = read_private_bytes(path, "cursor file", MAX_CURSOR)
     try:
         raw = json.loads(data.decode("utf-8"))
-        cursor = Cursor(raw["offset"], raw["dev"], raw["ino"], raw["head"])
+        cursor = Cursor(
+            raw["offset"], raw["dev"], raw["ino"], raw["head"], raw.get("discard", False)
+        )
     except (UnicodeDecodeError, ValueError, KeyError, TypeError, RecursionError) as exc:
         raise ConfigError("cursor file is corrupt; inspect or remove it deliberately") from exc
     ints = (cursor.offset, cursor.dev, cursor.ino)
-    if not all(type(n) is int and n >= 0 for n in ints) or not re.fullmatch(
-        r"[0-9a-f]{0,16}", str(cursor.head)
+    if (
+        not all(type(n) is int and n >= 0 for n in ints)
+        or type(cursor.discard) is not bool
+        or not re.fullmatch(r"[0-9a-f]{0,16}", str(cursor.head))
     ):
         raise ConfigError("cursor file is corrupt; inspect or remove it deliberately")
     return cursor
@@ -312,7 +318,13 @@ def load_cursor(path: str) -> Cursor:
 def save_cursor(path: str, cursor: Cursor) -> None:
     """Atomic: unique temp file (O_EXCL) + fsync + rename + directory fsync. Mode 0600."""
     payload = json.dumps(
-        {"offset": cursor.offset, "dev": cursor.dev, "ino": cursor.ino, "head": cursor.head}
+        {
+            "offset": cursor.offset,
+            "dev": cursor.dev,
+            "ino": cursor.ino,
+            "head": cursor.head,
+            "discard": cursor.discard,
+        }
     ).encode()
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -421,6 +433,7 @@ class Chunk:
     ino: int
     head: str
     restarted: bool
+    discard: bool = False  # the chunk starts inside an oversized line
 
 
 def _first_line_hash(fd: int) -> str:
@@ -462,7 +475,8 @@ def read_chunk(cfg: Config, cursor: Cursor) -> Chunk | None:
             log.warning("device number of the delivery file changed; treating it as the same file")
         start = 0 if replaced else cursor.offset
         data = os.pread(fd, _read_cap(cfg), start)
-    return Chunk(data, start, info.st_dev, info.st_ino, head, replaced)
+    discard = cursor.discard and not replaced
+    return Chunk(data, start, info.st_dev, info.st_ino, head, replaced, discard)
 
 
 def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
@@ -478,32 +492,55 @@ def read_at(cfg: Config, previous: Chunk, offset: int) -> Chunk | None:
     return replace(previous, data=data, start=offset, restarted=False)
 
 
-def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int]]:
-    """Complete lines as (line, offset after it), produced one at a time. A partial trailing line
-    is left alone, except a full chunk with no newline at all: that is one oversized line and is
-    skipped by the caller."""
+def split_lines(chunk: Chunk, cap: int) -> Iterator[tuple[bytes, int, int]]:
+    """Complete lines as (line, offset after it, LINE), produced one at a time. A partial
+    trailing line is left alone, except a full chunk with no newline at all: that is the start of
+    an oversized line, yielded once as (bytes, offset after them, OVERSIZED)."""
     pos = 0
     found = False
     while (end := chunk.data.find(b"\n", pos)) >= 0:
         found = True
-        yield chunk.data[pos:end], chunk.start + end + 1
+        yield chunk.data[pos:end], chunk.start + end + 1, LINE
         pos = end + 1
     if not found and len(chunk.data) >= cap:
-        yield chunk.data, chunk.start + len(chunk.data)
+        yield chunk.data, chunk.start + len(chunk.data), OVERSIZED
 
 
-def iter_lines(cfg: Config, chunk: Chunk) -> Iterator[tuple[bytes, int]]:
+def _past_newline(chunk: Chunk) -> tuple[Chunk, bool]:
+    """Drop the tail of an oversized line: bytes through the first newline. Returns the rest and
+    whether we are still inside the line (no newline in this chunk)."""
+    index = chunk.data.find(b"\n")
+    if index < 0:
+        return replace(chunk, data=b"", start=chunk.start + len(chunk.data)), True
+    return replace(chunk, data=chunk.data[index + 1 :], start=chunk.start + index + 1), False
+
+
+def iter_lines(
+    cfg: Config, chunk: Chunk, discard: bool = False
+) -> Iterator[tuple[bytes, int, int]]:
     """Every complete line of the file from the chunk on; later chunks are read lazily, so a
-    consumer that stops pulling never reads (or holds) more."""
+    consumer that stops pulling never reads (or holds) more. After an OVERSIZED item the rest of
+    that line is dropped here, never parsed as a record, and the progress is REPORTED so that the
+    consumer can persist it: DISCARDING (b"", offset, still inside the line) and DISCARDED
+    (b"", offset just after the line's newline). With `discard` the chunk starts inside such a
+    line."""
     cap = _read_cap(cfg)
     while True:
+        more = len(chunk.data) >= cap
+        if discard:
+            had_data = bool(chunk.data)
+            chunk, discard = _past_newline(chunk)
+            if discard and had_data:
+                yield b"", chunk.start, DISCARDING
+            elif not discard:
+                yield b"", chunk.start, DISCARDED
         last_end = None
         for item in split_lines(chunk, cap):
-            last_end = item[1]
+            last_end, discard = item[1], item[2] == OVERSIZED
             yield item
-        if last_end is None or len(chunk.data) < cap:
+        if not more:
             return
-        following = read_at(cfg, chunk, last_end)
+        following = read_at(cfg, chunk, chunk.start if last_end is None else last_end)
         if following is None:
             return
         chunk = following
@@ -682,15 +719,25 @@ def _drain(
     (400/413/414/422) is held back until the next valid record succeeds (a probe), however far
     away it is: then it is skipped for good (exit 5). If the probe is rejected too, or the file
     ends without a valid successor, the run stops with exit 3 and the cursor stays before it."""
-    cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head)
+    cursor = Cursor(chunk.start, chunk.dev, chunk.ino, chunk.head, chunk.discard)
     sent = skipped = rejected = taken = 0
     held: int | None = None  # file offset just after the rejected record
-    for line, end in iter_lines(cfg, chunk):
+    for line, end, kind in iter_lines(cfg, chunk, chunk.discard):
+        if kind == DISCARDED:  # free: the oversized line is over, remember it
+            if held is None:
+                cursor = replace(cursor, offset=end, discard=False)
+                save_cursor(cfg.cursor_file, cursor)
+            continue
         if held is None and taken >= cfg.max_batch:
             break
         if held is not None and expired():
             return _stop(Outcome("retry", None, "run budget exhausted"), sent, skipped)
         taken += 1
+        if kind == DISCARDING:
+            if held is None:
+                cursor = replace(cursor, offset=end, discard=True)
+                save_cursor(cfg.cursor_file, cursor)
+            continue
         try:
             record = parse_record(line)
         except ValueError as exc:
@@ -698,7 +745,7 @@ def _drain(
                 log.warning("skipping invalid record before offset %d: %s", end, exc)
             skipped += 1
             if held is None:
-                cursor = replace(cursor, offset=end)
+                cursor = replace(cursor, offset=end, discard=kind == OVERSIZED)
                 save_cursor(cfg.cursor_file, cursor)
             continue
         outcome = send(record)
@@ -714,7 +761,7 @@ def _drain(
             log.error("record skipped permanently (rejected by the server) before offset %d", held)
             skipped, rejected, held = skipped + 1, rejected + 1, None
         sent += 1
-        cursor = replace(cursor, offset=end)
+        cursor = replace(cursor, offset=end, discard=False)
         save_cursor(cfg.cursor_file, cursor)
     if skipped > MAX_SKIP_LOGS:
         log.warning(
