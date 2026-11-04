@@ -135,22 +135,25 @@ def process_batch(
     if collector_allow is not None and not collector_allow(env.collector_id):
         return 429, {"error": "rate_limited"}
 
-    deadline = time.monotonic() + settings.lock_retry_budget_s
+    start = time.monotonic()
+    deadline = start + settings.lock_retry_budget_s
+    # The first attempt always runs (budget 0 = one attempt, no retries) with at least
+    # MIN_ATTEMPT_S of lock waiting; the budget is enforced before each retry.
+    attempt_deadline = max(deadline, start + store.MIN_ATTEMPT_S)
     delay = LOCK_RETRY_FIRST_DELAY_S
     while True:
         try:
-            if time.monotonic() >= deadline:
-                raise store.LockBudgetExhausted("lock budget exhausted")
-            return _verify_and_store(settings, env, body, now, deadline)
+            return _verify_and_store(settings, env, body, now, attempt_deadline)
         except sqlite3.OperationalError as exc:
             if not _is_lock_error(exc):
                 raise
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or isinstance(exc, store.LockBudgetExhausted):
+            if remaining <= delay or isinstance(exc, store.LockBudgetExhausted):
                 log.warning("ingest_busy: batch not stored, collector will retry: %s", exc)
                 return 503, {"error": "busy"}
-            time.sleep(min(delay, remaining))  # no database lock is held here
+            time.sleep(delay)  # no database lock is held here
             delay = min(delay * 2, LOCK_RETRY_MAX_DELAY_S)
+            attempt_deadline = deadline
 
 
 def _is_lock_error(exc: sqlite3.OperationalError) -> bool:

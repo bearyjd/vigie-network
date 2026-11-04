@@ -11,6 +11,7 @@ normally (not reported as a duplicate) and replaces those rows.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from collections import defaultdict
@@ -166,6 +167,8 @@ def rows_by_day(batch: Batch) -> dict[date, ShardRows]:
     return out
 
 
+log = logging.getLogger("vigie.ingest")
+MIN_ATTEMPT_S = 0.25  # floor on lock waiting for a request's first attempt (retry budget 0)
 CLEANUP_BUDGET_S = 0.5  # cap on best-effort compensation after a failed attempt
 
 
@@ -275,7 +278,7 @@ def apply_batch(
                 conn.close()
         except sqlite3.OperationalError:
             # Not acknowledged (the batches row commits last): drop what this attempt wrote.
-            _discard_unacknowledged(data_dir, list(by_day), batch)
+            _discard_unacknowledged(inventory_path, data_dir, list(by_day), batch)
             raise
         if result not in ("applied", "duplicate"):
             # State changed after the pre-check (e.g. revoked by another process): undo our rows.
@@ -285,13 +288,20 @@ def apply_batch(
         SHARD_LOCK.release()
 
 
-def _discard_unacknowledged(data_dir: Path, days: list[date], batch: Batch) -> None:
-    """Best-effort cleanup after a failed attempt; a failure here leaves rows the next attempt
-    for this (collector_id, batch_id) deletes before inserting anyway."""
+def _discard_unacknowledged(
+    inventory_path: Path, data_dir: Path, days: list[date], batch: Batch
+) -> None:
+    """Best-effort cleanup after a failed attempt, called with SHARD_LOCK held. Rows are kept
+    (the next attempt deletes then rewrites them) if the batch turns out to be recorded, if that
+    cannot be checked, or if the delete fails: keeping rows is always safe, deleting a recorded
+    batch's rows is not. Never raises, so it cannot mask the original error."""
+    deadline = time.monotonic() + CLEANUP_BUDGET_S
     try:
-        _remove_shard_rows(data_dir, days, batch, time.monotonic() + CLEANUP_BUDGET_S)
-    except sqlite3.OperationalError:
-        pass
+        if _is_duplicate(inventory_path, batch, deadline):
+            return  # e.g. COMMIT reported failure but persisted
+        _remove_shard_rows(data_dir, days, batch, deadline)
+    except Exception as exc:  # noqa: BLE001 -- cleanup must never replace the real error
+        log.warning("ingest_cleanup_failed: %s", type(exc).__name__)
 
 
 def _is_duplicate(inventory_path: Path, batch: Batch, deadline: float | None = None) -> bool:

@@ -577,3 +577,108 @@ def test_lock_retry_budget_accepts_range(value: float, tmp_path) -> None:
 def test_body_timeout_rejects_nan(tmp_path) -> None:
     with pytest.raises(ValueError, match="body_timeout_s"):
         Settings(data_dir=tmp_path, secrets_dir=tmp_path, body_timeout_s=float("nan"))
+
+
+# --- fix round 2 ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("budget", [0.0, -0.0])
+def test_zero_budget_still_makes_one_attempt(make_env: Callable[..., Env], budget: float) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=budget)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 200 and resp.json() == {"duplicate": False}
+
+
+def test_zero_budget_with_held_lock_is_503_quickly(make_env: Callable[..., Env]) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0)
+    holder = hold_inventory_write_lock(env, 4.0)
+    start = time.monotonic()
+    resp = env.post(make_batch(seq=1))
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert resp.status_code == 503 and elapsed < 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_cleanup_never_deletes_a_recorded_batch(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COMMIT reported failure but persisted: the retry sees a duplicate and the rows survive."""
+    from contextlib import contextmanager
+
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=5)
+    real, calls = store.immediate, [0]
+
+    @contextmanager
+    def flaky(conn):
+        calls[0] += 1
+        with real(conn):
+            yield
+        if calls[0] == 2:  # the inventory commit, after it persisted
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "immediate", flaky)
+    monkeypatch.setattr(app_module.time, "sleep", lambda _s: None)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 200 and resp.json() == {"duplicate": True}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+@pytest.mark.parametrize("error", [sqlite3.DatabaseError("boom"), OSError("disk")])
+def test_cleanup_failure_does_not_mask_busy(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0)
+
+    def raising(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    def bad_cleanup(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_commit_inventory", raising)
+    monkeypatch.setattr(store, "_remove_shard_rows", bad_cleanup)
+    resp = env.post(make_batch(seq=1))
+    assert resp.status_code == 503 and resp.json() == {"error": "busy"}
+
+
+def test_deadline_passing_before_lock_acquire_is_budget_exhaustion_not_valueerror(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vigie_ingest.models import Batch
+
+    batch = Batch.model_validate(make_batch(seq=1), context={"max_spool_age_s": 10**9})
+    clock = [1000.0]
+    monkeypatch.setattr(store.time, "monotonic", lambda: clock[0])
+
+    def duplicate_check_passes_deadline(*_a, **_k) -> bool:
+        clock[0] += 50  # deadline (clock+10) is now in the past
+        return False
+
+    monkeypatch.setattr(store, "_is_duplicate", duplicate_check_passes_deadline)
+    with pytest.raises(store.LockBudgetExhausted):
+        store.apply_batch(
+            env.settings.inventory_path, env.settings.data_dir, batch, NOW, 300, deadline=1010.0
+        )
+
+
+def test_budget_exhaustion_error_is_never_retried(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=25)
+
+    def no_sleep(_s: float) -> None:
+        raise AssertionError("must not retry after LockBudgetExhausted")
+
+    def exhausted(*_a, **_k):
+        raise store.LockBudgetExhausted("shard lock wait exceeded the budget")
+
+    monkeypatch.setattr(app_module.time, "sleep", no_sleep)
+    monkeypatch.setattr(store, "apply_batch", exhausted)
+    assert env.post(make_batch(seq=1)).status_code == 503
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "301"])
+def test_body_timeout_env_rejects_bad_values(value: str, tmp_path) -> None:
+    with pytest.raises(ValueError, match="body_timeout_s"):
+        Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_BODY_TIMEOUT_S": value})
