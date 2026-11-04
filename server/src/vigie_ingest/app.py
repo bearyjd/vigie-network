@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from pydantic import ValidationError
 
 from vigie_ingest import auth, keeper, store
 from vigie_ingest.config import Settings
-from vigie_ingest.db import SHARD_RE, connect, open_inventory
+from vigie_ingest.db import BUSY_TIMEOUT_MS, SHARD_RE, connect, is_lock_error, open_inventory
 from vigie_ingest.lock import exclusive_data_dir
 from vigie_ingest.models import Batch
 from vigie_ingest.ratelimit import RateLimiter
@@ -26,6 +27,10 @@ from vigie_ingest.retention import run_maintenance
 log = logging.getLogger("vigie.ingest")
 MAINTENANCE_INTERVAL_S = 3600
 TRUSTED_PEERS_PER_COLLECTOR = 4
+# In-request retry of a locked database (host stalls): exponential, bounded by lock_retry_budget_s.
+LOCK_RETRY_FIRST_DELAY_S = 0.1
+LOCK_RETRY_MAX_DELAY_S = 1.0
+LOCK_RETRY_AFTER_S = 5  # advertised on 503; the collector backs off on its own schedule
 
 _UINT_RE = re.compile(r"^\d{1,19}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -111,13 +116,15 @@ def process_batch(
     now: float,
     collector_allow: Callable[[str], bool] | None = None,
     on_verified: Callable[[], None] | None = None,
+    arrived: float | None = None,
 ) -> tuple[int, dict[str, object]]:
     """PRP section 4 checks after size cap and rate limit. Sync; runs in a worker thread.
 
     The HMAC is verified before any database connection is opened, so unauthenticated
     requests cost no database work. `collector_allow` is the per-collector rate limiter; it is
     charged only after the HMAC verifies, so unauthenticated requests never touch its table.
-    `on_verified` runs right after the HMAC verifies (the peer allowlist hook).
+    `on_verified` runs right after the HMAC verifies (the peer allowlist hook). `arrived` is the
+    monotonic time the request reached the handler: the lock-retry budget counts from there.
     """
     key = auth.load_key(settings.secrets_dir, env.key_id)
     message = auth.signing_string(
@@ -130,7 +137,36 @@ def process_batch(
     if collector_allow is not None and not collector_allow(env.collector_id):
         return 429, {"error": "rate_limited"}
 
-    conn = connect(settings.inventory_path)
+    start = time.monotonic()
+    deadline = (start if arrived is None else arrived) + settings.lock_retry_budget_s
+    # The first attempt always runs (budget 0 = one attempt, no retries) with at least
+    # MIN_ATTEMPT_S of lock waiting; the budget is enforced before each retry.
+    attempt_deadline = max(deadline, start + store.MIN_ATTEMPT_S)
+    delay = LOCK_RETRY_FIRST_DELAY_S
+    while True:
+        try:
+            return _verify_and_store(settings, env, body, now, attempt_deadline)
+        except sqlite3.OperationalError as exc:
+            if not is_lock_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= delay + store.MIN_ATTEMPT_S or isinstance(
+                exc, store.LockBudgetExhausted
+            ):
+                log.warning("ingest_busy: batch not stored, collector will retry: %s", exc)
+                return 503, {"error": "busy"}
+            time.sleep(delay)  # no database lock is held here
+            delay = min(delay * 2, LOCK_RETRY_MAX_DELAY_S)
+            attempt_deadline = deadline
+
+
+def _verify_and_store(
+    settings: Settings, env: Envelope, body: bytes, now: float, deadline: float
+) -> tuple[int, dict[str, object]]:
+    """Everything after auth. Safe to re-run whole: applying a batch is idempotent by batch_id
+    (duplicate pre-check; shard rows are deleted-by-batch before insert; the inventory `batches`
+    row commits last, and only that commit acknowledges the batch)."""
+    conn = connect(settings.inventory_path, store.busy_ms(BUSY_TIMEOUT_MS, deadline), deadline)
     try:
         collector = store.get_collector(conn, env.collector_id)
         if collector is None or collector.key_id != env.key_id or collector.revoked:
@@ -166,7 +202,12 @@ def process_batch(
         conn.close()
 
     outcome = store.apply_batch(
-        settings.inventory_path, settings.data_dir, batch, now, settings.max_clock_skew_s
+        settings.inventory_path,
+        settings.data_dir,
+        batch,
+        now,
+        settings.max_clock_skew_s,
+        deadline,
     )
     if outcome == "applied":
         return 200, {"duplicate": False}
@@ -227,6 +268,7 @@ def create_app(
 
     @app.post("/v1/batch")
     async def post_batch(request: Request) -> Response:
+        arrived = time.monotonic()
         env = _parse_envelope(request.headers)
         peer = request.client.host if request.client else "?"
         if not peer_limiter.allow(peer):
@@ -249,8 +291,10 @@ def create_app(
             clock(),
             collector_limiter.allow,
             lambda: peer_limiter.mark_verified(peer),
+            arrived,
         )
-        return JSONResponse(payload, status_code=status)
+        headers = {"Retry-After": str(LOCK_RETRY_AFTER_S)} if status == 503 else None
+        return JSONResponse(payload, status_code=status, headers=headers)
 
     return app
 

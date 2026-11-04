@@ -129,18 +129,36 @@ SHARD_MIGRATIONS: Sequence[str] = (
 )
 
 
-def connect(path: Path | str, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> sqlite3.Connection:
-    """Open a connection with the mandatory pragmas (WAL, secure_delete, busy timeout)."""
+class LockBudgetExhausted(sqlite3.OperationalError):
+    """The request's lock-retry deadline passed before a lock could be taken (nothing stored)."""
+
+
+def is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED (incl. extended codes) by error code; message as a fallback."""
+    if isinstance(exc, LockBudgetExhausted):
+        return True
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def connect(
+    path: Path | str, busy_timeout_ms: int = BUSY_TIMEOUT_MS, deadline: float | None = None
+) -> sqlite3.Connection:
+    """Open a connection with the mandatory pragmas (WAL, secure_delete, busy timeout).
+    `deadline` (monotonic) bounds the WAL-switch retries."""
     conn = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    _enable_wal(conn)
+    _enable_wal(conn, deadline)
     conn.execute("PRAGMA secure_delete=ON")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def _enable_wal(conn: sqlite3.Connection) -> None:
+def _enable_wal(conn: sqlite3.Connection, deadline: float | None = None) -> None:
     """WAL is persistent in the file; switching it can fail with 'locked' under contention
     (busy_timeout does not cover the mode switch), so only switch when needed and retry."""
     for attempt in range(WAL_RETRIES):
@@ -148,10 +166,15 @@ def _enable_wal(conn: sqlite3.Connection) -> None:
             return
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
-            if attempt == WAL_RETRIES - 1:
-                raise
-            time.sleep(0.05 * (attempt + 1))
+        except sqlite3.OperationalError as exc:
+            if attempt == WAL_RETRIES - 1 or not is_lock_error(exc):
+                raise  # persistent failures (e.g. read-only) surface as themselves
+            pause = 0.05 * (attempt + 1)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= pause:
+                    raise LockBudgetExhausted("lock budget exhausted") from None
+            time.sleep(pause)
 
 
 @contextmanager
@@ -211,9 +234,14 @@ def shard_name(day: date) -> str:
     return f"raw-{day:%Y%m%d}.db"
 
 
-def ensure_shard(data_dir: Path, day: date, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> Path:
+def ensure_shard(
+    data_dir: Path,
+    day: date,
+    busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    deadline: float | None = None,
+) -> Path:
     path = data_dir / shard_name(day)
-    conn = connect(path, busy_timeout_ms)
+    conn = connect(path, busy_timeout_ms, deadline)
     try:
         migrate(conn, SHARD_MIGRATIONS)
     finally:
