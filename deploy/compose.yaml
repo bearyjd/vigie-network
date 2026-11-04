@@ -88,6 +88,7 @@ services:
       VIGIE_RATE_LIMIT_IPV6_PREFIX: ${VIGIE_RATE_LIMIT_IPV6_PREFIX:-64}
       VIGIE_MAX_SHARD_DAYS: ${VIGIE_MAX_SHARD_DAYS:-3}
       VIGIE_BODY_TIMEOUT_S: ${VIGIE_BODY_TIMEOUT_S:-10}
+      VIGIE_LOCK_RETRY_BUDGET_S: ${VIGIE_LOCK_RETRY_BUDGET_S:-15}
     volumes:
       - vigie-raw:/raw:rw
       - vigie-inv:/inv:rw

@@ -513,7 +513,7 @@ def test_request_queued_behind_shard_lock_gets_503_within_budget(
 def test_backoff_schedule_is_capped(
     make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=25)
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=20)
     sleeps: list[float] = []
     calls = [0]
 
@@ -561,7 +561,7 @@ def test_failed_attempt_leaves_no_orphan_shard_rows(
     assert shard_count(env, "raw_dns") == 0  # written, then compensated
 
 
-@pytest.mark.parametrize("value", ["nan", "inf", "-1", "25.5", "-inf"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "20.5", "25", "-inf"])
 def test_lock_retry_budget_rejects_bad_values(value: str, tmp_path) -> None:
     with pytest.raises(ValueError, match="lock_retry_budget_s"):
         Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_LOCK_RETRY_BUDGET_S": value})
@@ -569,7 +569,7 @@ def test_lock_retry_budget_rejects_bad_values(value: str, tmp_path) -> None:
         Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=float(value))
 
 
-@pytest.mark.parametrize("value", [0.0, 15.0, 25.0])
+@pytest.mark.parametrize("value", [0.0, 15.0, 20.0])
 def test_lock_retry_budget_accepts_range(value: float, tmp_path) -> None:
     assert Settings(data_dir=tmp_path, secrets_dir=tmp_path, lock_retry_budget_s=value)
 
@@ -665,7 +665,7 @@ def test_deadline_passing_before_lock_acquire_is_budget_exhaustion_not_valueerro
 def test_budget_exhaustion_error_is_never_retried(
     make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=25)
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=20)
 
     def no_sleep(_s: float) -> None:
         raise AssertionError("must not retry after LockBudgetExhausted")
@@ -682,3 +682,107 @@ def test_budget_exhaustion_error_is_never_retried(
 def test_body_timeout_env_rejects_bad_values(value: str, tmp_path) -> None:
     with pytest.raises(ValueError, match="body_timeout_s"):
         Settings.from_env({"VIGIE_DATA_DIR": str(tmp_path), "VIGIE_BODY_TIMEOUT_S": value})
+
+
+# --- fix round 3 ---------------------------------------------------------------------------------
+
+
+def test_wal_switch_respects_budget_and_releases_shard_lock(
+    make_env: Callable[..., Env],
+) -> None:
+    """Shard still in rollback-journal mode + a reader: the WAL switch cannot spin for seconds."""
+    from vigie_ingest.db import SHARD_MIGRATIONS, migrate
+
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.25)
+    path = shard_path(env)
+    plain = sqlite3.connect(path, isolation_level=None)
+    plain.execute("PRAGMA journal_mode=DELETE")
+    migrate(plain, SHARD_MIGRATIONS)
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM raw_dns").fetchall()
+    start = time.monotonic()
+    try:
+        resp = env.post(make_batch(seq=1))
+        elapsed = time.monotonic() - start
+        assert SHARD_LOCK.acquire(timeout=0)  # not left held by the failed request
+        SHARD_LOCK.release()
+    finally:
+        reader.close()
+        plain.close()
+    assert resp.status_code == 503 and elapsed < 0.25 + 1.0, elapsed
+    assert batch_count(env) == 0
+
+
+def test_budget_counts_from_request_arrival(make_env: Callable[..., Env]) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=5)
+    batch = make_batch(seq=1)
+    body = encode(batch)
+    headers = {k.lower(): v for k, v in signed_headers(body, batch).items()}
+    envelope = app_module._parse_envelope(headers)
+    holder = hold_inventory_write_lock(env, 3.0)
+    start = time.monotonic()
+    status, _ = app_module.process_batch(
+        env.settings, envelope, body, NOW, arrived=time.monotonic() - 100
+    )
+    elapsed = time.monotonic() - start
+    holder.join()
+    assert status == 503 and elapsed < 1.5, elapsed  # waited at most the first-attempt floor
+
+
+def test_no_retry_starts_with_less_than_min_attempt_left(
+    make_env: Callable[..., Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=1.6)
+    clock = [1000.0]
+    starts: list[float] = []
+
+    def locked(*_a, **_k):
+        starts.append(clock[0])
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(store, "apply_batch", locked)
+    assert env.post(make_batch(seq=1)).status_code == 503
+    assert len(starts) > 1
+    assert all(1000.0 + 1.6 - t >= store.MIN_ATTEMPT_S for t in starts[1:])
+
+
+@pytest.mark.parametrize("error", [sqlite3.DatabaseError("malformed"), OSError("disk")])
+def test_non_lock_failure_after_shard_write_leaves_no_orphans(
+    env: Env, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def boom(*_a, **_k):
+        raise error
+
+    monkeypatch.setattr(store, "_commit_inventory", boom)
+    with pytest.raises(type(error)):
+        env.post(make_batch(seq=1))
+    assert batch_count(env) == 0 and shard_count(env, "raw_dns") == 0
+
+
+def test_non_lock_failure_never_deletes_a_recorded_batch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import contextmanager
+
+    real, calls = store.immediate, [0]
+
+    @contextmanager
+    def flaky(conn):
+        calls[0] += 1
+        with real(conn):
+            yield
+        if calls[0] == 2:
+            raise sqlite3.DatabaseError("malformed")
+
+    monkeypatch.setattr(store, "immediate", flaky)
+    with pytest.raises(sqlite3.DatabaseError):
+        env.post(make_batch(seq=1))
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+def test_max_shard_days_has_an_upper_bound(tmp_path) -> None:
+    with pytest.raises(ValueError, match="max_shard_days"):
+        Settings(data_dir=tmp_path, secrets_dir=tmp_path, max_shard_days=31)

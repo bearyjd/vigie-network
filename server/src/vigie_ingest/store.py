@@ -25,6 +25,7 @@ from vigie_ingest.db import (
     LOCKED_BUSY_TIMEOUT_MS,
     SHARD_LOCK,
     SHARD_TABLES,
+    LockBudgetExhausted,
     connect,
     ensure_shard,
     immediate,
@@ -172,10 +173,6 @@ MIN_ATTEMPT_S = 0.25  # floor on lock waiting for a request's first attempt (ret
 CLEANUP_BUDGET_S = 0.5  # cap on best-effort compensation after a failed attempt
 
 
-class LockBudgetExhausted(sqlite3.OperationalError):
-    """The request's lock-retry deadline passed before a lock could be taken (nothing stored)."""
-
-
 def busy_ms(default_ms: int, deadline: float | None) -> int:
     """Busy timeout for one connection: the default, capped by the time left before `deadline`."""
     if deadline is None:
@@ -188,7 +185,7 @@ def busy_ms(default_ms: int, deadline: float | None) -> int:
 
 def _connect_locked(path: Path | str, deadline: float | None = None) -> sqlite3.Connection:
     """Connection for use while holding SHARD_LOCK (short busy timeout)."""
-    return connect(path, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline))
+    return connect(path, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline), deadline)
 
 
 def _after_shard_commit() -> None:
@@ -198,7 +195,7 @@ def _after_shard_commit() -> None:
 def _write_shard(
     data_dir: Path, day: date, tables: ShardRows, batch: Batch, deadline: float | None = None
 ) -> None:
-    ensure_shard(data_dir, day, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline))
+    ensure_shard(data_dir, day, busy_ms(LOCKED_BUSY_TIMEOUT_MS, deadline), deadline)
     hold_active(data_dir / shard_name(day))  # keeps -wal/-shm for the pipeline's read-only mount
     conn = _connect_locked(data_dir / shard_name(day), deadline)
     try:
@@ -276,13 +273,13 @@ def apply_batch(
                     result = _commit_inventory(conn, batch, now, max_skew_s)
             finally:
                 conn.close()
-        except sqlite3.OperationalError:
+        except Exception:  # noqa: BLE001 -- any failure here means not acknowledged; re-raised
             # Not acknowledged (the batches row commits last): drop what this attempt wrote.
             _discard_unacknowledged(inventory_path, data_dir, list(by_day), batch)
             raise
         if result not in ("applied", "duplicate"):
             # State changed after the pre-check (e.g. revoked by another process): undo our rows.
-            _remove_shard_rows(data_dir, list(by_day), batch)
+            _remove_shard_rows(data_dir, list(by_day), batch, time.monotonic() + CLEANUP_BUDGET_S)
         return result
     finally:
         SHARD_LOCK.release()
@@ -305,7 +302,7 @@ def _discard_unacknowledged(
 
 
 def _is_duplicate(inventory_path: Path, batch: Batch, deadline: float | None = None) -> bool:
-    conn = connect(inventory_path, busy_ms(BUSY_TIMEOUT_MS, deadline))
+    conn = connect(inventory_path, busy_ms(BUSY_TIMEOUT_MS, deadline), deadline)
     try:
         return (
             conn.execute(
