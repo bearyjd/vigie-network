@@ -22,13 +22,15 @@ import threading
 import time
 import urllib.error
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 PERSISTENT = Path(__file__).parents[1] / "persistent"
 REPO = Path(__file__).parents[2]
 SPEC = importlib.util.spec_from_file_location("ha_sender", PERSISTENT / "ha_sender.py")
-ha = importlib.util.module_from_spec(SPEC)
+assert SPEC is not None and SPEC.loader is not None
+ha: Any = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ha
 SPEC.loader.exec_module(ha)
 
@@ -48,7 +50,7 @@ def record(n: int = 1, label: str | None = None, **over: object) -> dict:
     template = kind if kind in TITLES else "open"
     name = label or f"Device abcde{chr(96 + n)}"
     link = f"/ui/#incident=i{n}"
-    rec = {
+    rec: dict[str, Any] = {
         "delivery_id": f"{n:032x}",
         "kind": kind,
         "title": TITLES[template].format(label=name),
@@ -73,7 +75,7 @@ class FakeHA:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args: object) -> None:
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 pass
 
             def do_POST(self) -> None:  # noqa: N802
@@ -545,6 +547,7 @@ def test_stale_temp_files_are_removed(env: Env) -> None:
 def _writer_module():
     path = REPO / "server/src/vigie_pipeline/delivery_publish.py"
     spec = importlib.util.spec_from_file_location("writer_under_test", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -694,6 +697,48 @@ def test_ip_literals_are_valid_hosts() -> None:
     )  # fmt: skip
     assert cfg.allowed_hosts == ("192.0.2.7", "fd00::1", "fd00::2")
     assert cfg.http_hosts == ("fd00::1",)
+
+
+def _warns_for_http_host(host: str, caplog: pytest.LogCaptureFixture) -> int:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        ha.parse_config(
+            {
+                "delivery_file": "/a", "cursor_file": "/b", "url_file": "/c",
+                "allowed_hosts": [host], "http_hosts": [host],
+            }
+        )  # fmt: skip
+    assert host.strip("[]") not in caplog.text  # the host is never named
+    return len(caplog.records)
+
+
+@pytest.mark.parametrize(
+    "host", ["10.0.0.9", "100.64.0.1", "100.127.255.254", "127.0.0.1", "::1", "::ffff:10.0.0.9",
+             "::ffff:100.64.0.1", "::ffff:127.0.0.1"],
+)  # fmt: skip
+def test_no_http_warning_for_private_cgnat_or_loopback(
+    host: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert _warns_for_http_host(host, caplog) == 0
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["192.0.2.7", "100.128.0.1", "100.63.255.255", "::ffff:192.0.2.7", "2001:db8::1", "h.ex"],
+)
+def test_http_warning_for_public_hosts(host: str, caplog: pytest.LogCaptureFixture) -> None:
+    assert _warns_for_http_host(host, caplog) == 1
+
+
+def test_http_warning_is_emitted_once_for_several_hosts(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        ha.parse_config(
+            {
+                "delivery_file": "/a", "cursor_file": "/b", "url_file": "/c",
+                "allowed_hosts": ["192.0.2.7", "192.0.2.8"], "http_hosts": ["192.0.2.7", "192.0.2.8"],
+            }
+        )  # fmt: skip
+    assert len(caplog.records) == 1
 
 
 def test_config_file_must_be_private(tmp_path: Path) -> None:
@@ -1131,6 +1176,13 @@ def test_failed_run_in_existing_empty_dir_leaves_no_lock(env: Env) -> None:
     assert list(env.state.iterdir()) == []
 
 
+def test_leftover_cursor_temp_does_not_make_the_dir_non_fresh(env: Env) -> None:
+    env.write(line(record(1)))
+    private(env.state / "cursor.json.123.deadbeef.tmp", b"x")  # crash during the first seed
+    assert env.run(start_at_end=True).code == 0
+    assert env.cursor_offset() == env.delivery.stat().st_size
+
+
 def test_unmarked_leftover_lock_does_not_block_seeding(env: Env) -> None:
     env.write(line(record(1)))
     private(Path(str(env.cursor) + ".lock"), b"")  # a peer or crashed run that never got a cursor
@@ -1146,14 +1198,14 @@ def test_two_concurrent_first_runs_seed_exactly_once(
     entered, release = threading.Event(), threading.Event()
     real = ha.seed_cursor
 
-    def slow_seed(cfg: ha.Config) -> ha.Cursor:
+    def slow_seed(cfg: Any) -> Any:
         calls.append(1)
         entered.set()
         assert release.wait(20)
         return real(cfg)
 
     monkeypatch.setattr(ha, "seed_cursor", slow_seed)
-    results: dict[str, object] = {}
+    results: dict[str, Any] = {}
     winner = threading.Thread(
         target=lambda: results.update(a=env.run(start_at_end=True)), daemon=True
     )
@@ -1281,7 +1333,7 @@ def test_non_private_http_host_logs_a_warning_without_the_host(
     with caplog.at_level(logging.WARNING):
         ha.parse_config({**base, "allowed_hosts": ["203.0.113.9", "ha.example.invalid"],
                          "http_hosts": ["203.0.113.9", "ha.example.invalid"]})  # fmt: skip
-    assert caplog.text.count("http_hosts") == 2
+    assert caplog.text.count("http_hosts") == 1  # once per run, not per host
     assert "203.0.113" not in caplog.text and "example" not in caplog.text
 
 
@@ -1343,7 +1395,7 @@ def test_lock_is_marked_after_the_first_cursor_save_of_a_run(
     calls: list[int] = []
     marked: list[bool] = []
 
-    def flaky(*_a: object, **_k: object) -> ha.Outcome:
+    def flaky(*_a: object, **_k: object) -> Any:
         calls.append(1)
         if len(calls) == 2:
             marked.append(_lock_marked(env))  # state a SIGKILL here would leave behind

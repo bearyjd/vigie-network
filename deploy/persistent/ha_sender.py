@@ -300,16 +300,27 @@ def _abs_path(value: object, key: str) -> str:
 
 _PRIVATE_NETS = tuple(
     ipaddress.ip_network(n)
-    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128")
+    for n in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",  # CGNAT, used by Tailscale
+        "127.0.0.0/8",
+        "fc00::/7",
+        "::1/128",
+    )
 )
 
 
 def _is_private_literal(host: str) -> bool:
-    """RFC 1918 / loopback IPv4 or ULA / loopback IPv6 literal (a host name is never one)."""
+    """RFC 1918 / CGNAT / loopback IPv4 or ULA / loopback IPv6 literal, an IPv4-mapped IPv6
+    literal judged by its IPv4 address (a host name is never one)."""
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
     return any(address in net for net in _PRIVATE_NETS if net.version == address.version)
 
 
@@ -345,12 +356,11 @@ def parse_config(raw: object) -> Config:
     plain = _hosts(raw.get("http_hosts", []), "http_hosts", required=False)
     if not set(plain) <= set(allowed):
         raise ConfigError("http_hosts must be a subset of allowed_hosts")
-    for host in plain:
-        if not _is_private_literal(host):
-            log.warning(
-                "an http_hosts entry is not a private-network address literal; plain HTTP to it "
-                "exposes the secret URL and payload to anyone on the path"
-            )
+    if not all(_is_private_literal(host) for host in plain):
+        log.warning(
+            "an http_hosts entry is not a private-network address literal; plain HTTP to it "
+            "exposes the secret URL and payload to anyone on the path"
+        )
     start_at_end = raw.get("start_at_end", True)
     if not isinstance(start_at_end, bool):
         raise ConfigError("start_at_end must be true or false")
@@ -501,11 +511,16 @@ def acquire_lock(cursor_file: str) -> int | None:
     return fd
 
 
+def _temp_pattern(cursor_base: str) -> re.Pattern[str]:
+    """Names save_cursor gives its temp files: `<cursor>.<pid>.<8 hex>.tmp`."""
+    return re.compile(re.escape(cursor_base) + r"\.[0-9]+\.[0-9a-f]{8}\.tmp")
+
+
 def clean_stale_temps(cursor_file: str, max_age: float = STALE_TEMP_AGE_S) -> None:
     """Remove our own leftover `<cursor>.<pid>.<8 hex>.tmp` files older than max_age. Only exact
     name matches, regular files (lstat, never followed) owned by us."""
     directory, base = os.path.split(cursor_file)
-    pattern = re.compile(re.escape(base) + r"\.[0-9]+\.[0-9a-f]{8}\.tmp")
+    pattern = _temp_pattern(base)
     try:
         names = os.listdir(directory or ".")
     except OSError as exc:
@@ -738,7 +753,7 @@ def parse_record(line: bytes) -> Record:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_args: object, **_kwargs: object) -> NoReturn:  # type: ignore[override]
+    def redirect_request(self, *_: object, **__: object) -> NoReturn:  # type: ignore[override]
         raise RedirectRefused
 
 
@@ -956,12 +971,17 @@ def run(
 
 def _is_fresh(cursor_file: str, lock_fd: int) -> bool:
     """True when no run ever established a cursor here: the directory holds nothing but the lock
-    file and the lock is unmarked. A lock left by a run that never got a cursor (failed first
-    run, or a peer that lost the race) does not count as sender state."""
+    file (and leftover cursor temp files) and the lock is unmarked. A lock left by a run that never
+    got a cursor (failed first run, or a peer that lost the race) and a temp file left by a crash
+    during the first seed do not count as sender state."""
+    base = os.path.basename(cursor_file)
+    temp = _temp_pattern(base)
     try:
-        others = set(os.listdir(os.path.dirname(cursor_file) or ".")) - {
-            os.path.basename(cursor_file) + ".lock"
-        }
+        others = [
+            n
+            for n in os.listdir(os.path.dirname(cursor_file) or ".")
+            if n != base + ".lock" and not temp.fullmatch(n)
+        ]
         return not others and os.pread(lock_fd, 1, 0) == b""
     except OSError as exc:
         raise ConfigError(f"cannot inspect cursor directory: {exc.strerror}") from exc
