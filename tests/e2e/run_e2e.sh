@@ -203,7 +203,11 @@ stage provision s_provision || exit 1
 stage ingest_up s_ingest_up || exit 1
 write_agent_inputs
 stage collector_check s_collector_check || exit 1
-sleep "$(hour_guard_wait_s "$(date -u +%s)" 240)" # keep ingest receipts inside one UTC hour
+# s_collect lasts: 1 (conntrack) + 3 (tail start) + PHONES*STEP_S (feed.py, one step per rolling MAC)
+# + 3*WINDOW_S (drain) seconds, plus a 60 s safety margin. PHONES matches PHONE_MACS in feed.py.
+PHONES=3
+COLLECT_BUDGET_S=$((4 + PHONES * STEP_S + 3 * WINDOW_S + 60))
+sleep "$(hour_guard_wait_s "$(date -u +%s)" "$COLLECT_BUDGET_S")" # keep ingest receipts inside one UTC hour
 stage collect s_collect
 stage ingest_assert s_ingest_assert
 stage ingest_down s_ingest_down
