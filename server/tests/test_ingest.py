@@ -398,3 +398,70 @@ def test_unique_batch_ids_distinguish_batches(env: Env) -> None:
     assert env.post(make_batch(seq=1)).json() == {"duplicate": False}
     assert env.post(make_batch(seq=2, batch_id=uuid7(99))).json() == {"duplicate": False}
     assert batch_count(env) == 2
+
+
+# --- transient SQLite lock contention (host stalls) ---------------------------------------------
+
+
+@pytest.fixture
+def short_locks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store, "LOCKED_BUSY_TIMEOUT_MS", 100)
+
+
+def hold_inventory_write_lock(env: Env, seconds: float) -> threading.Thread:
+    """Hold the inventory write lock from a second connection, as a stalled writer would."""
+    ready = threading.Event()
+
+    def hold() -> None:
+        conn = connect(env.settings.inventory_path)
+        conn.execute("BEGIN IMMEDIATE")
+        ready.set()
+        threading.Event().wait(seconds)
+        conn.execute("ROLLBACK")
+        conn.close()
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert ready.wait(5)
+    return thread
+
+
+def test_lock_released_within_budget_applies_once(env: Env, short_locks: None) -> None:
+    batch = make_batch(seq=1)
+    holder = hold_inventory_write_lock(env, 1.0)
+    resp = env.post(batch)
+    holder.join()
+    assert resp.status_code == 200 and resp.json() == {"duplicate": False}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+    again = env.post(batch)  # lost-ACK retry after success
+    assert again.json() == {"duplicate": True}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1
+
+
+def test_lock_budget_exhausted_is_503_and_unacknowledged(
+    make_env: Callable[..., Env], short_locks: None
+) -> None:
+    env = make_env(rate_limit_per_window=1000, lock_retry_budget_s=0.5)
+    batch = make_batch(seq=1)
+    holder = hold_inventory_write_lock(env, 2.0)
+    resp = env.post(batch)
+    holder.join()
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "busy"}
+    assert resp.headers["retry-after"] == "5"
+    assert "locked" not in resp.text
+    assert batch_count(env) == 0  # never acknowledged, never recorded as received
+    retry = env.post(batch)  # collector retry once the stall is over
+    assert retry.status_code == 200 and retry.json() == {"duplicate": False}
+    assert batch_count(env) == 1 and shard_count(env, "raw_dns") == 1  # no duplicate rows
+
+
+def test_non_lock_operational_error_is_not_masked(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_a, **_k):
+        raise sqlite3.OperationalError("no such table: batches")
+
+    monkeypatch.setattr(store, "apply_batch", broken)
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        env.post(make_batch(seq=1))

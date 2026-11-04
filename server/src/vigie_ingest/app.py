@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -26,6 +27,10 @@ from vigie_ingest.retention import run_maintenance
 log = logging.getLogger("vigie.ingest")
 MAINTENANCE_INTERVAL_S = 3600
 TRUSTED_PEERS_PER_COLLECTOR = 4
+# In-request retry of a locked database (host stalls): exponential, bounded by lock_retry_budget_s.
+LOCK_RETRY_FIRST_DELAY_S = 0.1
+LOCK_RETRY_MAX_DELAY_S = 1.0
+LOCK_RETRY_AFTER_S = 5  # advertised on 503; the collector backs off on its own schedule
 
 _UINT_RE = re.compile(r"^\d{1,19}$")
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -130,6 +135,32 @@ def process_batch(
     if collector_allow is not None and not collector_allow(env.collector_id):
         return 429, {"error": "rate_limited"}
 
+    deadline = time.monotonic() + settings.lock_retry_budget_s
+    delay = LOCK_RETRY_FIRST_DELAY_S
+    while True:
+        try:
+            return _verify_and_store(settings, env, body, now)
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc):
+                raise
+            if time.monotonic() + delay > deadline:
+                log.warning("ingest_busy: batch not stored, collector will retry: %s", exc)
+                return 503, {"error": "busy"}
+            time.sleep(delay)
+            delay = min(delay * 2, LOCK_RETRY_MAX_DELAY_S)
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _verify_and_store(
+    settings: Settings, env: Envelope, body: bytes, now: float
+) -> tuple[int, dict[str, object]]:
+    """Everything after auth. Safe to re-run whole: applying a batch is idempotent by batch_id
+    (duplicate pre-check; shard rows are deleted-by-batch before insert; the inventory `batches`
+    row commits last, and only that commit acknowledges the batch)."""
     conn = connect(settings.inventory_path)
     try:
         collector = store.get_collector(conn, env.collector_id)
@@ -250,7 +281,8 @@ def create_app(
             collector_limiter.allow,
             lambda: peer_limiter.mark_verified(peer),
         )
-        return JSONResponse(payload, status_code=status)
+        headers = {"Retry-After": str(LOCK_RETRY_AFTER_S)} if status == 503 else None
+        return JSONResponse(payload, status_code=status, headers=headers)
 
     return app
 
