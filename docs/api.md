@@ -321,3 +321,10 @@ the instant counts), computed in one SQL query that is not limited to the 10000-
 summary. It is `null` when the parameter is absent or when SQLite reports any operational error
 (for example integer overflow); a caller must treat `null` as unknown, never as zero. The existing
 `dropped_batches_in_retained_detail` and `summary_capped` keep their meaning.
+
+`ct_unmapped_bytes_in_retained_detail` and `ct_unmapped_flows_in_retained_detail` are summed in SQL
+over every retained batch of the collector, not just the newest 10000, so `summary_capped` does not
+limit them. Non-integer or malformed `truncated` values count as 0. `ct_unmapped_exact` is `true`
+when those two sums are this uncapped total; it is `false` (sums `0`) if SQLite reports an
+operational error such as integer overflow. A caller must treat `false`, or an absent field from an
+older server, as unknown.

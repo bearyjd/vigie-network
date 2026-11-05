@@ -306,6 +306,47 @@ class FinalCoverageContract(unittest.TestCase):
         self.assertIsNone(runner.coverage_metrics(collector, 1000)["dropped_batches"])
 
 
+class CtUnmappedExactGateTests(unittest.TestCase):
+    BASE = {
+        "ct_unmapped_flows_in_retained_detail": 4,
+        "ct_unmapped_bytes_in_retained_detail": 900,
+        "summary_capped": True,
+    }
+
+    def test_exact_server_totals_are_used_even_when_the_detail_summary_is_capped(self):
+        result = runner.coverage_metrics({**self.BASE, "ct_unmapped_exact": True}, 1000)
+        self.assertEqual(result["ct_unmapped_flows"], 4)
+        self.assertEqual(result["ct_unmapped_bytes"], 900)
+
+    def test_absent_or_not_true_exact_flag_keeps_the_totals_unknown(self):
+        for flag in ({}, {"ct_unmapped_exact": False}, {"ct_unmapped_exact": 1}):
+            for capped in (True, False):
+                with self.subTest(flag=flag, capped=capped):
+                    collector = {**self.BASE, **flag, "summary_capped": capped}
+                    result = runner.coverage_metrics(collector, 1000)
+                    self.assertIsNone(result["ct_unmapped_flows"])
+                    self.assertIsNone(result["ct_unmapped_bytes"])
+
+    def test_capped_exact_case_is_not_reported_missing_by_sample_issues(self):
+        spec = importlib.util.spec_from_file_location(
+            "soak_for_ct", Path(__file__).parents[1] / "persistent" / "soak.py"
+        )
+        soak = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = soak
+        spec.loader.exec_module(soak)
+
+        def missing(collector):
+            sample = {**HEALTHY_SAMPLE, **runner.coverage_metrics(collector, 1800000000)}
+            return soak.sample_issues(sample)[1]
+
+        capped_exact = {**self.BASE, "ct_unmapped_exact": True}
+        self.assertNotIn("ct_unmapped_flows", missing(capped_exact))
+        self.assertNotIn("ct_unmapped_bytes", missing(capped_exact))
+        old_server = {**self.BASE}
+        self.assertIn("ct_unmapped_flows", missing(old_server))
+        self.assertIn("ct_unmapped_bytes", missing(old_server))
+
+
 class DropsSinceRunStartTests(unittest.TestCase):
     CONFIG = {
         "api_token_file": "private",

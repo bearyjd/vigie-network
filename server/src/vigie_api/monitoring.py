@@ -50,6 +50,32 @@ def dropped_since(inv, collector, since):
         return None
 
 
+def _ct_term(key):
+    return (
+        f"SUM(CASE WHEN json_valid(truncated) AND json_type(truncated,'$.{key}')='integer' "
+        f"THEN json_extract(truncated,'$.{key}') ELSE 0 END)"
+    )
+
+
+_CT_UNMAPPED_SQL = (
+    f"SELECT {_ct_term('ct_unmapped_bytes')},{_ct_term('ct_unmapped_flows')} "  # noqa: S608
+    "FROM batches WHERE collector_id=?"
+)
+
+
+def ct_unmapped_totals(inv, collector):
+    """Exact (bytes, flows, exact) over every retained batch, not limited to the detail cap.
+
+    Non-integer or malformed `truncated` values count as 0; SQLite integer overflow reports
+    (0, 0, False) so a caller never mistakes a partial sum for the total.
+    """
+    try:
+        row = inv.execute(_CT_UNMAPPED_SQL, (collector,)).fetchone()
+    except sqlite3.OperationalError:
+        return 0, 0, False
+    return row[0] or 0, row[1] or 0, True
+
+
 def required(inv):
     tables = {row[0] for row in inv.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if (
@@ -142,7 +168,7 @@ def collector_summary(inv, collector, since=None):
         "AND m.batch_id=b.batch_id) ORDER BY b.received_at,b.batch_id LIMIT 10001",
         (collector,),
     ).fetchall()
-    truncated = [json.loads(row["truncated"] or "{}") for row in rows]
+    ct_bytes, ct_flows, ct_exact = ct_unmapped_totals(inv, collector)
     unavailable = [
         dict(row)
         for row in inv.execute(
@@ -169,12 +195,9 @@ def collector_summary(inv, collector, since=None):
         "summary_capped": capped,
         "dropped_batches_since": dropped_since(inv, collector, since),
         "dropped_batches_in_retained_detail": sum(row["dropped_batches"] for row in rows),
-        "ct_unmapped_bytes_in_retained_detail": sum(
-            t.get("ct_unmapped_bytes", 0) for t in truncated
-        ),
-        "ct_unmapped_flows_in_retained_detail": sum(
-            t.get("ct_unmapped_flows", 0) for t in truncated
-        ),
+        "ct_unmapped_bytes_in_retained_detail": ct_bytes,
+        "ct_unmapped_flows_in_retained_detail": ct_flows,
+        "ct_unmapped_exact": ct_exact,
         "source_flags_latest": flags.get("source_flags", 0) if latest and health else None,
         "agent_rss_kb": health.get("rss_kb"),
         "agent_uptime_s": health.get("uptime_s"),

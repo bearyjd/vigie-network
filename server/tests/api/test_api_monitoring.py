@@ -1,3 +1,5 @@
+import json
+
 from api_helpers import NOW, Env, env  # noqa: F401
 
 HOUR = int(NOW) // 3600 * 3600 - 3600
@@ -454,3 +456,58 @@ def test_dropped_since_sum_overflow_is_null_not_a_server_error(env: Env):
     response = _since(env, "2026-01-01T00:00:00Z")
     assert response.status_code == 200, response.text
     assert response.json()["data"]["collector"]["dropped_batches_since"] is None
+
+
+def _ct_rows(env, rows):
+    env.inv.executemany(
+        "INSERT INTO batches(collector_id,batch_id,received_at,truncated) VALUES ('c1',?,?,?)",
+        rows,
+    )
+
+
+def _ct_collector(env):
+    return env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600).json()[
+        "data"
+    ]["collector"]
+
+
+def test_ct_unmapped_sums_are_uncapped_beyond_10000_rows_and_flagged_exact(env: Env):
+    seed(env)
+    rows = [
+        (
+            f"a{i:05}",
+            f"2026-01-{1 + i // 1440:02}T{i % 1440 // 60:02}:{i % 60:02}:00Z",
+            json.dumps({"ct_unmapped_bytes": 10, "ct_unmapped_flows": 1, "other": 99}),
+        )
+        for i in range(10050)
+    ]
+    _ct_rows(env, rows)
+    value = _ct_collector(env)
+    assert value["summary_capped"] is True
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 100500
+    assert value["ct_unmapped_flows_in_retained_detail"] == 10050
+    assert value["ct_unmapped_exact"] is True
+
+
+def test_ct_unmapped_sum_tolerates_malformed_truncated_rows(env: Env):
+    seed(env)
+    good = '{"ct_unmapped_bytes":7,"ct_unmapped_flows":2}'
+    bad = ["not json", "[1]", "null", '{"ct_unmapped_bytes":"9"}', '{"ct_unmapped_flows":1.5}']
+    _ct_rows(
+        env,
+        [("g", "2026-01-01T00:00:00Z", good)]
+        + [(f"b{i}", f"2026-01-01T00:00:0{i + 1}Z", t) for i, t in enumerate(bad)],
+    )
+    value = _ct_collector(env)
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 7
+    assert value["ct_unmapped_flows_in_retained_detail"] == 2
+    assert value["ct_unmapped_exact"] is True
+
+
+def test_ct_unmapped_sum_overflow_is_not_exact_instead_of_an_error(env: Env):
+    seed(env)
+    big = json.dumps({"ct_unmapped_bytes": 2**62})
+    _ct_rows(env, [(f"o{i}", f"2026-01-01T00:00:0{i}Z", big) for i in range(3)])
+    value = _ct_collector(env)
+    assert value["ct_unmapped_exact"] is False
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 0
