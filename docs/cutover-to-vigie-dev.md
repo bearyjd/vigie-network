@@ -225,22 +225,27 @@ cursor 13453 vs max rowid 13454).
      10 s SIGKILL: it can also leave a partial JSONL line at the end of the old delivery file.
    - Once `stopped` is confirmed: if the pipeline log of its LAST container life contains any
      `delivery_publish_timeout` (journal filtered by that life's `CONTAINER_ID_FULL`, or `--since` its
-     container start; not the whole journal. Get the id after `--rm` with
-     `journalctl --user CONTAINER_NAME=<old-namespace>_pipeline -n1 -o json` and read
-     `CONTAINER_ID_FULL`. Precondition: the container uses the journald log driver
-     (`podman info --format '{{.Host.LogDriver}}'`, or `LogDriver=journald` in the quadlet); or `podman logs <old-namespace>_pipeline` captured before the stop) an abandoned publisher thread
-     can have left a partial JSONL line. The file is 0600 in a 0700 dir owned by a host subuid, so
+     container start, not the whole journal; or `podman logs <old-namespace>_pipeline` captured before
+     the stop), an abandoned publisher thread can have left a partial JSONL line. To get the id after
+     `--rm`, run `journalctl --user CONTAINER_NAME=<old-namespace>_pipeline -n1 -o json` and read
+     `CONTAINER_ID_FULL`; this needs the journald log driver (`podman info --format
+     '{{.Host.LogDriver}}'`, or `LogDriver=journald` in the quadlet). The file is 0600 in a 0700 dir
+     owned by a host subuid, so
      read it through `podman unshare`: `podman unshare tail -c1 <delivery-file> | od -An -tx1` must
      print `0a`; if not, stop and investigate.
    - Do NOT rely on a plain `systemctl --user stop` to drain. `podman stop` defaults to 10 s and
      `TimeoutStopSec=45` does not lengthen it, while a drain can need about 90 s. A plain stop drains
-     only once the pipeline runs with `--stop-timeout` >= 120 (`PIPELINE_STOP_TIMEOUT_S = 120`, on main,
-     `render.py:126`). A plain stop drains only if BOTH hold: (1) the image has the graceful-shutdown
+     only if BOTH hold: (1) the image has the graceful-shutdown
      handlers (`vigie_pipeline/cli.py:117-125` on main; the old host image predates them), AND (2) the
-     deployed container and unit carry the timeouts, which come from the rendered quadlet, not the
+     deployed container and unit carry the timeouts (`PIPELINE_STOP_TIMEOUT_S = 120`, `render.py:126`),
+     which come from the rendered quadlet, not the
      image (a new image under old quadlets is still SIGKILLed after 10 s): check
+     (run this BEFORE the stop: `podman inspect` only works while the container runs, as quadlet
+     containers use `--rm`)
      `podman inspect <old-namespace>_pipeline --format '{{.Config.StopTimeout}}'` >= 120 and
-     `systemctl --user show <old-namespace>-pipeline.service -p TimeoutStopUSec`. If either fails, use the
+     `systemctl --user show <old-namespace>-pipeline.service -p TimeoutStopUSec` at least `2min 30s` (the
+     rendered unit has `TimeoutStopSec=150`, `render.py:28`/`:184`; it must exceed the 120 s container
+     stop timeout, otherwise systemd kills the container early). If either fails, use the
      SIGINT-in-idle-window procedure above only.
 4. Run the old sender ONCE and confirm it caught up. First record the cursor offset (the `offset` in the
    JSON file named by `cursor_file` in the sender config; an absent file means 0; needed for invalid-record recovery, section 11)
