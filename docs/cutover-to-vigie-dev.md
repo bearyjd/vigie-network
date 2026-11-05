@@ -67,7 +67,10 @@ The old `pin2` value on the router is overwritten; note it before the edit if it
      | ssh <standby-ssh> 'sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user> \
          podman secret create vigie_standby_collector_key_<key-id> -'
    ```
-   Check the byte count only (`... | wc -c`, rehearsal: 66 = 64 hex + newline). Then add to
+   Check the byte count only (`... | wc -c`, rehearsal: 66 = 64 hex + newline). In the real cutover the
+   key piped from the old host arrived with one extra trailing newline (66 vs 65 bytes of data plus
+   newline). That is harmless: the key loader strips it. Compare a hash of the STRIPPED value on both
+   hosts; never print the key. Then add to
    `vigie_standby-ingest.container`, next to the existing `Secret=` lines, and run
    `systemctl --user daemon-reload`:
    ```
@@ -106,10 +109,19 @@ After the standby comes up the collector may still be sleeping in a backoff of u
 soak-style "fresh dropped batches" gate would fail. The measured technical path is under 30 s
 (section 8); the rest is operator time.
 
+Observed in the real cutover (2026-11-05), kept next to the estimates above: the first `200` on the
+standby arrived at T0 + 9.5 min (collector backoff, inside the "up to about T0+10 min" range). The
+whole technical path (drain, backup, ship, restore) took about 6 min of operator and script time. The
+1 MiB spool covered the gap with no drops (`dropped_batches_in_retained_detail` 0).
+
 ## 5. Sequence
 
 Run <old-host> commands on <old-host>, standby commands as the service account:
 `S='sudo -n -u <service-user> env XDG_RUNTIME_DIR=/run/user/<standby-uid> HOME=/home/<service-user>'`.
+
+Access gotchas on the standby: `sudo -u <service-user> podman ...` fails with `cannot chdir` when run
+from another user's home, so `cd /home/<service-user>` first; `XDG_RUNTIME_DIR` must be set (the `S`
+prefix does both except the `cd`).
 
 **Step 1: pre-flight (T-10 min).**
 - Old host: `podman ps` shows ingest/pipeline/api healthy; ingest log shows ~1 POST per minute.
@@ -123,6 +135,8 @@ Run <old-host> commands on <old-host>, standby commands as the service account:
   already had ACKed. So mount the key only in Step 5 (move the `Secret=` line and the
   `daemon-reload` from prerequisite 4 into Step 5), or keep the row revoked until the restore.
 - Old host's ntfy sender has caught up (cursor offset equals delivery file size).
+- Old host's pipeline is healthy and current: cursor == max rowid and `run_complete` every 30 s. A
+  pipeline that is already failing (`run_failed`) will not drain in Step 3.
 - Stop here if any check fails.
 
 **Step 2: flip the router (T0).** Immediately before the edit, re-check that the router queue is
@@ -133,6 +147,12 @@ certificates"; copy files with `scp -O`, no sftp on OpenWrt):
 cp /etc/vigie/collector.conf /etc/vigie/collector.conf.pre-cutover
 # edit /etc/vigie/collector.conf: server_url=https://<standby-addr>/v1/batch
 #                                 pin2=<standby pin from section 2>   (pin1 stays the old host's)
+# Do NOT use `sed -i` (BusyBox may replace the file with a different owner/mode; the collector runs as
+# the dedicated account and must read collector.conf). Edit a temp copy, then write it back in place,
+# which keeps inode, owner and mode:
+#   sed 's|^server_url=.*|server_url=https://<standby-addr>/v1/batch|; s|^pin2=.*|pin2=<standby pin>|' \
+#     /etc/vigie/collector.conf > /tmp/collector.conf.new && cat /tmp/collector.conf.new > /etc/vigie/collector.conf
+#   ls -l /etc/vigie/collector.conf    # owner and mode unchanged vs collector.conf.pre-cutover
 # --check must NOT run as root (exit 77 before --check is handled, main.rs:301-315). Run it as the
 # dedicated account through the audited helper, exactly as the init script does (vigie-collector.init:52):
 /usr/bin/vigie-privdrop "$(id -u vigie)" "$(id -g vigie)" /usr/bin/vigie-collector --config /etc/vigie/collector.conf --check
@@ -140,19 +160,26 @@ cp /etc/vigie/collector.conf /etc/vigie/collector.conf.pre-cutover
 /etc/init.d/vigie-collector restart
 ```
 `collector_id`, `key_id` and `/etc/vigie/key` do not change. Record the time.
+- `server_url` may hold a DNS name (it did): replace it with the standby IP literal, not another name.
+- `pin2` may already hold an old value; the edit overwrites it. Record the old value first (it is in
+  `collector.conf.pre-cutover`).
 - Check: the old host's ingest journal shows no new POST; the standby journal shows `401` responses,
   sparse because of the backoff (a few in the first minutes, then one every 2.5-5 min). No `200`, no
   TLS error. If the router logs TLS/pin failures instead, fix `pin2` or roll back now (section 9).
 
-**Step 3: drain and freeze the old host.** Order matters. A delivery is only a file append plus a
-`sent` mark in `inventory.db` (`delivery_runner.py:253-262`, `delivery_publish.py:163-181`); the mark
-is restored onto the standby, and Step 5 deletes the delivery file. Any line appended after the
+**Step 3: drain and freeze the old host.** Order matters, in two ways. First, a delivery is only a file
+append plus a `sent` mark in `inventory.db` (`delivery_runner.py:253-262`, `delivery_publish.py:163-181`);
+the mark is restored onto the standby, and Step 5 deletes the delivery file. Any line appended after the
 sender's last run would be marked sent and never delivered. The pipeline sets its cursor before the
 monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowid is NOT a full drain.
-1. Stop the old host's INGEST first (the router already moved):
-   `systemctl --user stop <old-namespace>-ingest.service`.
-2. Wait until the pipeline cursor equals max rowid AND at least one complete `run_complete` log line
-   appeared AFTER that point (pipeline interval is 30 s, so allow about 60 s):
+Second, drain BEFORE stopping ingest. A stopped ingest closes the raw shard DBs cleanly (the `-wal` and
+`-shm` sidecars disappear), and the read-only pipeline can then no longer open the shard of a batch
+that arrived just before the stop: it logs `shard_read_failed ... unable to open database file` and
+`run_failed`, and the cursor stays one behind for good (observed: batch arrived 8 s before the stop,
+cursor 13453 vs max rowid 13454).
+1. Wait, with the old ingest STILL RUNNING (the router already moved, so no new batch arrives), until
+   the pipeline cursor equals max rowid AND at least one complete `run_complete` log line appeared
+   AFTER that point (pipeline interval is 30 s, so allow about 60 s):
    ```sh
    podman run --rm --network none --user 0:0 --entrypoint python \
      -v <old-namespace>_inv:/inv:ro localhost/vigie-server:<tag> -c '
@@ -162,6 +189,11 @@ monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowi
    # container names use an underscore (<old-namespace>_pipeline); service names a hyphen
    podman logs --since 2m <old-namespace>_pipeline | grep -c run_complete
    ```
+2. Stop the old host's INGEST: `systemctl --user stop <old-namespace>-ingest.service`. Re-check that
+   cursor == max rowid (same query; the max cannot grow now). The pipeline is still running and idle.
+   If the cursor is behind and the log shows `shard_read_failed` / `run_failed`, you stopped too early:
+   recover by starting the old ingest again (the router no longer posts to it, so nothing forks), wait
+   for the drain as in item 1, then stop it again.
 3. Stop the pipeline, SIGINT ONLY during its idle wait. The images running on the old host predate
    the graceful-shutdown work: the pipeline ignores SIGTERM (PID 1, section 12), and a SIGINT that
    arrives while a pass is running raises `KeyboardInterrupt` out of the worker join, which can
@@ -172,11 +204,15 @@ monitoring and delivery stages run (`processor.py:64-75`), so cursor == max rowi
      `systemctl --user stop <old-namespace>-pipeline.service`.
    - If a pass is in progress (no `run_complete` yet since the last start of work), wait for the next
      `run_complete`; never signal mid-pass.
-   - Verify the log shows `stopped` (clean exit 0) and that no `sending` rows remain (query in
-     item 7). Never rely on the 10 s SIGKILL: it can also leave a partial JSONL line at the end of
+   - Verify the pipeline logged `stopped` (clean exit 0) and that no `sending` rows remain (query in
+     item 7). Quadlet containers run with `--rm`, so after the stop `podman logs <old-namespace>_pipeline
+     | grep stopped` fails. Read it from the journal right after the stop:
+     `journalctl --user -t <old-namespace>_pipeline | grep '"event":"stopped"'`, or capture the
+     container logs before the unit stops. The same applies to every later check of `stopped` in this
+     document (sections 9 and 12). Never rely on the 10 s SIGKILL: it can also leave a partial JSONL line at the end of
      the old delivery file.
-   - Once `stopped` is confirmed: if `podman logs <old-namespace>_pipeline` (no `--since`, so the
-     whole container life) contains any `delivery_publish_timeout`, an abandoned publisher thread
+   - Once `stopped` is confirmed: if the pipeline log for the whole container life (journal as above, or
+     `podman logs <old-namespace>_pipeline` captured before the stop) contains any `delivery_publish_timeout`, an abandoned publisher thread
      can have left a partial JSONL line. The file is 0600 in a 0700 dir owned by a host subuid, so
      read it through `podman unshare`: `podman unshare tail -c1 <delivery-file> | od -An -tx1` must
      print `0a`; if not, stop and investigate.
@@ -302,7 +338,7 @@ reported `backlog_batches` 0. Shard reads happen only for batches past the pipel
 (`processor.py:157`, `measurements.py`). **But**: a batch that is still pending at backup time
 and whose shard file is missing is consumed with zero MACs and the cursor advances
 (`sources.py:read_batch` skips a missing file). Test: cursor rewound by 2 in a scratch copy, empty
-raw: `batches 2, macs 0`, cursor advanced, no error. So draining the old host's pipeline (Step 3) is
+raw: `batches 2, macs 0`, cursor advanced, no error. So draining the old host's pipeline (Step 3, with ingest still running) is
 mandatory, not cosmetic. Not copying raw also respects "never back up raw shards"
 (`docs/deploy.md`, Backups): per-client DNS history stays on <old-host> and expires by retention.
 
@@ -356,6 +392,9 @@ is deployed. Add the <old-host> drain wait (<= about 60 s) and operator time. A 
 the identity tests) reproduced stop and replace within 0.2 s. Taking the backup does not touch
 the old host's live stack.
 
+Real cutover data point (2026-11-05): drain, backup, ship and restore took about 6 min of operator and
+script time (the rehearsal figures above are the script part only); the first `200` came at T0 + 9.5 min.
+
 ## 9. Rollback
 
 Decision point: do NOT wait for a first `200` (see section 4: it can legitimately arrive up to about
@@ -376,7 +415,7 @@ The old host's data is untouched by the cutover, so it is exactly as at Step 3.
    pipeline (`processor.py:71-74`), so it is lost after the stop.
    (b) Stop the pipeline so nothing can append after the sender reaches EOF: use the idle-window SIGINT
    procedure of section 3 (watch for `run_complete`, then `podman kill --signal SIGINT` and
-   `systemctl --user stop`) and confirm the log shows `stopped`. Then REPEAT the (a) query: this second result is the one that
+   `systemctl --user stop`) and confirm `stopped` (from the journal, Step 3 item 3). Then REPEAT the (a) query: this second result is the one that
    counts. If `pending` or `sending` is not 0, write the loss down. A plain stop is a 10 s SIGKILL until
    `fix/stopsignal-sigint` is merged (section 3, item on stopping) and can leave a `sending` row and a
    partial JSONL line. Removing the two `VIGIE_DELIVERY_*` env lines is optional once it is stopped.
@@ -414,7 +453,7 @@ Rehearsed: the standby side (revoke, services healthy). The old-host and router 
 ## 10. Verification checklist
 
 After Step 2: router accepted the config; standby shows 401s, <old-host> shows none.
-After Step 3: <old-host> pipeline cursor == max rowid; <old-host> units stopped.
+After Step 3: <old-host> pipeline cursor == max rowid (checked with ingest running, then again after the ingest stop), no `shard_read_failed` / `run_failed` in its log; <old-host> units stopped.
 After Step 5, on the standby:
 - `podman ps`: ingest, api, pipeline healthy.
 - `curl -sk -o /dev/null -w '%{http_code}\n' https://<standby-api-addr>/ui/` = 200 and `/healthz` = 200.
@@ -605,7 +644,8 @@ SIGTERM: PID 1 is the Python process (`deploy/entrypoint.sh:40` ends in `exec "$
 not the problem). The kernel does not deliver a signal with default disposition to PID 1, and the
 pipeline loop handles only `KeyboardInterrupt` (`vigie_pipeline/cli.py:98`); ingest and api run
 under uvicorn, which installs its own handlers (they stop in 0.5 s). Result: `podman stop` waits
-the 10 s timeout, SIGKILL, exit 137, the unit ends `failed`. Measured with throwaway containers:
+the 10 s timeout, SIGKILL, exit 137, the unit ends `failed`. Measured with throwaway containers (quadlet containers are removed on stop, so
+read `stopped` from the journal afterwards: Step 3 item 3):
 
 | Variant | Stop time | Exit |
 |---|---|---|
@@ -643,3 +683,20 @@ procedure of Step 3 and avoid relying on the 10 s SIGKILL. Ingest and api (uvico
   per step is not measured.
 - Fixed wall-clock figures come from a LAN-local VM with a warm image; a cold disk or a loaded
   host would be slower.
+
+## 14. Soak after cutover
+
+Prerequisites found in practice when starting the soak on the new host:
+
+1. Coverage cap: the coverage summary was capped at 10000 batch rows, and 7 days of retention is about
+   10080 rows, so the `ct_unmapped` counters were unknown and a pass was impossible. The fix is PR #76
+   (main >= `a6c3fe6`). Update BOTH the server image and the runner scripts; the runner scripts are
+   host-side files and do not come with the image.
+2. Same commit: the host-side runner scripts must be at the same commit as the server image.
+3. Unit copied from a desktop host: an `ExecStart` wrapped in `systemd-inhibit` fails on a headless
+   service account (`Failed to inhibit: Access denied`). Run python directly. A server VM has no idle
+   suspend; confirm in the logind and sleep settings.
+4. Router metrics grant: the window in `/etc/vigie-metrics/expiry` is at most 194400 s (54 h). Reissue
+   the grant right before the start.
+5. Updates: disable the `apt-daily` and `apt-daily-upgrade` timers on the VM for the run and restore
+   them afterwards.
