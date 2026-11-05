@@ -18,7 +18,7 @@ touches:
 ---
 
 ## Decided
-- Cutover to vigie-dev worked: router flipped at 00:21:25Z (collector.conf edit via `cat tmp > conf` to keep owner/mode, pin2 = standby pin, backup .pre-cutover), first 200 on the standby at T0+9.5 min (collector backoff), no drops, backlog 0. Scripts per runbook step (router / Tower drain+backup+ship / standby restore) in the main thread, logged step by step in ~/.cache/vigie-dev-prep/CUTOVER-LOG.md.
+- Cutover to vigie-dev worked: router flipped at 00:21:25Z (collector.conf edit via `cat tmp > conf` to keep owner/mode, pin2 = standby pin, backup .pre-cutover), first 200 on the standby at T0+9.5 min (collector backoff), no drops, backlog 0. Scripts per runbook step (router / Tower drain+backup+ship / standby restore) in the main thread, logged step by step in the private cutover log.
 - Soak 3 started 2026-11-05T02:01:19Z on vigie-dev (user vigie, unit vigie-soak.service). Router metrics grant window max 194400 s: reissue /etc/vigie-metrics/expiry right before the start. Needs host-side runner scripts from the SAME commit as the image.
 - Server tests: use server/.venv (system python3 has an old Starlette, rate-limit tests fail on main too). Soak meter tests need a TMPDIR outside /tmp.
 
@@ -29,6 +29,6 @@ touches:
 - Starting the soak before PR #76: the coverage summary is capped at 10000 batch rows (7 days retention = 10080), so ct_unmapped_* were unknown and no pass was possible. Fixed by ct_unmapped_exact.
 
 ## Watch out
-- A stray `chmod 755 /home/vigie` on the VM loosened the home dir for ~2 min (restored to 750). Never chmod parent dirs to satisfy ancestor checks.
+- A stray `chmod 755` on the service account home on the VM loosened the home dir for ~2 min (restored to 750). Never chmod parent dirs to satisfy ancestor checks.
 - Soak rules were left unchanged for soak 3 (DNS probe failures are isolated single samples; #73 now records failure causes). Decide any DNS-rule relaxation BEFORE a run, not after.
 - ntfy on vigie-dev is deliberately enabled only after the soak ends; apt timers on the VM are disabled for the run and must be restored after.
