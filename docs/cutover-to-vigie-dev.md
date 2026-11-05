@@ -156,8 +156,9 @@ cp /etc/vigie/collector.conf /etc/vigie/collector.conf.pre-cutover
 #     /etc/vigie/collector.conf > /tmp/collector.conf.new && cat /tmp/collector.conf.new > /etc/vigie/collector.conf
 #   ls -l /etc/vigie/collector.conf    # owner and mode unchanged vs collector.conf.pre-cutover
 # sed changes nothing if a key is absent (for example no `pin2=` line). BEFORE --check and restart,
-# both of these must print 1, and `diff collector.conf.pre-cutover collector.conf` must show exactly
-# two changed lines; otherwise ABORT (restore the .pre-cutover copy) and fix the file by hand:
+# both of these must print 1, and the file must differ from the backup in exactly two lines
+# (`diff /etc/vigie/collector.conf.pre-cutover /etc/vigie/collector.conf`; BusyBox may lack `diff`:
+# then `cmp -s` must report a difference and the two greps are the check); otherwise ABORT (restore the .pre-cutover copy) and fix the file by hand:
 #   grep -c '^server_url=https://<standby-addr>/v1/batch$' /etc/vigie/collector.conf
 #   grep -c '^pin2=<standby pin>$' /etc/vigie/collector.conf
 # --check must NOT run as root (exit 77 before --check is handled, main.rs:301-315). Run it as the
@@ -224,15 +225,23 @@ cursor 13453 vs max rowid 13454).
      10 s SIGKILL: it can also leave a partial JSONL line at the end of the old delivery file.
    - Once `stopped` is confirmed: if the pipeline log of its LAST container life contains any
      `delivery_publish_timeout` (journal filtered by that life's `CONTAINER_ID_FULL`, or `--since` its
-     container start; not the whole journal; or `podman logs <old-namespace>_pipeline` captured before the stop) an abandoned publisher thread
+     container start; not the whole journal. Get the id after `--rm` with
+     `journalctl --user CONTAINER_NAME=<old-namespace>_pipeline -n1 -o json` and read
+     `CONTAINER_ID_FULL`. Precondition: the container uses the journald log driver
+     (`podman info --format '{{.Host.LogDriver}}'`, or `LogDriver=journald` in the quadlet); or `podman logs <old-namespace>_pipeline` captured before the stop) an abandoned publisher thread
      can have left a partial JSONL line. The file is 0600 in a 0700 dir owned by a host subuid, so
      read it through `podman unshare`: `podman unshare tail -c1 <delivery-file> | od -An -tx1` must
      print `0a`; if not, stop and investigate.
    - Do NOT rely on a plain `systemctl --user stop` to drain. `podman stop` defaults to 10 s and
      `TimeoutStopSec=45` does not lengthen it, while a drain can need about 90 s. A plain stop drains
      only once the pipeline runs with `--stop-timeout` >= 120 (`PIPELINE_STOP_TIMEOUT_S = 120`, on main,
-     `render.py:126`). Only images built from main at or after that fix drain on a plain stop; the old
-     host image predates it. Use the SIGINT-in-idle-window procedure above only.
+     `render.py:126`). A plain stop drains only if BOTH hold: (1) the image has the graceful-shutdown
+     handlers (`vigie_pipeline/cli.py:117-125` on main; the old host image predates them), AND (2) the
+     deployed container and unit carry the timeouts, which come from the rendered quadlet, not the
+     image (a new image under old quadlets is still SIGKILLed after 10 s): check
+     `podman inspect <old-namespace>_pipeline --format '{{.Config.StopTimeout}}'` >= 120 and
+     `systemctl --user show <old-namespace>-pipeline.service -p TimeoutStopUSec`. If either fails, use the
+     SIGINT-in-idle-window procedure above only.
 4. Run the old sender ONCE and confirm it caught up. First record the cursor offset (the `offset` in the
    JSON file named by `cursor_file` in the sender config; an absent file means 0; needed for invalid-record recovery, section 11)
    and set the journal window: `start=$(date '+%Y-%m-%d %H:%M:%S')`. Then
@@ -431,7 +440,8 @@ The old host's data is untouched by the cutover, so it is exactly as at Step 3.
    the bounded query of that item, using the standby namespace
    (`journalctl --user CONTAINER_NAME=vigie_standby_pipeline --since "$t" | grep '"event":"stopped"'`). Then REPEAT the (a) query: this second result is the one that
    counts. If `pending` or `sending` is not 0, write the loss down. A plain stop is a 10 s SIGKILL unless
-   the image was built from main with the `--stop-timeout` fix (Section 5 Step 3 item 3) and can leave a `sending` row and a
+   BOTH the image has the drain handlers AND the deployed container/unit carry the stop timeouts
+   (checks in Section 5 Step 3 item 3), and it can leave a `sending` row and a
    partial JSONL line. Removing the two `VIGIE_DELIVERY_*` env lines is optional once it is stopped.
    (c) Partial-line check before the final sender run: `podman unshare tail -c1 <delivery-file> | od -An -tx1`
    must print `0a`; if not, stop and investigate. Skip it when the delivery file is absent (the publisher
@@ -462,10 +472,11 @@ The old host's data is untouched by the cutover, so it is exactly as at Step 3.
    pipeline cursor equals max batch rowid after two cycles; `/coverage` backlog 0.
 
 Abort points inside Step 3 (before Step 5, so the standby holds no data to lose; use steps 2-3 above):
-- After item 1 only (ingest stopped): `systemctl --user start <old-namespace>-ingest.service`; restore the
+- After item 2 only (ingest stopped): `systemctl --user start <old-namespace>-ingest.service`; restore the
   router conf (step 3 above) only if the standby is not accepting.
-- After items 2-5 (pipeline, sender timer, api stopped): start the stopped old units (ingest, pipeline,
-  api, `vigie-ntfy-sender.timer`) in the order of step 2 above.
+- After items 3-5 (pipeline stopped, sender run, timer and api stopped): start the stopped old units
+  (ingest, pipeline, api, `vigie-ntfy-sender.timer`) in the order of step 2 above, skipping its `cp`
+  (no sources were removed yet, so `<backup-dir>` does not exist).
 - After item 6 (`[Install]` removed): restore the saved quadlet sources first, `daemon-reload`, then
   start the units (step 2 above).
 
@@ -663,8 +674,10 @@ Boot: the quadlets have `WantedBy=default.target`; confirm user linger for the s
 (`loginctl show-user vigie -p Linger`) and reboot once in a quiet window; it is not rehearsed here.
 
 SIGTERM: PID 1 is the Python process (`deploy/entrypoint.sh:40` ends in `exec "$@"`, so the shell is
-not the problem). The kernel does not deliver a signal with default disposition to PID 1, and the
-pipeline loop handles only `KeyboardInterrupt` (`vigie_pipeline/cli.py:98`); ingest and api run
+not the problem). The kernel does not deliver a signal with default disposition to PID 1. In images
+built before the drain handlers, the pipeline loop handles only `KeyboardInterrupt`
+(`vigie_pipeline/cli.py:98` at that time); main has SIGTERM/SIGINT drain handlers
+(`vigie_pipeline/cli.py:117-125`). For such an old image: ingest and api run
 under uvicorn, which installs its own handlers (they stop in 0.5 s). Result: `podman stop` waits
 the 10 s timeout, SIGKILL, exit 137, the unit ends `failed`. Measured with throwaway containers (quadlet containers are removed on stop, so
 read `stopped` from the journal with the bounded `--since` query: Section 5 Step 3 item 3):
@@ -677,9 +690,10 @@ read `stopped` from the journal with the bounded `--since` query: Section 5 Step
 
 Fix: a stop-signal change is NOT the fix. `--stop-signal=SIGINT` / `STOPSIGNAL SIGINT` stop the idle
 pipeline in 0.1 s (table above), but SIGINT cuts an in-flight delivery, so that approach was rejected.
-The fix is real SIGTERM/SIGINT drain handlers in the pipeline (in progress in another change,
-unverified here). Until an image with them is deployed on the old host, use the idle-wait SIGINT
-procedure of Step 3 and avoid relying on the 10 s SIGKILL. Ingest and api (uvicorn) already stop in
+The fix is the SIGTERM/SIGINT drain handlers in the pipeline (on main, not exercised in this
+rehearsal). They only help when the deployed quadlet also carries the stop timeouts (Step 3 item 3
+checks). Until an image with the handlers AND matching units are deployed on the old host, use the
+idle-wait SIGINT procedure of Step 3 and avoid relying on the 10 s SIGKILL. Ingest and api (uvicorn) already stop in
 0.5 s.
 
 ## 13. Risks and unknowns
