@@ -42,7 +42,7 @@ null oldest receipt. Missing, capped, malformed or inconsistent receipt/count ev
 and cannot produce a pass. Future timestamps do not create a favorable age. Keep the original
 raw count/caps alongside age; do not hide stalled receipts by relabeling them normal handoff.
 
-The live meter's collector RSS is authoritative for resource acceptance. API coverage uses the exact `backlog_capped`/`summary_capped` booleans; absent or capped detail makes relevant counts unknown and blocks a favorable partial result. The API's older RSS report is retained separately as `api_collector_rss_kib` and cannot replace it. A resumed collection appends failure or missing evidence durably before applying gates, so retrying cannot silently omit that observation.
+The live meter's collector RSS is authoritative for resource acceptance. API coverage uses the exact `backlog_capped`/`summary_capped` booleans; absent or capped detail makes relevant counts unknown (the conntrack-unmapped counts instead use the server's uncapped totals, trusted only when `ct_unmapped_exact` is `true`; an older server without it stays unknown) and blocks a favorable partial result. The API's older RSS report is retained separately as `api_collector_rss_kib` and cannot replace it. A resumed collection appends failure or missing evidence durably before applying gates, so retrying cannot silently omit that observation.
 
 The meter returns one JSON object with the following fields only (other fields are discarded):
 

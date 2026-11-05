@@ -401,7 +401,9 @@ def coverage_metrics(collector, now):
         if "oldest_pending_received_at" in collector
         else None
     )
-    if collector.get("summary_capped") is not False:
+    # The totals are server-side SQL sums over all retained rows, trusted only when the server
+    # says so; an older server (flag absent) stays unknown regardless of summary_capped.
+    if collector.get("ct_unmapped_exact") is not True:
         for key in ("ct_unmapped_flows", "ct_unmapped_bytes"):
             result[key] = None
     return result
