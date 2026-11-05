@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
+LOG = logging.getLogger("vigie_api")
 MAX_MACS = 64
 MAX_ALIASES = 256
 # The exact form the ingest writes to batches.received_at, so text comparison is chronological.
@@ -53,6 +55,7 @@ def dropped_since(inv, collector, since):
 def _ct_term(key):
     return (
         f"SUM(CASE WHEN json_valid(truncated) AND json_type(truncated,'$.{key}')='integer' "
+        f"AND typeof(json_extract(truncated,'$.{key}'))='integer' "
         f"THEN json_extract(truncated,'$.{key}') ELSE 0 END)"
     )
 
@@ -63,6 +66,15 @@ _CT_UNMAPPED_SQL = (
 )
 
 
+def _json_dict(text):
+    """Parsed JSON object, or {} when absent, malformed or not an object."""
+    try:
+        value = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def ct_unmapped_totals(inv, collector):
     """Exact (bytes, flows, exact) over every retained batch, not limited to the detail cap.
 
@@ -71,7 +83,8 @@ def ct_unmapped_totals(inv, collector):
     """
     try:
         row = inv.execute(_CT_UNMAPPED_SQL, (collector,)).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        LOG.warning("ct_unmapped totals unavailable: %s", type(exc).__name__)
         return 0, 0, False
     return row[0] or 0, row[1] or 0, True
 
@@ -160,8 +173,8 @@ def collector_summary(inv, collector, since=None):
         None,
     )
     latest = observed or (rows[0] if rows else None)
-    health = json.loads(latest["health"] or "{}") if latest else {}
-    flags = json.loads(latest["truncated"] or "{}") if latest else {}
+    health = _json_dict(latest["health"]) if latest else {}
+    flags = _json_dict(latest["truncated"]) if latest else {}
     pending = inv.execute(
         "SELECT b.received_at FROM batches b WHERE b.collector_id=? AND NOT EXISTS "
         "(SELECT 1 FROM measurement_batches m WHERE m.collector_id=b.collector_id "
