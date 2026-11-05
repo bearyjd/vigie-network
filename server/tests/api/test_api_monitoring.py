@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from api_helpers import NOW, Env, env  # noqa: F401
 
 HOUR = int(NOW) // 3600 * 3600 - 3600
@@ -511,3 +512,108 @@ def test_ct_unmapped_sum_overflow_is_not_exact_instead_of_an_error(env: Env):
     value = _ct_collector(env)
     assert value["ct_unmapped_exact"] is False
     assert value["ct_unmapped_bytes_in_retained_detail"] == 0
+
+
+def test_ct_unmapped_integer_beyond_int64_never_loses_precision_in_an_exact_sum(env: Env):
+    seed(env)
+    rows = [
+        ("hi", "2026-01-01T00:00:01Z", '{"ct_unmapped_bytes":9223372036854775808}'),
+        ("max", "2026-01-01T00:00:02Z", '{"ct_unmapped_bytes":9223372036854775807}'),
+        ("min", "2026-01-01T00:00:03Z", '{"ct_unmapped_flows":-9223372036854775807}'),
+        ("lo", "2026-01-01T00:00:04Z", '{"ct_unmapped_flows":-9223372036854775809}'),
+    ]
+    _ct_rows(env, rows)
+    value = _ct_collector(env)
+    assert value["ct_unmapped_exact"] is True
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 2**63 - 1
+    assert value["ct_unmapped_flows_in_retained_detail"] == -(2**63 - 1)
+
+
+def test_ct_unmapped_sums_do_not_leak_across_collectors(env: Env):
+    seed(env)
+    env.inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c2','k2')")
+    _ct_rows(env, [("m", "2026-01-01T00:00:01Z", '{"ct_unmapped_bytes":5,"ct_unmapped_flows":1}')])
+    env.inv.execute(
+        "INSERT INTO batches(collector_id,batch_id,received_at,truncated) "
+        "VALUES ('c2','x','2026-01-01T00:00:02Z','{\"ct_unmapped_bytes\":1000,"
+        '"ct_unmapped_flows":100}\')'
+    )
+    value = _ct_collector(env)
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 5
+    assert value["ct_unmapped_flows_in_retained_detail"] == 1
+
+
+def test_ct_unmapped_json5ish_text_counts_zero(env: Env):
+    seed(env)
+    _ct_rows(
+        env,
+        [
+            ("j", "2026-01-01T00:00:01Z", "{ct_unmapped_bytes:5,ct_unmapped_flows:5}"),
+            ("k", "2026-01-01T00:00:02Z", "{'ct_unmapped_bytes':5}"),
+            ("g", "2026-01-01T00:00:03Z", '{"ct_unmapped_bytes":3}'),
+        ],
+    )
+    value = _ct_collector(env)
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 3
+    assert value["ct_unmapped_flows_in_retained_detail"] == 0
+    assert value["ct_unmapped_exact"] is True
+
+
+def test_ct_unmapped_collector_with_zero_batches_is_zero_and_exact(env: Env):
+    seed(env)
+    value = _ct_collector(env)
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 0
+    assert value["ct_unmapped_flows_in_retained_detail"] == 0
+    assert value["ct_unmapped_exact"] is True
+
+
+@pytest.mark.parametrize("bad", ["not json", "[1]", "null", '"s"', "5"])
+def test_malformed_latest_truncated_or_health_does_not_500(env: Env, bad):
+    seed(env)
+    env.inv.execute(
+        "INSERT INTO batches(collector_id,batch_id,received_at,truncated,health,"
+        "observation_kind) VALUES ('c1','z','2026-01-01T00:00:01Z',?,?,'observation')",
+        (bad, bad),
+    )
+    response = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["collector"]["source_flags_latest"] in (0, None)
+
+
+def test_ct_unmapped_fallback_logs_only_the_exception_class(env: Env, caplog):
+    seed(env)
+    big = json.dumps({"ct_unmapped_bytes": 2**62, "secret_marker": "SECRETVALUE"})
+    _ct_rows(env, [(f"o{i}", f"2026-01-01T00:00:0{i}Z", big) for i in range(3)])
+    with caplog.at_level("WARNING", logger="vigie_api"):
+        value = _ct_collector(env)
+    assert value["ct_unmapped_exact"] is False
+    records = [r for r in caplog.records if "ct_unmapped" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert "OperationalError" in records[0].getMessage()
+    assert "SECRETVALUE" not in records[0].getMessage()
+    assert "integer overflow" not in records[0].getMessage()
+
+
+def test_ct_unmapped_json_booleans_count_zero(env: Env):
+    seed(env)
+    _ct_rows(
+        env,
+        [("t", "2026-01-01T00:00:01Z", '{"ct_unmapped_bytes":true,"ct_unmapped_flows":false}')],
+    )
+    value = _ct_collector(env)
+    assert value["ct_unmapped_bytes_in_retained_detail"] == 0
+    assert value["ct_unmapped_flows_in_retained_detail"] == 0
+    assert value["ct_unmapped_exact"] is True
+
+
+def test_valid_health_with_non_object_truncated_reports_zero_source_flags(env: Env):
+    seed(env)
+    env.inv.execute(
+        "INSERT INTO batches(collector_id,batch_id,received_at,truncated,health,"
+        "observation_kind) VALUES ('c1','z','2026-01-01T00:00:01Z','[1]','{\"rss_kb\":1}',"
+        "'observation')"
+    )
+    response = env.get("/coverage", collector_id="c1", from_hour=HOUR, to_hour=HOUR + 3600)
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["collector"]["source_flags_latest"] == 0
