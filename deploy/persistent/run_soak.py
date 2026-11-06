@@ -470,7 +470,7 @@ def dns_probe_diagnosed(router_address):
     """Return (primary_ok, diagnostics); the primary probe alone decides.
 
     On failure the diagnostics hold its class and one informational retry. Collection takes
-    at least 26 s in the worst case (10 s meter + 10 s coverage + 2 x 3 s DNS), but the
+    nominally 26 s in the worst case (10 s meter + 10 s coverage + 2 x 3 s DNS), but the
     urlopen timeout is per socket operation, not total, so it can run longer. A slow
     sample never shifts the schedule: the next is due at the last monotonic + 60 s. The
     retry outcome is never read by the assessment rules.

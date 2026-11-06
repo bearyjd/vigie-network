@@ -77,8 +77,8 @@ def sample(second, **overrides):
 
 
 class FakeSocket:
-    def __init__(self, reply=None, error=None):
-        self.reply, self.error = reply, error
+    def __init__(self, reply=None, error=None, wrong_id=False):
+        self.reply, self.error, self.wrong_id = reply, error, wrong_id
 
     def __enter__(self):
         return self
@@ -98,12 +98,16 @@ class FakeSocket:
     def recv(self, size):
         if self.error:
             raise self.error
+        if self.wrong_id:
+            return bytes([self.request[0] ^ 255, self.request[1]]) + self.reply
         return self.request[:2] + self.reply
 
 
-def classify(reply=None, error=None):
+def classify(reply=None, error=None, wrong_id=False):
     diag = {}
-    with patch.object(runner.socket, "socket", return_value=FakeSocket(reply, error)):
+    with patch.object(
+        runner.socket, "socket", return_value=FakeSocket(reply, error, wrong_id)
+    ):
         ok = runner.dns_probe("192.0.2.1", diag)
     return ok, diag.get("error")
 
@@ -137,10 +141,12 @@ class DnsClassTests(unittest.TestCase):
             (head(0x8183, 0) + QUESTION, None, False),
             (head(0x8180, 0) + QUESTION, None, False),
             (head(0x8180, 1) + QUESTION + cname, None, False),
+            # Otherwise-valid answer with a wrong transaction ID must still fail.
+            (head(0x8180, 1) + QUESTION + a_rec, None, False, True),
         ]
-        for reply, error, expected in table:
-            ok, _ = classify(reply, error)
-            self.assertIs(ok, expected, (reply, error))
+        for reply, error, expected, *wrong_id in table:
+            ok, _ = classify(reply, error, bool(wrong_id))
+            self.assertIs(ok, expected, (reply, error, wrong_id))
 
     def test_wrong_id_is_bad_id(self):
         class Wrong(FakeSocket):
