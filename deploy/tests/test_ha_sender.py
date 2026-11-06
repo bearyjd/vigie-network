@@ -1433,3 +1433,205 @@ def test_certificate_clock_errors_are_retryable_others_permanent(code: int, kind
             raise _cert_error(code)
 
     assert ha.send_once(Opener(), object(), 1.0).kind == kind
+
+
+# --- H0 check (ha_h0_check.py, PRP-004 H0) --------------------------------------------------
+
+H0_SPEC = importlib.util.spec_from_file_location("ha_h0_check", PERSISTENT / "ha_h0_check.py")
+assert H0_SPEC is not None and H0_SPEC.loader is not None
+h0: Any = importlib.util.module_from_spec(H0_SPEC)
+sys.modules[H0_SPEC.name] = h0
+
+
+def _load_h0() -> None:
+    if not hasattr(h0, "main"):
+        H0_SPEC.loader.exec_module(h0)  # type: ignore[union-attr]
+
+
+def h0_run(
+    env: Env, capsys: pytest.CaptureFixture[str], *extra: str, ca: Path | None = None, **over: object
+) -> tuple[int, str]:
+    _load_h0()
+    if ca is not None:
+        over["ca_file"] = str(private(env.tmp / "ca.pem", ca.read_bytes()))
+    cfg = private(env.tmp / "h0.json", json.dumps(env.raw_config(**over)))
+    code = h0.main([str(cfg), *extra])
+    out = capsys.readouterr()
+    return code, out.out + out.err
+
+
+def assert_no_secret(text: str) -> None:
+    assert WEBHOOK_ID not in text
+    assert "/api/webhook" not in text
+
+
+@pytest.fixture
+def h0env(tmp_path: Path, tls_server: FakeHA) -> Env:
+    return Env(tmp_path, tls_server, None)
+
+
+def test_h0_200_is_ok_and_posts_a_dummy_payload(h0env: Env, capsys, certs) -> None:
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 0
+    assert "status=200" in out and "class=ok" in out and "host=127.0.0.1" in out
+    assert_no_secret(out)
+    (req,) = h0env.server.requests
+    assert req["path"] == f"/api/webhook/{WEBHOOK_ID}"
+    body = json.loads(req["body"])
+    assert body["kind"] == "h0check" and "link" not in body
+
+
+@pytest.mark.parametrize("status", [401, 404])
+def test_h0_4xx_is_permanent_and_single_attempt(h0env: Env, capsys, certs, status: int) -> None:
+    h0env.server.default = {"status": status}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 3
+    assert f"status={status}" in out and "class=client-error" in out and "never retry" in out
+    assert len(h0env.server.requests) == 1
+    assert_no_secret(out)
+
+
+def test_h0_500_is_retry_class_and_not_retried(h0env: Env, capsys, certs) -> None:
+    h0env.server.default = {"status": 500}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 4
+    assert "status=500" in out and "class=retry" in out
+    assert len(h0env.server.requests) == 1
+    assert_no_secret(out)
+
+
+def test_h0_timeout_is_retry_class(h0env: Env, capsys, certs) -> None:
+    h0env.server.default = {"delay": 1.5}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0], timeout_seconds=0.3)
+    assert code == 4
+    assert "class=retry" in out and "timeout" in out
+    assert_no_secret(out)
+
+
+def test_h0_tls_verification_failure(h0env: Env, capsys) -> None:
+    code, out = h0_run(h0env, capsys)  # self-signed server, no CA configured
+    assert code == 5
+    assert "class=tls-verify" in out
+    assert_no_secret(out)
+
+
+def test_h0_dns_failure(h0env: Env, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    def fail(*_a: object, **_k: object) -> None:
+        raise socket.gaierror(socket.EAI_NONAME, "no such name")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    private(h0env.url_file, f"https://ha.example.invalid/api/webhook/{WEBHOOK_ID}\n")
+    code, out = h0_run(h0env, capsys, allowed_hosts=["ha.example.invalid"])
+    assert code == 6
+    assert "class=dns" in out and "host=ha.example.invalid" in out
+    assert_no_secret(out)
+
+
+def test_h0_plain_http_url_is_refused_without_a_request(
+    tmp_path: Path, http_server: FakeHA, capsys
+) -> None:
+    e = Env(tmp_path, http_server, None)
+    code, out = h0_run(e, capsys, http_hosts=[])
+    assert code == 2
+    assert "webhook URL invalid: scheme" in out
+    assert http_server.requests == []
+    assert_no_secret(out)
+
+
+def test_h0_invalid_url_error_never_echoes_it(h0env: Env, capsys) -> None:
+    private(h0env.url_file, f"https://127.0.0.1:1/wrong/{WEBHOOK_ID}\n")
+    code, out = h0_run(h0env, capsys)
+    assert code == 2 and "path" in out
+    assert WEBHOOK_ID not in out
+
+
+def test_h0_url_from_env_var_then_url_file(h0env: Env, capsys, monkeypatch, certs) -> None:
+    ca = certs["good"][0]
+    private(h0env.url_file, "garbage\n")  # config url_file is ignored when the env var is set
+    monkeypatch.setenv("HA_H0_WEBHOOK_URL", h0env.server.webhook)
+    code, out = h0_run(h0env, capsys, ca=ca)
+    assert code == 0
+    assert_no_secret(out)
+    monkeypatch.delenv("HA_H0_WEBHOOK_URL")
+    other = private(h0env.tmp / "other-url", h0env.server.webhook + "\n")
+    code, out = h0_run(h0env, capsys, "--url-file", str(other), ca=ca)
+    assert code == 0
+    assert_no_secret(out)
+
+
+def test_h0_help_documents_exit_codes(capsys) -> None:
+    _load_h0()
+    with pytest.raises(SystemExit) as exc:
+        h0.main(["--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    for code in "023456":
+        assert f"\n  {code} " in text
+    assert "408/425/429" in text
+    assert "--url-file" in text
+
+
+@pytest.mark.parametrize("status", [408, 425, 429])
+def test_h0_retry_status_codes_are_retry_class(h0env: Env, capsys, certs, status: int) -> None:
+    h0env.server.default = {"status": status, "headers": {"Retry-After": "30"}}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 4
+    assert f"status={status}" in out and "class=retry" in out
+    assert len(h0env.server.requests) == 1  # one attempt, Retry-After not honoured
+    assert_no_secret(out)
+
+
+def test_h0_redirect_is_refused_after_one_request(h0env: Env, capsys, certs) -> None:
+    h0env.server.default = {"status": 302, "headers": {"Location": "https://127.0.0.1:1/elsewhere"}}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 3
+    assert "redirect refused" in out and "never retry" in out
+    assert len(h0env.server.requests) == 1
+    assert_no_secret(out)
+
+
+def test_h0_url_file_flag_wins_over_env_var(h0env: Env, capsys, monkeypatch, certs) -> None:
+    monkeypatch.setenv("HA_H0_WEBHOOK_URL", "https://127.0.0.1:1/wrong")  # would fail validation
+    other = private(h0env.tmp / "other-url", h0env.server.webhook + "\n")
+    code, out = h0_run(h0env, capsys, "--url-file", str(other), ca=certs["good"][0])
+    assert code == 0
+
+
+def h0_help(capsys) -> str:
+    with pytest.raises(SystemExit):
+        h0.main(["--help"])
+    return capsys.readouterr().out
+
+
+def test_h0_unexpected_exception_reports_only_its_type(h0env: Env, capsys, monkeypatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError(f"secret {WEBHOOK_ID}")
+
+    _load_h0()
+    monkeypatch.setattr(h0.ha, "send_once", boom)
+    code, out = h0_run(h0env, capsys)
+    assert code == 4 and "RuntimeError" in out
+    assert_no_secret(out)
+
+
+def test_h0_bad_arguments_never_echo_values(capsys) -> None:
+    _load_h0()
+    pasted = f"https://ha.example.invalid/api/webhook/{WEBHOOK_ID}"
+    with pytest.raises(SystemExit) as exc:
+        h0.main(["/ABSOLUTE/PATH/cfg.json", pasted])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "values not shown" in err and "usage:" in err
+    assert WEBHOOK_ID not in err and "ha.example.invalid" not in err
+
+
+def test_h0_loads_ha_sender_without_sys_path_help() -> None:
+    src = (PERSISTENT / "ha_h0_check.py").read_text()
+    assert "sys.path" not in src
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", str(PERSISTENT / "ha_h0_check.py"), "--help"],
+        capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert result.returncode == 0 and "exit codes" in result.stdout

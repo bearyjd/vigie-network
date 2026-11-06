@@ -850,6 +850,29 @@ above (without `--seed-at-end` the first run seeds a new directory by itself), t
 `systemctl --user enable --now ha-sender.timer`. Stop with
 `systemctl --user disable --now ha-sender.timer`.
 
+**H0 check.** `deploy/persistent/ha_h0_check.py` automates the by-hand request above. It reuses the
+sender's config, URL validation, TLS context and status classification, sends ONE dummy POST
+(`kind` `h0check`, no link) and prints only the host and a status class, never the URL, id or body:
+
+```
+python3 deploy/persistent/ha_h0_check.py /ABSOLUTE/PATH/TO/private/ha-sender.json \
+  --url-file /ABSOLUTE/PATH/TO/private/other-webhook-url
+
+# or, without a file (the URL, for example https://ha.example.invalid/api/webhook/ID, is
+# typed at the prompt, so it stays out of the command line and shell history):
+read -rs u; HA_H0_WEBHOOK_URL="$u" python3 deploy/persistent/ha_h0_check.py /ABSOLUTE/PATH/TO/private/ha-sender.json; unset u
+```
+
+Precedence: `--url-file`, then `HA_H0_WEBHOOK_URL`, then the config's `url_file`. The environment
+variable is readable by the same user in `/proc/PID/environ` and skips the 0600/0400 file-mode
+check; unset it afterwards. Run the check from the machine and path the sender will use. The dummy
+payload can fire the real automation. Exit codes (also in `--help`): 0 any 2xx (not proof an
+automation ran); 2 configuration or URL rule failed, nothing sent; 3 4xx other than 408/425/429 or
+a redirect (auth or webhook-id problem, never retry); 4 retry class (5xx, 408, 425, 429, timeout,
+connection error); 5 TLS verification failed (including not yet valid or expired, which the sender
+would retry); 6 DNS failure. Record the codes for a wrong id, a disabled automation and so on in
+the PRP-004 H0 table.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
