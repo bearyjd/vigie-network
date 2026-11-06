@@ -9,7 +9,7 @@ touches:
 ---
 
 ## Decided
-After /clear, read head of .omc/STATE.md (RESUME HERE), then do only the read-only soak check: ssh to vigie-dev, `sudo -n -u vigie env XDG_RUNTIME_DIR=/run/user/1001 HOME=/home/vigie systemctl --user is-active vigie-soak.service`, tail the journal and journal.jsonl row count. Soak 3 started 2026-11-05T02:01:19Z, earliest end 2026-11-07T02:01Z.
+After /clear, read head of .omc/STATE.md (RESUME HERE), then do only the read-only soak check: ssh to vigie-dev, `sudo -n -u vigie env XDG_RUNTIME_DIR=/run/user/1001 HOME=<vigie-user-home> systemctl --user is-active vigie-soak.service`, tail the journal and journal.jsonl row count. Soak 3 started 2026-11-05T02:01:19Z, earliest end 2026-11-07T02:01Z.
 
 ## Tried and ruled out
 Nothing deployed or restarted. Redeploying main, ntfy apply and apt timer restore all wait until the soak ends and the owner approves.
