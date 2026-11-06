@@ -1569,3 +1569,69 @@ def test_h0_help_documents_exit_codes(capsys) -> None:
     text = capsys.readouterr().out
     for code in "023456":
         assert f"\n  {code} " in text
+    assert "408/425/429" in text
+
+
+@pytest.mark.parametrize("status", [408, 425, 429])
+def test_h0_retry_status_codes_are_retry_class(h0env: Env, capsys, certs, status: int) -> None:
+    h0env.server.default = {"status": status, "headers": {"Retry-After": "30"}}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 4
+    assert f"status={status}" in out and "class=retry" in out
+    assert len(h0env.server.requests) == 1  # one attempt, Retry-After not honoured
+    assert_no_secret(out)
+
+
+def test_h0_redirect_is_refused_after_one_request(h0env: Env, capsys, certs) -> None:
+    h0env.server.default = {"status": 302, "headers": {"Location": "https://127.0.0.1:1/elsewhere"}}
+    code, out = h0_run(h0env, capsys, ca=certs["good"][0])
+    assert code == 3
+    assert "redirect refused" in out and "never retry" in out
+    assert len(h0env.server.requests) == 1
+    assert_no_secret(out)
+
+
+def test_h0_url_file_flag_wins_over_env_var(h0env: Env, capsys, monkeypatch, certs) -> None:
+    monkeypatch.setenv("HA_H0_WEBHOOK_URL", "https://127.0.0.1:1/wrong")  # would fail validation
+    other = private(h0env.tmp / "other-url", h0env.server.webhook + "\n")
+    code, out = h0_run(h0env, capsys, "--url-file", str(other), ca=certs["good"][0])
+    assert code == 0
+    assert "--url-file" in h0_help(capsys)
+
+
+def h0_help(capsys) -> str:
+    with pytest.raises(SystemExit):
+        h0.main(["--help"])
+    return capsys.readouterr().out
+
+
+def test_h0_unexpected_exception_reports_only_its_type(h0env: Env, capsys, monkeypatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError(f"secret {WEBHOOK_ID}")
+
+    _load_h0()
+    monkeypatch.setattr(h0.ha, "send_once", boom)
+    code, out = h0_run(h0env, capsys)
+    assert code == 4 and "RuntimeError" in out
+    assert_no_secret(out)
+
+
+def test_h0_bad_arguments_never_echo_values(capsys) -> None:
+    _load_h0()
+    pasted = f"https://ha.example.invalid/api/webhook/{WEBHOOK_ID}"
+    with pytest.raises(SystemExit) as exc:
+        h0.main(["/ABSOLUTE/PATH/cfg.json", pasted])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "values not shown" in err and "usage:" in err
+    assert WEBHOOK_ID not in err and "ha.example.invalid" not in err
+
+
+def test_h0_loads_ha_sender_without_sys_path_help() -> None:
+    src = (PERSISTENT / "ha_h0_check.py").read_text()
+    assert "sys.path" not in src
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", str(PERSISTENT / "ha_h0_check.py"), "--help"],
+        capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert result.returncode == 0 and "exit codes" in result.stdout
