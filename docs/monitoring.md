@@ -860,8 +860,7 @@ python3 deploy/persistent/ha_h0_check.py /ABSOLUTE/PATH/TO/private/ha-sender.jso
 
 # or, without a file (the URL, for example https://ha.example.invalid/api/webhook/ID, is
 # typed at the prompt, so it stays out of the command line and shell history):
-read -rs HA_H0_WEBHOOK_URL; export HA_H0_WEBHOOK_URL
-python3 deploy/persistent/ha_h0_check.py /ABSOLUTE/PATH/TO/private/ha-sender.json
+read -rs u; HA_H0_WEBHOOK_URL="$u" python3 deploy/persistent/ha_h0_check.py /ABSOLUTE/PATH/TO/private/ha-sender.json; unset u
 ```
 
 Precedence: `--url-file`, then `HA_H0_WEBHOOK_URL`, then the config's `url_file`. The environment

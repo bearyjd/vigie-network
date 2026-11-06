@@ -98,7 +98,7 @@ def classify(outcome: Any, ok_status: int | None) -> Verdict:
         note = (
             "auth or webhook-id problem; never retry"
             if 400 <= code < 500
-            else ("unexpected status; never retry")
+            else "unexpected status; never retry"
         )
         return Verdict(EXIT_CLIENT, "client-error", code, note)
     if detail == "redirect refused":
@@ -191,4 +191,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

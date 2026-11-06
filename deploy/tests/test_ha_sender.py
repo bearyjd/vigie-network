@@ -1570,6 +1570,7 @@ def test_h0_help_documents_exit_codes(capsys) -> None:
     for code in "023456":
         assert f"\n  {code} " in text
     assert "408/425/429" in text
+    assert "--url-file" in text
 
 
 @pytest.mark.parametrize("status", [408, 425, 429])
@@ -1596,7 +1597,6 @@ def test_h0_url_file_flag_wins_over_env_var(h0env: Env, capsys, monkeypatch, cer
     other = private(h0env.tmp / "other-url", h0env.server.webhook + "\n")
     code, out = h0_run(h0env, capsys, "--url-file", str(other), ca=certs["good"][0])
     assert code == 0
-    assert "--url-file" in h0_help(capsys)
 
 
 def h0_help(capsys) -> str:
