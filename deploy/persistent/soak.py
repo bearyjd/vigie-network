@@ -230,6 +230,8 @@ def _dns_rescue_excess(samples):
         for s, flag in zip(samples, flags)
         if flag and _number(s.get("monotonic"))
     ]
+    # Rescued samples are assumed time-ordered; disorder or a missing monotonic is
+    # already blocked by the cadence/clock and missing-metrics checks.
     span = DNS_RESCUE_MAX_PER_HOUR
     dense = any(
         later - earlier <= DNS_RESCUE_WINDOW_SECONDS
@@ -251,6 +253,8 @@ def assess(samples, *, mode="simulated"):
         "collector_cpu_percent": None,
         "reasons": [],
         "quality_notes": [],
+        "dns_probe_retry_recovered_count": 0,
+        "dns_probe_retry_longest_streak": 0,
     }
     if not isinstance(samples, list) or len(samples) > MAX_SAMPLES:
         return dict(result, status="fail", reasons=["invalid_sample_count"])

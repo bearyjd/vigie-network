@@ -368,6 +368,7 @@ def series_with(rescued_slots, slots=2881):
 
 
 # Soak 3 facts: 7 rescued timeouts of 2881, at most one per hour, none adjacent.
+# Illustrative: 7 isolated rescues, evenly spread (soak 3 had 7 timeouts, closest pair 106 min apart).
 SOAK3_SLOTS = (100, 400, 800, 1200, 1800, 2200, 2600)
 
 
@@ -549,6 +550,16 @@ class JournalCompatTests(unittest.TestCase):
             all(len(v) <= 16 for v in sum(map(list, soak._DIAG_ENUMS.values()), []))
         )
         self.assertFalse(re.search(r"\d+\.\d+\.\d+\.\d+", json.dumps(soak._DIAG_ENUMS)))
+
+
+
+
+class DnsRescueResultShapeTests(unittest.TestCase):
+    def test_counters_present_on_early_returns(self):
+        for samples in ([], [{}] * (soak.MAX_SAMPLES + 1)):
+            result = soak.assess(samples)
+            self.assertEqual(result["dns_probe_retry_recovered_count"], 0)
+            self.assertEqual(result["dns_probe_retry_longest_streak"], 0)
 
 
 if __name__ == "__main__":
