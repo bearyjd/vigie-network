@@ -18,6 +18,14 @@ MAX_GAP_SECONDS = 180
 MIN_COVERAGE = 0.99
 MAX_SAMPLES = 4000
 MAX_RECORD_BYTES = 16384
+# A first-probe timeout answered by its immediate retry is tolerated only in isolation.
+# Soak 3 had 7 of 2881 slots (0.24%, at most 1 per hour, none adjacent). The run limit is
+# 0.5% of 2880 slots (14, about 2x that rate); more than 2 per rolling hour or any two
+# adjacent slots look like a degraded path rather than isolated loss.
+DNS_RESCUE_MAX_RUN = 14
+DNS_RESCUE_MAX_PER_HOUR = 2
+DNS_RESCUE_WINDOW_SECONDS = 3600
+DNS_RESCUE_MAX_STREAK = 1
 _REQUIRED_NUMERIC = (
     "wall",
     "monotonic",
@@ -70,7 +78,7 @@ _DIAG_NUMBERS = ("host_load1", "host_psi_cpu_avg10")
 
 
 def diagnostics_valid(key, value):
-    """Informational fields only: a bad one is dropped on append and never alters a verdict."""
+    """Diagnostic fields: a bad one is dropped on append, so it can never fail a sample."""
     if key in _DIAG_ENUMS:
         return value in _DIAG_ENUMS[key]
     if key in _DIAG_INTS:
@@ -193,11 +201,44 @@ def sample_issues(sample):
     quality = set()
     if sample.get("dns_log_quiet") is True:
         quality.add("dns_log_quiet")
-    if sample.get("dns_probe_ok") is False:
+    if sample.get("dns_probe_ok") is False and not _dns_rescued(sample):
         quality.add("dns_probe_failed")
     if "dns_parsed_age_s" not in missing and sample["dns_parsed_age_s"] > 120:
         quality.add("parsed_dns_stale")
     return failures, missing, quality
+
+
+def _dns_rescued(sample):
+    """Failed first probe with a timeout, recovered by the immediate retry (strict values)."""
+    return (
+        isinstance(sample, dict)
+        and sample.get("dns_probe_ok") is False
+        and sample.get("dns_probe_error") == "timeout"
+        and sample.get("dns_probe_retry_ok") is True
+    )
+
+
+def _dns_rescue_excess(samples):
+    """Return (count, longest adjacent streak, over_budget) for rescued samples."""
+    flags = [_dns_rescued(s) for s in samples]
+    count, streak, longest = sum(flags), 0, 0
+    for flag in flags:
+        streak = streak + 1 if flag else 0
+        longest = max(longest, streak)
+    times = [
+        s["monotonic"]
+        for s, flag in zip(samples, flags)
+        if flag and _number(s.get("monotonic"))
+    ]
+    # Rescued samples are assumed time-ordered; disorder or a missing monotonic is
+    # already blocked by the cadence/clock and missing-metrics checks.
+    span = DNS_RESCUE_MAX_PER_HOUR
+    dense = any(
+        later - earlier <= DNS_RESCUE_WINDOW_SECONDS
+        for earlier, later in zip(times, times[span:])
+    )
+    over = count > DNS_RESCUE_MAX_RUN or dense or longest > DNS_RESCUE_MAX_STREAK
+    return count, longest, over
 
 
 def assess(samples, *, mode="simulated"):
@@ -212,6 +253,8 @@ def assess(samples, *, mode="simulated"):
         "collector_cpu_percent": None,
         "reasons": [],
         "quality_notes": [],
+        "dns_probe_retry_recovered_count": 0,
+        "dns_probe_retry_longest_streak": 0,
     }
     if not isinstance(samples, list) or len(samples) > MAX_SAMPLES:
         return dict(result, status="fail", reasons=["invalid_sample_count"])
@@ -233,10 +276,17 @@ def assess(samples, *, mode="simulated"):
             and sample["ct_unmapped_flows"] > 0
         ):
             notes.add("unmapped_conntrack")
+        if _dns_rescued(sample):
+            notes.add("dns_probe_retry_recovered")
         if isinstance(sample, dict) and all(
             _number(sample.get(k)) for k in ("wall", "monotonic", "boottime")
         ):
             clock_samples.append(sample)
+    rescued, streak, excess = _dns_rescue_excess(samples)
+    result["dns_probe_retry_recovered_count"] = rescued
+    result["dns_probe_retry_longest_streak"] = streak
+    if excess:
+        quality.add("dns_probe_retry_excess")
     if clock_samples:
         first, last = clock_samples[0], clock_samples[-1]
         elapsed = last["monotonic"] - first["monotonic"]
