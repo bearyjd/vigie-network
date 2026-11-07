@@ -193,7 +193,10 @@ def sample_issues(sample):
     quality = set()
     if sample.get("dns_log_quiet") is True:
         quality.add("dns_log_quiet")
-    if sample.get("dns_probe_ok") is False:
+    if (
+        sample.get("dns_probe_ok") is False
+        and sample.get("dns_probe_retry_ok") is not True
+    ):
         quality.add("dns_probe_failed")
     if "dns_parsed_age_s" not in missing and sample["dns_parsed_age_s"] > 120:
         quality.add("parsed_dns_stale")
@@ -233,6 +236,12 @@ def assess(samples, *, mode="simulated"):
             and sample["ct_unmapped_flows"] > 0
         ):
             notes.add("unmapped_conntrack")
+        if (
+            isinstance(sample, dict)
+            and sample.get("dns_probe_ok") is False
+            and sample.get("dns_probe_retry_ok") is True
+        ):
+            notes.add("dns_probe_retry_recovered")
         if isinstance(sample, dict) and all(
             _number(sample.get(k)) for k in ("wall", "monotonic", "boottime")
         ):

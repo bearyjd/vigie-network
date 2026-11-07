@@ -473,7 +473,7 @@ def dns_probe_diagnosed(router_address):
     nominally 26 s in the worst case (10 s meter + 10 s coverage + 2 x 3 s DNS), but the
     urlopen timeout is per socket operation, not total, so it can run longer. A slow
     sample never shifts the schedule: the next is due at the last monotonic + 60 s. The
-    retry outcome is never read by the assessment rules.
+    retry uses the same validated probe; the assessment reads only its boolean (see README).
     """
     diag = {}
     ok = dns_probe(router_address, diag)

@@ -333,19 +333,83 @@ class VerdictIdentityTests(unittest.TestCase):
             lambda extra: [sample(0), sample(60, collector_rss_kib=99999, **extra)],
         ):
             old = soak.assess(rows({}))
-            new = soak.assess(rows(NEW_FIELDS))
+            new = soak.assess(rows(dict(NEW_FIELDS, dns_probe_retry_ok=False)))
             self.assertEqual(
                 json.dumps(old, sort_keys=True), json.dumps(new, sort_keys=True)
             )
 
-    def test_retry_ok_never_rescues_a_failed_probe(self):
-        rows = [
-            sample(t, dns_probe_ok=False, dns_probe_retry_ok=True)
+    def test_failed_probe_without_recovery_evidence_is_unchanged(self):
+        plain = [sample(t, dns_probe_ok=False) for t in range(0, 172801, 60)]
+        bad_retry = [
+            sample(t, dns_probe_ok=False, dns_probe_retry_ok=False)
             for t in range(0, 172801, 60)
         ]
-        plain = [sample(t, dns_probe_ok=False) for t in range(0, 172801, 60)]
-        self.assertEqual(soak.assess(rows), soak.assess(plain))
-        self.assertNotEqual(soak.assess(rows)["status"], "pass")
+        self.assertEqual(soak.assess(plain), soak.assess(bad_retry))
+        self.assertIn("dns_probe_failed", soak.assess(plain)["reasons"])
+        self.assertNotEqual(soak.assess(plain)["status"], "pass")
+
+
+def rescued_series():
+    rows = [sample(t) for t in range(0, 172801, 60)]
+    for index in (100, 400, 800, 1200, 1800, 2200, 2600):
+        rows[index] = dict(rows[index], dns_probe_ok=False, dns_probe_retry_ok=True)
+    return rows
+
+
+class DnsRetryRuleTests(unittest.TestCase):
+    def test_rescued_failure_is_noted_and_sample_stays_valid(self):
+        rows = [sample(0), sample(60, dns_probe_ok=False, dns_probe_retry_ok=True)]
+        result = soak.assess(rows)
+        self.assertNotIn("dns_probe_failed", result["reasons"])
+        self.assertEqual(result["quality_notes"], ["dns_probe_retry_recovered"])
+        self.assertEqual(result["coverage"], 1.0)
+
+    def test_failed_with_failed_or_missing_retry_still_blocks(self):
+        for extra in ({"dns_probe_retry_ok": False}, {}):
+            result = soak.assess([sample(0), sample(60, dns_probe_ok=False, **extra)])
+            self.assertEqual(result["status"], "pending", extra)
+            self.assertIn("dns_probe_failed", result["reasons"], extra)
+            self.assertNotIn("dns_probe_retry_recovered", result["quality_notes"])
+
+    def test_retry_true_without_a_failed_probe_adds_no_note(self):
+        absent = sample(60, dns_probe_retry_ok=True)
+        del absent["dns_probe_ok"]
+        for row in (sample(60, dns_probe_retry_ok=True), absent):
+            notes = soak.assess([sample(0), row])["quality_notes"]
+            self.assertNotIn("dns_probe_retry_recovered", notes)
+
+    def test_only_strict_true_counts(self):
+        for value in (1, "true", None):
+            row = sample(60, dns_probe_ok=False, dns_probe_retry_ok=value)
+            result = soak.assess([sample(0), row])
+            self.assertIn("dns_probe_failed", result["reasons"], value)
+            self.assertNotIn("dns_probe_retry_recovered", result["quality_notes"])
+
+    def test_48h_with_seven_rescued_failures_is_pass_eligible(self):
+        clean = soak.assess([sample(t) for t in range(0, 172801, 60)])
+        result = soak.assess(rescued_series())
+        self.assertEqual(result["status"], clean["status"])
+        self.assertEqual(result["coverage"], clean["coverage"])
+        self.assertEqual(result["reasons"], clean["reasons"])
+        self.assertIn("dns_probe_retry_recovered", result["quality_notes"])
+
+    def test_unrescued_failure_in_the_same_run_still_blocks(self):
+        rows = rescued_series()
+        rows[1000] = dict(rows[1000], dns_probe_ok=False, dns_probe_retry_ok=False)
+        result = soak.assess(rows)
+        self.assertEqual(result["status"], "pending")
+        self.assertIn("dns_probe_failed", result["reasons"])
+
+    def test_rescued_failures_never_mask_other_problems(self):
+        stale = rescued_series()
+        stale[500] = dict(stale[500], dns_parsed_age_s=500)
+        self.assertIn("parsed_dns_stale", soak.assess(stale)["reasons"])
+        hard = rescued_series()
+        hard[500] = dict(hard[500], dropped_batches=3)
+        self.assertEqual(soak.assess(hard)["status"], "fail")
+        both = rescued_series()
+        both[100] = dict(both[100], collector_rss_kib=99999)
+        self.assertEqual(soak.assess(both)["status"], "fail")
 
 
 class JournalCompatTests(unittest.TestCase):
