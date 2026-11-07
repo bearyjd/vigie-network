@@ -467,13 +467,13 @@ def coverage_error_class(error):
 
 
 def dns_probe_diagnosed(router_address):
-    """Return (primary_ok, diagnostics); the primary probe alone decides.
+    """Return (primary_ok, diagnostics); the assessment reads the primary and the retry.
 
-    On failure the diagnostics hold its class and one informational retry. Collection takes
+    On failure the diagnostics hold its class and one immediate retry. Collection takes
     nominally 26 s in the worst case (10 s meter + 10 s coverage + 2 x 3 s DNS), but the
     urlopen timeout is per socket operation, not total, so it can run longer. A slow
     sample never shifts the schedule: the next is due at the last monotonic + 60 s. The
-    retry uses the same validated probe; the assessment reads only its boolean (see README).
+    retry uses the same validated probe; a rescued timeout is budgeted in soak.py.
     """
     diag = {}
     ok = dns_probe(router_address, diag)
