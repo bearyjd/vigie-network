@@ -56,10 +56,14 @@ quietness is reported separately; it does not establish traffic completeness.
   a gap. When the remembered end disagrees with the monotonic clock by more than 2 s (first
   window, a held flush, a wall-clock jump) it falls back to monotonic arithmetic, never longer
   than 24 h. A spooled or retried batch keeps its original window.
-- **Sticky IP to MAC.** A conntrack source whose neighbor entry expired while its flow lives on
-  is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since the
-  neighbor table last held the address). A current table entry always wins, so a reassigned
-  address is billed to its new owner; nothing is attributed from memory after the 2 h.
+- **Sticky IP to MAC.** An IPv6 conntrack source whose neighbor entry expired while its flow
+  lives on is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since
+  the neighbor table last held the address). IPv4 is never remembered (DHCP reuses addresses),
+  and an address the current table reports FAILED or INCOMPLETE is never served from memory. A
+  current table entry always wins, so a reassigned address is billed to its new owner; nothing is
+  attributed from memory after the 2 h. Residual risk: another device taking over the same IPv6
+  address inside the 2 h while the table has no entry for it would be billed to the previous
+  owner; for privacy/temporary and per-device ULA addresses this is negligible.
 - **Split unmapped counters.** `ct_unmapped_bytes` / `ct_unmapped_flows` count only EXPECTED
   exclusions: the helper's global remainder and the router's own addresses (read from
   `/proc/net/fib_trie`, `/proc/net/if_inet6` and the configured LAN address, every 5 minutes; a
@@ -67,6 +71,12 @@ quietness is reported separately; it does not establish traffic completeness.
   any other source still without a MAC, a genuine attribution failure. Collectors that predate
   the new pair send everything in the legacy pair. When the `truncated` map exceeds 16 keys the
   `ct_lan_unmapped_*` pair is kept ahead of all other counts and `ct_unmapped_flows` is merged first.
+  Accepted, bounded risk: a source equal to one of the router's own addresses is treated as
+  expected even though conntrack tuples cannot prove the packet came from the router. It only
+  affects whether an hour qualifies (the traffic is not hidden from the totals), and needs spoofed
+  packets to reach conntrack despite source validation. A source that currently has a MAC mapping
+  is never classified as own. The procfs reads are bounded (1 MiB for `fib_trie`, 64 KiB for
+  `if_inet6`); a file over its bound counts as a read failure.
 
 Deployment order: the server must learn a share-of-bytes threshold for `ct_lan_unmapped_*`
 before this collector is deployed; until then any hour with a non-zero `ct_lan_unmapped_*` count

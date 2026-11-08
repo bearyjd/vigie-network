@@ -7,8 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::Neighbor;
-use crate::neigh::parse_ip_neigh;
+use crate::neigh::{parse_ip_neigh_table, NeighTable};
 
 pub const MAX_CMD_OUTPUT: usize = 1024 * 1024;
 
@@ -42,7 +41,7 @@ pub fn random_u64() -> io::Result<u64> {
 }
 
 /// IPv4 and IPv6 neighbor tables (`ip -4 neigh show`, `ip -6 neigh show`).
-pub fn read_neighbors() -> Vec<Neighbor> {
+pub fn read_neighbors() -> NeighTable {
     let mut text = String::new();
     for fam in ["-4", "-6"] {
         match Command::new("ip").args([fam, "neigh", "show"]).output() {
@@ -55,5 +54,5 @@ pub fn read_neighbors() -> Vec<Neighbor> {
             Err(e) => eprintln!("cannot run ip {fam} neigh: {e}"),
         }
     }
-    parse_ip_neigh(&text)
+    parse_ip_neigh_table(&text)
 }

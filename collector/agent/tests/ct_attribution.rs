@@ -20,6 +20,7 @@ use vigie_agent::wiring::Sources;
 const A: &str = "aa:bb:cc:dd:ee:01";
 const B: &str = "aa:bb:cc:dd:ee:02";
 const ULA: &str = "fd00::10";
+static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
 
 fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
@@ -54,7 +55,7 @@ fn snap(records: Vec<Record>) -> Snapshot {
 fn an_expired_neighbor_entry_still_attributes_within_the_ttl() {
     let mut m = IpMemory::default();
     m.observe(&map(&[(ULA, A)]), 100);
-    let got = m.overlay(&HashMap::new(), 100 + IP_MEMORY_TTL_S);
+    let got = m.overlay(&HashMap::new(), &NONE, 100 + IP_MEMORY_TTL_S);
     assert_eq!(got.get(ULA).map(String::as_str), Some(A));
 }
 
@@ -62,7 +63,7 @@ fn an_expired_neighbor_entry_still_attributes_within_the_ttl() {
 fn after_the_ttl_the_memory_no_longer_attributes() {
     let mut m = IpMemory::default();
     m.observe(&map(&[(ULA, A)]), 100);
-    let got = m.overlay(&HashMap::new(), 100 + IP_MEMORY_TTL_S + 1);
+    let got = m.overlay(&HashMap::new(), &NONE, 100 + IP_MEMORY_TTL_S + 1);
     assert!(got.is_empty());
     m.observe(&HashMap::new(), 100 + IP_MEMORY_TTL_S + 1);
     assert!(m.is_empty(), "expired entries are purged");
@@ -73,10 +74,13 @@ fn a_reassigned_address_uses_the_new_mac() {
     let mut m = IpMemory::default();
     m.observe(&map(&[(ULA, A)]), 100);
     let now = map(&[(ULA, B)]);
-    assert_eq!(m.overlay(&now, 101).get(ULA).map(String::as_str), Some(B));
+    assert_eq!(
+        m.overlay(&now, &NONE, 101).get(ULA).map(String::as_str),
+        Some(B)
+    );
     m.observe(&now, 101);
     // The table loses it again: the memory holds the NEW owner, never the old one.
-    let got = m.overlay(&HashMap::new(), 102);
+    let got = m.overlay(&HashMap::new(), &NONE, 102);
     assert_eq!(got.get(ULA).map(String::as_str), Some(B));
 }
 
@@ -87,7 +91,7 @@ fn the_memory_is_capped_and_evicts_the_oldest() {
         m.observe(&map(&[(&format!("fd00::{i:x}"), A)]), 100);
     }
     assert_eq!(m.len(), IP_MEMORY_CAP);
-    let got = m.overlay(&HashMap::new(), 100);
+    let got = m.overlay(&HashMap::new(), &NONE, 100);
     assert!(!got.contains_key("fd00::0"), "oldest evicted");
     assert!(got.contains_key(&format!("fd00::{:x}", IP_MEMORY_CAP + 9)));
 }

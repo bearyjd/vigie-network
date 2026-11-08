@@ -11,7 +11,7 @@
 //! `ct_*`/`mcast_*` and the bitmask `source_flags` (see `flag`). The server accepts any
 //! `[a-z_]{1,32}` key with a non-negative integer, at most 16 keys (the builder enforces that).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use crate::ctsock::{trusted_uids, CtConfig, CtReader, CtShared};
 use crate::ipmemory::IpMemory;
 use crate::mcast::{McConfig, McMsg, McReader, McShared, Pkt};
 use crate::model::Neighbor;
+use crate::neigh::NeighTable;
 use crate::ownaddr::{read_local, OwnAddrs};
 use crate::sightings::{from_mdns, from_ssdp};
 use crate::window::Window;
@@ -100,6 +101,8 @@ pub struct Sources {
     memory: IpMemory,
     /// The router's own addresses (expected unmapped sources).
     own: OwnAddrs,
+    /// Addresses the latest neighbor read reports FAILED/INCOMPLETE (never served from memory).
+    failed: HashSet<String>,
     /// `flag::CT_TABLE_PRESSURE`/`CT_ACCT_OFF` seen in this window.
     window_flags: u64,
     ct_last_mono: u64,
@@ -183,9 +186,11 @@ impl Sources {
         self
     }
 
-    /// Records that the agent read the neighbor table at `mono_s`.
-    pub fn note_refresh(&mut self, mono_s: u64) {
+    /// Records that the agent read the neighbor table at `mono_s`; `failed` are the addresses it
+    /// reported FAILED or INCOMPLETE.
+    pub fn note_refresh(&mut self, mono_s: u64, failed: HashSet<String>) {
         self.last_refresh = Some(mono_s);
+        self.failed = failed;
     }
 
     /// Whether a data-triggered neighbor read is allowed now (see `REFRESH_MIN_S`).
@@ -209,7 +214,7 @@ impl Sources {
         &mut self,
         w: &mut Window,
         ip_to_mac: &HashMap<String, String>,
-        mut refresh: Option<&mut dyn FnMut() -> Vec<Neighbor>>,
+        mut refresh: Option<&mut dyn FnMut() -> NeighTable>,
         mono_s: u64,
     ) -> Option<Vec<Neighbor>> {
         let mut fresh: Option<(Vec<Neighbor>, HashMap<String, String>)> = None;
@@ -217,7 +222,9 @@ impl Sources {
             while let Ok(snap) = ct.rx().try_recv() {
                 if let Some(read) = refresh.as_deref_mut() {
                     if refresh_ok(self.last_refresh, mono_s) {
-                        let all = read();
+                        let table = read();
+                        let all = table.neighbors;
+                        self.failed = table.failed;
                         self.last_refresh = Some(mono_s);
                         fresh = Some((all.clone(), crate::neigh::ip_to_mac(&all)));
                     }
@@ -226,7 +233,7 @@ impl Sources {
                 self.ct_last_mono = mono_s;
                 self.own.refresh(mono_s);
                 self.memory.observe(map, mono_s);
-                let attributed = self.memory.overlay(map, mono_s);
+                let attributed = self.memory.overlay(map, &self.failed, mono_s);
                 self.acc
                     .add_snapshot_with_own(&snap, &attributed, self.own.set());
                 if snap.table_pressure {

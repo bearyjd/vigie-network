@@ -649,13 +649,14 @@ impl Neigh {
     fn new(tables: Vec<Vec<(&'static str, &'static str)>>) -> Self {
         Self { tables, calls: 0 }
     }
-    fn read(&mut self) -> Vec<vigie_agent::model::Neighbor> {
+    fn read(&mut self) -> vigie_agent::neigh::NeighTable {
         let i = self.calls.min(self.tables.len() - 1);
         self.calls += 1;
         self.tables[i]
             .iter()
             .map(|(ip, mac)| vigie_agent::model::Neighbor::new(ip, mac).unwrap())
-            .collect()
+            .collect::<Vec<_>>()
+            .into()
     }
 }
 
@@ -722,7 +723,7 @@ fn snapshot_refreshes_are_rate_limited() {
         .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 50);
     assert_eq!(n.calls, 1);
     // A refresh by the agent counts too: the next snapshot in the same second does not re-read.
-    f.sources.note_refresh(60);
+    f.sources.note_refresh(60, Default::default());
     f.ct_tx
         .send(snap(vec![rec("192.168.8.77", 1, 0, 1)]))
         .unwrap();

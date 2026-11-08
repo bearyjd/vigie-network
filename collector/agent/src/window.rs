@@ -56,7 +56,8 @@ impl WindowClock {
     }
     /// Start of the window ending at `wall_s`: the previous window's end when it is consistent
     /// (not in the future, within `END_REUSE_SLACK_S` of the monotonic elapsed time, and at most
-    /// `MAX_WINDOW_S` long), else the monotonic arithmetic of `start`, bounded to `MAX_WINDOW_S`.
+    /// `MAX_WINDOW_S` long), else the monotonic arithmetic of `start`, bounded to `MAX_WINDOW_S` and
+    /// never earlier than a previous end that is not in the future.
     pub fn window_start(&self, wall_s: u64, mono_s: u64) -> u64 {
         let elapsed = mono_s.saturating_sub(self.last_flush_mono_s);
         let reusable = self.prev_end.filter(|&p| {
@@ -65,8 +66,15 @@ impl WindowClock {
                 && (wall_s - p).abs_diff(elapsed) <= END_REUSE_SLACK_S
         });
         reusable.unwrap_or_else(|| {
-            self.start(wall_s, mono_s)
-                .max(wall_s.saturating_sub(MAX_WINDOW_S))
+            let computed = self
+                .start(wall_s, mono_s)
+                .max(wall_s.saturating_sub(MAX_WINDOW_S));
+            // After a small wall correction the arithmetic can land before the previous end:
+            // never overlap it (a small forward gap is acceptable).
+            match self.prev_end {
+                Some(p) if wall_s >= p => computed.max(p),
+                _ => computed,
+            }
         })
     }
     /// Call after a flush attempt that produced no window (skipped because the clock is not

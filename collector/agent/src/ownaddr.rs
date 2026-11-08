@@ -6,6 +6,7 @@
 //! falls into the suspect counter.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Monotonic seconds between re-reads of the router's addresses.
@@ -37,10 +38,29 @@ pub fn parse_if_inet6(text: &str) -> Vec<Ipv6Addr> {
         .collect()
 }
 
+/// Largest `/proc/net/fib_trie` accepted (bytes); a bigger file counts as a read failure.
+pub const FIB_TRIE_MAX: usize = 1024 * 1024;
+/// Largest `/proc/net/if_inet6` accepted (bytes).
+pub const IF_INET6_MAX: usize = 64 * 1024;
+
+/// The file as text, or `None` when it cannot be read, is not UTF-8, or exceeds `limit` bytes.
+pub fn read_bounded(path: &std::path::Path, limit: usize) -> Option<String> {
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > limit {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// The router's addresses from procfs; `None` when either file cannot be read.
 pub fn read_local() -> Option<HashSet<IpAddr>> {
-    let v4 = std::fs::read_to_string("/proc/net/fib_trie").ok()?;
-    let v6 = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+    let v4 = read_bounded("/proc/net/fib_trie".as_ref(), FIB_TRIE_MAX)?;
+    let v6 = read_bounded("/proc/net/if_inet6".as_ref(), IF_INET6_MAX)?;
     Some(
         parse_fib_trie(&v4)
             .into_iter()

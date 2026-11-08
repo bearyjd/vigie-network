@@ -116,7 +116,7 @@ struct Agent {
     mono: u64,
     sources: Sources,
     /// `read_neighbors` in production; tests substitute a fake table.
-    neigh_source: fn() -> Vec<vigie_agent::model::Neighbor>,
+    neigh_source: fn() -> vigie_agent::neigh::NeighTable,
 }
 
 impl Agent {
@@ -151,9 +151,9 @@ impl Agent {
     }
 
     fn refresh_neighbors(&mut self) {
-        let all = (self.neigh_source)();
-        self.sources.note_refresh(self.mono);
-        self.adopt_neighbors(&all);
+        let table = (self.neigh_source)();
+        self.sources.note_refresh(self.mono, table.failed);
+        self.adopt_neighbors(&table.neighbors);
     }
 
     /// Makes `all` the attribution map and reports its entries that are new since the last read.
@@ -432,7 +432,7 @@ mod tests {
             started: Instant::now(),
             mono: 0,
             sources: Sources::inert(),
-            neigh_source: Vec::new,
+            neigh_source: Default::default,
         }
     }
 
@@ -594,8 +594,8 @@ mod tests {
     static NEIGH: std::sync::Mutex<Vec<vigie_agent::model::Neighbor>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn fake_neighbors() -> Vec<vigie_agent::model::Neighbor> {
-        NEIGH.lock().unwrap().clone()
+    fn fake_neighbors() -> vigie_agent::neigh::NeighTable {
+        NEIGH.lock().unwrap().clone().into()
     }
 
     /// The loop with fake sources, a fake clock, a fake neighbor table and a recording transport.
@@ -711,13 +711,14 @@ mod tests {
         static TL_READS: RefCell<usize> = const { RefCell::new(0) };
     }
 
-    fn tl_fake_neigh() -> Vec<Neighbor> {
+    fn tl_fake_neigh() -> vigie_agent::neigh::NeighTable {
         TL_READS.with(|r| *r.borrow_mut() += 1);
         TL_NEIGH.with(|n| {
             n.borrow()
                 .iter()
                 .map(|(ip, mac)| Neighbor::new(ip, mac).unwrap())
-                .collect()
+                .collect::<Vec<_>>()
+                .into()
         })
     }
 
