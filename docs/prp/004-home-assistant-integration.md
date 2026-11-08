@@ -94,7 +94,7 @@ The sender does not add a Vigie base URL by default; the owner can set an option
 
 ### H0: measurement before any code
 
-HA's behaviour on a bad request is **per HA docs, unverified**, and the likely answer is that HA returns HTTP 200 and only logs the problem. Everything in H1 that depends on status codes is conditional on this table. Steps, each with a dummy payload only and recorded as status code plus whether anything appeared in the HA log:
+HA's behaviour on a bad request is **per HA docs, unverified** (step 2 measured once; see the results table below), and the likely answer is that HA returns HTTP 200 and only logs the problem. Everything in H1 that depends on status codes is conditional on this table. Steps, each with a dummy payload only and recorded as status code plus whether anything appeared in the HA log:
 
 1. POST to a correct webhook id with an enabled automation (baseline).
 2. POST to a **wrong** id.
@@ -104,6 +104,19 @@ HA's behaviour on a bad request is **per HA docs, unverified**, and the likely a
 6. If D4 allows plain HTTP, repeat step 1 over HTTP and confirm the sender's TLS rules do not break it.
 
 **A 2xx does not prove delivery.** If steps 2 and 3 return 2xx, the sender cannot learn about a wrong id or a disabled automation from the status code at all, and its 4xx "permanent" class would almost never fire.
+
+**H0 measured results.** Recorded with `deploy/persistent/ha_h0_check.py` (dummy payload, `kind` `h0check`; host and id never recorded here). Unmeasured rows stay open.
+
+| Step | Case | Result | Date | Path |
+|---|---|---|---|---|
+| 1 | Correct id, enabled automation | not measured (needs the owner's dummy automation) | | |
+| 2 | **Wrong** id | **HTTP 200** (`ok`, exit 0); by construction no automation listens on that id; HA log not checked | 2026-11-07 | HTTPS by name from the Tower host, over its Tailscale path (not the LAN reverse proxy) |
+| 3 | Disabled automation | not measured | | |
+| 4 | `local_only` refusal | not measured | | |
+| 5 | Malformed / oversized body | not measured | | |
+| 6 | Plain HTTP (D4) | not applicable while D4's recommendation holds (HTTPS, `http_hosts` empty); run it if a host is listed in `http_hosts` | | |
+
+Consequence of row 2: in one probe, over the path in that row, HA answered 200 for an unknown id. This supports the 2xx caveat above for step 2 only (a wrong or rotated id may be indistinguishable from success by status code, so the sender's permanent-4xx class may rarely fire); step 3 and the vigie-dev proxy path are unmeasured. It strengthens the case for the end-to-end canary below. Rows 1 and 3 and a repeat of row 2 through the LAN reverse proxy from the vigie-dev host (watch for an HTTP 400 without `use_x_forwarded_for` and `trusted_proxies`) are still to do.
 
 **End-to-end canary.** Because the status code may be blind, the automation stamps an `input_datetime` helper (per HA docs, unverified) with the time of each received message (or of a periodic sender heartbeat message). The owner watches that value, for example on a dashboard card or an HA-side "stale for N hours" check. ntfy stays the counted alert channel; the canary only tells the owner that the HA path has gone quiet. Whether the canary needs an extra `kind` such as `heartbeat` is an H1 review item.
 
