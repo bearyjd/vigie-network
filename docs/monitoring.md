@@ -55,7 +55,10 @@ quietness is reported separately; it does not establish traffic completeness.
   window exactly there (`start_n == end_{n-1}`), so consecutive windows neither overlap nor leave
   a gap. When the remembered end disagrees with the monotonic clock by more than 2 s (first
   window, a held flush, a wall-clock jump) it falls back to monotonic arithmetic, never longer
-  than 24 h. A spooled or retried batch keeps its original window.
+  than 24 h; a fallback never starts before the previous end. If the wall clock steps back
+  behind the previous end, the flush is deferred (data kept, retried each loop step) until the
+  clock catches up, for at most 600 s of monotonic time, after which the monotonic arithmetic is
+  used so a permanent step cannot stall uploads. A spooled or retried batch keeps its original window.
 - **Sticky IP to MAC.** An IPv6 conntrack source whose neighbor entry expired while its flow
   lives on is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since
   the neighbor table last held the address). IPv4 is never remembered (DHCP reuses addresses),

@@ -88,12 +88,12 @@ fn a_reassigned_address_uses_the_new_mac() {
 fn the_memory_is_capped_and_evicts_the_oldest() {
     let mut m = IpMemory::default();
     for i in 0..(IP_MEMORY_CAP + 10) {
-        m.observe(&map(&[(&format!("fd00::{i:x}"), A)]), 100);
+        m.observe(&map(&[(&format!("fd00::{:x}", i + 1), A)]), 100);
     }
     assert_eq!(m.len(), IP_MEMORY_CAP);
     let got = m.overlay(&HashMap::new(), &NONE, 100);
-    assert!(!got.contains_key("fd00::0"), "oldest evicted");
-    assert!(got.contains_key(&format!("fd00::{:x}", IP_MEMORY_CAP + 9)));
+    assert!(!got.contains_key("fd00::1"), "oldest evicted");
+    assert!(got.contains_key(&format!("fd00::{:x}", IP_MEMORY_CAP + 10)));
 }
 
 // ---- CtAccum split ----

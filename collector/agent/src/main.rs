@@ -208,12 +208,15 @@ impl Agent {
         self.engine.enqueue(b.encoded.as_probe());
     }
 
-    fn flush_window(&mut self, now: u64, mono_s: u64) {
+    /// Returns `false` when the flush was deferred (the wall clock is behind the previous
+    /// window's end, so a window ending now would overlap it): nothing is consumed and the
+    /// caller retries on a later step.
+    fn flush_window(&mut self, now: u64, mono_s: u64) -> bool {
         self.mono = mono_s;
         let plan = self.sync.plan(self.engine.gate.is_sane(now, mono_s));
         if plan == FlushPlan::Probe {
             self.queue_probe(now, mono_s);
-            return;
+            return true;
         }
         if plan == FlushPlan::Hold {
             // No sane clock: batches would carry wrong times. Drop the window and count it.
@@ -221,7 +224,10 @@ impl Agent {
             drop(self.window.take());
             self.engine.spool.note_dropped(1);
             self.clock.mark_flush(mono_s);
-            return;
+            return true;
+        }
+        if self.clock.should_defer(now, mono_s) {
+            return false;
         }
         self.refresh_neighbors();
         match std::fs::read_to_string(&self.cfg.leases_file) {
@@ -240,12 +246,13 @@ impl Agent {
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
         let Some(meta) = self.meta(now, mono_s) else {
-            return;
+            return true;
         };
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
         self.clock.mark_window(mono_s, now);
         self.engine.enqueue(b.encoded);
+        true
     }
 }
 
@@ -280,8 +287,7 @@ impl Agent {
         if self.urgent.take_pending(started_ms(self.started)) {
             self.push_identity();
         }
-        if mono.saturating_sub(*last_flush) >= window_s {
-            self.flush_window(wall, mono);
+        if mono.saturating_sub(*last_flush) >= window_s && self.flush_window(wall, mono) {
             *last_flush = mono;
         }
         let tick = self.engine.tick(transport, wall, mono, jitter);
@@ -467,6 +473,67 @@ mod tests {
         assert_eq!(a.window.dns_count(), 1);
         let kept = a.window.take_identity();
         assert_eq!(kept.leases.len(), 1, "lease kept too");
+    }
+
+    fn pop_window(a: &mut Agent, now: u64) -> (u64, u64) {
+        let b = a.engine.spool.pop_front().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b.body(now, 0)).unwrap();
+        (
+            v["window_start"].as_u64().unwrap(),
+            v["window_end"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_flush_behind_the_previous_end_is_deferred_with_its_data_then_contiguous() {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        assert!(a.flush_window(t0 + 60, 60));
+        let (_, first_end) = pop_window(&mut a, t0 + 60);
+        assert_eq!(first_end, t0 + 60);
+
+        add_row(&mut a);
+        // the wall clock stepped back 70 s: deferred, nothing consumed, nothing queued
+        assert!(!a.flush_window(t0 + 50, 120));
+        assert!(!a.flush_window(t0 + 55, 125));
+        assert!(a.engine.spool.is_empty());
+        assert_eq!(a.window.dns_count(), 1, "data retained");
+
+        assert!(a.flush_window(t0 + 65, 135));
+        let (start, end) = pop_window(&mut a, t0 + 65);
+        assert_eq!((start, end), (first_end, t0 + 65), "contiguous, no overlap");
+        assert_eq!(a.window.dns_count(), 0, "consumed by the flush");
+    }
+
+    #[test]
+    fn the_loop_retries_a_deferred_flush_on_the_next_step_not_a_window_later() {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        let mut tr = Recorder(Vec::new());
+        let mut last = (0u64, 0u64);
+        let mut step = |a: &mut Agent, wall: u64, mono: u64, tr: &mut Recorder| {
+            let when = Clock {
+                wall,
+                mono,
+                jitter: 0,
+            };
+            a.step(when, 60, (&mut last.0, &mut last.1), tr);
+        };
+        step(&mut a, t0 + 60, 60, &mut tr);
+        assert_eq!(tr.0.len(), 1);
+        // wall stepped back 70 s: deferred, nothing sent
+        step(&mut a, t0 + 50, 120, &mut tr);
+        assert_eq!(tr.0.len(), 1);
+        // the very next step after the wall caught up flushes (not 60 s later)
+        step(&mut a, t0 + 65, 121, &mut tr);
+        assert_eq!(tr.0.len(), 2);
+        let v: serde_json::Value = serde_json::from_slice(&tr.0[1]).unwrap();
+        assert_eq!(v["window_start"], t0 + 60);
+        assert_eq!(v["window_end"], t0 + 65);
     }
 
     #[test]

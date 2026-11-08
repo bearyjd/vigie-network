@@ -29,6 +29,8 @@ pub const MAX_FP_MEMORY: usize = 1024;
 /// Largest tolerated disagreement (s) between the wall span since the previous window's end and
 /// the monotonic time since the previous flush before the previous end is no longer trusted.
 const END_REUSE_SLACK_S: u64 = 2;
+/// Monotonic seconds a flush may be deferred while the wall clock is behind the previous end.
+pub const MAX_DEFER_S: u64 = 600;
 
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
@@ -41,6 +43,8 @@ const END_REUSE_SLACK_S: u64 = 2;
 pub struct WindowClock {
     last_flush_mono_s: u64,
     prev_end: Option<u64>,
+    /// Monotonic second the current deferral began (see `should_defer`).
+    defer_since: Option<u64>,
 }
 
 impl WindowClock {
@@ -48,6 +52,7 @@ impl WindowClock {
         Self {
             last_flush_mono_s: mono_s,
             prev_end: None,
+            defer_since: None,
         }
     }
     /// Wall time the current window started, given the current wall and monotonic clocks.
@@ -76,6 +81,29 @@ impl WindowClock {
                 _ => computed,
             }
         })
+    }
+    /// Whether a flush at `wall_s` must wait: the wall clock is behind the previous window's end
+    /// (it stepped back), so a window ending now would overlap the previous one.
+    ///
+    /// Deferral is bounded: after `MAX_DEFER_S` of monotonic time the remembered end is dropped
+    /// (returns `false`), so a permanent backward step cannot stall uploads; the window then comes
+    /// from the monotonic arithmetic. The caller keeps the window's data and retries later.
+    pub fn should_defer(&mut self, wall_s: u64, mono_s: u64) -> bool {
+        match self.prev_end {
+            Some(p) if wall_s < p => {
+                let since = *self.defer_since.get_or_insert(mono_s);
+                if mono_s.saturating_sub(since) >= MAX_DEFER_S {
+                    self.prev_end = None;
+                    self.defer_since = None;
+                    return false;
+                }
+                true
+            }
+            _ => {
+                self.defer_since = None;
+                false
+            }
+        }
     }
     /// Call after a flush attempt that produced no window (skipped because the clock is not
     /// sane): the next window cannot continue from a previous end.
