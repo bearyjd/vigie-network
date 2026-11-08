@@ -43,10 +43,11 @@ pub const MAX_DEFER_S: u64 = 600;
 pub struct WindowClock {
     last_flush_mono_s: u64,
     prev_end: Option<u64>,
-    /// Monotonic second the current deferral began (see `should_defer`).
-    defer_since: Option<u64>,
-    /// A deferral ended because the wall clock caught up (see `after_deferral`).
-    deferred: bool,
+    /// The current deferral: (monotonic second it began, lowest wall second polled so far).
+    deferral: Option<(u64, u64)>,
+    /// Lowest wall second polled by the deferral that just ended because the wall clock caught
+    /// up; kept until the window it deferred is built (see `deferral_min_wall`).
+    deferred_floor: Option<u64>,
 }
 
 impl WindowClock {
@@ -54,8 +55,8 @@ impl WindowClock {
         Self {
             last_flush_mono_s: mono_s,
             prev_end: None,
-            defer_since: None,
-            deferred: false,
+            deferral: None,
+            deferred_floor: None,
         }
     }
     /// Wall time the current window started, given the current wall and monotonic clocks.
@@ -94,16 +95,27 @@ impl WindowClock {
     pub fn should_defer(&mut self, wall_s: u64, mono_s: u64) -> bool {
         match self.prev_end {
             Some(p) if wall_s < p => {
-                let since = *self.defer_since.get_or_insert(mono_s);
+                let (since, min) = match self.deferral {
+                    Some((since, min)) => (since, min.min(wall_s)),
+                    None => {
+                        // A new deferral starts clean: a catch-up still pending from an earlier
+                        // one (its window was never built) must not leak into this one.
+                        self.deferred_floor = None;
+                        (mono_s, wall_s)
+                    }
+                };
                 if mono_s.saturating_sub(since) >= MAX_DEFER_S {
                     self.prev_end = None;
-                    self.defer_since = None;
+                    self.deferral = None;
                     return false;
                 }
+                self.deferral = Some((since, min));
                 true
             }
             _ => {
-                self.deferred |= self.defer_since.take().is_some();
+                if let Some((_, min)) = self.deferral.take() {
+                    self.deferred_floor = Some(min);
+                }
                 false
             }
         }
@@ -113,19 +125,20 @@ impl WindowClock {
     pub fn mark_flush(&mut self, mono_s: u64) {
         self.last_flush_mono_s = mono_s;
         self.prev_end = None;
-        self.deferred = false;
+        self.deferral = None;
+        self.deferred_floor = None;
     }
     /// Call after a window ending at wall second `end_s` was built at monotonic `mono_s`.
     pub fn mark_window(&mut self, mono_s: u64, end_s: u64) {
         self.last_flush_mono_s = mono_s;
         self.prev_end = Some(end_s);
-        self.deferred = false;
+        self.deferred_floor = None;
     }
-    /// Whether the window about to be built was deferred past a backward wall step and now
-    /// starts at the previous end: its rows were stamped with the stepped-back clock, so those
-    /// below the window start belong to the window (see `Window::raise_dns_floor`).
-    pub fn after_deferral(&self) -> bool {
-        self.deferred
+    /// The lowest wall second polled during the deferral that just ended, when the window about
+    /// to be built was deferred past a backward wall step (it now starts at the previous end).
+    /// Rows stamped at or after it were stamped during the deferral (see `Window::raise_dns_floor`).
+    pub fn deferral_min_wall(&self) -> Option<u64> {
+        self.deferred_floor
     }
 }
 
@@ -269,11 +282,16 @@ impl Window {
         }
     }
 
-    /// Raises every DNS timestamp below `floor` to `floor`. Used for a deferred window, whose
-    /// rows carry the stepped-back wall clock of the deferral; not a general out-of-window fix.
-    pub fn raise_dns_floor(&mut self, floor: u64) {
+    /// Raises DNS timestamps in `min_ts..floor` to `floor`. Provenance rule: only rows stamped
+    /// DURING a deferral (at or after `min_ts`, the lowest wall second polled while deferring)
+    /// carry the stepped-back clock and belong to the window that starts at `floor`. Rows older
+    /// than `min_ts` are left alone, so the builder still drops and counts them as out of window.
+    /// Not a general out-of-window fix.
+    pub fn raise_dns_floor(&mut self, min_ts: u64, floor: u64) {
         for q in &mut self.dns {
-            q.ts = q.ts.max(floor);
+            if q.ts >= min_ts {
+                q.ts = q.ts.max(floor);
+            }
         }
     }
 

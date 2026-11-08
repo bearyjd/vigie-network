@@ -248,8 +248,8 @@ impl Agent {
         let Some(meta) = self.meta(now, mono_s) else {
             return true;
         };
-        if self.clock.after_deferral() {
-            self.window.raise_dns_floor(meta.window_start);
+        if let Some(min_ts) = self.clock.deferral_min_wall() {
+            self.window.raise_dns_floor(min_ts, meta.window_start);
         }
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
@@ -510,12 +510,20 @@ mod tests {
         assert_eq!(a.window.dns_count(), 0, "consumed by the flush");
     }
 
+    /// When the DNS row of `next_batch_with_old_dns` is read.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Row {
+        BeforeDeferral,
+        DuringDeferral,
+    }
+
     /// A synced agent whose first window ended at `t0 + 300` (the wall clock running at the
-    /// time gate's +240 s skew limit), then read a DNS row stamped `back` seconds before that
-    /// end; returns the next batch after flushing at wall `t0 + wall2`, monotonic `mono2`
-    /// (after a flush at `defer_at` was refused, if given).
+    /// time gate's +240 s skew limit). A flush at `defer_at` (offset from `t0`, monotonic) is
+    /// refused, if given. A DNS row stamped `t0 + row_ts` is read at `row`. Returns the batch
+    /// flushed at wall `t0 + wall2`, monotonic `mono2`.
     fn next_batch_with_old_dns(
-        back: u64,
+        row_ts: i64,
+        row: Row,
         defer_at: Option<(i64, u64)>,
         wall2: i64,
         mono2: u64,
@@ -526,10 +534,19 @@ mod tests {
         assert!(a.sync.observe(&a.engine.gate).is_some());
         assert!(a.flush_window(t0 + 300, 60));
         a.engine.spool.pop_front().unwrap();
-        a.window
-            .add_dns(DnsQuery::new(t0 + 300 - back, MAC, "a.example.com", "A", None).unwrap());
+        let add = |a: &mut Agent| {
+            let ts = (t0 as i64 + row_ts) as u64;
+            a.window
+                .add_dns(DnsQuery::new(ts, MAC, "a.example.com", "A", None).unwrap());
+        };
+        if row == Row::BeforeDeferral {
+            add(&mut a);
+        }
         if let Some((w, m)) = defer_at {
             assert!(!a.flush_window((t0 as i64 + w) as u64, m), "deferred");
+        }
+        if row == Row::DuringDeferral {
+            add(&mut a);
         }
         let wall2 = (t0 as i64 + wall2) as u64;
         assert!(a.flush_window(wall2, mono2));
@@ -540,9 +557,9 @@ mod tests {
     #[test]
     fn dns_read_during_a_deferral_is_clamped_to_the_window_start_not_dropped() {
         // The wall clock stepped from +240 s to -240 s of the server's: 420 s behind the
-        // previous window's end, so the row (stamped 410 s before that end) is further back
+        // previous window's end (t0 + 300), so a row stamped 410 s before it is further back
         // than DNS_TS_SLACK_S from the deferred window's start.
-        let j = next_batch_with_old_dns(410, Some((-120, 120)), 370, 130);
+        let j = next_batch_with_old_dns(-110, Row::DuringDeferral, Some((-120, 120)), 370, 130);
         let t0 = BUILD_TS + 1000;
         assert_eq!(j["window_start"], t0 + 300);
         let dns = j["dns"].as_array().unwrap();
@@ -552,8 +569,16 @@ mod tests {
     }
 
     #[test]
+    fn a_row_stamped_before_the_deferral_began_is_not_rewritten_and_is_counted_as_dropped() {
+        // stamped at t0 - 130, before the first deferred poll (wall t0 - 120)
+        let j = next_batch_with_old_dns(-130, Row::BeforeDeferral, Some((-120, 120)), 370, 130);
+        assert!(j["dns"].as_array().is_none_or(|d| d.is_empty()), "{j}");
+        assert_eq!(j["truncated"]["dns_out_of_window"], 1);
+    }
+
+    #[test]
     fn without_a_deferral_a_genuinely_old_dns_row_is_still_dropped() {
-        let j = next_batch_with_old_dns(410, None, 360, 120);
+        let j = next_batch_with_old_dns(-110, Row::BeforeDeferral, None, 360, 120);
         assert_eq!(j["window_start"], BUILD_TS + 1000 + 300);
         assert!(j["dns"].as_array().is_none_or(|d| d.is_empty()));
         assert_eq!(j["truncated"]["dns_out_of_window"], 1);

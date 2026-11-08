@@ -128,16 +128,19 @@ fn a_poll_with_the_wall_caught_up_restarts_the_timer_of_a_later_deferral() {
 #[test]
 fn after_deferral_is_set_only_by_a_catch_up_and_cleared_by_the_next_window() {
     let mut c = after_first_window();
-    assert!(!c.after_deferral(), "no deferral yet");
+    assert!(!c.deferral_min_wall().is_some(), "no deferral yet");
     assert!(c.should_defer(P - 10, 120));
-    assert!(!c.after_deferral(), "still deferring");
+    assert!(!c.deferral_min_wall().is_some(), "still deferring");
     assert!(!c.should_defer(P + 5, 135));
     assert!(
-        c.after_deferral(),
+        c.deferral_min_wall().is_some(),
         "the window about to be built was deferred"
     );
     c.mark_window(135, P + 5);
-    assert!(!c.after_deferral(), "cleared once the window is built");
+    assert!(
+        !c.deferral_min_wall().is_some(),
+        "cleared once the window is built"
+    );
 }
 
 #[test]
@@ -147,7 +150,7 @@ fn a_deferral_that_hit_the_cap_is_not_a_deferred_window() {
     assert!(c.should_defer(w, 120));
     assert!(!c.should_defer(w + MAX_DEFER_S, 120 + MAX_DEFER_S));
     assert!(
-        !c.after_deferral(),
+        !c.deferral_min_wall().is_some(),
         "rows keep their own stamps after the cap"
     );
 }
@@ -158,5 +161,80 @@ fn a_hold_clears_the_deferred_state() {
     assert!(c.should_defer(P - 10, 120));
     assert!(!c.should_defer(P + 5, 135));
     c.mark_flush(135);
-    assert!(!c.after_deferral());
+    assert!(!c.deferral_min_wall().is_some());
+}
+
+#[test]
+fn a_hold_in_the_middle_of_a_deferral_does_not_taint_the_next_window() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120));
+    c.mark_flush(130); // Hold: the accumulated window is dropped
+    assert!(!c.should_defer(P + 60, 190));
+    assert!(
+        c.deferral_min_wall().is_none(),
+        "an unrelated window is not rewritten"
+    );
+    c.mark_window(190, P + 60);
+    assert!(!c.should_defer(P + 120, 250));
+    assert!(c.deferral_min_wall().is_none());
+}
+
+#[test]
+fn a_pending_catch_up_does_not_survive_a_second_deferral() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120));
+    assert!(!c.should_defer(P + 5, 135));
+    assert!(
+        c.deferral_min_wall().is_some(),
+        "caught up, window not built yet"
+    );
+    // the batch could not be built (no mark_window); the wall steps back again
+    assert!(c.should_defer(P - 100_000, 140));
+    assert!(
+        c.deferral_min_wall().is_none(),
+        "a new deferral starts clean"
+    );
+    // ... and runs into the cap: no rewriting despite the stale catch-up
+    assert!(!c.should_defer(P - 100_000 + MAX_DEFER_S, 140 + MAX_DEFER_S));
+    assert!(c.deferral_min_wall().is_none());
+}
+
+#[test]
+fn the_deferral_floor_is_the_lowest_wall_polled_while_deferring() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120));
+    assert!(c.should_defer(P - 30, 125)); // stepped back further
+    assert!(c.should_defer(P - 5, 130));
+    assert!(!c.should_defer(P + 5, 140)); // the catch-up poll is not part of the deferral
+    assert_eq!(c.deferral_min_wall(), Some(P - 30));
+    c.mark_window(140, P + 5);
+    assert_eq!(c.deferral_min_wall(), None);
+}
+
+#[test]
+fn the_floor_raise_is_inclusive_of_the_lowest_polled_wall() {
+    use vigie_agent::model::DnsQuery;
+    use vigie_agent::window::Window;
+    let mut w = Window::default();
+    for (i, ts) in [99u64, 100, 101, 700].iter().enumerate() {
+        w.add_dns(
+            DnsQuery::new(
+                *ts,
+                "aa:bb:cc:dd:ee:01",
+                &format!("h{i}.example.com"),
+                "A",
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    w.raise_dns_floor(100, 500);
+    let (sections, _) = w.take_with_drops();
+    let mut got: Vec<u64> = sections.dns.iter().map(|q| q.ts).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [99, 500, 500, 700],
+        "below the lowest wall: untouched; at it: raised"
+    );
 }

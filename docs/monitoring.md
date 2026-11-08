@@ -60,8 +60,8 @@ quietness is reported separately; it does not establish traffic completeness.
   clock catches up, for at most 600 s of monotonic time, after which the monotonic arithmetic is
   used so a permanent step cannot stall uploads. DNS rows read during a deferral carry the
   stepped-back clock; the deferred window raises those below its start up to the start (the
-  server rejects rows outside the window), while outside a deferral an out-of-window row is
-  still dropped and counted. A deferred batch shares one window's caps (the per-window
+  server rejects rows outside the window), while a row stamped before the deferral began, or
+  outside any deferral, is still dropped and counted when it is out of the window. A deferred batch shares one window's caps (the per-window
   sightings admission and the batch size cap) across up to about eight windows of data, so
   more counted drops are possible. A Hold during a deferral drops the whole accumulated
   window but counts it as one dropped window. A spooled or retried batch keeps its original window.
