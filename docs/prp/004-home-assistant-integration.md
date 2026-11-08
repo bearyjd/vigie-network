@@ -105,6 +105,19 @@ HA's behaviour on a bad request is **per HA docs, unverified**, and the likely a
 
 **A 2xx does not prove delivery.** If steps 2 and 3 return 2xx, the sender cannot learn about a wrong id or a disabled automation from the status code at all, and its 4xx "permanent" class would almost never fire.
 
+**H0 measured results.** Recorded with `deploy/persistent/ha_h0_check.py` (dummy payload, `kind` `h0check`; host and id never recorded here). Unmeasured rows stay open.
+
+| Step | Case | Result | Date | Path |
+|---|---|---|---|---|
+| 1 | Correct id, enabled automation | not measured (needs the owner's dummy automation) | | |
+| 2 | **Wrong** id | **HTTP 200** (`ok`, exit 0); no automation can fire | 2026-11-07 | HTTPS by name from the Tower host, over its Tailscale path (not the LAN reverse proxy) |
+| 3 | Disabled automation | not measured | | |
+| 4 | `local_only` refusal | not measured | | |
+| 5 | Malformed / oversized body | not measured | | |
+| 6 | Plain HTTP (D4) | not applicable: D4 is HTTPS by name | | |
+
+Consequence of row 2: HA answers 2xx for an unknown webhook id, so the sender cannot tell a wrong or rotated id from success by status code, and its permanent-4xx class will rarely fire. This confirms the 2xx caveat above and the need for the end-to-end canary below. Rows 1 and 3 and a repeat of row 2 through the LAN reverse proxy from the vigie-dev host (watch for an HTTP 400 without `use_x_forwarded_for` and `trusted_proxies`) are still to do.
+
 **End-to-end canary.** Because the status code may be blind, the automation stamps an `input_datetime` helper (per HA docs, unverified) with the time of each received message (or of a periodic sender heartbeat message). The owner watches that value, for example on a dashboard card or an HA-side "stale for N hours" check. ntfy stays the counted alert channel; the canary only tells the owner that the HA path has gone quiet. Whether the canary needs an extra `kind` such as `heartbeat` is an H1 review item.
 
 ### H1: `ha_sender`
