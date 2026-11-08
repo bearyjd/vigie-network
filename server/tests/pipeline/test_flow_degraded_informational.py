@@ -92,6 +92,35 @@ def test_informational_keys_never_mask_a_real_degradation(tmp_path, extra):
     assert qualified == 0
 
 
+def test_collector_folded_truncated_other_degrades_the_hour(tmp_path):
+    # collector cap_truncated_keys shape for 17 non-zero counters: the 3 smallest (ct_errors=1,
+    # ct_unmapped_flows=3 and ct_unmapped_bytes) fold into truncated_other
+    keys = {f"other_{letter}": 100 for letter in "abcdefghijklmn"}
+    _record(tmp_path, {**keys, "truncated_other": 4})
+    qualified, reasons = _hour(tmp_path)
+    assert "flow_degraded" in reasons
+    assert qualified == 0
+
+
+def test_bit_8_alone_in_source_flags_does_not_degrade(tmp_path):
+    _record(tmp_path, {"source_flags": 8})
+    assert _hour(tmp_path) == (3540, [])
+
+
+def test_bit_8_mixed_with_another_source_flag_degrades(tmp_path):
+    _record(tmp_path, {"source_flags": 8 | 1})
+    qualified, reasons = _hour(tmp_path)
+    assert "flow_degraded" in reasons
+    assert qualified == 0
+
+
+def test_informational_set_is_exact(tmp_path):
+    _record(tmp_path, {"ct_unmapped_errors": 1})
+    qualified, reasons = _hour(tmp_path)
+    assert "flow_degraded" in reasons
+    assert qualified == 0
+
+
 def test_informational_keys_never_mask_dropped_batches(tmp_path):
     _record(tmp_path, INFO)
     inv = open_inventory(tmp_path / "inventory.db")

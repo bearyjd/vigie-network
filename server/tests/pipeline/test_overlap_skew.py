@@ -62,7 +62,7 @@ def test_overlap_of_exactly_tolerance_qualifies(tmp_path):
         tmp_path, [(HOUR, HOUR + 60), (HOUR + 58, HOUR + 120)]
     )
     assert "overlapping_window" not in reasons
-    assert (observed, qualified) == (122, 122)
+    assert (observed, qualified) == (120, 120)  # union, not the 122 s sum
 
 
 def test_overlap_beyond_tolerance_disqualifies(tmp_path):
@@ -89,4 +89,104 @@ def test_full_hour_of_skewed_windows_qualifies(tmp_path):
     windows = [(HOUR + 60 * n - (1 if n else 0), HOUR + 60 * (n + 1)) for n in range(60)]
     observed, qualified, reasons = _hour_coverage(tmp_path, windows)
     assert reasons == []
-    assert qualified == observed >= 3420
+    assert qualified == observed == 3600  # union credit: the skewed seconds are counted once
+
+
+def _abs(windows):
+    return [(HOUR + s, HOUR + e) for s, e in windows]
+
+
+def test_nested_short_window_still_disqualifies(tmp_path):
+    _, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 60), (10, 12)]))
+    assert "overlapping_window" in reasons
+    assert qualified == 0
+
+
+def test_nested_window_arriving_first_still_disqualifies(tmp_path):
+    _, qualified, reasons = _hour_coverage(tmp_path, _abs([(10, 12), (0, 60)]))
+    assert "overlapping_window" in reasons
+    assert qualified == 0
+
+
+def test_duplicate_two_second_window_with_new_batch_id_disqualifies(tmp_path):
+    _, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 2), (0, 2)]))
+    assert "overlapping_window" in reasons
+    assert qualified == 0
+
+
+def test_short_windows_get_no_tolerance(tmp_path):
+    # both windows are below MIN_TOLERANT_WINDOW_S (4 s): 3 s windows shifted by 1 s
+    _, _, reasons = _hour_coverage(tmp_path, _abs([(0, 3), (1, 4)]))
+    assert "overlapping_window" in reasons
+
+
+def test_short_new_window_on_the_edge_of_a_long_one_is_not_tolerated(tmp_path):
+    _, _, reasons = _hour_coverage(tmp_path, _abs([(0, 60), (58, 61)]))
+    assert "overlapping_window" in reasons
+
+
+def test_short_prior_window_on_the_edge_of_a_long_new_one_is_not_tolerated(tmp_path):
+    _, _, reasons = _hour_coverage(tmp_path, _abs([(58, 61), (0, 60)]))
+    assert "overlapping_window" in reasons
+
+
+def test_more_than_two_intersecting_neighbours_adds_no_coverage(tmp_path):
+    observed, qualified, reasons = _hour_coverage(
+        tmp_path, _abs([(0, 100), (50, 100), (40, 100), (98, 200)])
+    )
+    assert "overlapping_window" in reasons
+    assert (observed, qualified) == (100, 0)
+
+
+def test_observed_and_qualified_are_clamped_to_one_hour(tmp_path):
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    _window(inv, 0, HOUR, HOUR + 3500)
+    inv.execute("UPDATE coverage_hourly SET observed_seconds=3590,qualified_seconds=3590")
+    _window(inv, 1, HOUR + 3500, HOUR + 3600)  # contiguous; sum would be 3690
+    observed, qualified, _ = _coverage(inv)
+    inv.close()
+    assert (observed, qualified) == (3600, 3600)
+
+
+def test_four_second_windows_edge_overlap_is_tolerated(tmp_path):
+    observed, _, reasons = _hour_coverage(tmp_path, _abs([(0, 4), (2, 6)]))
+    assert "overlapping_window" not in reasons
+    assert observed == 6
+
+
+def test_three_chained_windows_credit_the_union_not_the_sum(tmp_path):
+    observed, qualified, reasons = _hour_coverage(
+        tmp_path, _abs([(0, 1200), (1198, 2400), (2398, 3600)])
+    )
+    assert reasons == []
+    assert observed == qualified == 3600
+
+
+def test_chain_with_union_below_threshold_does_not_qualify_as_3420(tmp_path):
+    # 57 windows of 60 s, each overlapping the previous by 2 s: union is 57*58+2 = 3308 s
+    windows = [(58 * n, 58 * n + 60) for n in range(57)]
+    observed, qualified, reasons = _hour_coverage(tmp_path, _abs(windows))
+    assert reasons == []
+    assert observed == qualified == 58 * 57 + 2
+    assert observed < 3420
+
+
+def test_reverse_arrival_order_credits_the_union(tmp_path):
+    observed, qualified, reasons = _hour_coverage(
+        tmp_path, _abs([(2398, 3600), (1198, 2400), (0, 1200)])
+    )
+    assert reasons == []
+    assert observed == qualified == 3600
+
+
+def test_overlap_with_two_prior_neighbours_subtracts_both(tmp_path):
+    # arrival order: left, right, then the middle one overlapping each by 2 s
+    observed, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 100), (198, 300), (98, 200)]))
+    assert reasons == []
+    assert observed == qualified == 300
+
+
+def test_four_second_middle_window_overlapped_on_both_sides(tmp_path):
+    observed, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 100), (98, 102), (100, 200)]))
+    assert reasons == []
+    assert observed == qualified == 200
