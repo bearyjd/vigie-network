@@ -327,6 +327,37 @@ class CtUnmappedExactGateTests(unittest.TestCase):
                     self.assertIsNone(result["ct_unmapped_flows"])
                     self.assertIsNone(result["ct_unmapped_bytes"])
 
+    def test_lan_pair_follows_the_same_exact_gate(self):
+        lan = {
+            "ct_lan_unmapped_flows_in_retained_detail": 2,
+            "ct_lan_unmapped_bytes_in_retained_detail": 700,
+        }
+        result = runner.coverage_metrics(
+            {**self.BASE, **lan, "ct_unmapped_exact": True}, 1000
+        )
+        self.assertEqual(result["ct_lan_unmapped_flows"], 2)
+        self.assertEqual(result["ct_lan_unmapped_bytes"], 700)
+        for flag in ({}, {"ct_unmapped_exact": False}, {"ct_unmapped_exact": 1}):
+            with self.subTest(flag=flag):
+                result = runner.coverage_metrics({**self.BASE, **lan, **flag}, 1000)
+                self.assertIsNone(result["ct_lan_unmapped_flows"])
+                self.assertIsNone(result["ct_lan_unmapped_bytes"])
+
+    def test_older_server_without_lan_fields_is_unknown_and_not_a_missing_sample_field(
+        self,
+    ):
+        spec = importlib.util.spec_from_file_location(
+            "soak_for_lan", Path(__file__).parents[1] / "persistent" / "soak.py"
+        )
+        soak = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = soak
+        spec.loader.exec_module(soak)
+        result = runner.coverage_metrics({**self.BASE, "ct_unmapped_exact": True}, 1000)
+        self.assertIsNone(result["ct_lan_unmapped_bytes"])
+        sample = {**HEALTHY_SAMPLE, **result}
+        missing = soak.sample_issues(sample)[1]
+        self.assertFalse({k for k in missing if k.startswith("ct_lan")})
+
     def test_capped_exact_case_is_not_reported_missing_by_sample_issues(self):
         spec = importlib.util.spec_from_file_location(
             "soak_for_ct", Path(__file__).parents[1] / "persistent" / "soak.py"
@@ -336,7 +367,10 @@ class CtUnmappedExactGateTests(unittest.TestCase):
         spec.loader.exec_module(soak)
 
         def missing(collector):
-            sample = {**HEALTHY_SAMPLE, **runner.coverage_metrics(collector, 1800000000)}
+            sample = {
+                **HEALTHY_SAMPLE,
+                **runner.coverage_metrics(collector, 1800000000),
+            }
             return soak.sample_issues(sample)[1]
 
         capped_exact = {**self.BASE, "ct_unmapped_exact": True}

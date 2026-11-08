@@ -276,6 +276,11 @@ def assess(samples, *, mode="simulated"):
             and sample["ct_unmapped_flows"] > 0
         ):
             notes.add("unmapped_conntrack")
+        if isinstance(sample, dict) and any(
+            _number(sample.get(key)) and sample[key] > 0
+            for key in ("ct_lan_unmapped_flows", "ct_lan_unmapped_bytes")
+        ):
+            notes.add("lan_unmapped_conntrack")
         if _dns_rescued(sample):
             notes.add("dns_probe_retry_recovered")
         if isinstance(sample, dict) and all(

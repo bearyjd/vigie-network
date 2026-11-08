@@ -61,7 +61,8 @@ def _ct_term(key):
 
 
 _CT_UNMAPPED_SQL = (
-    f"SELECT {_ct_term('ct_unmapped_bytes')},{_ct_term('ct_unmapped_flows')} "  # noqa: S608
+    f"SELECT {_ct_term('ct_unmapped_bytes')},{_ct_term('ct_unmapped_flows')},"  # noqa: S608
+    f"{_ct_term('ct_lan_unmapped_bytes')},{_ct_term('ct_lan_unmapped_flows')} "
     "FROM batches WHERE collector_id=?"
 )
 
@@ -76,17 +77,19 @@ def _json_dict(text):
 
 
 def ct_unmapped_totals(inv, collector):
-    """Exact (bytes, flows, exact) over every retained batch, not limited to the detail cap.
+    """Exact (bytes, flows, lan_bytes, lan_flows, exact) over every retained batch.
+
+    Not limited to the detail cap. `exact` covers all four sums (one query).
 
     Non-integer or malformed `truncated` values count as 0; SQLite integer overflow reports
-    (0, 0, False) so a caller never mistakes a partial sum for the total.
+    (0, 0, 0, 0, False) so a caller never mistakes a partial sum for the total.
     """
     try:
         row = inv.execute(_CT_UNMAPPED_SQL, (collector,)).fetchone()
     except sqlite3.OperationalError as exc:
         LOG.warning("ct_unmapped totals unavailable: %s", type(exc).__name__)
-        return 0, 0, False
-    return row[0] or 0, row[1] or 0, True
+        return 0, 0, 0, 0, False
+    return row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0, True
 
 
 def required(inv):
@@ -181,7 +184,7 @@ def collector_summary(inv, collector, since=None):
         "AND m.batch_id=b.batch_id) ORDER BY b.received_at,b.batch_id LIMIT 10001",
         (collector,),
     ).fetchall()
-    ct_bytes, ct_flows, ct_exact = ct_unmapped_totals(inv, collector)
+    ct_bytes, ct_flows, lan_bytes, lan_flows, ct_exact = ct_unmapped_totals(inv, collector)
     unavailable = [
         dict(row)
         for row in inv.execute(
@@ -210,6 +213,8 @@ def collector_summary(inv, collector, since=None):
         "dropped_batches_in_retained_detail": sum(row["dropped_batches"] for row in rows),
         "ct_unmapped_bytes_in_retained_detail": ct_bytes,
         "ct_unmapped_flows_in_retained_detail": ct_flows,
+        "ct_lan_unmapped_bytes_in_retained_detail": lan_bytes,
+        "ct_lan_unmapped_flows_in_retained_detail": lan_flows,
         "ct_unmapped_exact": ct_exact,
         "source_flags_latest": flags.get("source_flags", 0) if latest and health else None,
         "agent_rss_kb": health.get("rss_kb"),

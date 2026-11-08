@@ -14,13 +14,31 @@ from vigie_pipeline.sources import ShardReadError, normalize_mac
 
 # Unattributed traffic seen on every batch of a normal LAN; reported, never a coverage defect.
 # Every other ct_*/conntrack* key (and any future one) stays degrading: fail closed.
-INFORMATIONAL_TRUNCATED_KEYS = frozenset({"ct_unmapped_bytes", "ct_unmapped_flows"})
+# ct_unmapped_* now means only expected exclusions (global remainder, the router's own addresses);
+# ct_lan_unmapped_flows counts LAN-prefix sources without a MAC and is informational as well.
+INFORMATIONAL_TRUNCATED_KEYS = frozenset(
+    {"ct_unmapped_bytes", "ct_unmapped_flows", "ct_lan_unmapped_flows"}
+)
+# ct_lan_unmapped_bytes (LAN-prefix sources with no MAC: a genuine attribution failure) is governed
+# by a threshold instead of presence. It is handled separately and must not hit the generic rule.
+LAN_UNMAPPED_BYTES_KEY = "ct_lan_unmapped_bytes"
+# Distinct reason for the threshold trip (attribution trouble), not a collector fault.
+LAN_UNMAPPED_REASON = "lan_unmapped_share"
+# The hour is disqualified (`lan_unmapped_share`) only when BOTH hold; at or below either bound
+# it qualifies. Both numbers are PER WINDOW and the share is collector-wide: see docs/monitoring.md.
+# Floor per window: a quiet hour must not be disqualified by a few KB of unattributed traffic.
+LAN_UNMAPPED_MIN_BYTES = 262144  # 256 KiB
+# Share of all conntrack bytes (mapped + LAN-unmapped). A read-only router snapshot showed
+# unmapped-but-LAN traffic at ~0.02% of bytes, so 5% leaves a ~250x margin. Policy number, to be
+# tuned on real data.
+LAN_UNMAPPED_MAX_SHARE_PCT = 5
 # Independent whole-second truncation of the collector's wall and monotonic clocks can overlap
 # consecutive 60 s windows by 1 s. Replays are already rejected by batch_id.
 OVERLAP_TOLERANCE_S = 2
 # The tolerance only covers the EDGE overlap of two normal windows. The collector's nominal window
 # is 60 s; windows under 30 s get no tolerance. That bounds the counters that may be summed twice
-# for the shared sliver to 2 s of a >= 30 s window (about 6.7%) per boundary, and a short window
+# for the shared slivers to 2 s per boundary; a chain window has two boundaries, so counters
+# inflate by at most 2/(L-2) of the union (~7.1% at 30 s, ~3.4% at 60 s), and a short window
 # can never hide inside, or duplicate, another one (a 4 s window every 2 s used to double them).
 MIN_TOLERANT_WINDOW_S = 30
 # Second bound, independent of the constants above: the shared seconds are at most 1/10 of the
@@ -46,6 +64,23 @@ class Measurements:
     received: str
     reasons: tuple[str, ...]
     counters: dict[str, tuple[int, int, int, int]]
+
+
+def _lan_unmapped_reason(value: object, counters: dict, overflowed: bool) -> str | None:
+    """Reason ct_lan_unmapped_bytes degrades the hour, or None. Fails closed on any doubt.
+
+    A malformed value or uncomputable totals is a data fault (`flow_degraded`); only the policy
+    threshold itself reports the distinct `lan_unmapped_share`, so operators can tell
+    attribution trouble from a collector fault.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or overflowed:
+        return "flow_degraded"
+    if value <= LAN_UNMAPPED_MIN_BYTES:
+        return None
+    mapped = sum(v[0] + v[1] for v in counters.values())
+    if value * 100 > LAN_UNMAPPED_MAX_SHARE_PCT * (mapped + value):
+        return LAN_UNMAPPED_REASON
+    return None
 
 
 def read_measurements(
@@ -81,7 +116,8 @@ def read_measurements(
                 or (
                     key != "source_flags"
                     and key not in INFORMATIONAL_TRUNCATED_KEYS
-                    and (key.startswith("ct_") or key.startswith("conntrack"))
+                    and key != LAN_UNMAPPED_BYTES_KEY
+                    and key.lower().startswith(("ct_", "conntrack"))
                 )
             )
         ):
@@ -140,6 +176,12 @@ def read_measurements(
             mac = normalize_mac(mac)
             if mac is not None:
                 counters.setdefault(mac, [0, 0, 0, 0])[3] += 1
+        if LAN_UNMAPPED_BYTES_KEY in truncated:
+            lan_reason = _lan_unmapped_reason(
+                truncated[LAN_UNMAPPED_BYTES_KEY], counters, "counter_overflow" in reasons
+            )
+            if lan_reason is not None:
+                reasons.append(lan_reason)
     return Measurements(
         collector,
         batch_id,
@@ -157,7 +199,8 @@ def _tolerated_overlap(start: int, end: int, neighbours: list) -> int | None:
     Tolerated only when every neighbour is an edge overlap (neither window contains the other)
     of at most OVERLAP_TOLERANCE_S, at most 1/MAX_SHARED_FRACTION_INV of the shorter window,
     between two windows of at least MIN_TOLERANT_WINDOW_S. Counters of that sliver may still be
-    summed twice: at most 2 s of deltas (about 6.7% of a window) per window boundary.
+    summed twice: at most 2 s of deltas per window boundary, i.e. 2/(L-2) of the union
+    (~7.1% at 30 s).
     Neighbours are (start, end, credited) rows; rows never credited (already flagged
     overlapping_window) still count as overlaps but are not subtracted from the credit.
     """

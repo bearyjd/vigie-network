@@ -374,6 +374,10 @@ def coverage_metrics(collector, now):
         "dns_log_quiet": "dns_log_quiet",
         "ct_unmapped_flows": "ct_unmapped_flows_in_retained_detail",
         "ct_unmapped_bytes": "ct_unmapped_bytes_in_retained_detail",
+        # LAN sources without a MAC (attribution failure). Notes only: not a required sample
+        # field, so an older server that lacks them is unknown, never a missing sample.
+        "ct_lan_unmapped_flows": "ct_lan_unmapped_flows_in_retained_detail",
+        "ct_lan_unmapped_bytes": "ct_lan_unmapped_bytes_in_retained_detail",
     }
     for target, source in mapping.items():
         result[target] = collector.get(source)
@@ -404,7 +408,12 @@ def coverage_metrics(collector, now):
     # The totals are server-side SQL sums over all retained rows, trusted only when the server
     # says so; an older server (flag absent) stays unknown regardless of summary_capped.
     if collector.get("ct_unmapped_exact") is not True:
-        for key in ("ct_unmapped_flows", "ct_unmapped_bytes"):
+        for key in (
+            "ct_unmapped_flows",
+            "ct_unmapped_bytes",
+            "ct_lan_unmapped_flows",
+            "ct_lan_unmapped_bytes",
+        ):
             result[key] = None
     return result
 

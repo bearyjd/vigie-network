@@ -429,6 +429,14 @@
             "title": "Collector Id",
             "type": "string"
           },
+          "ct_lan_unmapped_bytes_in_retained_detail": {
+            "title": "Ct Lan Unmapped Bytes In Retained Detail",
+            "type": "integer"
+          },
+          "ct_lan_unmapped_flows_in_retained_detail": {
+            "title": "Ct Lan Unmapped Flows In Retained Detail",
+            "type": "integer"
+          },
           "ct_unmapped_bytes_in_retained_detail": {
             "title": "Ct Unmapped Bytes In Retained Detail",
             "type": "integer"
@@ -595,6 +603,8 @@
           "dropped_batches_in_retained_detail",
           "ct_unmapped_bytes_in_retained_detail",
           "ct_unmapped_flows_in_retained_detail",
+          "ct_lan_unmapped_bytes_in_retained_detail",
+          "ct_lan_unmapped_flows_in_retained_detail",
           "ct_unmapped_exact",
           "source_flags_latest",
           "agent_rss_kb",

@@ -328,6 +328,8 @@ class CollectorCoverage(BaseModel):
     dropped_batches_in_retained_detail: int
     ct_unmapped_bytes_in_retained_detail: int
     ct_unmapped_flows_in_retained_detail: int
+    ct_lan_unmapped_bytes_in_retained_detail: int
+    ct_lan_unmapped_flows_in_retained_detail: int
     ct_unmapped_exact: bool
     source_flags_latest: int | None
     agent_rss_kb: int | None
