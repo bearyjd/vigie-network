@@ -6,6 +6,7 @@ Expected to FAIL on current code (the blanket ct_* rule in measurements.py marks
 
 import json
 
+import pytest
 from test_monitoring import HOUR, MAC
 
 from vigie_ingest.db import open_inventory
@@ -68,3 +69,35 @@ def test_informational_ct_unmapped_counts_do_not_degrade_the_hour(tmp_path):
     qualified, reasons = _hour(tmp_path)
     assert "flow_degraded" not in reasons
     assert qualified == 3540
+
+
+INFO = {"ct_unmapped_bytes": 4096, "ct_unmapped_flows": 3}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"ct_errors": 1},
+        {"source_flags": 1},
+        {"ct_new_thing": 1},
+        {"ct_dropped_keys": 2},
+        {"ct_recounted": 1},
+        {"conntrack_lost": 1},
+    ],
+)
+def test_informational_keys_never_mask_a_real_degradation(tmp_path, extra):
+    _record(tmp_path, {**INFO, **extra})
+    qualified, reasons = _hour(tmp_path)
+    assert "flow_degraded" in reasons
+    assert qualified == 0
+
+
+def test_informational_keys_never_mask_dropped_batches(tmp_path):
+    _record(tmp_path, INFO)
+    inv = open_inventory(tmp_path / "inventory.db")
+    inv.execute("UPDATE batches SET dropped_batches=1")
+    inv.commit()
+    inv.close()
+    qualified, reasons = _hour(tmp_path)
+    assert "flow_degraded" in reasons
+    assert qualified == 0

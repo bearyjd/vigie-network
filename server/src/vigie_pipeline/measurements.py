@@ -12,6 +12,12 @@ from vigie_ingest.db import shard_name, utc_day
 from vigie_ingest.models import FUTURE_WINDOW_SLACK
 from vigie_pipeline.sources import ShardReadError, normalize_mac
 
+# Unattributed traffic seen on every batch of a normal LAN; reported, never a coverage defect.
+# Every other ct_*/conntrack* key (and any future one) stays degrading: fail closed.
+INFORMATIONAL_TRUNCATED_KEYS = frozenset({"ct_unmapped_bytes", "ct_unmapped_flows"})
+# Independent whole-second truncation of the collector's wall and monotonic clocks can overlap
+# consecutive 60 s windows by 1 s. Replays are already rejected by batch_id.
+OVERLAP_TOLERANCE_S = 2
 MAX_VALUE = (2**63 - 1) // 64  # at most64 canonical MACs can be summed safely
 
 
@@ -55,7 +61,9 @@ def read_measurements(
             or any(
                 value
                 for key, value in truncated.items()
-                if key != "source_flags" and (key.startswith("ct_") or key.startswith("conntrack"))
+                if key != "source_flags"
+                and key not in INFORMATIONAL_TRUNCATED_KEYS
+                and (key.startswith("ct_") or key.startswith("conntrack"))
             )
         ):
             reasons.append("flow_degraded")
@@ -140,8 +148,9 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
     if hour is not None and "cross_hour" not in reasons and "probe" not in reasons:
         overlap = inv.execute(
             "SELECT 1 FROM measurement_batches WHERE collector_id=? AND hour=? "
-            "AND window_start<? AND window_end>? AND quality NOT LIKE ? LIMIT 1",
-            (m.collector, hour, m.end, m.start, "%probe%"),
+            "AND window_start<? AND window_end>? AND quality NOT LIKE ? "
+            "AND MIN(window_end,?)-MAX(window_start,?)>? LIMIT 1",
+            (m.collector, hour, m.end, m.start, "%probe%", m.end, m.start, OVERLAP_TOLERANCE_S),
         ).fetchone()
         if overlap:
             reasons.append("overlapping_window")
