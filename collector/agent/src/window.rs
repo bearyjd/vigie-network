@@ -45,6 +45,8 @@ pub struct WindowClock {
     prev_end: Option<u64>,
     /// Monotonic second the current deferral began (see `should_defer`).
     defer_since: Option<u64>,
+    /// A deferral ended because the wall clock caught up (see `after_deferral`).
+    deferred: bool,
 }
 
 impl WindowClock {
@@ -53,6 +55,7 @@ impl WindowClock {
             last_flush_mono_s: mono_s,
             prev_end: None,
             defer_since: None,
+            deferred: false,
         }
     }
     /// Wall time the current window started, given the current wall and monotonic clocks.
@@ -100,7 +103,7 @@ impl WindowClock {
                 true
             }
             _ => {
-                self.defer_since = None;
+                self.deferred |= self.defer_since.take().is_some();
                 false
             }
         }
@@ -110,11 +113,19 @@ impl WindowClock {
     pub fn mark_flush(&mut self, mono_s: u64) {
         self.last_flush_mono_s = mono_s;
         self.prev_end = None;
+        self.deferred = false;
     }
     /// Call after a window ending at wall second `end_s` was built at monotonic `mono_s`.
     pub fn mark_window(&mut self, mono_s: u64, end_s: u64) {
         self.last_flush_mono_s = mono_s;
         self.prev_end = Some(end_s);
+        self.deferred = false;
+    }
+    /// Whether the window about to be built was deferred past a backward wall step and now
+    /// starts at the previous end: its rows were stamped with the stepped-back clock, so those
+    /// below the window start belong to the window (see `Window::raise_dns_floor`).
+    pub fn after_deferral(&self) -> bool {
+        self.deferred
     }
 }
 
@@ -255,6 +266,14 @@ impl Window {
     pub fn rebase_dns(&mut self, offset: u64) {
         for q in &mut self.dns {
             q.ts = q.ts.saturating_add(offset).min(crate::model::MAX_EPOCH);
+        }
+    }
+
+    /// Raises every DNS timestamp below `floor` to `floor`. Used for a deferred window, whose
+    /// rows carry the stepped-back wall clock of the deferral; not a general out-of-window fix.
+    pub fn raise_dns_floor(&mut self, floor: u64) {
+        for q in &mut self.dns {
+            q.ts = q.ts.max(floor);
         }
     }
 

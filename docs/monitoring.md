@@ -58,7 +58,13 @@ quietness is reported separately; it does not establish traffic completeness.
   than 24 h; a fallback never starts before the previous end. If the wall clock steps back
   behind the previous end, the flush is deferred (data kept, retried each loop step) until the
   clock catches up, for at most 600 s of monotonic time, after which the monotonic arithmetic is
-  used so a permanent step cannot stall uploads. A spooled or retried batch keeps its original window.
+  used so a permanent step cannot stall uploads. DNS rows read during a deferral carry the
+  stepped-back clock; the deferred window raises those below its start up to the start (the
+  server rejects rows outside the window), while outside a deferral an out-of-window row is
+  still dropped and counted. A deferred batch shares one window's caps (the per-window
+  sightings admission and the batch size cap) across up to about eight windows of data, so
+  more counted drops are possible. A Hold during a deferral drops the whole accumulated
+  window but counts it as one dropped window. A spooled or retried batch keeps its original window.
 - **Sticky IP to MAC.** An IPv6 conntrack source whose neighbor entry expired while its flow
   lives on is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since
   the neighbor table last held the address). IPv4 is never remembered (DHCP reuses addresses),

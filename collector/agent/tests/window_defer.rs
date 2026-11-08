@@ -124,3 +124,39 @@ fn a_poll_with_the_wall_caught_up_restarts_the_timer_of_a_later_deferral() {
     // behind again much later, with no window marked in between: a fresh budget
     assert!(c.should_defer(P - 100, 130 + MAX_DEFER_S + 100));
 }
+
+#[test]
+fn after_deferral_is_set_only_by_a_catch_up_and_cleared_by_the_next_window() {
+    let mut c = after_first_window();
+    assert!(!c.after_deferral(), "no deferral yet");
+    assert!(c.should_defer(P - 10, 120));
+    assert!(!c.after_deferral(), "still deferring");
+    assert!(!c.should_defer(P + 5, 135));
+    assert!(
+        c.after_deferral(),
+        "the window about to be built was deferred"
+    );
+    c.mark_window(135, P + 5);
+    assert!(!c.after_deferral(), "cleared once the window is built");
+}
+
+#[test]
+fn a_deferral_that_hit_the_cap_is_not_a_deferred_window() {
+    let w = P - 100_000;
+    let mut c = after_first_window();
+    assert!(c.should_defer(w, 120));
+    assert!(!c.should_defer(w + MAX_DEFER_S, 120 + MAX_DEFER_S));
+    assert!(
+        !c.after_deferral(),
+        "rows keep their own stamps after the cap"
+    );
+}
+
+#[test]
+fn a_hold_clears_the_deferred_state() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120));
+    assert!(!c.should_defer(P + 5, 135));
+    c.mark_flush(135);
+    assert!(!c.after_deferral());
+}

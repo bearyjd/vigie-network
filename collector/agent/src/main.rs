@@ -248,6 +248,9 @@ impl Agent {
         let Some(meta) = self.meta(now, mono_s) else {
             return true;
         };
+        if self.clock.after_deferral() {
+            self.window.raise_dns_floor(meta.window_start);
+        }
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
         self.clock.mark_window(mono_s, now);
@@ -505,6 +508,55 @@ mod tests {
         let (start, end) = pop_window(&mut a, t0 + 65);
         assert_eq!((start, end), (first_end, t0 + 65), "contiguous, no overlap");
         assert_eq!(a.window.dns_count(), 0, "consumed by the flush");
+    }
+
+    /// A synced agent whose first window ended at `t0 + 300` (the wall clock running at the
+    /// time gate's +240 s skew limit), then read a DNS row stamped `back` seconds before that
+    /// end; returns the next batch after flushing at wall `t0 + wall2`, monotonic `mono2`
+    /// (after a flush at `defer_at` was refused, if given).
+    fn next_batch_with_old_dns(
+        back: u64,
+        defer_at: Option<(i64, u64)>,
+        wall2: i64,
+        mono2: u64,
+    ) -> serde_json::Value {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        assert!(a.flush_window(t0 + 300, 60));
+        a.engine.spool.pop_front().unwrap();
+        a.window
+            .add_dns(DnsQuery::new(t0 + 300 - back, MAC, "a.example.com", "A", None).unwrap());
+        if let Some((w, m)) = defer_at {
+            assert!(!a.flush_window((t0 as i64 + w) as u64, m), "deferred");
+        }
+        let wall2 = (t0 as i64 + wall2) as u64;
+        assert!(a.flush_window(wall2, mono2));
+        let b = a.engine.spool.pop_front().unwrap();
+        serde_json::from_slice(&b.body(wall2, 0)).unwrap()
+    }
+
+    #[test]
+    fn dns_read_during_a_deferral_is_clamped_to_the_window_start_not_dropped() {
+        // The wall clock stepped from +240 s to -240 s of the server's: 420 s behind the
+        // previous window's end, so the row (stamped 410 s before that end) is further back
+        // than DNS_TS_SLACK_S from the deferred window's start.
+        let j = next_batch_with_old_dns(410, Some((-120, 120)), 370, 130);
+        let t0 = BUILD_TS + 1000;
+        assert_eq!(j["window_start"], t0 + 300);
+        let dns = j["dns"].as_array().unwrap();
+        assert_eq!(dns.len(), 1, "no row lost: {j}");
+        assert_eq!(dns[0]["ts"], t0 + 300, "clamped up to the window start");
+        assert!(j["truncated"].get("dns_out_of_window").is_none());
+    }
+
+    #[test]
+    fn without_a_deferral_a_genuinely_old_dns_row_is_still_dropped() {
+        let j = next_batch_with_old_dns(410, None, 360, 120);
+        assert_eq!(j["window_start"], BUILD_TS + 1000 + 300);
+        assert!(j["dns"].as_array().is_none_or(|d| d.is_empty()));
+        assert_eq!(j["truncated"]["dns_out_of_window"], 1);
     }
 
     #[test]
