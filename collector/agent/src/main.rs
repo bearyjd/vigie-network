@@ -121,7 +121,7 @@ struct Agent {
 
 impl Agent {
     /// `None` when no random batch id can be had; the caller keeps its data and retries later.
-    fn meta(&mut self, now: u64) -> Option<Meta> {
+    fn meta(&mut self, now: u64, mono_s: u64) -> Option<Meta> {
         let rand = match random::<10>() {
             Ok(r) => r,
             Err(e) => {
@@ -136,7 +136,7 @@ impl Agent {
             boot_id: self.boot_id.clone(),
             seq: self.seq,
             batch_id: ids::uuid7(wall_ms(), rand),
-            window_start: self.clock.start(now, self.started.elapsed().as_secs()),
+            window_start: self.clock.window_start(now, mono_s),
             window_end: now,
         })
     }
@@ -187,7 +187,9 @@ impl Agent {
         {
             return;
         }
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono) else {
+            return;
+        };
         let sections = self.window.take_identity();
         let b = build(&meta, sections, &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded.as_probe());
@@ -195,11 +197,13 @@ impl Agent {
 
     /// Before the first server `Date` the only thing sent is an empty probe: its reply, accepted
     /// or rejected, tells us the time. Data stays in the window (bounded) with monotonic stamps.
-    fn queue_probe(&mut self, now: u64) {
+    fn queue_probe(&mut self, now: u64, mono_s: u64) {
         if !self.engine.spool.is_empty() {
             return;
         }
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono_s) else {
+            return;
+        };
         let b = build(&meta, Sections::default(), &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded.as_probe());
     }
@@ -208,7 +212,7 @@ impl Agent {
         self.mono = mono_s;
         let plan = self.sync.plan(self.engine.gate.is_sane(now, mono_s));
         if plan == FlushPlan::Probe {
-            self.queue_probe(now);
+            self.queue_probe(now, mono_s);
             return;
         }
         if plan == FlushPlan::Hold {
@@ -235,10 +239,12 @@ impl Agent {
         let quiet = self
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono_s) else {
+            return;
+        };
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
-        self.clock.mark_flush(mono_s);
+        self.clock.mark_window(mono_s, now);
         self.engine.enqueue(b.encoded);
     }
 }

@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::builder::MAX_WINDOW_S;
 use crate::model::{ConntrackSummary, DnsQuery, Lease, Neighbor, Sections, Sighting};
 
 /// (mac, kind, name, service, ua)
@@ -25,27 +26,59 @@ pub const SIGHTINGS_ADMIT_PER_WINDOW: usize = 1024;
 /// MACs whose fingerprint is remembered across windows (memory bound).
 pub const MAX_FP_MEMORY: usize = 1024;
 
+/// Largest tolerated disagreement (s) between the wall span since the previous window's end and
+/// the monotonic time since the previous flush before the previous end is no longer trusted.
+const END_REUSE_SLACK_S: u64 = 2;
+
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
 /// span the jump and the server would reject the whole batch (window > 24 h).
+///
+/// Consecutive windows must tile exactly (`start_n == end_{n-1}`): re-deriving the start from two
+/// independently truncated clocks overlaps them by up to 1 s, which the server rejects. So the
+/// previous window's end is remembered and reused when it agrees with the monotonic clock.
 #[derive(Debug, Default)]
 pub struct WindowClock {
     last_flush_mono_s: u64,
+    prev_end: Option<u64>,
 }
 
 impl WindowClock {
     pub fn new(mono_s: u64) -> Self {
         Self {
             last_flush_mono_s: mono_s,
+            prev_end: None,
         }
     }
     /// Wall time the current window started, given the current wall and monotonic clocks.
     pub fn start(&self, wall_s: u64, mono_s: u64) -> u64 {
         wall_s.saturating_sub(mono_s.saturating_sub(self.last_flush_mono_s))
     }
-    /// Call after every flush attempt, including one skipped because the clock is not sane.
+    /// Start of the window ending at `wall_s`: the previous window's end when it is consistent
+    /// (not in the future, within `END_REUSE_SLACK_S` of the monotonic elapsed time, and at most
+    /// `MAX_WINDOW_S` long), else the monotonic arithmetic of `start`, bounded to `MAX_WINDOW_S`.
+    pub fn window_start(&self, wall_s: u64, mono_s: u64) -> u64 {
+        let elapsed = mono_s.saturating_sub(self.last_flush_mono_s);
+        let reusable = self.prev_end.filter(|&p| {
+            wall_s >= p
+                && wall_s - p <= MAX_WINDOW_S
+                && (wall_s - p).abs_diff(elapsed) <= END_REUSE_SLACK_S
+        });
+        reusable.unwrap_or_else(|| {
+            self.start(wall_s, mono_s)
+                .max(wall_s.saturating_sub(MAX_WINDOW_S))
+        })
+    }
+    /// Call after a flush attempt that produced no window (skipped because the clock is not
+    /// sane): the next window cannot continue from a previous end.
     pub fn mark_flush(&mut self, mono_s: u64) {
         self.last_flush_mono_s = mono_s;
+        self.prev_end = None;
+    }
+    /// Call after a window ending at wall second `end_s` was built at monotonic `mono_s`.
+    pub fn mark_window(&mut self, mono_s: u64, end_s: u64) {
+        self.last_flush_mono_s = mono_s;
+        self.prev_end = Some(end_s);
     }
 }
 
