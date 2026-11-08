@@ -46,14 +46,27 @@ raw data degrades coverage and makes API counters null rather than asserting zer
 
 Qualification requires at least3420 observed qualified seconds (95%) and no quality reasons.
 Missing health, CT source gaps/truncation, dropped batches and counter overflow disqualify
-the hour (`flow_degraded`). The only informational truncation keys are `ct_unmapped_bytes` and
-`ct_unmapped_flows` (unattributed traffic, present in every batch on a normal LAN); they never
-degrade coverage. The rule fails closed: every other nonzero `ct_*`/`conntrack*` key, including
-any future one, still degrades the hour, as do `source_flags` (other than bit 8 alone) and
-`dropped_batches`. A non-zero `truncated_other` always degrades: the collector only produces it
-when more than 16 counters were non-zero (severe degradation), and it folds the informational pair
-in first, so it can hide `ct_errors`, `ct_dropped_keys` or `conntrack_lost`. Unmapped conntrack stays visible in the API collector summary
-(`ct_unmapped_*_in_retained_detail`) and in the soak note. Hours ingested before this change
+the hour (`flow_degraded`). The informational truncation keys are `ct_unmapped_bytes`,
+`ct_unmapped_flows` and `ct_lan_unmapped_flows`; they never degrade coverage. The two pairs mean
+different things: `ct_unmapped_*` is only expected exclusions (the global remainder and the
+router's own addresses, present in every batch on a normal LAN), while `ct_lan_unmapped_*` is
+LAN-prefix sources that have no MAC, a genuine attribution failure (unattributed traffic of known
+devices would otherwise look like a quiet hour). `ct_lan_unmapped_bytes` is governed by a
+threshold, not presence: it degrades the hour only when it is above `LAN_UNMAPPED_MIN_BYTES`
+(262144, 256 KiB per window, so a few KB cannot disqualify a quiet hour) AND above
+`LAN_UNMAPPED_MAX_SHARE_PCT` (5) percent of `mapped_bytes + ct_lan_unmapped_bytes`, where
+`mapped_bytes` is the up + down bytes the batch attributes to MACs. Exactly at either bound
+qualifies. A read-only router snapshot showed unmapped-but-LAN traffic at about 0.02% of bytes,
+so 5% leaves a 250x margin; both numbers are policy to be tuned on real data. The rule fails
+closed: a missing-valued, non-integer, boolean or negative `ct_lan_unmapped_bytes`, or per-MAC
+totals that cannot be computed (counter overflow), degrade the hour. A batch from an older
+collector without `ct_lan_*` keys behaves as before. Every other nonzero `ct_*`/`conntrack*` key,
+including any future one, still degrades the hour, as do `source_flags` (other than bit 8 alone)
+and `dropped_batches`. A non-zero `truncated_other` always degrades: the collector only produces it
+when more than 16 counters were non-zero (severe degradation), and it folds the informational keys
+in first, so it can hide `ct_errors`, `ct_dropped_keys` or `conntrack_lost`. Unmapped conntrack
+stays visible in the API collector summary (`ct_unmapped_*_in_retained_detail` and
+`ct_lan_unmapped_*_in_retained_detail`) and in the soak note. Hours ingested before this change
 keep their stored `flow_degraded` reason and stay disqualified; they are not recomputed.
 
 A distinct overlapping batch degrades the existing hour without adding its bytes or duration,
@@ -68,7 +81,8 @@ windows, and a window intersecting more than two others. Batches that never cont
 credited only for the seconds no earlier credited batch already covered, so a chain of windows
 adds up to its union, never its sum, and an hour's observed and qualified seconds are capped at
 3600. Counters of the tolerated sliver may be counted twice, bounded by at most 2 s of deltas
-(about 6.7% of a 30 s window, 3.3% of a 60 s one) per window boundary. An identical
+per boundary. A chain window has two boundaries, so a chain of windows of length L inflates its
+counters by at most 2/(L-2) of the union: about 7.1% at 30 s windows, 3.4% at 60 s. An identical
 receipt replay does neither (it is rejected by `batch_id`). Hours already marked
 `overlapping_window` stay disqualified. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.
