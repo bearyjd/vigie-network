@@ -9,7 +9,9 @@ use vigie_agent::ctparse::{Kind, Record, Snapshot};
 use vigie_agent::ipmemory::{IpMemory, IP_MEMORY_TTL_S};
 use vigie_agent::model::Proto;
 use vigie_agent::neigh::parse_ip_neigh_table;
-use vigie_agent::ownaddr::{read_bounded, OwnAddrs, FIB_TRIE_MAX, OWN_REFRESH_S};
+use vigie_agent::ownaddr::{
+    read_bounded, read_bounded_from, OwnAddrs, FIB_TRIE_MAX, OWN_REFRESH_S,
+};
 
 const A: &str = "aa:bb:cc:dd:ee:01";
 const V6: &str = "fd00::10";
@@ -134,8 +136,6 @@ fn a_file_over_the_bound_is_a_read_failure() {
     );
     std::fs::write(&p, [0xff, 0xfe]).unwrap();
     assert!(read_bounded(&p, 10).is_none(), "not UTF-8");
-    // An endless file must stop at the bound instead of being read to the end.
-    assert!(read_bounded("/dev/zero".as_ref(), 4096).is_none());
     assert!(read_bounded(&p.with_extension("missing"), 10).is_none());
     let _ = std::fs::remove_file(&p);
 }
@@ -176,4 +176,53 @@ fn a_failed_re_read_drops_the_previously_known_addresses() {
     HEALTHY.store(false, Ordering::SeqCst);
     o.refresh(OWN_REFRESH_S);
     assert!(o.set().is_empty(), "nothing is own after a failed read");
+}
+
+/// Endless 'a' bytes; panics the moment more than `cap` bytes were ever served.
+struct Guarded {
+    served: usize,
+    cap: usize,
+}
+
+impl std::io::Read for Guarded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.served += buf.len();
+        assert!(
+            self.served <= self.cap,
+            "read past the bound: {} bytes",
+            self.served
+        );
+        buf.fill(b'a');
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn a_bounded_read_never_asks_the_source_for_more_than_limit_plus_one() {
+    let r = Guarded {
+        served: 0,
+        cap: 4096 + 1,
+    };
+    assert!(
+        read_bounded_from(r, 4096).is_none(),
+        "endless source: rejected, bounded"
+    );
+}
+
+#[test]
+fn a_source_of_exactly_the_limit_is_accepted_and_one_more_is_rejected() {
+    let at = [b'a'; 100];
+    let over = [b'a'; 101];
+    assert_eq!(read_bounded_from(&at[..], 100).map(|s| s.len()), Some(100));
+    assert!(read_bounded_from(&over[..], 100).is_none());
+}
+
+#[test]
+fn ipv4_mapped_ipv6_addresses_are_not_remembered_or_served() {
+    let mut m = IpMemory::default();
+    m.observe(&map(&[("::ffff:192.168.8.10", A), (V6, A)]), 100);
+    assert_eq!(m.len(), 1);
+    let got = m.overlay(&HashMap::new(), &none(), 101);
+    assert!(!got.contains_key("::ffff:192.168.8.10"));
+    assert!(got.contains_key(V6));
 }

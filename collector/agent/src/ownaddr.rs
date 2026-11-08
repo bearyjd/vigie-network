@@ -45,12 +45,13 @@ pub const IF_INET6_MAX: usize = 64 * 1024;
 
 /// The file as text, or `None` when it cannot be read, is not UTF-8, or exceeds `limit` bytes.
 pub fn read_bounded(path: &std::path::Path, limit: usize) -> Option<String> {
+    read_bounded_from(std::fs::File::open(path).ok()?, limit)
+}
+
+/// `read_bounded` over any reader; never requests more than `limit + 1` bytes from it.
+pub fn read_bounded_from(reader: impl Read, limit: usize) -> Option<String> {
     let mut buf = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(limit as u64 + 1)
-        .read_to_end(&mut buf)
-        .ok()?;
+    reader.take(limit as u64 + 1).read_to_end(&mut buf).ok()?;
     if buf.len() > limit {
         return None;
     }

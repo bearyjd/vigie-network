@@ -20,6 +20,12 @@ pub const IP_MEMORY_TTL_S: u64 = 2 * 3600;
 /// Hard bound on remembered pairings.
 pub const IP_MEMORY_CAP: usize = 4096;
 
+/// A genuine IPv6 address: IPv4-mapped forms (`::ffff:a.b.c.d`) are IPv4 in disguise.
+fn is_native_ipv6(ip: &str) -> bool {
+    ip.parse::<Ipv6Addr>()
+        .is_ok_and(|a| a.to_ipv4_mapped().is_none())
+}
+
 #[derive(Debug, Default)]
 pub struct IpMemory {
     /// ip -> (mac, monotonic second last seen in the table, store order)
@@ -32,10 +38,7 @@ impl IpMemory {
     pub fn observe(&mut self, current: &HashMap<String, String>, mono_s: u64) {
         self.entries
             .retain(|_, (_, seen, _)| mono_s.saturating_sub(*seen) <= IP_MEMORY_TTL_S);
-        for (ip, mac) in current
-            .iter()
-            .filter(|(ip, _)| ip.parse::<Ipv6Addr>().is_ok())
-        {
+        for (ip, mac) in current.iter().filter(|(ip, _)| is_native_ipv6(ip)) {
             self.seq += 1;
             self.entries
                 .insert(ip.clone(), (mac.clone(), mono_s, self.seq));
