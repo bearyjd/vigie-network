@@ -18,9 +18,14 @@ INFORMATIONAL_TRUNCATED_KEYS = frozenset({"ct_unmapped_bytes", "ct_unmapped_flow
 # Independent whole-second truncation of the collector's wall and monotonic clocks can overlap
 # consecutive 60 s windows by 1 s. Replays are already rejected by batch_id.
 OVERLAP_TOLERANCE_S = 2
-# The tolerance only covers the EDGE overlap of two normal windows. Shorter windows get none, so a
-# short window can never hide inside, or duplicate, another one.
-MIN_TOLERANT_WINDOW_S = 2 * OVERLAP_TOLERANCE_S
+# The tolerance only covers the EDGE overlap of two normal windows. The collector's nominal window
+# is 60 s; windows under 30 s get no tolerance. That bounds the counters that may be summed twice
+# for the shared sliver to 2 s of a >= 30 s window (about 6.7%) per boundary, and a short window
+# can never hide inside, or duplicate, another one (a 4 s window every 2 s used to double them).
+MIN_TOLERANT_WINDOW_S = 30
+# Second bound, independent of the constants above: the shared seconds are at most 1/10 of the
+# shorter window. Redundant today (2 s <= 30 s / 10) but it keeps the bound if either is changed.
+MAX_SHARED_FRACTION_INV = 10
 # A tolerated window has at most one neighbour on each edge; more intersecting rows disqualify.
 MAX_TOLERATED_NEIGHBOURS = 2
 HOUR_S = 3600
@@ -142,28 +147,40 @@ def read_measurements(
         end,
         row["received_at"],
         tuple(sorted(set(reasons))),
-        {mac: tuple(v) for mac, v in counters.items()},
+        {mac: (v[0], v[1], v[2], v[3]) for mac, v in counters.items()},
     )
 
 
 def _tolerated_overlap(start: int, end: int, neighbours: list) -> int | None:
-    """Seconds of the new window already covered by its neighbours, or None to disqualify.
+    """Seconds of the new window already credited to its neighbours, or None to disqualify.
 
     Tolerated only when every neighbour is an edge overlap (neither window contains the other)
-    of at most OVERLAP_TOLERANCE_S between two windows of at least MIN_TOLERANT_WINDOW_S. Counters
-    of that sliver may still be summed twice: at most 2 s of deltas per window boundary.
+    of at most OVERLAP_TOLERANCE_S, at most 1/MAX_SHARED_FRACTION_INV of the shorter window,
+    between two windows of at least MIN_TOLERANT_WINDOW_S. Counters of that sliver may still be
+    summed twice: at most 2 s of deltas (about 6.7% of a window) per window boundary.
+    Neighbours are (start, end, credited) rows; rows never credited (already flagged
+    overlapping_window) still count as overlaps but are not subtracted from the credit.
     """
     if not neighbours:
         return 0
     if len(neighbours) > MAX_TOLERATED_NEIGHBOURS or end - start < MIN_TOLERANT_WINDOW_S:
         return None
     covered = 0
-    for n_start, n_end in neighbours:
+    for n_start, n_end, credited in neighbours:
         shared = min(end, n_end) - max(start, n_start)
+        # Containment is redundant with the minimum-window rule (a nested overlap of at most
+        # OVERLAP_TOLERANCE_S needs a window shorter than MIN_TOLERANT_WINDOW_S); kept as defence
+        # in depth.
         nested = (n_start <= start and n_end >= end) or (start <= n_start and end >= n_end)
-        if shared > OVERLAP_TOLERANCE_S or nested or n_end - n_start < MIN_TOLERANT_WINDOW_S:
+        if (
+            shared > OVERLAP_TOLERANCE_S
+            or nested
+            or n_end - n_start < MIN_TOLERANT_WINDOW_S
+            or shared * MAX_SHARED_FRACTION_INV > min(end - start, n_end - n_start)
+        ):
             return None
-        covered += shared
+        if credited:
+            covered += shared
     return covered
 
 
@@ -175,19 +192,35 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
     ).fetchone():
         return
     reasons = list(m.reasons)
+    start, end = m.start, m.end
     hour = (
-        (m.end - 1) // 3600 * 3600
-        if m.start is not None and m.end is not None and m.end > m.start
-        else None
+        (end - 1) // 3600 * 3600 if start is not None and end is not None and end > start else None
     )
     already_covered = 0
-    if hour is not None and "cross_hour" not in reasons and "probe" not in reasons:
+    if (
+        start is not None
+        and end is not None
+        and hour is not None
+        and "cross_hour" not in reasons
+        and "probe" not in reasons
+    ):
         neighbours = inv.execute(
-            "SELECT window_start,window_end FROM measurement_batches WHERE collector_id=? "
-            "AND hour=? AND window_start<? AND window_end>? AND quality NOT LIKE ? LIMIT ?",
-            (m.collector, hour, m.end, m.start, "%probe%", MAX_TOLERATED_NEIGHBOURS + 1),
+            "SELECT window_start,window_end,quality FROM measurement_batches "
+            "WHERE collector_id=? AND hour=? AND window_start<? AND window_end>? "
+            "AND quality NOT LIKE ? AND quality NOT LIKE ? LIMIT ?",
+            (
+                m.collector,
+                hour,
+                end,
+                start,
+                "%probe%",
+                "%cross_hour%",
+                MAX_TOLERATED_NEIGHBOURS + 1,
+            ),
         ).fetchall()
-        shared = _tolerated_overlap(m.start, m.end, neighbours)
+        shared = _tolerated_overlap(
+            start, end, [(n[0], n[1], "overlapping_window" not in n[2]) for n in neighbours]
+        )
         if shared is None:
             reasons.append("overlapping_window")
         else:
@@ -211,9 +244,20 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         "INSERT INTO measurement_batches VALUES (?,?,?,?,?,?,?)",
         (m.collector, m.batch_id, m.start, m.end, m.received, hour, json.dumps(reasons)),
     )
-    if hour is None or any(
-        reason in reasons
-        for reason in ("probe", "cross_hour", "empty_window", "legacy_window", "overlapping_window")
+    if (
+        hour is None
+        or start is None
+        or end is None
+        or any(
+            reason in reasons
+            for reason in (
+                "probe",
+                "cross_hour",
+                "empty_window",
+                "legacy_window",
+                "overlapping_window",
+            )
+        )
     ):
         return
     bounded = {}
@@ -228,7 +272,7 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
             reasons.append("counter_overflow")
         bounded[mac] = tuple(min(MAX_VALUE, value) for value in values)
     # Credit only seconds not already covered by a prior batch, so a chain's total is its union.
-    duration = max(0, m.end - m.start - already_covered)
+    duration = max(0, end - start - already_covered)
     qualified = duration if not reasons else 0
     old = inv.execute(
         "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?", (m.collector, hour)

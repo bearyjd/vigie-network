@@ -59,13 +59,16 @@ keep their stored `flow_degraded` reason and stay disqualified; they are not rec
 A distinct overlapping batch degrades the existing hour without adding its bytes or duration,
 unless it is a tolerated edge overlap. Independent whole-second truncation of the collector's wall
 and monotonic clocks can overlap consecutive 60 s windows by 1 s, so an overlap is tolerated only
-when it is at most 2 s (`OVERLAP_TOLERANCE_S`), neither window contains the other, and both
-windows are at least 4 s long (`MIN_TOLERANT_WINDOW_S`). Anything else disqualifies: overlaps over
-2 s, nested or duplicate windows under a new batch id (including 2 s duplicates), very short
-windows, and a window intersecting more than two others. A tolerated batch is credited only for
-the seconds no earlier batch already covered, so a chain of windows adds up to its union, never
-its sum, and an hour's observed and qualified seconds are capped at 3600. Counters of the tolerated
-sliver may be counted twice, bounded by at most 2 s of deltas per window boundary. An identical
+when it is at most 2 s (`OVERLAP_TOLERANCE_S`), at most a tenth of the shorter window, neither
+window contains the other, and both windows are at least 30 s long (`MIN_TOLERANT_WINDOW_S`; the
+collector's nominal window is 60 s). Windows shorter than 30 s get no tolerance at all. Anything
+else disqualifies: overlaps over 2 s, nested or duplicate windows under a new batch id, short
+windows, and a window intersecting more than two others. Batches that never contribute coverage
+(clock probes and windows crossing an hour boundary) are not neighbours. A tolerated batch is
+credited only for the seconds no earlier credited batch already covered, so a chain of windows
+adds up to its union, never its sum, and an hour's observed and qualified seconds are capped at
+3600. Counters of the tolerated sliver may be counted twice, bounded by at most 2 s of deltas
+(about 6.7% of a 30 s window, 3.3% of a 60 s one) per window boundary. An identical
 receipt replay does neither (it is rejected by `batch_id`). Hours already marked
 `overlapping_window` stay disqualified. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.

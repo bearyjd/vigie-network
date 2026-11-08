@@ -6,6 +6,7 @@ truncated independently, so start_n can be 1 s before end_{n-1}. See collector/a
 
 import json
 
+from vigie_pipeline import measurements
 from vigie_pipeline.measurements import Measurements, apply_measurements
 from vigie_pipeline.schema import open_pipeline_inventory
 
@@ -115,7 +116,7 @@ def test_duplicate_two_second_window_with_new_batch_id_disqualifies(tmp_path):
 
 
 def test_short_windows_get_no_tolerance(tmp_path):
-    # both windows are below MIN_TOLERANT_WINDOW_S (4 s): 3 s windows shifted by 1 s
+    # both windows are below MIN_TOLERANT_WINDOW_S (30 s): 3 s windows shifted by 1 s
     _, _, reasons = _hour_coverage(tmp_path, _abs([(0, 3), (1, 4)]))
     assert "overlapping_window" in reasons
 
@@ -148,10 +149,66 @@ def test_observed_and_qualified_are_clamped_to_one_hour(tmp_path):
     assert (observed, qualified) == (3600, 3600)
 
 
-def test_four_second_windows_edge_overlap_is_tolerated(tmp_path):
-    observed, _, reasons = _hour_coverage(tmp_path, _abs([(0, 4), (2, 6)]))
+def test_thirty_second_windows_edge_overlap_is_tolerated(tmp_path):
+    observed, _, reasons = _hour_coverage(tmp_path, _abs([(0, 30), (28, 58)]))
     assert "overlapping_window" not in reasons
-    assert observed == 6
+    assert observed == 58
+
+
+def test_twenty_nine_second_window_gets_no_tolerance(tmp_path):
+    _, _, reasons = _hour_coverage(tmp_path, _abs([(0, 29), (27, 56)]))
+    assert "overlapping_window" in reasons
+
+
+def test_twenty_nine_second_new_window_next_to_a_long_one_gets_no_tolerance(tmp_path):
+    _, _, reasons = _hour_coverage(tmp_path, _abs([(0, 60), (58, 87)]))
+    assert "overlapping_window" in reasons
+
+
+def test_chain_of_short_windows_cannot_double_the_counters(tmp_path):
+    # Opus's repro: 4 s windows every 2 s used to qualify with ~2x the real bytes
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    for n in range(100):
+        apply_measurements(
+            inv,
+            Measurements(
+                "c1", f"b{n}", HOUR + 2 * n, HOUR + 2 * n + 4, "t", (), {MAC: (4, 0, 1, 0)}
+            ),
+        )
+    _, qualified, reasons = _coverage(inv)
+    (bytes_up,) = inv.execute("SELECT bytes_up FROM measurements_hourly").fetchone()
+    inv.close()
+    assert "overlapping_window" in reasons
+    assert qualified == 0
+    assert bytes_up <= 4 * 1.1 * 100 / 2  # real traffic is 202 s * 1 B/s; never ~2x
+
+
+def test_ratio_bound_caps_the_shared_share_of_either_window(monkeypatch, tmp_path):
+    # with a wider tolerance the 10% ratio is what limits it: 30 s window, 3 s ok, 4 s not
+    monkeypatch.setattr(measurements, "OVERLAP_TOLERANCE_S", 5)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _, _, ok = _hour_coverage(tmp_path / "a", _abs([(0, 60), (57, 87)]))
+    _, _, bad = _hour_coverage(tmp_path / "b", _abs([(0, 60), (56, 86)]))
+    assert "overlapping_window" not in ok
+    assert "overlapping_window" in bad
+
+
+def test_cross_hour_neighbour_does_not_change_eligibility(tmp_path):
+    def run(order):
+        inv = open_pipeline_inventory(tmp_path / f"{order}.db", migrate=True)
+        cross = Measurements("c1", "x", HOUR - 59, HOUR + 1, "t", ("cross_hour",), {})
+        wins = [
+            Measurements("c1", f"w{n}", HOUR + 60 * n, HOUR + 60 * (n + 1), "t", (), {})
+            for n in range(57)
+        ]
+        for item in [cross, *wins] if order == "cross-first" else [*wins, cross]:
+            apply_measurements(inv, item)
+        result = _coverage(inv)
+        inv.close()
+        return result
+
+    assert run("cross-first") == run("cross-last") == (3420, 3420, [])
 
 
 def test_three_chained_windows_credit_the_union_not_the_sum(tmp_path):
@@ -186,7 +243,15 @@ def test_overlap_with_two_prior_neighbours_subtracts_both(tmp_path):
     assert observed == qualified == 300
 
 
-def test_four_second_middle_window_overlapped_on_both_sides(tmp_path):
-    observed, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 100), (98, 102), (100, 200)]))
+def test_thirty_second_middle_window_overlapped_on_both_sides(tmp_path):
+    observed, qualified, reasons = _hour_coverage(tmp_path, _abs([(0, 100), (98, 128), (126, 200)]))
     assert reasons == []
     assert observed == qualified == 200
+
+
+def test_disqualified_neighbour_is_never_subtracted_from_credit(tmp_path):
+    # B overlaps A by 10 s (disqualified, never credited). C overlaps only B, by 2 s: B adds no
+    # coverage, so C is credited in full (112 s), not 110.
+    observed, _, reasons = _hour_coverage(tmp_path, _abs([(0, 100), (90, 190), (188, 300)]))
+    assert "overlapping_window" in reasons
+    assert observed == 100 + 112
