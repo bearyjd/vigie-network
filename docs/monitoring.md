@@ -87,8 +87,8 @@ while the informational set is an exact, case-sensitive match: an upper-cased in
 not informational. Every other nonzero `ct_*`/`conntrack*` key, including any future one, still
 degrades the hour, as do `source_flags` (other than bit 8 alone) and `dropped_batches`. A non-zero
 `truncated_other` always degrades: the collector only produces it when more than 16 counters were
-non-zero (severe degradation). It folds `ct_unmapped_flows` first, then the smallest counters (the
-`ct_lan_*` pair is kept ahead of them), so it can hide `ct_errors`, `ct_dropped_keys` or
+non-zero (severe degradation). It folds `ct_unmapped_flows` first, then the smallest counters (a collector
+that emits the `ct_lan_*` pair keeps it ahead of the others when it folds), so it can hide `ct_errors`, `ct_dropped_keys` or
 `conntrack_lost`. Unmapped conntrack stays visible in the API collector summary
 (`ct_unmapped_*_in_retained_detail` and `ct_lan_unmapped_*_in_retained_detail`) and in the soak
 note (`unmapped_conntrack`, `lan_unmapped_conntrack`). Hours ingested before this change
