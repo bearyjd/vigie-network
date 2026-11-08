@@ -52,21 +52,46 @@ different things: `ct_unmapped_*` is only expected exclusions (the global remain
 router's own addresses, present in every batch on a normal LAN), while `ct_lan_unmapped_*` is
 LAN-prefix sources that have no MAC, a genuine attribution failure (unattributed traffic of known
 devices would otherwise look like a quiet hour). `ct_lan_unmapped_bytes` is governed by a
-threshold, not presence: it degrades the hour only when it is above `LAN_UNMAPPED_MIN_BYTES`
+threshold, not presence: the hour is disqualified only when it is above `LAN_UNMAPPED_MIN_BYTES`
 (262144, 256 KiB per window, so a few KB cannot disqualify a quiet hour) AND above
 `LAN_UNMAPPED_MAX_SHARE_PCT` (5) percent of `mapped_bytes + ct_lan_unmapped_bytes`, where
 `mapped_bytes` is the up + down bytes the batch attributes to MACs. Exactly at either bound
 qualifies. A read-only router snapshot showed unmapped-but-LAN traffic at about 0.02% of bytes,
-so 5% leaves a 250x margin; both numbers are policy to be tuned on real data. The rule fails
-closed: a missing-valued, non-integer, boolean or negative `ct_lan_unmapped_bytes`, or per-MAC
-totals that cannot be computed (counter overflow), degrade the hour. A batch from an older
-collector without `ct_lan_*` keys behaves as before. Every other nonzero `ct_*`/`conntrack*` key,
-including any future one, still degrades the hour, as do `source_flags` (other than bit 8 alone)
-and `dropped_batches`. A non-zero `truncated_other` always degrades: the collector only produces it
-when more than 16 counters were non-zero (severe degradation), and it folds the informational keys
-in first, so it can hide `ct_errors`, `ct_dropped_keys` or `conntrack_lost`. Unmapped conntrack
-stays visible in the API collector summary (`ct_unmapped_*_in_retained_detail` and
-`ct_lan_unmapped_*_in_retained_detail`) and in the soak note. Hours ingested before this change
+so 5% leaves a 250x margin; both numbers are policy to be tuned on real data.
+
+A threshold trip is recorded under its own reason, `lan_unmapped_share`, instead of
+`flow_degraded`, so an operator can tell attribution trouble from a collector fault. It
+disqualifies the hour exactly like any other reason (qualified seconds 0; the API reports the hour
+as `partial` with that reason; the monitoring engine does not use the hour as a sample). If a
+collector fault is also present the hour lists both reasons, sorted. A malformed, non-integer,
+boolean or negative `ct_lan_unmapped_bytes`, or per-MAC totals that cannot be computed (counter
+overflow), is a data fault and stays `flow_degraded`. A batch from an older collector without
+`ct_lan_*` keys behaves as before.
+
+Limits of this gate, stated plainly:
+
+- The floor and the share are PER WINDOW, not per hour. Up to about 15 MiB per hour of
+  unattributed traffic (256 KiB in each of roughly 60 windows) can pass while the hour qualifies.
+- The denominator is collector-wide. Busy mapped traffic from other hosts dilutes the share of one
+  host's unattributed traffic, and no per-device gate is possible because unattributed traffic has
+  no device.
+- Therefore this gate protects baseline quality; it is not a detector and must not be read as
+  one.
+- A LAN host sourcing unattributed traffic above both the floor and the share can deny baselines
+  for the whole collector. Operators see it as the `lan_unmapped_share` reason and in
+  `ct_lan_unmapped_bytes_in_retained_detail` / `ct_lan_unmapped_flows_in_retained_detail` in the
+  API collector summary.
+
+The generic loss rule matches the `ct_` and `conntrack` prefixes case-insensitively (fail closed),
+while the informational set is an exact, case-sensitive match: an upper-cased informational key is
+not informational. Every other nonzero `ct_*`/`conntrack*` key, including any future one, still
+degrades the hour, as do `source_flags` (other than bit 8 alone) and `dropped_batches`. A non-zero
+`truncated_other` always degrades: the collector only produces it when more than 16 counters were
+non-zero (severe degradation). It folds `ct_unmapped_flows` first, then the smallest counters (the
+`ct_lan_*` pair is kept ahead of them), so it can hide `ct_errors`, `ct_dropped_keys` or
+`conntrack_lost`. Unmapped conntrack stays visible in the API collector summary
+(`ct_unmapped_*_in_retained_detail` and `ct_lan_unmapped_*_in_retained_detail`) and in the soak
+note (`unmapped_conntrack`, `lan_unmapped_conntrack`). Hours ingested before this change
 keep their stored `flow_degraded` reason and stay disqualified; they are not recomputed.
 
 A distinct overlapping batch degrades the existing hour without adding its bytes or duration,

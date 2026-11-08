@@ -71,7 +71,7 @@ def test_exactly_at_floor_qualifies_even_when_share_is_huge(tmp_path):
 
 def test_one_byte_above_floor_with_huge_share_degrades(tmp_path):
     qualified, reasons = _lan(tmp_path, {"ct_lan_unmapped_bytes": FLOOR + 1}, up=5, down=5)
-    assert "flow_degraded" in reasons
+    assert reasons == ["lan_unmapped_share"]
     assert qualified == 0
 
 
@@ -89,14 +89,28 @@ def test_exactly_five_percent_of_total_qualifies(tmp_path):
 def test_one_byte_over_five_percent_degrades(tmp_path):
     truncated = {"ct_lan_unmapped_bytes": 1_000_001}
     qualified, reasons = _lan(tmp_path, truncated, up=9_500_000, down=9_500_000)
-    assert "flow_degraded" in reasons
+    assert reasons == ["lan_unmapped_share"]
     assert qualified == 0
 
 
 def test_above_both_thresholds_degrades(tmp_path):
     qualified, reasons = _lan(tmp_path, {"ct_lan_unmapped_bytes": 500_000})
-    assert "flow_degraded" in reasons
+    assert reasons == ["lan_unmapped_share"]
     assert qualified == 0
+
+
+def test_threshold_trip_beside_a_collector_fault_lists_both_reasons_sorted(tmp_path):
+    truncated = {"ct_lan_unmapped_bytes": 500_000, "ct_errors": 1}
+    qualified, reasons = _lan(tmp_path, truncated)
+    assert reasons == ["flow_degraded", "lan_unmapped_share"]
+    assert qualified == 0
+
+
+def test_a_fault_alone_is_still_flow_degraded_only(tmp_path):
+    assert _lan(tmp_path, {"ct_lan_unmapped_bytes": 1_000, "ct_errors": 1}) == (
+        0,
+        ["flow_degraded"],
+    )
 
 
 def test_mapped_bytes_is_up_plus_down(tmp_path):
@@ -149,7 +163,7 @@ def _reasons(tmp_path, truncated):
 
 @pytest.mark.parametrize("bad", ["12", 1.5, -1, True, None, [1], {"a": 1}])
 def test_garbage_or_negative_lan_bytes_degrade(tmp_path, bad):
-    assert "flow_degraded" in _reasons(tmp_path, {"ct_lan_unmapped_bytes": bad})
+    assert _reasons(tmp_path, {"ct_lan_unmapped_bytes": bad}) == ("flow_degraded",)
 
 
 def test_zero_lan_bytes_qualifies(tmp_path):
@@ -159,5 +173,44 @@ def test_zero_lan_bytes_qualifies(tmp_path):
 def test_lan_bytes_with_uncomputable_totals_degrade(tmp_path, monkeypatch):
     monkeypatch.setattr(measurements, "MAX_VALUE", 100)  # per-MAC totals saturate
     reasons = _reasons(tmp_path, {"ct_lan_unmapped_bytes": 1})
-    assert "flow_degraded" in reasons
-    assert "counter_overflow" in reasons
+    assert reasons == ("counter_overflow", "flow_degraded")
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["CT_ERRORS", "Ct_errors", "CONNTRACK_LOST", "Conntrack_lost", "CT_UNMAPPED_BYTES"],
+)
+def test_loss_key_prefix_match_is_case_insensitive(tmp_path, key):
+    assert _reasons(tmp_path, {key: 1}) == ("flow_degraded",)
+
+
+@pytest.mark.parametrize(
+    "key", ["CT_LAN_UNMAPPED_FLOWS", "Ct_Unmapped_Flows", "CT_LAN_UNMAPPED_BYTES"]
+)
+def test_informational_set_stays_exact_match_for_upper_case(tmp_path, key):
+    assert _reasons(tmp_path, {key: 1}) == ("flow_degraded",)
+
+
+def test_lower_case_informational_keys_still_do_not_degrade(tmp_path):
+    assert _reasons(tmp_path, {**INFO, "ct_lan_unmapped_flows": 5}) == ()
+
+
+def test_engine_treats_an_hour_with_the_new_reason_as_ineligible(tmp_path):
+    from types import SimpleNamespace
+
+    from test_monitoring_engine import MAC as ENGINE_MAC
+    from test_monitoring_engine import hour, seeded
+
+    from vigie_pipeline.monitoring_engine import samples_for
+
+    inv, ov = seeded(tmp_path)
+    try:
+        hour(inv, HOUR, 1000)
+        identity = SimpleNamespace(macs=[ENGINE_MAC], device_id="d1", key="k")
+        now = HOUR + 7200
+        assert samples_for(inv, "c1", identity, now)[0].eligible is True
+        inv.execute("UPDATE coverage_hourly SET reasons=?", ('["lan_unmapped_share"]',))
+        assert samples_for(inv, "c1", identity, now)[0].eligible is False
+    finally:
+        inv.close()
+        ov.close()

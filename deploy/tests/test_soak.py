@@ -170,6 +170,21 @@ class SoakTests(unittest.TestCase):
         values[-1]["ct_unmapped_flows"] = 5
         self.assertIn("unmapped_conntrack", soak.assess(values)["quality_notes"])
 
+    def test_lan_unmapped_conntrack_is_a_note_not_a_verdict_change(self):
+        baseline = soak.assess(full())
+        for key in ("ct_lan_unmapped_flows", "ct_lan_unmapped_bytes"):
+            with self.subTest(key=key):
+                values = full()
+                values[-1][key] = 5
+                result = soak.assess(values)
+                self.assertIn("lan_unmapped_conntrack", result["quality_notes"])
+                self.assertNotIn("unmapped_conntrack", result["quality_notes"])
+                self.assertEqual(result["status"], baseline["status"])
+        values = full()
+        values[-1]["ct_lan_unmapped_flows"] = 0
+        values[-1]["ct_lan_unmapped_bytes"] = None
+        self.assertNotIn("lan_unmapped_conntrack", soak.assess(values)["quality_notes"])
+
     def test_invalid_numbers_fail_closed(self):
         for value in [float("nan"), float("inf"), True, -1]:
             self.assertEqual(

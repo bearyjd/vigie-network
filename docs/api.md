@@ -325,7 +325,9 @@ summary. It is `null` when the parameter is absent or when SQLite reports any op
 `ct_unmapped_bytes_in_retained_detail`, `ct_unmapped_flows_in_retained_detail` and the LAN pair
 `ct_lan_unmapped_bytes_in_retained_detail` / `ct_lan_unmapped_flows_in_retained_detail` (LAN-prefix
 sources with no MAC, see `docs/monitoring.md`) are summed in SQL over every retained batch of the
-collector, not just the newest 10000, so `summary_capped` does not limit them. Non-integer or malformed `truncated` values count as 0. `ct_unmapped_exact` is `true`
-when those four sums are this uncapped total; it is `false` (all four sums `0`) if SQLite reports an
-operational error such as integer overflow. A caller must treat `false`, or an absent field from an
-older server, as unknown.
+collector, not just the newest 10000, so `summary_capped` does not limit them. Non-integer or
+malformed `truncated` values count as 0. `ct_unmapped_exact` is `true` when those four sums are
+this uncapped total; it is `false` (all four sums `0`) if SQLite reports an operational error such
+as integer overflow. A caller must treat `false`, or an absent field from an older server, as
+unknown. Coverage hour `reasons` is a free list of strings; `lan_unmapped_share` marks an hour
+disqualified by the LAN-unmapped threshold (`docs/monitoring.md`).

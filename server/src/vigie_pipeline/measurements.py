@@ -22,7 +22,10 @@ INFORMATIONAL_TRUNCATED_KEYS = frozenset(
 # ct_lan_unmapped_bytes (LAN-prefix sources with no MAC: a genuine attribution failure) is governed
 # by a threshold instead of presence. It is handled separately and must not hit the generic rule.
 LAN_UNMAPPED_BYTES_KEY = "ct_lan_unmapped_bytes"
-# The hour degrades (flow_degraded) only when BOTH hold; at or below either bound it qualifies.
+# Distinct reason for the threshold trip (attribution trouble), not a collector fault.
+LAN_UNMAPPED_REASON = "lan_unmapped_share"
+# The hour is disqualified (`lan_unmapped_share`) only when BOTH hold; at or below either bound
+# it qualifies. Both numbers are PER WINDOW and the share is collector-wide: see docs/monitoring.md.
 # Floor per window: a quiet hour must not be disqualified by a few KB of unattributed traffic.
 LAN_UNMAPPED_MIN_BYTES = 262144  # 256 KiB
 # Share of all conntrack bytes (mapped + LAN-unmapped). A read-only router snapshot showed
@@ -63,14 +66,21 @@ class Measurements:
     counters: dict[str, tuple[int, int, int, int]]
 
 
-def _lan_unmapped_degrades(value: object, counters: dict, overflowed: bool) -> bool:
-    """True when ct_lan_unmapped_bytes must degrade the hour. Fails closed on any doubt."""
+def _lan_unmapped_reason(value: object, counters: dict, overflowed: bool) -> str | None:
+    """Reason ct_lan_unmapped_bytes degrades the hour, or None. Fails closed on any doubt.
+
+    A malformed value or uncomputable totals is a data fault (`flow_degraded`); only the policy
+    threshold itself reports the distinct `lan_unmapped_share`, so operators can tell
+    attribution trouble from a collector fault.
+    """
     if isinstance(value, bool) or not isinstance(value, int) or value < 0 or overflowed:
-        return True
+        return "flow_degraded"
     if value <= LAN_UNMAPPED_MIN_BYTES:
-        return False
+        return None
     mapped = sum(v[0] + v[1] for v in counters.values())
-    return value * 100 > LAN_UNMAPPED_MAX_SHARE_PCT * (mapped + value)
+    if value * 100 > LAN_UNMAPPED_MAX_SHARE_PCT * (mapped + value):
+        return LAN_UNMAPPED_REASON
+    return None
 
 
 def read_measurements(
@@ -107,7 +117,7 @@ def read_measurements(
                     key != "source_flags"
                     and key not in INFORMATIONAL_TRUNCATED_KEYS
                     and key != LAN_UNMAPPED_BYTES_KEY
-                    and (key.startswith("ct_") or key.startswith("conntrack"))
+                    and key.lower().startswith(("ct_", "conntrack"))
                 )
             )
         ):
@@ -166,10 +176,12 @@ def read_measurements(
             mac = normalize_mac(mac)
             if mac is not None:
                 counters.setdefault(mac, [0, 0, 0, 0])[3] += 1
-        if LAN_UNMAPPED_BYTES_KEY in truncated and _lan_unmapped_degrades(
-            truncated[LAN_UNMAPPED_BYTES_KEY], counters, "counter_overflow" in reasons
-        ):
-            reasons.append("flow_degraded")
+        if LAN_UNMAPPED_BYTES_KEY in truncated:
+            lan_reason = _lan_unmapped_reason(
+                truncated[LAN_UNMAPPED_BYTES_KEY], counters, "counter_overflow" in reasons
+            )
+            if lan_reason is not None:
+                reasons.append(lan_reason)
     return Measurements(
         collector,
         batch_id,

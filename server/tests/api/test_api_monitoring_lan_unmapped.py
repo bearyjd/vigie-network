@@ -3,7 +3,7 @@
 import json
 
 from api_helpers import Env, env  # noqa: F401
-from test_api_monitoring import _ct_collector, _ct_rows, seed
+from test_api_monitoring import HOUR, _ct_collector, _ct_rows, seed
 
 
 def test_ct_lan_unmapped_sums_are_separate_from_the_legacy_pair(env: Env):
@@ -67,3 +67,13 @@ def test_ct_lan_unmapped_does_not_leak_across_collectors(env: Env):
         "VALUES ('c2','x','2026-01-01T00:00:02Z','{\"ct_lan_unmapped_bytes\":1000}')"
     )
     assert _ct_collector(env)["ct_lan_unmapped_bytes_in_retained_detail"] == 5
+
+
+def test_hour_with_lan_unmapped_share_reason_is_not_eligible(env: Env):
+    seed(env)
+    query = {"collector_id": "c1", "from_hour": HOUR, "to_hour": HOUR + 3600}
+    assert env.get("/coverage", **query).json()["data"]["hours"][0]["state"] == "eligible"
+    env.inv.execute("UPDATE coverage_hourly SET reasons=?", ('["lan_unmapped_share"]',))
+    hour = env.get("/coverage", **query).json()["data"]["hours"][0]
+    assert hour["state"] == "partial"
+    assert hour["reasons"] == ["lan_unmapped_share"]
