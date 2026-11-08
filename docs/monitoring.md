@@ -45,8 +45,32 @@ and DNS clock slack; persisted expected DNS-row counts detect a retired query-da
 raw data degrades coverage and makes API counters null rather than asserting zero.
 
 Qualification requires at least3420 observed qualified seconds (95%) and no quality reasons.
-Missing health, CT source gaps/unmapped/truncation, dropped batches and counter overflow disqualify
-the hour. A distinct overlapping batch also degrades the existing hour without adding its bytes or duration; an identical receipt replay does neither. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
+Missing health, CT source gaps/truncation, dropped batches and counter overflow disqualify
+the hour (`flow_degraded`). The only informational truncation keys are `ct_unmapped_bytes` and
+`ct_unmapped_flows` (unattributed traffic, present in every batch on a normal LAN); they never
+degrade coverage. The rule fails closed: every other nonzero `ct_*`/`conntrack*` key, including
+any future one, still degrades the hour, as do `source_flags` (other than bit 8 alone) and
+`dropped_batches`. A non-zero `truncated_other` always degrades: the collector only produces it
+when more than 16 counters were non-zero (severe degradation), and it folds the informational pair
+in first, so it can hide `ct_errors`, `ct_dropped_keys` or `conntrack_lost`. Unmapped conntrack stays visible in the API collector summary
+(`ct_unmapped_*_in_retained_detail`) and in the soak note. Hours ingested before this change
+keep their stored `flow_degraded` reason and stay disqualified; they are not recomputed.
+
+A distinct overlapping batch degrades the existing hour without adding its bytes or duration,
+unless it is a tolerated edge overlap. Independent whole-second truncation of the collector's wall
+and monotonic clocks can overlap consecutive 60 s windows by 1 s, so an overlap is tolerated only
+when it is at most 2 s (`OVERLAP_TOLERANCE_S`), at most a tenth of the shorter window, neither
+window contains the other, and both windows are at least 30 s long (`MIN_TOLERANT_WINDOW_S`; the
+collector's nominal window is 60 s). Windows shorter than 30 s get no tolerance at all. Anything
+else disqualifies: overlaps over 2 s, nested or duplicate windows under a new batch id, short
+windows, and a window intersecting more than two others. Batches that never contribute coverage
+(clock probes and windows crossing an hour boundary) are not neighbours. A tolerated batch is
+credited only for the seconds no earlier credited batch already covered, so a chain of windows
+adds up to its union, never its sum, and an hour's observed and qualified seconds are capped at
+3600. Counters of the tolerated sliver may be counted twice, bounded by at most 2 s of deltas
+(about 6.7% of a 30 s window, 3.3% of a 60 s one) per window boundary. An identical
+receipt replay does neither (it is rejected by `batch_id`). Hours already marked
+`overlapping_window` stay disqualified. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.
 
 Each stored per-MAC hourly counter saturates at `(2**63-1)//64`; saturation marks the entire hour
