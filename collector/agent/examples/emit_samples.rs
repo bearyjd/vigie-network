@@ -195,6 +195,8 @@ fn main() {
         "ct_recounted",
         "ct_dropped_keys",
         "ct_unmapped_bytes",
+        "ct_lan_unmapped_bytes",
+        "ct_lan_unmapped_flows",
         "mcast_unmapped",
         "mcast_dropped",
     ]

@@ -20,8 +20,10 @@ use crate::config::Config;
 use crate::ctfold::CtAccum;
 use crate::ctparse::Snapshot;
 use crate::ctsock::{trusted_uids, CtConfig, CtReader, CtShared};
+use crate::ipmemory::IpMemory;
 use crate::mcast::{McConfig, McMsg, McReader, McShared, Pkt};
 use crate::model::Neighbor;
+use crate::ownaddr::{read_local, OwnAddrs};
 use crate::sightings::{from_mdns, from_ssdp};
 use crate::window::Window;
 
@@ -94,6 +96,10 @@ pub struct Sources {
     ct: Option<CtSide>,
     mc: Option<McSide>,
     acc: CtAccum,
+    /// Last-known IP -> MAC pairings, for flows that outlive their neighbor entry.
+    memory: IpMemory,
+    /// The router's own addresses (expected unmapped sources).
+    own: OwnAddrs,
     /// `flag::CT_TABLE_PRESSURE`/`CT_ACCT_OFF` seen in this window.
     window_flags: u64,
     ct_last_mono: u64,
@@ -143,6 +149,7 @@ impl Sources {
     pub fn start(cfg: &Config, mono_s: u64) -> Self {
         let mut s = Self {
             ct_last_mono: mono_s,
+            own: OwnAddrs::new(cfg.lan_addr, read_local),
             ..Self::default()
         };
         let ct = trusted_uids()
@@ -168,6 +175,12 @@ impl Sources {
             }
         }
         s
+    }
+
+    /// Replaces the router-address source (tests inject a fake reader).
+    pub fn with_own_addrs(mut self, own: OwnAddrs) -> Self {
+        self.own = own;
+        self
     }
 
     /// Records that the agent read the neighbor table at `mono_s`.
@@ -211,7 +224,11 @@ impl Sources {
                 }
                 let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
                 self.ct_last_mono = mono_s;
-                self.acc.add_snapshot(&snap, map);
+                self.own.refresh(mono_s);
+                self.memory.observe(map, mono_s);
+                let attributed = self.memory.overlay(map, mono_s);
+                self.acc
+                    .add_snapshot_with_own(&snap, &attributed, self.own.set());
                 if snap.table_pressure {
                     self.window_flags |= flag::CT_TABLE_PRESSURE;
                 }
@@ -270,6 +287,7 @@ impl Sources {
     /// batch is built (after a final `pump`). Resets the per-window state.
     pub fn finish_window(&mut self, w: &mut Window, mono_s: u64) {
         let (rows, unmapped_bytes, unmapped_flows) = self.acc.take();
+        let (lan_bytes, lan_flows) = self.acc.take_lan_unmapped();
         for r in rows {
             w.add_conntrack(r);
         }
@@ -287,6 +305,8 @@ impl Sources {
             ("ct_dropped_keys", std::mem::take(&mut self.ct_dropped_keys)),
             ("ct_unmapped_bytes", unmapped_bytes),
             ("ct_unmapped_flows", unmapped_flows),
+            ("ct_lan_unmapped_bytes", lan_bytes),
+            ("ct_lan_unmapped_flows", lan_flows),
             ("mcast_unmapped", std::mem::take(&mut self.mc_unmapped)),
             ("mcast_dropped", std::mem::take(&mut self.mc_dropped)),
         ];

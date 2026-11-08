@@ -49,6 +49,29 @@ Missing health, CT source gaps/unmapped/truncation, dropped batches and counter 
 the hour. A distinct overlapping batch also degrades the existing hour without adding its bytes or duration; an identical receipt replay does neither. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.
 
+### Collector window and attribution behaviour
+
+- **Window continuity.** The collector remembers the previous window's end and starts the next
+  window exactly there (`start_n == end_{n-1}`), so consecutive windows neither overlap nor leave
+  a gap. When the remembered end disagrees with the monotonic clock by more than 2 s (first
+  window, a held flush, a wall-clock jump) it falls back to monotonic arithmetic, never longer
+  than 24 h. A spooled or retried batch keeps its original window.
+- **Sticky IP to MAC.** A conntrack source whose neighbor entry expired while its flow lives on
+  is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since the
+  neighbor table last held the address). A current table entry always wins, so a reassigned
+  address is billed to its new owner; nothing is attributed from memory after the 2 h.
+- **Split unmapped counters.** `ct_unmapped_bytes` / `ct_unmapped_flows` count only EXPECTED
+  exclusions: the helper's global remainder and the router's own addresses (read from
+  `/proc/net/fib_trie`, `/proc/net/if_inet6` and the configured LAN address, every 5 minutes; a
+  read failure treats nothing as own). `ct_lan_unmapped_bytes` / `ct_lan_unmapped_flows` count
+  any other source still without a MAC, a genuine attribution failure. Collectors that predate
+  the new pair send everything in the legacy pair. When the `truncated` map exceeds 16 keys the
+  `ct_lan_unmapped_*` pair is kept ahead of all other counts and `ct_unmapped_flows` is merged first.
+
+Deployment order: the server must learn a share-of-bytes threshold for `ct_lan_unmapped_*`
+before this collector is deployed; until then any hour with a non-zero `ct_lan_unmapped_*` count
+degrades under the fail-closed unmapped rule above.
+
 Each stored per-MAC hourly counter saturates at `(2**63-1)//64`; saturation marks the entire hour
 `counter_overflow`. At most64 MACs may contribute to one identity, so SQLite sums remain integer
 and cannot overflow. Values remain capped displays, not training samples. Identity components

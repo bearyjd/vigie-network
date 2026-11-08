@@ -129,12 +129,16 @@ fn snapshot_rows_and_flags_reach_the_batch_per_mac() {
     assert_eq!(t["ct_recounted"], 7);
     assert_eq!(t["ct_dropped_keys"], 9);
     assert_eq!(
-        t["ct_unmapped_bytes"], 10,
+        t["ct_lan_unmapped_bytes"], 10,
         "the unmapped host's bytes are counted, not lost"
     );
     assert_eq!(
-        t["ct_unmapped_flows"], 1,
+        t["ct_lan_unmapped_flows"], 1,
         "and so are its flows (summed over the window's samples)"
+    );
+    assert!(
+        t.get("ct_unmapped_bytes").is_none(),
+        "not an expected exclusion"
     );
     assert!(j["truncated"].as_object().unwrap().len() <= 16);
 }
