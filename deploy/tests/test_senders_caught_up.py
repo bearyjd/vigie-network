@@ -326,6 +326,19 @@ def test_help_never_exits_0(capsys, flag) -> None:
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize("empty_flag", ["--ntfy-config", "--ha-config"])
+def test_empty_flag_value_is_an_error_not_skipped(tmp_path, capsys, empty_flag) -> None:
+    caught_up = make_sender(tmp_path, "other", len(DELIVERY))
+    other_flag = "--ha-config" if empty_flag == "--ntfy-config" else "--ntfy-config"
+    code, out, _ = run(capsys, empty_flag, "", other_flag, str(caught_up))
+    assert code == 2 and "caught_up" in out  # the named other sender is still reported
+
+
+def test_only_an_empty_flag_value_exits_2(capsys) -> None:
+    code, out, _ = run(capsys, "--ha-config", "")
+    assert code == 2 and out == ""
+
+
 def test_no_config_message_is_shown(capsys) -> None:
     with pytest.raises(SystemExit) as exc:
         scu.main([])

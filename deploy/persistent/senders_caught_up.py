@@ -107,8 +107,9 @@ def check(config_path: str) -> Status:
 
 
 class _Parser(argparse.ArgumentParser):
-    def error(self, _message: str) -> NoReturn:
+    def error(self, message: str) -> NoReturn:
         """argparse's own text can echo argument values, so it is never shown."""
+        del message
         self.print_usage(sys.stderr)
         sys.stderr.write("error: bad arguments (values not shown)\n")
         raise SystemExit(EXIT_ERROR)
@@ -131,7 +132,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    named = [(n, p) for n, p in (("ntfy", args.ntfy_config), ("ha", args.ha_config)) if p]
+    named = [
+        (n, p)
+        for n, p in (("ntfy", args.ntfy_config), ("ha", args.ha_config))
+        if p is not None  # an empty value is a named sender that fails validation, not a skip
+    ]
     if not named:
         _usage_error(parser, "at least one of --ntfy-config / --ha-config is required")
     results: list[Status | None] = []

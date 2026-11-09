@@ -731,8 +731,10 @@ pipeline's deliveries run out their attempts, so the file needs attention before
 
 1. The file belongs to the container's subuid, so truncate it inside the namespace
    (`podman unshare`), and stop the timer first (`systemctl --user stop ntfy-sender.timer`).
-   Also stop the pipeline (the process that appends to the delivery file) BEFORE the check in
-   step 2, or a record can arrive between the check and the truncate and be lost.
+   Stopping a timer does not stop a run already in progress: wait until the sender service is
+   inactive (`systemctl --user is-active ntfy-sender.service` must not print `active`). Also
+   stop the pipeline (the process that appends to the delivery file) BEFORE the check in step 2,
+   or a record can arrive between the check and the truncate and be lost.
 2. Truncate ONLY when the cursor offset equals the file size, that is when the sender has
    delivered everything. Check with the read-only helper (it reads each sender config only for
    `cursor_file` and `delivery_file`, writes nothing and prints no path). Run it from the
@@ -951,8 +953,9 @@ Logs and the summary line (`ha_sender sent=N skipped=M exit=C`) never contain th
 webhook id, the host, the response body or record text.
 
 **Two senders, one delivery file.** With ntfy and HA both enabled, the truncate procedure in the
-ntfy section changes: stop BOTH timers and the pipeline (the process that appends to the delivery
-file), and truncate only when the cursor `offset` of EVERY enabled sender equals the delivery file
+ntfy section changes: stop BOTH timers, wait until BOTH sender services are inactive (a stopped
+timer does not stop a run in progress), stop the pipeline (the process that appends to the
+delivery file), and truncate only when the cursor `offset` of EVERY enabled sender equals the delivery file
 size; truncating while either is behind drops its pending messages. Check both at once with the
 read-only helper (exit 0 only when every named sender is caught up; any other exit means do not
 truncate). Run it from the repository root (or give the absolute script path), as `python3 -I`,
