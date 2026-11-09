@@ -221,8 +221,10 @@ def test_cleanup_leaves_a_file_swapped_in_after_our_create(
 
     def store(dfd, name, *args):
         real(dfd, name, *args)
-        (dest / name).unlink()
-        (dest / name).write_bytes(b"someone else's")
+        # a different file: created BEFORE the old one goes away, so it cannot reuse its inode
+        # number (a file system may hand a freed inode straight back, which looks like ours)
+        (dest / "other").write_bytes(b"someone else's")
+        os.replace(dest / "other", dest / name)
         raise sqlite3.OperationalError("boom")
 
     monkeypatch.setattr(backup, "_store", store)

@@ -206,19 +206,27 @@ def test_cpu_limit_is_set_by_run_with_a_soft_handler(monkeypatch: pytest.MonkeyP
 # --- 4: memory, absolute ---
 
 _MEASURE = """
-import resource, sys
+import sys
 sys.path.insert(0, {src!r})
 from pathlib import Path
 from vigie_pipeline import backup
+
+
+def hwm() -> int:  # VmHWM is per address space; ru_maxrss would inherit the parent's peak
+    for line in open("/proc/self/status"):
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1]) * 1024
+    raise SystemExit("no VmHWM")
+
+
 mode, work = sys.argv[1], Path(sys.argv[2])
 dest = work / "dest"
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+before = hwm()
 if mode == "backup":
     backup.backup(dest, inventory=None, overrides=work / "overrides.db")
 else:
     backup.verify(dest)
-after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print(before * 1024, (after - before) * 1024)
+print(before, hwm() - before)
 """
 
 
@@ -234,6 +242,20 @@ def _measure(mode: str, work: Path) -> tuple[float, float]:
     assert out.returncode == 0, out.stderr[-300:]
     base, grown = out.stdout.split()
     return float(base), float(grown)
+
+
+def test_measurement_does_not_inherit_the_parent_processes_peak(tmp_path: Path) -> None:
+    """ru_maxrss of an exec'd child includes the parent's peak (the CI runner's big pytest process
+    read 510 MiB of "baseline"); VmHWM is per address space and does not."""
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "dest").mkdir(mode=0o700)
+    open_overrides(work / "overrides.db").close()
+    ballast = bytearray(200 * 1024 * 1024)  # make this process's peak large, then free it
+    ballast[::4096] = b"x" * len(ballast[::4096])
+    del ballast
+    base, _ = _measure("backup", work)
+    assert base < 100 * 1024 * 1024, f"child baseline {base / 1048576:.0f} MiB"
 
 
 def test_worst_case_peak_at_the_cap_stays_under_400_mib(tmp_path: Path) -> None:
