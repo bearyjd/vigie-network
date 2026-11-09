@@ -38,11 +38,29 @@ def report(env: Env, capsys, monkeypatch) -> dict:  # noqa: F811
     return json.loads(out)
 
 
-def cover(env: Env, collector: str, hour: int, seconds: int = 3600, reasons: str = "[]") -> None:  # noqa: F811
+def engine_ran(env: Env) -> None:  # noqa: F811
+    """A profile the engine stamped inside the window (updated_hour = the hour just completed)."""
+    env.inv.execute(
+        "INSERT OR IGNORE INTO monitoring_profiles VALUES "
+        "('c1','engine-probe','l',?,0,'mature',NULL,?,0,0)",
+        (POOLED_V, HOUR0 - 3600),
+    )
+
+
+def cover(  # noqa: PLR0913
+    env: Env,  # noqa: F811
+    collector: str,
+    hour: int,
+    seconds: int = 3600,
+    reasons: str = "[]",
+    engine: bool = True,
+) -> None:
     env.inv.execute(
         "INSERT OR REPLACE INTO coverage_hourly VALUES (?,?,?,?,?)",
         (collector, hour, 3600, seconds, reasons),
     )
+    if engine:
+        engine_ran(env)
 
 
 def delivery(  # noqa: PLR0913
@@ -397,17 +415,19 @@ def _profile(  # noqa: PLR0913
     hours: int,
     days: int,
     version: str = POOLED_V,
+    updated: int = HOUR0 - 3600,
+    training_since: int = 0,
 ) -> None:
     env.inv.execute(
-        "INSERT INTO monitoring_profiles VALUES ('c1',?,'l',?,0,?,NULL,0,?,?)",
-        (device, version, state, hours, days),
+        "INSERT INTO monitoring_profiles VALUES ('c1',?,'l',?,?,?,NULL,?,?,?)",
+        (device, version, training_since, state, updated, hours, days),
     )
 
 
-def _baseline_row(env: Env, n: int, algorithm: str) -> None:  # noqa: F811
+def _baseline_row(env: Env, n: int, algorithm: str, version: str = "v") -> None:  # noqa: F811
     env.inv.execute(
-        "INSERT INTO monitoring_baselines VALUES (?,'c1',?,'l',?,'v','{}',1,25,15,0,0,'[]')",
-        (f"b{n}", f"d{n}", algorithm),
+        "INSERT INTO monitoring_baselines VALUES (?,'c1',?,'l',?,?,'{}',1,25,15,0,0,'[]')",
+        (f"b{n}", f"d{n}", algorithm, version),
     )
 
 
@@ -418,14 +438,17 @@ def profiles(env: Env, capsys, monkeypatch, *extra: str) -> dict:  # noqa: F811
     return json.loads(capsys.readouterr().out)["profiles"]
 
 
-def test_profiles_gate_only_counts_learning_pooled(env, capsys, monkeypatch):  # noqa: F811
+def test_pooled_learning_shows_progress_never_a_gate_pass(env, capsys, monkeypatch):  # noqa: F811
     _profile(env, "a", "learning", 25, 15)
     _profile(env, "b", "learning", 5, 3)
     _profile(env, "c", "lineage_unavailable", 25, 15)
     p = profiles(env, capsys, monkeypatch)
     assert p["baseline"] == "pooled" and p["baseline_source"] == "database"
-    assert p["per_state"]["learning"] == {"devices": 2, "gate_met": 1}
-    assert p["per_state"]["lineage_unavailable"]["gate_met"] is None
+    learning = p["per_state"]["learning"]
+    assert learning["devices"] == 2 and "gate_met" not in learning
+    assert learning["learning_progress"] == {"max_sample_hours": 25, "max_distinct_days": 15}
+    assert "gate_met" not in p["per_state"]["lineage_unavailable"]
+    assert "learning_progress" not in p["per_state"]["lineage_unavailable"]
 
 
 def test_tod_family_in_db_is_not_derivable_whatever_the_env(env, capsys, monkeypatch):  # noqa: F811
@@ -434,6 +457,7 @@ def test_tod_family_in_db_is_not_derivable_whatever_the_env(env, capsys, monkeyp
     p = profiles(env, capsys, monkeypatch)
     assert p["baseline"] == "tod"
     assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+    assert "learning_progress" not in p["per_state"]["learning"]
     monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "pooled")  # env must have no influence
     assert profiles(env, capsys, monkeypatch)["baseline"] == "tod"
 
@@ -442,36 +466,88 @@ def test_pooled_family_in_db_ignores_a_tod_env(env, capsys, monkeypatch):  # noq
     _profile(env, "a", "learning", 25, 15)
     monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "tod")
     p = profiles(env, capsys, monkeypatch)
-    assert p["baseline"] == "pooled" and p["per_state"]["learning"]["gate_met"] == 1
+    assert p["baseline"] == "pooled" and "learning_progress" in p["per_state"]["learning"]
 
 
-def test_baseline_family_from_monitoring_baselines_algorithm(env, capsys, monkeypatch):  # noqa: F811
-    _profile(env, "a", "learning", 25, 15, version="custom-policy")  # version tells nothing
-    _baseline_row(env, 1, "tod-median-v1")
+def test_unrecognised_current_version_resolved_by_its_own_baseline_row(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version="custom-policy")
+    _baseline_row(env, 1, "tod-median-v1", version="custom-policy")
     p = profiles(env, capsys, monkeypatch)
     assert p["baseline"] == "tod" and p["per_state"]["learning"]["gate_met"] == "not_derivable"
 
 
-def test_mixed_or_unknown_family_is_not_derivable(env, capsys, monkeypatch):  # noqa: F811
+def test_historical_baseline_never_classifies_a_different_current_version(env, capsys, monkeypatch):  # noqa: F811
+    _baseline_row(env, 1, "pooled-median-v1", version=POOLED_V)  # history of the OLD policy
+    _profile(env, "a", "learning", 25, 15, version="nondefault-hash")  # current, unrecognised
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "unknown" and p["status"] == "partial"
+    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+    assert "learning_progress" not in p["per_state"]["learning"]
+
+
+def test_any_unresolved_current_version_makes_the_family_unknown(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15)
+    _profile(env, "b", "learning", 25, 15, version="nondefault-hash")
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "unknown"
+
+
+def test_two_current_versions_in_window_is_unknown_with_disclosure(env, capsys, monkeypatch):  # noqa: F811
     _profile(env, "a", "learning", 25, 15)
     _profile(env, "b", "learning", 25, 15, version=TOD_V)
     p = profiles(env, capsys, monkeypatch)
-    assert p["baseline"] == "unknown"
-    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+    assert p["status"] == "unknown" and p["reason"] == "policy version changed in window"
+    assert len(p["config_versions_in_window"]) == 2
+    assert all(v["gate_met"] == "not_derivable" for v in p["per_state"].values())
 
 
-def test_unrecognised_policy_version_is_not_derivable(env, capsys, monkeypatch):  # noqa: F811
-    _profile(env, "a", "learning", 25, 15, version="custom-policy")
+def test_stale_profiles_are_excluded_and_disclosed(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15)
+    _profile(env, "old", "mature", 99, 99, version=TOD_V, updated=HOUR0 - 20 * DAY)
     p = profiles(env, capsys, monkeypatch)
-    assert p["baseline"] == "unknown"
-    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+    assert p["baseline"] == "pooled" and p["profiles_not_analysed_in_window"] == 1
+    assert set(p["per_state"]) == {"learning"}
+    assert len(p["config_versions_in_window"]) == 1
 
 
-def test_baseline_flag_overrides_the_database(env, capsys, monkeypatch):  # noqa: F811
+def test_profiles_reset_in_window_is_disclosed(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 5, 1, training_since=HOUR0 - 3600)
+    _profile(env, "b", "learning", 5, 1, training_since=HOUR0 - 30 * DAY)
+    _profile(env, "c", "learning", 5, 1, training_since=HOUR0 - 7200)
+    assert profiles(env, capsys, monkeypatch)["profiles_reset_in_window"] == 2
+
+
+def test_no_profile_analysed_in_window_is_unknown(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "old", "mature", 99, 99, updated=HOUR0 - 20 * DAY)
+    p = profiles(env, capsys, monkeypatch)
+    assert p["status"] == "unknown" and p["profiles_not_analysed_in_window"] == 1
+
+
+def test_baseline_flag_contradicting_the_database_is_refused(env, capsys, monkeypatch):  # noqa: F811
     _profile(env, "a", "learning", 25, 15, version=TOD_V)
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    argv = ["pilot-report", "--data-dir", str(env.root), "--since", SINCE, "--baseline", "pooled"]
+    assert cli.main(argv) == 2
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert out.err.strip() == (
+        "vigie-api: --baseline pooled contradicts the stored tod baseline family"
+    )
+    assert str(env.root) not in out.err
+
+
+def test_baseline_flag_may_decide_only_when_detection_is_empty(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version="nondefault-hash")
     p = profiles(env, capsys, monkeypatch, "--baseline", "pooled")
     assert p["baseline"] == "pooled" and p["baseline_source"] == "flag"
-    assert p["per_state"]["learning"]["gate_met"] == 1
+    assert p["baseline_detected"] is None
+    assert "learning_progress" in p["per_state"]["learning"]
+
+
+def test_baseline_flag_agreeing_with_the_database_is_fine(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15)
+    p = profiles(env, capsys, monkeypatch, "--baseline", "pooled")
+    assert p["baseline_detected"] == "pooled" and p["baseline_source"] == "database"
 
 
 def test_baseline_flag_is_validated(env, capsys):  # noqa: F811
@@ -507,19 +583,21 @@ def test_window_beyond_delivery_retention_is_unknown(env, capsys, monkeypatch): 
         assert "within_target" not in r[name] and "per_day" not in r[name]
 
 
-def test_window_at_delivery_retention_is_still_evidence(env, capsys, monkeypatch):  # noqa: F811
+def test_delivery_retention_edge(env, capsys, monkeypatch):  # noqa: F811
     seed_collector(env)
     cover(env, "c1", HOUR0 - 3600)
-    r = report_since(env, capsys, monkeypatch, "30d")
-    assert r["deliveries"]["status"] == "ok"
-    assert r["unwanted_notifications"]["status"] == "ok"
+    assert report_since(env, capsys, monkeypatch, "719h")["deliveries"]["status"] == "ok"
+    r = report_since(env, capsys, monkeypatch, "721h")
+    assert r["deliveries"]["reason"] == "window exceeds delivery retention"
+    assert r["unwanted_notifications"]["reason"] == "window exceeds delivery retention"
 
 
 def test_window_beyond_incident_retention_is_unknown(seeded, capsys, monkeypatch):
-    r = report_since(seeded, capsys, monkeypatch, "100d")
-    assert r["incidents"]["status"] == "unknown"
-    assert r["incidents"]["reason"] == "window exceeds incident retention"
-    assert report_since(seeded, capsys, monkeypatch, "90d")["incidents"]["status"] == "ok"
+    for since in ("90d", "91d", "100d"):
+        r = report_since(seeded, capsys, monkeypatch, since)
+        assert r["incidents"]["status"] == "unknown", since
+        assert r["incidents"]["reason"] == "window exceeds incident retention"
+    assert report_since(seeded, capsys, monkeypatch, "89d")["incidents"]["status"] == "ok"
 
 
 def test_text_keeps_evidence_of_an_unknown_unwanted_section(env, capsys, monkeypatch):  # noqa: F811
