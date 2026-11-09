@@ -219,8 +219,8 @@ def test_cleanup_leaves_a_file_swapped_in_after_our_create(
 ) -> None:
     real = backup._store
 
-    def store(dfd, name, data, created):
-        real(dfd, name, data, created)
+    def store(dfd, name, *args):
+        real(dfd, name, *args)
         (dest / name).unlink()
         (dest / name).write_bytes(b"someone else's")
         raise sqlite3.OperationalError("boom")
@@ -298,7 +298,7 @@ def test_copy_manifest_and_directory_are_fsynced(
 def test_oversized_source_is_refused(sources, dest: Path, monkeypatch) -> None:
     monkeypatch.setattr(backup, "MAX_DB_BYTES", 1024)
     monkeypatch.setattr(backup, "_store", lambda *a: pytest.fail("must refuse before writing"))
-    with pytest.raises(backup.BackupError, match="larger"):
+    with pytest.raises(backup.BackupError, match="host-level"):
         backup.backup(dest, inventory=sources[0], overrides=None)
     assert list(dest.iterdir()) == []
 
@@ -364,8 +364,14 @@ def test_ancestor_owned_by_another_user_is_refused(dest: Path, monkeypatch) -> N
 def test_copy_that_does_not_read_back_identical_is_refused(
     sources, dest: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real = backup._write_all
-    monkeypatch.setattr(backup, "_write_all", lambda fd, data: real(fd, data + b"\0" * 4096))
+    real = backup._write_image
+
+    def write_then_append(fd: int, image: bytes):
+        out = real(fd, image)
+        os.write(fd, b"\0" * 4096)  # the file no longer matches what was hashed
+        return out
+
+    monkeypatch.setattr(backup, "_write_image", write_then_append)
     with pytest.raises(backup.BackupError):
         backup.backup(dest, inventory=sources[0], overrides=None)
     assert list(dest.iterdir()) == []

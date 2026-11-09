@@ -124,6 +124,15 @@ vigie-backup verify <dir> --no-manifest   # only for a manual copy that has no m
 - **Run as the service user, or inside the container.** Reading a WAL database creates `-wal`/`-shm`
   beside it, so a source owned by another user is refused, and the service must keep `-shm`
   writable for the backup to read it while the service runs.
+- **Memory is bounded, and bigger databases need a host-level backup.** Copies are held in memory:
+  measured peak is about 2.7x the database for `backup` and about 1.6x for `verify`, so the CLI
+  refuses a database above 128 MiB (about 350 MiB peak, under the 512 MiB container limit) with
+  "database too large for the in-memory backup: use a host-level backup". Use the manual online
+  backup below for anything larger.
+- **`verify` is strict about hostile or leftover files.** It refuses a copy whose header is not the
+  rollback-journal format the CLI writes, any `-wal`/`-shm`/`-journal` file next to it, and an image
+  that exceeds a time or value-size budget. A copy that the apps have since opened (and switched to
+  WAL) therefore no longer verifies; verify before restoring.
 - **Verify with the same build that took the backup.** The `user_version` must match exactly, so an
   older backup fails `verify` after a release adds a migration.
 - **There is no restore command.** Run `verify`, then restore by hand as described below, and test

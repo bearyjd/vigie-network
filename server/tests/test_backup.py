@@ -243,9 +243,9 @@ def test_verify_accepts_fresh_backup_and_restores_onto_scratch(sources, dest, tm
     assert {r["name"] for r in results} == {"inventory.db", "overrides.db"}
     scratch = tmp_path / "scratch"
     scratch.mkdir(mode=0o700)
-    for name in ("inventory.db", "overrides.db"):
+    for name in ("inventory.db", "overrides.db", "manifest.json"):
         (scratch / name).write_bytes((dest / name).read_bytes())
-    (scratch / "manifest.json").write_bytes((dest / "manifest.json").read_bytes())
+    assert len(backup.verify(scratch)) == 2  # a verbatim copy of a backup verifies
     # The restored copy opens with the repo's own openers and is writable and migrated.
     open_overrides(scratch / "overrides.db").close()
     inv = open_inventory(scratch / "inventory.db")
@@ -253,9 +253,9 @@ def test_verify_accepts_fresh_backup_and_restores_onto_scratch(sources, dest, tm
     assert inv.execute("SELECT count(*) FROM probe").fetchone()[0] == 1
     assert inv.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     inv.close()
-    # Opened for write by the repo's openers since, so it no longer matches the manifest.
-    results = backup.verify(scratch, require_manifest=False)
-    assert [r["name"] for r in results] == ["inventory.db", "overrides.db"]
+    # The repo's openers switched the copies to WAL: verify refuses that (header is not 1/1).
+    with pytest.raises(backup.VerifyError, match="header"):
+        backup.verify(scratch, require_manifest=False)
 
 
 def test_verify_rejects_corrupted_copy(sources, dest: Path) -> None:

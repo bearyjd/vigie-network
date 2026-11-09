@@ -26,6 +26,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_notes(exc: BaseException) -> None:
+    for note in getattr(exc, "__notes__", []):
+        print(f"vigie-backup: {note}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -38,12 +43,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = backup.verify(args.directory, require_manifest=not args.no_manifest)
     except (backup.BackupError, backup.VerifyError) as exc:
         print(f"vigie-backup: {exc}", file=sys.stderr)
+        _print_notes(exc)
         return 1
-    except KeyboardInterrupt:
-        print("vigie-backup: interrupted; partial files were removed", file=sys.stderr)
+    except KeyboardInterrupt as exc:
+        clean = args.command == "backup" and not getattr(exc, "__notes__", [])
+        cleaned = "; partial files were removed" if clean else ""
+        print(f"vigie-backup: interrupted{cleaned}", file=sys.stderr)
+        _print_notes(exc)
         return 130
     except Exception as exc:  # noqa: BLE001 - fixed message, never a traceback or a path
         print(f"vigie-backup: unexpected error ({type(exc).__name__})", file=sys.stderr)
+        _print_notes(exc)
         return 1
     print(json.dumps(result, indent=2))
     return 0
