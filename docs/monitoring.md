@@ -4,16 +4,18 @@ This slice derives collector-scoped hourly activity, a frozen pooled-median uplo
 read-only incidents, and conservative service-based device hints. It does not establish malicious
 activity, identity trust, enforcement, calibrated classification accuracy, or production readiness.
 A baseline cannot mature before real qualifying history exists; synthetic fixtures prove arithmetic,
-not detection accuracy. A local monitoring UI and notifications remain subsequent product work.
+not detection accuracy. A read-only local monitoring GUI and opt-in, off-by-default notification
+senders are merged; GUI writes and live notification acceptance remain open.
 
 Source is merged through the reviewed DNS-probe fixes. The
 [2026-10-25 field status](monitoring-field-status-2026-10-25.md) records healthy server deployment
 and actual router logging/parsed-DNS and collector privilege evidence. A LAN correction produced
 fresh source flags 0; flagged history is retained and controlled drain reached backlog0.
 PR12 processing-age API is deployed and verified. Bounded outage, drop-in repair and reconciled
-helper respawn passed; natural rotation and cold boot remain pending. The
-48-hour run has not started. No fourteen-date mature
-field reference is claimed.
+helper respawn passed; natural rotation and cold boot remain pending. Real-router 48-hour soaks
+1-3 have run since; soak 4 was running on 2026-11-09 (no outcome claimed). #86-#92 (merged
+2026-11-08/09) are not deployed; the deployment state of earlier merges is not recorded here. No
+fourteen-date mature field reference is claimed.
 
 ## Rollout and ownership
 
@@ -305,8 +307,9 @@ class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numer
 Delivery is **off by default** and the local inbox works without any publisher. The pipeline (not
 the API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
 delivery is disabled the runner is not called, so nothing is created and nothing expires. The
-real network adapter (topic, ownership: D5) is a later unit; no code here names a topic or opens a
-socket.
+real network adapter (topic, ownership: D5) is not in the pipeline: the standalone ntfy and Home
+Assistant senders (#49, #71; see below) ship the delivery file and are off by default. No pipeline
+code names a topic or opens a socket.
 
 **What is wired (unit 4b).** After `analyze_monitoring`, when `VIGIE_DELIVERY_ENABLED` is set,
 each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_delivery`:
