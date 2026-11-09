@@ -14,10 +14,14 @@ from incident_helpers import incident, seed_collector
 
 from vigie_api import cli, pilot_report, pilot_report_cli
 from vigie_ingest.db import iso_utc
+from vigie_pipeline.baselines import BaselineConfig
+from vigie_pipeline.baselines_tod import TodConfig
 
 DAY = 86400
 HOUR0 = int(NOW) // 3600 * 3600
 SINCE = "7d"
+POOLED_V = BaselineConfig().version
+TOD_V = TodConfig().version
 
 
 def run(root: Path, capsys, *extra: str) -> tuple[int, str, str]:
@@ -386,36 +390,195 @@ def test_dates_are_utc_not_local(env, capsys, monkeypatch):  # noqa: F811
     assert c["distinct_utc_dates"] == 2
 
 
-def _profile(env: Env, device: str, state: str, hours: int, days: int) -> None:  # noqa: F811
+def _profile(  # noqa: PLR0913
+    env: Env,  # noqa: F811
+    device: str,
+    state: str,
+    hours: int,
+    days: int,
+    version: str = POOLED_V,
+) -> None:
     env.inv.execute(
-        "INSERT INTO monitoring_profiles VALUES ('c1',?,'l','v',0,?,NULL,0,?,?)",
-        (device, state, hours, days),
+        "INSERT INTO monitoring_profiles VALUES ('c1',?,'l',?,0,?,NULL,0,?,?)",
+        (device, version, state, hours, days),
     )
+
+
+def _baseline_row(env: Env, n: int, algorithm: str) -> None:  # noqa: F811
+    env.inv.execute(
+        "INSERT INTO monitoring_baselines VALUES (?,'c1',?,'l',?,'v','{}',1,25,15,0,0,'[]')",
+        (f"b{n}", f"d{n}", algorithm),
+    )
+
+
+def profiles(env: Env, capsys, monkeypatch, *extra: str) -> dict:  # noqa: F811
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    argv = ["pilot-report", "--data-dir", str(env.root), "--since", SINCE, "--json", *extra]
+    assert cli.main(argv) == 0
+    return json.loads(capsys.readouterr().out)["profiles"]
 
 
 def test_profiles_gate_only_counts_learning_pooled(env, capsys, monkeypatch):  # noqa: F811
     _profile(env, "a", "learning", 25, 15)
     _profile(env, "b", "learning", 5, 3)
     _profile(env, "c", "lineage_unavailable", 25, 15)
-    states = report(env, capsys, monkeypatch)["profiles"]["per_state"]
-    assert states["learning"] == {"devices": 2, "gate_met": 1}
-    assert states["lineage_unavailable"]["gate_met"] is None
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "pooled" and p["baseline_source"] == "database"
+    assert p["per_state"]["learning"] == {"devices": 2, "gate_met": 1}
+    assert p["per_state"]["lineage_unavailable"]["gate_met"] is None
 
 
-def test_profiles_gate_not_derivable_for_tod(env, capsys, monkeypatch):  # noqa: F811
+def test_tod_family_in_db_is_not_derivable_whatever_the_env(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version=TOD_V)
+    monkeypatch.delenv("VIGIE_MONITORING_BASELINE", raising=False)
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "tod"
+    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+    monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "pooled")  # env must have no influence
+    assert profiles(env, capsys, monkeypatch)["baseline"] == "tod"
+
+
+def test_pooled_family_in_db_ignores_a_tod_env(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15)
     monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "tod")
-    _profile(env, "a", "learning", 25, 15)
-    states = report(env, capsys, monkeypatch)["profiles"]["per_state"]
-    assert states["learning"]["gate_met"] == "not_derivable"
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "pooled" and p["per_state"]["learning"]["gate_met"] == 1
 
 
-def test_unreadable_baseline_config_is_not_derivable(env, capsys, monkeypatch):  # noqa: F811
-    monkeypatch.setenv("VIGIE_MONITORING_BASELINE", "bogus")
+def test_baseline_family_from_monitoring_baselines_algorithm(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version="custom-policy")  # version tells nothing
+    _baseline_row(env, 1, "tod-median-v1")
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "tod" and p["per_state"]["learning"]["gate_met"] == "not_derivable"
+
+
+def test_mixed_or_unknown_family_is_not_derivable(env, capsys, monkeypatch):  # noqa: F811
     _profile(env, "a", "learning", 25, 15)
-    states = report(env, capsys, monkeypatch)["profiles"]["per_state"]
-    assert states["learning"]["gate_met"] == "not_derivable"
+    _profile(env, "b", "learning", 25, 15, version=TOD_V)
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "unknown"
+    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+
+
+def test_unrecognised_policy_version_is_not_derivable(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version="custom-policy")
+    p = profiles(env, capsys, monkeypatch)
+    assert p["baseline"] == "unknown"
+    assert p["per_state"]["learning"]["gate_met"] == "not_derivable"
+
+
+def test_baseline_flag_overrides_the_database(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version=TOD_V)
+    p = profiles(env, capsys, monkeypatch, "--baseline", "pooled")
+    assert p["baseline"] == "pooled" and p["baseline_source"] == "flag"
+    assert p["per_state"]["learning"]["gate_met"] == 1
+
+
+def test_baseline_flag_is_validated(env, capsys):  # noqa: F811
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["pilot-report", "--data-dir", str(env.root), "--since", "7d", "--baseline", "x"])
+    assert stop.value.code == 2
 
 
 def test_coverage_note_says_upper_bound(seeded, capsys, monkeypatch):
     note = report(seeded, capsys, monkeypatch)["coverage"]["note"]
     assert "upper bound" in note and "14" in note
+
+
+# ---- round 3: retention windows, text evidence, leaks ----
+
+
+def report_since(env: Env, capsys, monkeypatch, since: str, *extra: str) -> dict:  # noqa: F811
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    argv = ["pilot-report", "--data-dir", str(env.root), f"--since={since}", "--json", *extra]
+    assert cli.main(argv) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_window_beyond_delivery_retention_is_unknown(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    delivery(env, 1, "sent", NOW - 45 * DAY, "old", updated=NOW - 45 * DAY)
+    decide(env, "old", "expected", 1)
+    r = report_since(env, capsys, monkeypatch, "60d")  # the 45-day-old row's siblings are pruned
+    for name in ("deliveries", "unwanted_notifications"):
+        assert r[name]["status"] == "unknown", name
+        assert r[name]["reason"] == "window exceeds delivery retention"
+        assert "within_target" not in r[name] and "per_day" not in r[name]
+
+
+def test_window_at_delivery_retention_is_still_evidence(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    r = report_since(env, capsys, monkeypatch, "30d")
+    assert r["deliveries"]["status"] == "ok"
+    assert r["unwanted_notifications"]["status"] == "ok"
+
+
+def test_window_beyond_incident_retention_is_unknown(seeded, capsys, monkeypatch):
+    r = report_since(seeded, capsys, monkeypatch, "100d")
+    assert r["incidents"]["status"] == "unknown"
+    assert r["incidents"]["reason"] == "window exceeds incident retention"
+    assert report_since(seeded, capsys, monkeypatch, "90d")["incidents"]["status"] == "ok"
+
+
+def test_text_keeps_evidence_of_an_unknown_unwanted_section(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    for i in range(3):
+        delivery(env, i, "sent", NOW - 3600, f"t{i}")
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    assert cli.main(["pilot-report", "--data-dir", str(env.root), "--since", SINCE]) == 0
+    out = capsys.readouterr().out
+    assert "unwanted_notifications: UNKNOWN" in out
+    for field in ("notifications_sent: 3", "undecided_total: 3", "unwanted_total: 0", "truncated"):
+        assert field in out
+    assert "within_target" not in out
+
+
+def test_recover_notification_is_not_unwanted(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    delivery(env, 1, "sent", NOW - 3600, "r1", kind="recover")
+    decide(env, "r1", "expected", 1)
+    u = report(env, capsys, monkeypatch)["unwanted_notifications"]
+    assert u["notifications_sent"] == 0 and u["unwanted_total"] == 0
+
+
+def test_unwanted_uses_the_current_decision(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    delivery(env, 1, "sent", NOW - 3600, "z1")
+    decide(env, "z1", "expected", 1)
+    env.ov.execute("UPDATE incident_decisions SET status='acknowledged' WHERE incident_id='z1'")
+    assert report(env, capsys, monkeypatch)["unwanted_notifications"]["unwanted_total"] == 0
+
+
+def test_first_connection_closed_when_second_open_refused(seeded, monkeypatch):
+    opened: list = []
+
+    class Spy:
+        closed = False
+
+        def __init__(self, conn):
+            self.conn = conn
+
+        def close(self):
+            self.closed = True
+            self.conn.close()
+
+    real = pilot_report.open_ro
+
+    def fake(path):
+        if path.name == "overrides.db":
+            raise pilot_report.NotDatabaseOwner("x")
+        spy = Spy(real(path))
+        opened.append(spy)
+        return spy
+
+    monkeypatch.setattr(pilot_report, "open_ro", fake)
+    with pytest.raises(pilot_report.NotDatabaseOwner):
+        pilot_report.build_report(
+            seeded.root / "inventory.db", seeded.root / "overrides.db", NOW - 7 * DAY, NOW, "pooled"
+        )
+    assert opened and all(s.closed for s in opened)

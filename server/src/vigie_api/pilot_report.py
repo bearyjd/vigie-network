@@ -22,6 +22,9 @@ from urllib.parse import quote
 
 from vigie_ingest.db import iso_utc
 from vigie_pipeline.baselines import BaselineConfig
+from vigie_pipeline.baselines_tod import TodConfig
+from vigie_pipeline.delivery_types import DeliveryConfig
+from vigie_pipeline.monitoring_engine import AGGREGATE_DAYS
 
 SCHEMA = "vigie-pilot-report/1"
 QUALIFIED_SECONDS = 3420  # same floor as vigie_pipeline.monitoring_engine.samples_for
@@ -30,6 +33,10 @@ CHUNK = 500
 TARGET_UNWANTED_PER_NETWORK_DAY = 1
 NOT_DERIVABLE = "not_derivable"
 DELIVERY_STATES = ("sent", "failed")
+DELIVERY_RETENTION_S = DeliveryConfig().retention_seconds  # pipeline default, not env
+INCIDENT_RETENTION_S = AGGREGATE_DAYS * 86400
+FAMILY_BY_ALGORITHM = {"pooled-median-v1": "pooled", "tod-median-v1": "tod"}
+FAMILY_BY_VERSION = {BaselineConfig().version: "pooled", TodConfig().version: "tod"}
 _GATE = BaselineConfig()
 COVERAGE_NOTE = (
     f"upper bound only: a qualified hour also needs a measurement row, a non-suspicious sample "
@@ -84,6 +91,8 @@ def pipeline_ran(inv: sqlite3.Connection | None, lo: int, hi: int) -> bool:
 def incidents_section(inv: sqlite3.Connection | None, lo: int, hi: int, ran: bool) -> Section:
     if inv is None or not _has_table(inv, "monitoring_incidents"):
         return _unknown("monitoring_incidents table missing")
+    if lo < hi - INCIDENT_RETENTION_S:
+        return _unknown("window exceeds incident retention")
     rows = inv.execute(
         "SELECT detector,substr(detected_at,1,10) AS day,COUNT(*) AS n FROM monitoring_incidents "
         "WHERE last_hour>=? AND detected_at>=? AND detected_at<? GROUP BY detector,day "
@@ -132,6 +141,8 @@ def deliveries_section(inv: sqlite3.Connection | None, lo: int, hi: int, ran: bo
     """Per UTC day of completion (updated_at: when it was sent or failed), not of enqueue."""
     if inv is None or not _has_table(inv, "incident_deliveries"):
         return _unknown("incident_deliveries table missing")
+    if lo < hi - DELIVERY_RETENTION_S:
+        return _unknown("window exceeds delivery retention")
     rows = inv.execute(
         "SELECT strftime('%Y-%m-%d',updated_at,'unixepoch') AS day,state,COUNT(*) AS n "
         "FROM incident_deliveries WHERE updated_at>=? AND updated_at<? "
@@ -183,7 +194,7 @@ def coverage_section(inv: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
     }
 
 
-def profiles_section(inv: sqlite3.Connection | None, baseline: str) -> Section:
+def profiles_section(inv: sqlite3.Connection | None, baseline: str | None, source: str) -> Section:
     """Per-state device counts. The pooled 20-hour / 14-date gate is only meaningful for pooled
     baselines and only for devices still learning; every other state or baseline is not derivable
     as "can mature" and reports no gate count."""
@@ -199,16 +210,34 @@ def profiles_section(inv: sqlite3.Connection | None, baseline: str) -> Section:
         return _unknown("no monitoring profiles")
 
     def gate(row: sqlite3.Row) -> Any:
-        if baseline != "pooled":
+        if baseline != "pooled":  # tod, or no unambiguous evidence of the family
             return NOT_DERIVABLE
         return row["gate_met"] if row["state"] == "learning" else None
 
     return {
         "status": "ok",
-        "baseline": baseline,
+        "baseline": baseline or "unknown",
+        "baseline_source": source,
         "pooled_gate": {"hours_needed": _GATE.minimum_hours, "dates_needed": _GATE.minimum_days},
         "per_state": {r["state"]: {"devices": r["n"], "gate_met": gate(r)} for r in rows},
     }
+
+
+def detect_baseline(inv: sqlite3.Connection | None) -> str | None:
+    """The baseline family the pipeline persisted: pooled, tod, or None when the database does not
+    show exactly one (empty, unrecognised policy versions, or mixed). Never read from the env: the
+    pipeline's environment is not this process's."""
+    if inv is None:
+        return None
+    found: set[str] = set()
+    for table, column, known in (
+        ("monitoring_baselines", "algorithm", FAMILY_BY_ALGORITHM),
+        ("monitoring_profiles", "config_version", FAMILY_BY_VERSION),
+    ):
+        if _has_table(inv, table):
+            sql = f"SELECT DISTINCT {column} FROM {table} LIMIT 50"  # noqa: S608
+            found |= {known[r[0]] for r in inv.execute(sql) if r[0] in known}
+    return found.pop() if len(found) == 1 else None
 
 
 def _lookup(conn: sqlite3.Connection, sql: str, ids: list[str]) -> dict[str, tuple]:
@@ -225,7 +254,8 @@ def unwanted_section(
     inv: sqlite3.Connection | None, ov: sqlite3.Connection | None, lo: int, hi: int, ran: bool
 ) -> Section:
     """Open notifications sent (by completion time) for incidents the owner marked `expected`,
-    per network-day; the network is the decision row's collector.
+    per network-day; the network is the decision row's collector. It counts by the CURRENT
+    decision, not the one in force at send time: a sent notification later acknowledged drops out.
 
     The verdict (`within_target`) exists only when every sent notification has a decision and
     nothing was truncated. Otherwise the status is "unknown" and the counts say why.
@@ -233,6 +263,8 @@ def unwanted_section(
     if not (_has_table(inv, "incident_deliveries") and _has_table(ov, "incident_decisions")):
         return {"status": NOT_DERIVABLE, "reason": "needs incident_deliveries and decisions"}
     assert inv is not None and ov is not None  # noqa: S101 (narrowing for mypy)
+    if lo < hi - DELIVERY_RETENTION_S:
+        return _unknown("window exceeds delivery retention")
     rows = inv.execute(
         "SELECT incident_id,strftime('%Y-%m-%d',updated_at,'unixepoch') AS day "
         "FROM incident_deliveries WHERE updated_at>=? AND updated_at<? AND state='sent' "
@@ -276,13 +308,15 @@ def unwanted_section(
 
 
 def build_report(
-    inv_path: Path, ov_path: Path, since: float, now: float, baseline: str = "pooled"
+    inv_path: Path, ov_path: Path, since: float, now: float, baseline: str | None = None
 ) -> dict[str, Any]:
     lo, hi = int(since), int(now)
     done = hi // 3600 * 3600  # complete hours only, like the engine
     inv = ov = None
     try:
-        inv, ov = open_ro(inv_path), open_ro(ov_path)
+        inv = open_ro(inv_path)
+        ov = open_ro(ov_path)
+        family = baseline or detect_baseline(inv)
         ran = pipeline_ran(inv, lo // 3600 * 3600, done)
         return {
             "schema": SCHEMA,
@@ -297,7 +331,7 @@ def build_report(
             "decisions": decisions_section(ov, lo),
             "deliveries": deliveries_section(inv, lo, hi, ran),
             "coverage": coverage_section(inv, lo, done),
-            "profiles": profiles_section(inv, baseline),
+            "profiles": profiles_section(inv, family, "flag" if baseline else "database"),
             "unwanted_notifications": unwanted_section(inv, ov, lo, hi, ran),
         }
     finally:

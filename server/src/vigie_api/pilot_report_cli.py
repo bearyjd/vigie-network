@@ -17,7 +17,6 @@ from pathlib import Path
 
 from vigie_api.config import Settings
 from vigie_api.pilot_report import NotDatabaseOwner, build_report
-from vigie_pipeline.config import PipelineConfig
 
 MAX_LOOKBACK_S = 366 * 86400
 _RELATIVE = re.compile(r"([1-9][0-9]{0,3})([dh])")
@@ -43,20 +42,33 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vigie-api pilot-report",
         description="Read-only pilot gate report. Run as the service user that owns the "
-        "databases. Collector date counts are an upper bound; --since 7d can never reach 14 dates.",
+        "databases. Collector date counts are an upper bound; --since 7d can never reach 14 dates. "
+        "Unwanted notifications count by the current decision, not the one at send time. Windows "
+        "beyond delivery (30d) or incident (90d) retention report unknown.",
     )
     parser.add_argument("--data-dir", default=None, help="default: $VIGIE_DATA_DIR")
     parser.add_argument("--since", required=True, help="7d, 36h, ISO date or ISO datetime (UTC)")
+    parser.add_argument(
+        "--baseline",
+        choices=("pooled", "tod"),
+        default=None,
+        help="baseline family; default: read from the stored profiles (never from the "
+        "environment). Without evidence the pooled gate is reported as not_derivable.",
+    )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     return parser
 
 
 def _section_lines(name: str, section: dict) -> list[str]:
     status = section.get("status", "unknown")
-    if status != "ok":
-        return [f"{name}: {status.upper()} ({section.get('reason', 'no detail')})"]
-    body = {k: v for k, v in section.items() if k != "status"}
-    return [f"{name}: ok", *(f"  {k}: {json.dumps(v, sort_keys=True)}" for k, v in body.items())]
+    head = (
+        f"{name}: ok"
+        if status == "ok"
+        else (f"{name}: {status.upper()} ({section.get('reason', 'no detail')})")
+    )
+    # evidence fields are always shown; an unknown section simply carries no verdict field
+    body = {k: v for k, v in section.items() if k not in ("status", "reason")}
+    return [head, *(f"  {k}: {json.dumps(v, sort_keys=True)}" for k, v in body.items())]
 
 
 def render_text(report: dict) -> str:
@@ -84,12 +96,8 @@ def main(argv: list[str]) -> int:
     if args.data_dir:
         settings = Settings(data_dir=Path(args.data_dir))
     try:
-        baseline = PipelineConfig.from_env().monitoring_baseline
-    except ValueError:
-        baseline = "unknown"  # unreadable config: the gate is reported as not derivable
-    try:
         report = build_report(
-            settings.inventory_path, settings.overrides_path, since, now, baseline
+            settings.inventory_path, settings.overrides_path, since, now, args.baseline
         )
     except NotDatabaseOwner:
         print("vigie-api: pilot report must run as the database owner", file=sys.stderr)
