@@ -121,11 +121,19 @@ API's 512 MiB cgroup). Placeholders only; mount the real volumes yourself:
 
 ```sh
 podman run --rm --user 10001:10001 --memory 512m \
-  -v <overrides-volume>:/ov -v <inventory-volume>:/inv -v <backup-dir>:/out \
+  -v <overrides-volume>:/ov -v <inventory-volume>:/inv -v <backup-dir>:/out:U \
   <server-image> vigie-backup backup --dest /out --overrides /ov/overrides.db --inventory /inv/inventory.db
-vigie-backup verify <backup-dir>          # read-only: manifest, user_version, tables, integrity
-vigie-backup verify <dir> --no-manifest   # only for a manual copy that has no manifest
+podman run --rm --user 10001:10001 --memory 512m -v <backup-dir>:/out:U \
+  <server-image> vigie-backup verify /out   # read-only: manifest, user_version, tables, integrity
+# add --no-manifest to `verify` only for a manual copy that has no manifest
 ```
+
+A host directory you own appears as uid 0 inside the container, so the owner check would refuse
+it: the `:U` option gives the directory to uid 10001 for the run (or run `podman unshare chown
+10001:10001 <backup-dir>` once). The files it writes then belong to a host subuid, so `verify` also
+has to run the same way (a one-shot container as above, or under `podman unshare`); a plain host-side
+`vigie-backup verify` refuses them. A SIGKILL (OOM, `kill -9`) during `backup` can leave 0600 partial
+files: the next run refuses to overwrite them (fail closed), so remove them by hand.
 
 - **Run as the service user, or inside the container.** Reading a WAL database creates `-wal`/`-shm`
   beside it, so a source owned by another user is refused, and the service must keep `-shm`
@@ -164,16 +172,25 @@ Rootless volume paths are under your home directory and usually readable by your
 `podman unshare`. Encrypt backups at rest (for example `age` or `gpg`); they contain token hashes and
 your labels. Never `podman-compose down -v` without a backup: it deletes this volume.
 
-**Restore (manual, there is no restore command).**
+**Restore (manual, there is no restore command).** The compose services use the volumes like this:
+`ingest` writes `vigie-inv` (`inventory.db`) and `vigie-raw`; `pipeline` writes `vigie-inv` and reads
+`vigie-overrides`; `api` writes `vigie-overrides` (`overrides.db`) and reads `vigie-inv`.
 
-1. Stop `api` and `pipeline`.
-2. **Delete the sidecars first**: `overrides.db-wal`, `overrides.db-shm`, `overrides.db-journal`, and
-   `inventory.db-wal`, `inventory.db-shm`, `inventory.db-journal` in the volume. A stale `-wal` left
-   by a crash or an OOM kill is replayed onto the restored copy on first open and silently replaces
-   it with the old live rows (the backup is lost; `integrity_check` still says `ok`).
-3. Copy the verified backup over `overrides.db` (and `inventory.db` if you back it up), then
-   `chown 10001` and `chmod 0600` them.
-4. Start `api` and `pipeline`.
+1. Take a fresh backup of the live files you are about to overwrite, so the restore can be undone.
+2. Restore onto a **copy** first: put the verified backup in a scratch directory, open it with the
+   same build (for example run `vigie-backup verify` on it, then start the API against it), and only
+   then swap it in.
+3. Stop **every service that uses the file you are replacing**. For `overrides.db`: `api` and
+   `pipeline`. For `inventory.db`: `ingest`, `pipeline` and `api` (ingest keeps a WAL connection to
+   it open; deleting its sidecars under a running ingest can lose committed data or corrupt it).
+4. **Delete that database's sidecars first, and only that database's**: when replacing
+   `overrides.db`, delete `overrides.db-wal`, `overrides.db-shm` and `overrides.db-journal`; when
+   replacing `inventory.db`, delete `inventory.db-wal`, `inventory.db-shm` and `inventory.db-journal`.
+   An overrides-only restore leaves the inventory sidecars untouched. A stale `-wal` left by a crash
+   or an OOM kill is replayed onto the restored copy on first open and silently replaces it with the
+   old live rows (the backup is lost; `integrity_check` still says `ok`).
+5. Copy the verified backup over the database, then `chown 10001` and `chmod 0600` it.
+6. Start the services you stopped.
 
 ## Retention
 

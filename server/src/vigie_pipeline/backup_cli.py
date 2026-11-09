@@ -38,7 +38,11 @@ def _on_cpu_limit(signum: int, frame: object) -> None:
 
 def run() -> int:
     """Console-script entry: bound CPU time (about 2 minutes), then dispatch to `main`."""
-    resource.setrlimit(resource.RLIMIT_CPU, (CPU_SOFT_S, CPU_SOFT_S + CPU_HARD_MARGIN_S))
+    cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_CPU)
+    inf = resource.RLIM_INFINITY
+    soft = min(CPU_SOFT_S, cur_soft) if cur_soft != inf else CPU_SOFT_S
+    hard = soft + CPU_HARD_MARGIN_S if cur_hard == inf else min(soft + CPU_HARD_MARGIN_S, cur_hard)
+    resource.setrlimit(resource.RLIMIT_CPU, (soft, hard))  # inherited limits are only lowered
     signal.signal(signal.SIGXCPU, _on_cpu_limit)
     return main()
 
@@ -74,3 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     print(json.dumps(result, indent=2))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

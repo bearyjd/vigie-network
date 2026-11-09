@@ -384,3 +384,67 @@ def test_vacuum_into_of_a_wal_source_verifies_but_a_sqlite_backup_does_not(
     assert backup.verify(ok, require_manifest=False)[0]["status"] == "ok"
     with pytest.raises(backup.VerifyError, match="header"):
         backup.verify(bad, require_manifest=False)
+
+
+# --- final round: the rlimit never raises an inherited limit, -m is bounded too ---
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        ((60, 60), (60, 60)),  # ulimit -t 60: clamp both, never raise
+        ((30, -1), (30, 40)),  # a lower soft limit stays; hard becomes soft + margin
+        ((-1, -1), (120, 130)),  # unlimited: our limits
+        ((200, 300), (120, 130)),
+    ],
+)
+def test_cpu_rlimit_is_clamped_to_the_inherited_limit(
+    monkeypatch: pytest.MonkeyPatch, current, expected
+) -> None:
+    import resource
+    import signal
+
+    from vigie_pipeline import backup_cli
+
+    inf = resource.RLIM_INFINITY
+    cur = tuple(inf if v == -1 else v for v in current)
+    calls: list[tuple] = []
+    monkeypatch.setattr(resource, "getrlimit", lambda r: cur)
+
+    def setrlimit(r, lim):
+        if cur[1] != inf and lim[1] > cur[1]:
+            raise ValueError("current limit exceeds maximum limit")  # what the kernel does
+        calls.append(lim)
+
+    monkeypatch.setattr(resource, "setrlimit", setrlimit)
+    monkeypatch.setattr(signal, "signal", lambda s, h: None)
+    monkeypatch.setattr(sys, "argv", ["vigie-backup", "verify", "/nonexistent-dir-xyz"])
+    assert backup_cli.run() == 1
+    assert calls == [expected]
+
+
+def test_python_dash_m_entry_is_cpu_bounded_and_works() -> None:
+    env = {**_ENV, "PYTHONPATH": SRC}
+    out = subprocess.run(  # noqa: S603 - fixed argv, our own interpreter
+        [sys.executable, "-m", "vigie_pipeline.backup_cli", "--help"],
+        capture_output=True,
+        timeout=20,
+        check=False,
+        env=env,
+    )
+    assert out.returncode == 0 and b"vigie-backup" in out.stdout
+    code = (
+        "import resource, runpy, sys; sys.argv = ['x', '--help']\n"
+        "try:\n"
+        "    runpy.run_module('vigie_pipeline.backup_cli', run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    print(resource.getrlimit(resource.RLIMIT_CPU)[0])\n"
+    )
+    out = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code],
+        capture_output=True,
+        timeout=20,
+        check=False,
+        env=env,
+    )
+    assert out.stdout.split()[-1] == b"120"
