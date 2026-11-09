@@ -124,10 +124,11 @@ quietness is reported separately; it does not establish traffic completeness.
   used so a permanent step cannot stall uploads. DNS rows read during a deferral carry the
   stepped-back clock; the deferred window raises those below its start up to the start (the
   server rejects rows outside the window), while a row stamped before the deferral began, or
-  outside any deferral, is still dropped and counted when it is out of the window. A deferred batch shares one window's caps (the per-window
-  sightings admission and the batch size cap) across up to about eight windows of data, so
-  more counted drops are possible. A Hold during a deferral drops the whole accumulated
-  window but counts it as one dropped window. A spooled or retried batch keeps its original window.
+  outside any deferral, is still dropped and counted when it is out of the window. A deferred batch
+  shares one window's caps (the per-window sightings admission and the batch size cap) across up to
+  about eight windows of data, so more counted drops are possible. A Hold during a deferral drops
+  the whole accumulated window but counts it as one dropped window. A spooled or retried batch keeps
+  its original window.
 - **Sticky IP to MAC.** An IPv6 conntrack source whose neighbor entry expired while its flow
   lives on is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since
   the neighbor table last held the address). IPv4 is never remembered (DHCP reuses addresses),
