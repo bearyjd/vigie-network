@@ -180,23 +180,53 @@ fn a_hold_in_the_middle_of_a_deferral_does_not_taint_the_next_window() {
 }
 
 #[test]
-fn a_pending_catch_up_does_not_survive_a_second_deferral() {
+fn a_pending_catch_up_survives_a_second_deferral() {
     let mut c = after_first_window();
     assert!(c.should_defer(P - 10, 120));
     assert!(!c.should_defer(P + 5, 135));
-    assert!(
-        c.deferral_min_wall().is_some(),
-        "caught up, window not built yet"
-    );
-    // the batch could not be built (no mark_window); the wall steps back again
+    assert_eq!(c.deferral_min_wall(), Some(P - 10), "window not built yet");
+    // the batch-id draw failed (no mark_window); the wall steps back again, further
     assert!(c.should_defer(P - 100_000, 140));
-    assert!(
-        c.deferral_min_wall().is_none(),
-        "a new deferral starts clean"
+    assert_eq!(
+        c.deferral_min_wall(),
+        Some(P - 10),
+        "pending floor kept while deferring"
     );
-    // ... and runs into the cap: no rewriting despite the stale catch-up
-    assert!(!c.should_defer(P - 100_000 + MAX_DEFER_S, 140 + MAX_DEFER_S));
-    assert!(c.deferral_min_wall().is_none());
+    assert!(!c.should_defer(P + 10, 150));
+    assert_eq!(
+        c.deferral_min_wall(),
+        Some(P - 100_000),
+        "lowest min wall wins"
+    );
+    c.mark_window(150, P + 10);
+    assert_eq!(c.deferral_min_wall(), None);
+}
+
+#[test]
+fn a_pending_floor_survives_a_second_deferral_that_hits_the_cap() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120)); // deferral A
+    assert!(!c.should_defer(P + 5, 135)); // caught up, no mark_window
+    assert!(c.should_defer(P - 100_000, 140)); // deferral B
+    assert!(
+        !c.should_defer(P - 100_000 + MAX_DEFER_S, 140 + MAX_DEFER_S),
+        "cap reached"
+    );
+    assert_eq!(
+        c.deferral_min_wall(),
+        Some(P - 10),
+        "A's floor is still pending"
+    );
+}
+
+#[test]
+fn a_pending_floor_is_not_raised_by_a_shallower_second_deferral() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 30, 120));
+    assert!(!c.should_defer(P + 5, 135));
+    assert!(c.should_defer(P - 10, 140));
+    assert!(!c.should_defer(P + 10, 150));
+    assert_eq!(c.deferral_min_wall(), Some(P - 30));
 }
 
 #[test]
