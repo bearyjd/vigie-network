@@ -97,12 +97,10 @@ impl WindowClock {
             Some(p) if wall_s < p => {
                 let (since, min) = match self.deferral {
                     Some((since, min)) => (since, min.min(wall_s)),
-                    None => {
-                        // A new deferral starts clean: a catch-up still pending from an earlier
-                        // one (its window was never built) must not leak into this one.
-                        self.deferred_floor = None;
-                        (mono_s, wall_s)
-                    }
+                    // A catch-up still pending from an earlier deferral (its window was never
+                    // built, e.g. the batch-id draw failed) stays in `deferred_floor`; the
+                    // ending of this deferral folds its minimum into it.
+                    None => (mono_s, wall_s),
                 };
                 if mono_s.saturating_sub(since) >= MAX_DEFER_S {
                     self.prev_end = None;
@@ -114,7 +112,7 @@ impl WindowClock {
             }
             _ => {
                 if let Some((_, min)) = self.deferral.take() {
-                    self.deferred_floor = Some(min);
+                    self.deferred_floor = Some(self.deferred_floor.map_or(min, |f| f.min(min)));
                 }
                 false
             }
