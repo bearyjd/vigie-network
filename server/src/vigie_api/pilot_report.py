@@ -11,6 +11,9 @@ bounded by its own retention instead.
 
 Evidence rules: coverage rows prove ingest, a recently stamped monitoring profile proves the engine
 ran; windows older than a table's retention are unknown (or partial) because the rows are gone.
+Liveness is checked at report time only: a recovered mid-window outage is invisible (the schema
+keeps no per-pass history), and an idle engine (nothing queued, so no re-stamp) looks like a stopped
+one; a per-pass heartbeat is a post-pilot follow-up. Profile states are as of the last analysis.
 Sent delivery rows are inert: only the completion statement writes `updated_at` on a `sent` row, and
 its next change is deletion after retention, so `updated_at` is the send time.
 """
@@ -39,6 +42,11 @@ QUALIFIED_SECONDS = 3420  # same floor as vigie_pipeline.monitoring_engine.sampl
 ROW_LIMIT = 10_000
 CHUNK = 500
 EXAMPLE_LIMIT = 5
+LIVENESS_NOTE = (
+    "liveness is checked at report time only: a recovered mid-window outage is invisible, and an "
+    "idle engine (no re-stamp when nothing is queued) can look stopped; profile states are as of "
+    "engine_last_hour"
+)
 LIVE_LAG_S = 7200  # the engine may not have run yet this hour
 TARGET_UNWANTED_PER_NETWORK_DAY = 1
 NOT_DERIVABLE = "not_derivable"
@@ -156,7 +164,7 @@ def stale_reason(engine: int | None, ingest: int | None, done: int) -> str:
     """Why a window-wide pass is not enough: the engine or ingest stopped before the end."""
     why = []
     if engine is not None and engine < done - LIVE_LAG_S:
-        why.append(f"engine last ran {iso_utc(engine)}")
+        why.append(f"no device analysed since {iso_utc(engine)}")
     if ingest is not None and ingest < done - LIVE_LAG_S:
         why.append(f"ingest last ran {iso_utc(ingest)}")
     return "; ".join(why)
@@ -231,10 +239,10 @@ def incidents_missing_open(
         "(SELECT 1 FROM incident_deliveries d WHERE d.incident_id=i.id AND d.kind='open')"
     )
     args = _incident_args(lo, hi)
+    # no LIMIT before the watermark split: pre-watermark rows must never hide eligible ones
     counts = inv.execute(
-        f"SELECT COALESCE(SUM(detected_at>=?),0),COALESCE(SUM(detected_at<?),0) FROM "  # noqa: S608
-        f"(SELECT detected_at {base} LIMIT ?)",
-        (mark, mark, *args, ROW_LIMIT),
+        f"SELECT COALESCE(SUM(detected_at>=?),0),COALESCE(SUM(detected_at<?),0) {base}",  # noqa: S608
+        (mark, mark, *args),
     ).fetchone()
     examples = inv.execute(
         f"SELECT id,substr(detected_at,1,10) AS day {base} AND detected_at>=? "  # noqa: S608
@@ -590,13 +598,14 @@ def build_report(  # noqa: PLR0913
             "inventory": "present" if inv is not None else "unknown: file missing",
             "engine_last_hour": None if engine_last is None else iso_utc(engine_last),
             "ingest_last_hour": None if ingest_last is None else iso_utc(ingest_last),
+            "liveness_note": LIVENESS_NOTE,
             "incidents": _degrade(incidents_section(inv, lo, hi, gap), stale),
             "decisions": decisions_section(ov, lo, hi),
             "deliveries": _degrade(
                 deliveries_section(inv, lo, hi, gap, delivery_retention_s, missing_open), stale
             ),
             "coverage": coverage_section(inv, lo, done),
-            "profiles": profiles_section(inv, lo, family, source, detected),
+            "profiles": _degrade(profiles_section(inv, lo, family, source, detected), stale),
             "unwanted_notifications": _degrade(
                 unwanted_section(
                     inv, ov, lo, hi, gap, delivery_retention_s, missing_open, watermark

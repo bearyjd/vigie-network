@@ -203,7 +203,7 @@ def test_engine_that_stopped_days_ago_makes_zero_incidents_partial(env, capsys, 
     r = report(env, capsys, monkeypatch)
     for name in ("incidents", "deliveries"):
         assert r[name]["status"] == "partial", name
-        assert "engine last ran" in r[name]["reason"]
+        assert "no device analysed since" in r[name]["reason"]
     assert r["engine_last_hour"] == iso_utc(HOUR0 - 3600 - 6 * DAY)
     assert r["ingest_last_hour"] == iso_utc(HOUR0 - 3600)
 
@@ -213,7 +213,7 @@ def test_stale_engine_withholds_the_notification_verdict(env, capsys, monkeypatc
     delivery(env, 1, "sent", NOW - 3600, "n1")
     decide(env, "n1", "acknowledged", 1)
     u = report(env, capsys, monkeypatch)["unwanted_notifications"]
-    assert u["status"] == "partial" and "engine last ran" in u["reason"]
+    assert u["status"] == "partial" and "no device analysed since" in u["reason"]
     assert "within_target" not in u
 
 
@@ -336,3 +336,51 @@ def test_coverage_outside_the_window_is_not_evidence(env, capsys, monkeypatch): 
     r = report(env, capsys, monkeypatch)
     assert r["incidents"]["status"] == "unknown"
     assert "no coverage evidence" in r["incidents"]["reason"]
+
+
+def test_watermark_split_happens_before_the_row_limit(env, capsys, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(pilot_report, "ROW_LIMIT", 2)
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    _watermark(env, -5 * DAY)
+    for i in range(3):  # more pre-watermark incidents without rows than the limit ...
+        incident(env, f"p{i}", detector=f"p{i}", episode=HOUR0 - 3600)
+        set_detected(env, f"p{i}", -6 * DAY)
+    incident(env, "eligible", detector="e", episode=HOUR0 - 3600)  # ... hide this one
+    set_detected(env, "eligible", -3600)
+    delivery(env, 1, "sent", NOW - 1800, "other")
+    decide(env, "other", "acknowledged", 1)
+    r = report(env, capsys, monkeypatch)
+    u = r["unwanted_notifications"]
+    assert (
+        u["incidents_without_open_delivery"] == 1 and u["incidents_before_delivery_watermark"] == 3
+    )
+    assert u["status"] == "unknown" and "within_target" not in u
+    assert r["deliveries"]["status"] == "unknown"
+    assert [e["incident_id"] for e in u["missing_open_examples"]] == ["eligible"]
+
+
+def test_examples_never_list_pre_watermark_incidents(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    _watermark(env, -5 * DAY)
+    incident(env, "ancient", detector="a", episode=HOUR0 - 3600)
+    set_detected(env, "ancient", -6 * DAY)
+    incident(env, "stuck", detector="b", episode=HOUR0 - 3600)
+    set_detected(env, "stuck", -3600)
+    u = report(env, capsys, monkeypatch)["unwanted_notifications"]
+    assert [e["incident_id"] for e in u["missing_open_examples"]] == ["stuck"]
+
+
+def test_stale_engine_degrades_profiles_too(env, capsys, monkeypatch):  # noqa: F811
+    _stale_engine(env, 2 * DAY)
+    p = report(env, capsys, monkeypatch)["profiles"]
+    assert p["status"] == "partial" and "no device analysed since" in p["reason"]
+
+
+def test_liveness_is_disclosed_as_a_report_time_check(seeded, capsys, monkeypatch):
+    r = report(seeded, capsys, monkeypatch)
+    assert "report time" in r["liveness_note"] and "idle" in r["liveness_note"]
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    assert cli.main(["pilot-report", "--data-dir", str(seeded.root), "--since", "7d"]) == 0
+    assert "liveness_note:" in capsys.readouterr().out

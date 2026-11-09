@@ -107,6 +107,7 @@ def render_text(report: dict) -> str:
         f"assumed delivery retention: {report['assumed_delivery_retention_s']}s",
         f"engine_last_hour: {report['engine_last_hour']}",
         f"ingest_last_hour: {report['ingest_last_hour']}",
+        f"liveness_note: {report['liveness_note']}",
     ]
     for name in ("incidents", "decisions", "deliveries", "coverage", "profiles"):
         lines += _section_lines(name, report[name])
