@@ -1,6 +1,6 @@
 # PRP-004: Home Assistant integration (outbound webhook sender)
 
-Status: **Design proposal. Nothing is built.** No owner decision below is confirmed yet; the open decisions are listed in section 9.
+Status: **Partly built.** H1 (`ha_sender.py`), the H4 templates and docs, the H0 tool (`ha_h0_check.py`) and the truncate helper (`senders_caught_up.py`) are merged or on a branch; H2 and H3 are not started. No owner decision below is confirmed yet; the open decisions are listed in section 9.
 License: AGPL-3.0-or-later. Branch: `docs/prp-004-home-assistant`.
 
 Relationship to other docs: [PRP-001](001-vigie-architecture.md) is the architecture this extends. [PRP-003](003-endpoint-events.md) is the format model for this document (phases, threat table, owner decisions). The delivery design this reuses is the ntfy sender: [`deploy/persistent/ntfy_sender.py`](../../deploy/persistent/ntfy_sender.py) and "Incident delivery to ntfy" in [monitoring](../monitoring.md). The delivery file is written by [`delivery_publish.py`](../../server/src/vigie_pipeline/delivery_publish.py); the deployment note is in [deploy](../deploy.md).
@@ -153,7 +153,7 @@ Modelled on the ntfy sender; each item below mirrors a property of [`ntfy_sender
 | First run | Starts at offset 0 | Seeds at end of file by default |
 | Auth | Optional bearer token | None; the URL is the secret |
 
-**Two senders, one delivery file: the truncate rule.** The current instructions in [monitoring](../monitoring.md) (lines 627-635) assume one sender. With ntfy and `ha_sender` both enabled they must become: stop BOTH timers, and truncate only when EVERY enabled sender's cursor offset equals the delivery file size, because truncating while either sender is behind drops its pending alerts. H4 updates those lines and ships a helper check (a small read-only script that prints each sender's cursor offset against the file size and exits nonzero unless all enabled senders are caught up) so the owner does not compare numbers by hand.
+**Two senders, one delivery file: the truncate rule.** The current instructions in [monitoring](../monitoring.md) (section "Incident delivery to ntfy", truncate steps 1-3, currently lines 732-742) assume one sender. With ntfy and `ha_sender` both enabled they must become: stop BOTH timers, and truncate only when EVERY enabled sender's cursor offset equals the delivery file size, because truncating while either sender is behind drops its pending alerts. H4 updates those lines and ships a helper check (a small read-only script that prints each sender's cursor offset against the file size and exits nonzero unless all enabled senders are caught up) so the owner does not compare numbers by hand.
 
 ### H2: read-only entities (notes, no code)
 
@@ -180,7 +180,7 @@ Embedding the Vigie UI in HA depends on the installation type (per HA docs, unve
 | IP, MAC, DNS names, ports, process paths, raw evidence | Never | Never |
 | Per-device entities (H2) | No | Per device |
 
-`VIGIE_DELIVERY_INCLUDE_LABEL` is a pipeline-wide switch: it changes what the pipeline writes to the delivery file, so it affects every sender that reads it. [monitoring](../monitoring.md) (lines 235-236) describes it as meant for local-only publishers such as the FilePublisher, so enabling it for a network sender is an accepted pipeline-wide risk, not an HA feature. This PRP therefore does not offer it as an HA option. If the owner enables it anyway for another reason, `ha_sender` fails closed: the record carries no device id, so it cannot rewrite a label to the alias, and the ntfy label charset accepts any ordinary name. The sender therefore skips (counted warning, never sent, no record text logged) any record whose label is not exactly the alias pattern `^Device [a-z]{6}$`, with a test that a named-device record is skipped. A per-sender label policy would need a pipeline change and is not proposed.
+`VIGIE_DELIVERY_INCLUDE_LABEL` is a pipeline-wide switch: it changes what the pipeline writes to the delivery file, so it affects every sender that reads it. [monitoring](../monitoring.md) (currently lines 340-341) describes it as meant for local-only publishers such as the FilePublisher, so enabling it for a network sender is an accepted pipeline-wide risk, not an HA feature. This PRP therefore does not offer it as an HA option. If the owner enables it anyway for another reason, `ha_sender` fails closed: the record carries no device id, so it cannot rewrite a label to the alias, and the ntfy label charset accepts any ordinary name. The sender therefore skips (counted warning, never sent, no record text logged) any record whose label is not exactly the alias pattern `^Device [a-z]{6}$`, with a test that a named-device record is skipped. A per-sender label policy would need a pipeline change and is not proposed.
 
 ## 7. Test plan
 
@@ -213,11 +213,11 @@ Embedding the Vigie UI in HA depends on the installation type (per HA docs, unve
 | # | Decision | Recommendation | State |
 |---|---|---|---|
 | D1 | Which HA installation type is in use (OS, supervised, container, core)? Drives H3 and whether add-ons or ingress are possible | None until known | **Open** |
-| D2 | Transport: webhook rather than MQTT | Webhook | Proposed |
-| D3 | Content: alias plus relative link only, the same default as ntfy. The label switch is pipeline-wide and meant for local-only publishers, so it is not an HA option | Same default as ntfy | Proposed |
-| D4 | Plain HTTP allowed for a private LAN HA address (an RFC 1918 or ULA literal, or a name, listed in `http_hosts`), or HTTPS required, implemented as the separate `http_hosts` key (empty by default, subset of `allowed_hosts`). Plain HTTP exposes the secret URL and payload to a LAN observer, who can replay them | HTTPS required (with `ca_file` for a private CA) unless the owner lists the host in `http_hosts` | **Open** |
+| D2 | Transport: webhook rather than MQTT | Webhook | Proposed; implemented by `ha_sender.py` (owner confirmation not recorded) |
+| D3 | Content: alias plus relative link only, the same default as ntfy. The label switch is pipeline-wide and meant for local-only publishers, so it is not an HA option | Same default as ntfy | Proposed; implemented by `ha_sender.py` (only `Device xxxxxx` aliases are sent, other labels are skipped; owner confirmation not recorded) |
+| D4 | Plain HTTP allowed for a private LAN HA address (an RFC 1918 or ULA literal, or a name, listed in `http_hosts`), or HTTPS required, implemented as the separate `http_hosts` key (empty by default, subset of `allowed_hosts`). Plain HTTP exposes the secret URL and payload to a LAN observer, who can replay them | HTTPS required (with `ca_file` for a private CA) unless the owner lists the host in `http_hosts` | **Open** (the `http_hosts` key, empty by default and a subset of `allowed_hosts`, is implemented in `ha_sender.py`; whether the owner uses plain HTTP is not decided) |
 | D5 | Is H2 (read path, read-only token, per-device entities) wanted at all | Defer until H1 has run for a while | **Open** |
-| D6 | On a 4xx, skip the record after a good probe (ntfy rule, exit 5) or stop on every other 4xx. H0 may show that HA returns 2xx for the wrong-id and disabled cases, which would make the 4xx class nearly unreachable | Stop on every other 4xx, unless H0 shows a per-record 4xx exists | **Open** (decided after H0 and in H1 review) |
+| D6 | On a 4xx, skip the record after a good probe (ntfy rule, exit 5) or stop on every other 4xx. H0 may show that HA returns 2xx for the wrong-id and disabled cases, which would make the 4xx class nearly unreachable | Stop on every other 4xx, unless H0 shows a per-record 4xx exists | **Open** (decided after H0 and in H1 review; `ha_sender.py` currently implements the recommendation, any other 4xx exits 3 with the cursor not advanced, and H0 rows 1 and 3 to 5 are still unmeasured) |
 | D7 | Does the sender reach HA directly on the LAN, or through a reverse proxy, tunnel or cloud URL (a third party sees the URL and payload, and `local_only` must be off) | Direct on the LAN; the owner states the path; no real hostnames go into the repository | **Open** |
 
 ## 10. Review log
