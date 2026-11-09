@@ -203,6 +203,23 @@ fn a_pending_catch_up_survives_a_second_deferral() {
 }
 
 #[test]
+fn a_pending_floor_survives_a_second_deferral_that_hits_the_cap() {
+    let mut c = after_first_window();
+    assert!(c.should_defer(P - 10, 120)); // deferral A
+    assert!(!c.should_defer(P + 5, 135)); // caught up, no mark_window
+    assert!(c.should_defer(P - 100_000, 140)); // deferral B
+    assert!(
+        !c.should_defer(P - 100_000 + MAX_DEFER_S, 140 + MAX_DEFER_S),
+        "cap reached"
+    );
+    assert_eq!(
+        c.deferral_min_wall(),
+        Some(P - 10),
+        "A's floor is still pending"
+    );
+}
+
+#[test]
 fn a_pending_floor_is_not_raised_by_a_shallower_second_deferral() {
     let mut c = after_first_window();
     assert!(c.should_defer(P - 30, 120));

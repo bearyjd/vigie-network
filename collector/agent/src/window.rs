@@ -45,8 +45,8 @@ pub struct WindowClock {
     prev_end: Option<u64>,
     /// The current deferral: (monotonic second it began, lowest wall second polled so far).
     deferral: Option<(u64, u64)>,
-    /// Lowest wall second polled by the deferral that just ended because the wall clock caught
-    /// up; kept until the window it deferred is built (see `deferral_min_wall`).
+    /// Lowest wall second polled by any deferral since the last built window (it can span several
+    /// deferrals); kept until the window it deferred is built (see `deferral_min_wall`).
     deferred_floor: Option<u64>,
 }
 
@@ -132,8 +132,9 @@ impl WindowClock {
         self.prev_end = Some(end_s);
         self.deferred_floor = None;
     }
-    /// The lowest wall second polled during the deferral that just ended, when the window about
-    /// to be built was deferred past a backward wall step (it now starts at the previous end).
+    /// The lowest wall second polled by any deferral since the last built window, when the window
+    /// about to be built was deferred past a backward wall step (it starts at its computed start:
+    /// the previous end, or the monotonic arithmetic after a cap).
     /// Rows stamped at or after it were stamped during the deferral (see `Window::raise_dns_floor`).
     pub fn deferral_min_wall(&self) -> Option<u64> {
         self.deferred_floor
