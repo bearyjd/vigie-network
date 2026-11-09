@@ -153,7 +153,7 @@ Modelled on the ntfy sender; each item below mirrors a property of [`ntfy_sender
 | First run | Starts at offset 0 | Seeds at end of file by default |
 | Auth | Optional bearer token | None; the URL is the secret |
 
-**Two senders, one delivery file: the truncate rule.** The current instructions in [monitoring](../monitoring.md) (section "Incident delivery to ntfy", truncate steps 1-3, currently lines 732-742) assume one sender. With ntfy and `ha_sender` both enabled they must become: stop BOTH timers, and truncate only when EVERY enabled sender's cursor offset equals the delivery file size, because truncating while either sender is behind drops its pending alerts. H4 updates those lines and ships a helper check (a small read-only script that prints each sender's cursor offset against the file size and exits nonzero unless all enabled senders are caught up) so the owner does not compare numbers by hand.
+**Two senders, one delivery file: the truncate rule.** The current instructions in [monitoring](../monitoring.md) (section "Incident delivery to ntfy", truncate steps 1-3, currently lines 732-749) assume one sender. With ntfy and `ha_sender` both enabled they must become: stop BOTH timers, and truncate only when EVERY enabled sender's cursor offset equals the delivery file size, because truncating while either sender is behind drops its pending alerts. H4 updates those lines and ships a helper check (a small read-only script that prints each sender's cursor offset against the file size and exits nonzero unless all enabled senders are caught up) so the owner does not compare numbers by hand.
 
 ### H2: read-only entities (notes, no code)
 

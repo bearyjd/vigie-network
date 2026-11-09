@@ -217,6 +217,129 @@ def test_output_never_contains_paths(tmp_path, capsys, offset) -> None:
     assert code == 2
 
 
+def cursor_for_zero(tmp: Path, name: str, delivery: Path) -> Path:
+    """Config and an offset-0 cursor that point at `delivery` (any file type)."""
+    cursor = private(tmp / f"{name}.cursor", '{"offset": 0, "dev": 0, "ino": 0, "head": ""}')
+    cfg = {"delivery_file": str(delivery), "cursor_file": str(cursor)}
+    return private(tmp / f"{name}.json", json.dumps(cfg))
+
+
+def test_fifo_delivery_file_exit_2_without_hanging(tmp_path) -> None:
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    cfg = cursor_for_zero(tmp_path, "ntfy", fifo)
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", str(PERSISTENT / "senders_caught_up.py"), "--ntfy-config", str(cfg)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert proc.returncode == 2 and "caught_up" not in proc.stdout
+
+
+def test_symlinked_delivery_file_exit_2(tmp_path, capsys) -> None:
+    real = private(tmp_path / "real.jsonl", DELIVERY)
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real)
+    cfg = cursor_for_zero(tmp_path, "ntfy", link)
+    real.write_bytes(b"")  # size 0 == offset 0: only the symlink refusal can stop "caught_up"
+    code, out, _ = run(capsys, "--ntfy-config", str(cfg))
+    assert code == 2 and "caught_up" not in out
+
+
+@pytest.mark.parametrize("target", ["_first_line_hash", "_paths"])
+def test_oserror_from_a_read_exits_2_with_a_fixed_message(
+    tmp_path, capsys, monkeypatch, target
+) -> None:
+    ntfy = make_sender(tmp_path, "ntfy", len(DELIVERY))
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise OSError(5, "Input/output error", str(tmp_path))
+
+    owner = scu.ha if target == "_first_line_hash" else scu
+    monkeypatch.setattr(owner, target, boom)
+    code, out, err = run(capsys, "--ntfy-config", str(ntfy))
+    assert code == 2 and "caught_up" not in out and str(tmp_path) not in err
+    assert "Input/output error" in err  # mapped by check(), not the generic catch-all
+
+
+def test_fstat_oserror_exits_2(tmp_path, capsys, monkeypatch) -> None:
+    ntfy = make_sender(tmp_path, "ntfy", len(DELIVERY))
+    real_fstat = os.fstat
+    calls: list[int] = []
+
+    def flaky(fd: int) -> os.stat_result:
+        calls.append(fd)
+        if len(calls) == 3:  # config, cursor, then the delivery file
+            raise OSError(5, "Input/output error")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(scu.os, "fstat", flaky)
+    code, _, _ = run(capsys, "--ntfy-config", str(ntfy))
+    assert code == 2
+
+
+def test_unexpected_exception_exits_2_with_a_fixed_message(tmp_path, capsys, monkeypatch) -> None:
+    ntfy = make_sender(tmp_path, "ntfy", len(DELIVERY))
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError(f"secret {tmp_path}")
+
+    monkeypatch.setattr(scu, "check", boom)
+    code, out, err = run(capsys, "--ntfy-config", str(ntfy))
+    assert code == 2 and "caught_up" not in out
+    assert str(tmp_path) not in err and "Traceback" not in err
+
+
+def test_keyboard_interrupt_is_not_swallowed(tmp_path, monkeypatch) -> None:
+    ntfy = make_sender(tmp_path, "ntfy", len(DELIVERY))
+
+    def stop(*_a: object, **_k: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scu, "check", stop)
+    with pytest.raises(KeyboardInterrupt):
+        scu.main(["--ntfy-config", str(ntfy)])
+
+
+def test_missing_ha_sender_exits_2_without_a_path(tmp_path) -> None:
+    lone = tmp_path / "lonely"
+    lone.mkdir()
+    script = lone / "senders_caught_up.py"
+    script.write_bytes((PERSISTENT / "senders_caught_up.py").read_bytes())
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", str(script), "--ha-config", str(tmp_path / "x.json")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 2 and "Traceback" not in proc.stderr
+    assert str(tmp_path) not in proc.stderr + proc.stdout
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_never_exits_0(capsys, flag) -> None:
+    with pytest.raises(SystemExit) as exc:
+        scu.main([flag])
+    assert exc.value.code == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_no_config_message_is_shown(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        scu.main([])
+    assert exc.value.code == 2
+    assert "at least one of --ntfy-config / --ha-config is required" in capsys.readouterr().err
+
+
+def test_argparse_errors_do_not_echo_values(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        scu.main(["--bogus=/SECRET/VALUE", "/SECRET/POSITIONAL"])
+    assert exc.value.code == 2
+    assert "SECRET" not in capsys.readouterr().err
+
+
 def test_runs_isolated_as_a_script(tmp_path) -> None:
     n = len(DELIVERY)
     ntfy = make_sender(tmp_path, "ntfy", n)
