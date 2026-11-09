@@ -10,10 +10,13 @@ from incident_helpers import incident, seed_collector
 from test_pilot_report import (  # noqa: F401
     DAY,
     HOUR0,
+    TOD_V,
+    _env_with_sent,
     _profile,
     cover,
     decide,
     delivery,
+    profiles,
     report,
     report_since,
     seeded,
@@ -182,3 +185,154 @@ def test_coverage_retention_edge_is_the_exact_prune_cutoff(  # noqa: F811
 ):
     cover(env, "c1", HOUR0 - 3600)
     assert report_since(env, capsys, monkeypatch, since)["coverage"]["status"] == status
+
+
+# ---- liveness, watermark, boundaries ----
+
+
+def _stale_engine(env: Env, age_s: int) -> None:  # noqa: F811
+    """Hourly coverage up to the last complete hour; the engine's last pass `age_s` before it."""
+    seed_collector(env)
+    for h in range(1, 48):
+        cover(env, "c1", HOUR0 - 3600 * h, engine=False)
+    _profile(env, "e", "mature", 1, 1, updated=HOUR0 - 3600 - age_s)
+
+
+def test_engine_that_stopped_days_ago_makes_zero_incidents_partial(env, capsys, monkeypatch):  # noqa: F811
+    _stale_engine(env, 6 * DAY)
+    r = report(env, capsys, monkeypatch)
+    for name in ("incidents", "deliveries"):
+        assert r[name]["status"] == "partial", name
+        assert "engine last ran" in r[name]["reason"]
+    assert r["engine_last_hour"] == iso_utc(HOUR0 - 3600 - 6 * DAY)
+    assert r["ingest_last_hour"] == iso_utc(HOUR0 - 3600)
+
+
+def test_stale_engine_withholds_the_notification_verdict(env, capsys, monkeypatch):  # noqa: F811
+    _stale_engine(env, 6 * DAY)
+    delivery(env, 1, "sent", NOW - 3600, "n1")
+    decide(env, "n1", "acknowledged", 1)
+    u = report(env, capsys, monkeypatch)["unwanted_notifications"]
+    assert u["status"] == "partial" and "engine last ran" in u["reason"]
+    assert "within_target" not in u
+
+
+def test_fresh_engine_and_ingest_are_ok(env, capsys, monkeypatch):  # noqa: F811
+    _stale_engine(env, 0)
+    r = report(env, capsys, monkeypatch)
+    assert r["incidents"]["status"] == "ok" and r["deliveries"]["status"] == "ok"
+
+
+def test_stale_ingest_makes_sections_partial(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3 * DAY)  # coverage stopped 3 days ago, engine is fresh
+    r = report(env, capsys, monkeypatch)
+    assert r["incidents"]["status"] == "partial"
+    assert "ingest last ran" in r["incidents"]["reason"]
+
+
+@pytest.mark.parametrize(("lag", "status"), [(7200, "ok"), (10800, "partial")])
+def test_liveness_boundary_is_two_hours_behind_the_current_hour(
+    lag, status, env, capsys, monkeypatch
+):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - lag, engine=False)
+    _profile(env, "e", "mature", 1, 1, updated=HOUR0 - lag)
+    assert report(env, capsys, monkeypatch)["incidents"]["status"] == status
+
+
+def test_text_shows_liveness_hours(env, capsys, monkeypatch):  # noqa: F811
+    cover(env, "c1", HOUR0 - 3600)
+    monkeypatch.setattr(pilot_report_cli.time, "time", lambda: NOW)
+    assert cli.main(["pilot-report", "--data-dir", str(env.root), "--since", "7d"]) == 0
+    out = capsys.readouterr().out
+    assert f"engine_last_hour: {iso_utc(HOUR0 - 3600)}" in out
+    assert f"ingest_last_hour: {iso_utc(HOUR0 - 3600)}" in out
+
+
+def _watermark(env: Env, offset: float) -> None:  # noqa: F811
+    env.inv.execute(
+        "INSERT OR REPLACE INTO pipeline_meta(key,value) VALUES ('delivery_eligible_since',?)",
+        (str(int(NOW + offset)),),
+    )
+
+
+def test_pre_watermark_incident_does_not_force_unknown(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    incident(env, "old", detector="a", episode=HOUR0 - 3600)
+    set_detected(env, "old", -3 * DAY)
+    _watermark(env, -DAY)  # delivery was enabled after the incident: it never gets a row
+    incident(env, "new", detector="b", episode=HOUR0 - 3600)
+    set_detected(env, "new", -3600)
+    delivery(env, 1, "sent", NOW - 1800, "new")
+    decide(env, "new", "acknowledged", 1)
+    u = report(env, capsys, monkeypatch)["unwanted_notifications"]
+    assert u["status"] == "ok" and u["incidents_without_open_delivery"] == 0
+    assert u["incidents_before_delivery_watermark"] == 1
+    assert u["delivery_watermark"] == iso_utc(NOW - DAY)
+
+
+def test_post_watermark_incident_without_row_is_unknown_and_named(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    _watermark(env, -5 * DAY)
+    incident(env, "stuck", detector="a", episode=HOUR0 - 3600)
+    set_detected(env, "stuck", -3600)
+    delivery(env, 1, "sent", NOW - 1800, "other")
+    decide(env, "other", "acknowledged", 1)
+    r = report(env, capsys, monkeypatch)
+    u = r["unwanted_notifications"]
+    assert u["status"] == "unknown" and u["incidents_without_open_delivery"] == 1
+    assert u["missing_open_examples"] == [
+        {"incident_id": "stuck", "day": pilot_report._day(int(NOW - 3600))}
+    ]
+    assert "stuck" in r["deliveries"]["reason"]
+
+
+def test_missing_open_examples_are_bounded(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 3600)
+    for i in range(8):
+        incident(env, f"m{i}", detector=f"d{i}", episode=HOUR0 - 3600)
+        set_detected(env, f"m{i}", -3600)
+    u = report(env, capsys, monkeypatch)["unwanted_notifications"]
+    assert u["incidents_without_open_delivery"] == 8
+    assert len(u["missing_open_examples"]) == 5
+
+
+def test_tod_profiles_are_not_derivable_status(env, capsys, monkeypatch):  # noqa: F811
+    _profile(env, "a", "learning", 25, 15, version=TOD_V)
+    p = report(env, capsys, monkeypatch)["profiles"]
+    assert p["status"] == "not_derivable"
+
+
+def test_uncheckable_missing_open_says_so(env, capsys, monkeypatch):  # noqa: F811
+    cover(env, "c1", HOUR0 - 3600)
+    env.inv.execute("DROP TABLE monitoring_incidents")
+    r = report(env, capsys, monkeypatch)
+    assert "cannot be checked" in r["deliveries"]["reason"]
+    assert "None" not in r["deliveries"]["reason"]
+
+
+def test_profile_stamped_exactly_at_the_window_edge_is_analysed(env, capsys, monkeypatch):  # noqa: F811
+    edge = int(NOW - 7 * DAY) // 3600 * 3600 - 3600
+    _profile(env, "edge", "learning", 1, 1, updated=edge)
+    p = profiles(env, capsys, monkeypatch)
+    assert p["profiles_not_analysed_in_window"] == 0 and "learning" in p["per_state"]
+
+
+@pytest.mark.parametrize(("expected", "within"), [(1, True), (2, False)])
+def test_one_per_network_day_boundary(expected, within, env, capsys, monkeypatch):  # noqa: F811
+    decisions = {f"b{i}": "expected" for i in range(expected)}
+    u = _env_with_sent(env, decisions, capsys, monkeypatch)
+    assert u["status"] == "ok" and u["within_target"] is within
+
+
+def test_coverage_outside_the_window_is_not_evidence(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)
+    cover(env, "c1", HOUR0 - 30 * DAY, engine=False)  # long before the 7d window
+    _profile(env, "e", "mature", 1, 1)  # engine ran in the window
+    r = report(env, capsys, monkeypatch)
+    assert r["incidents"]["status"] == "unknown"
+    assert "no coverage evidence" in r["incidents"]["reason"]

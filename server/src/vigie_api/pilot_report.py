@@ -38,6 +38,8 @@ SCHEMA = "vigie-pilot-report/1"
 QUALIFIED_SECONDS = 3420  # same floor as vigie_pipeline.monitoring_engine.samples_for
 ROW_LIMIT = 10_000
 CHUNK = 500
+EXAMPLE_LIMIT = 5
+LIVE_LAG_S = 7200  # the engine may not have run yet this hour
 TARGET_UNWANTED_PER_NETWORK_DAY = 1
 NOT_DERIVABLE = "not_derivable"
 DELIVERY_STATES = ("sent", "failed")
@@ -138,6 +140,36 @@ def evidence_gap(inv: sqlite3.Connection | None, lo: int, done: int) -> str | No
     return None if row.fetchone() else "monitoring engine did not run in window"
 
 
+def liveness(inv: sqlite3.Connection | None) -> tuple[int | None, int | None]:
+    """(last engine pass hour, last ingested coverage hour); None when there is no row."""
+    engine = ingest = None
+    if _has_table(inv, "monitoring_profiles"):
+        assert inv is not None  # noqa: S101 (narrowing for mypy)
+        engine = inv.execute("SELECT MAX(updated_hour) FROM monitoring_profiles").fetchone()[0]
+    if _has_table(inv, "coverage_hourly"):
+        assert inv is not None  # noqa: S101 (narrowing for mypy)
+        ingest = inv.execute("SELECT MAX(hour) FROM coverage_hourly").fetchone()[0]
+    return engine, ingest
+
+
+def stale_reason(engine: int | None, ingest: int | None, done: int) -> str:
+    """Why a window-wide pass is not enough: the engine or ingest stopped before the end."""
+    why = []
+    if engine is not None and engine < done - LIVE_LAG_S:
+        why.append(f"engine last ran {iso_utc(engine)}")
+    if ingest is not None and ingest < done - LIVE_LAG_S:
+        why.append(f"ingest last ran {iso_utc(ingest)}")
+    return "; ".join(why)
+
+
+def _degrade(section: Section, stale: str, *withhold: str) -> Section:
+    """An ok section proven only by an engine/ingest that has since stopped is partial."""
+    if section.get("status") != "ok" or not stale:
+        return section
+    kept = {k: v for k, v in section.items() if k not in withhold}
+    return {**kept, "status": "partial", "reason": stale}
+
+
 def _incident_args(lo: int, hi: int) -> tuple[int, str, str]:
     return engine_lo(lo), iso_utc(lo), iso_utc(hi)
 
@@ -168,22 +200,56 @@ def incidents_section(inv: sqlite3.Connection | None, lo: int, hi: int, gap: str
     }
 
 
-def incidents_missing_open(inv: sqlite3.Connection | None, lo: int, hi: int) -> int | None:
-    """Incidents in the window with no `open` delivery row at all (None: cannot be checked).
+def delivery_watermark(inv: sqlite3.Connection | None) -> int | None:
+    """pipeline_meta.delivery_eligible_since: incidents before it never get a delivery row."""
+    if not _has_table(inv, "pipeline_meta"):
+        return None
+    assert inv is not None  # noqa: S101 (narrowing for mypy)
+    row = inv.execute("SELECT value FROM pipeline_meta WHERE key='delivery_eligible_since'")
+    found = row.fetchone()
+    try:
+        return int(found[0]) if found else None
+    except (TypeError, ValueError):
+        return None
 
-    Conservative: an incident older than the delivery watermark legitimately has none and is
-    counted too, so a non-zero value makes the notification verdict unknown rather than clean."""
+
+def incidents_missing_open(
+    inv: sqlite3.Connection | None, lo: int, hi: int, watermark: int | None
+) -> dict[str, Any] | None:
+    """Incidents in the window with no `open` delivery row (None: cannot be checked).
+
+    Those detected before the delivery watermark legitimately never get one and are only counted
+    (`before`). The rest (`after`) make the notification verdict unknown; the first few are named
+    so a stuck gate can be diagnosed."""
     if inv is None or not (
         _has_table(inv, "monitoring_incidents") and _has_table(inv, "incident_deliveries")
     ):
         return None
-    row = inv.execute(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM monitoring_incidents i "  # noqa: S608
-        f"WHERE {_INCIDENT_WINDOW} AND NOT EXISTS (SELECT 1 FROM incident_deliveries d "
-        "WHERE d.incident_id=i.id AND d.kind='open') LIMIT ?)",
-        (*_incident_args(lo, hi), ROW_LIMIT),
+    mark = iso_utc(watermark) if watermark is not None else ""
+    base = (
+        f"FROM monitoring_incidents i WHERE {_INCIDENT_WINDOW} AND NOT EXISTS "  # noqa: S608
+        "(SELECT 1 FROM incident_deliveries d WHERE d.incident_id=i.id AND d.kind='open')"
     )
-    return int(row.fetchone()[0])
+    args = _incident_args(lo, hi)
+    counts = inv.execute(
+        f"SELECT COALESCE(SUM(detected_at>=?),0),COALESCE(SUM(detected_at<?),0) FROM "  # noqa: S608
+        f"(SELECT detected_at {base} LIMIT ?)",
+        (mark, mark, *args, ROW_LIMIT),
+    ).fetchone()
+    examples = inv.execute(
+        f"SELECT id,substr(detected_at,1,10) AS day {base} AND detected_at>=? "  # noqa: S608
+        "ORDER BY seq LIMIT ?",
+        (*args, mark, EXAMPLE_LIMIT),
+    ).fetchall()
+    return {
+        "after": int(counts[0]),
+        "before": int(counts[1]),
+        "examples": [{"incident_id": r["id"], "day": r["day"]} for r in examples],
+    }
+
+
+def _missing_after(missing: dict[str, Any] | None) -> int | None:
+    return None if missing is None else int(missing["after"])
 
 
 def decisions_section(ov: sqlite3.Connection | None, lo: int, hi: int) -> Section:
@@ -215,15 +281,19 @@ def deliveries_section(  # noqa: PLR0913
     hi: int,
     gap: str | None,
     retention: int,
-    missing_open: int | None,
+    missing_open: dict[str, Any] | None,
 ) -> Section:
     """Per UTC day of completion (updated_at: when it was sent or failed), not of enqueue."""
     if inv is None or not _has_table(inv, "incident_deliveries"):
         return _unknown("incident_deliveries table missing")
     if lo < hi - retention:
         return _unknown("window exceeds delivery retention")
-    if missing_open is None or missing_open > 0:
-        return _unknown(f"incidents in the window have no open delivery row: {missing_open}")
+    after = _missing_after(missing_open)
+    if after is None:
+        return _unknown("open delivery rows cannot be checked: incidents unavailable")
+    if after > 0:
+        named = ", ".join(e["incident_id"] for e in (missing_open or {})["examples"])
+        return _unknown(f"{after} incident(s) have no open delivery row: {named}")
     rows = inv.execute(
         "SELECT strftime('%Y-%m-%d',updated_at,'unixepoch') AS day,state,COUNT(*) AS n "
         "FROM incident_deliveries WHERE updated_at>=? AND updated_at<? "
@@ -378,6 +448,8 @@ def profiles_section(
         head = _unknown("policy version changed in window")
     elif family is None:
         head = {"status": "partial", "reason": "baseline family not established"}
+    elif family == "tod":
+        head = {"status": NOT_DERIVABLE, "reason": "tod baseline: the pooled gate does not apply"}
     return {
         **head,
         **disclosure,
@@ -397,12 +469,12 @@ def _lookup(conn: sqlite3.Connection, sql: str, ids: list[str]) -> dict[str, tup
 
 
 def _unwanted_verdict(
-    undecided: int, truncated: bool, missing_open: int | None, sent: int
+    undecided: int, truncated: bool, missing_after: int | None, sent: int
 ) -> str | None:
     """Why no verdict can be given, or None when the evidence is complete."""
     if undecided or truncated:
         return "evidence incomplete: undecided or truncated notifications"
-    if missing_open is None or missing_open > 0:
+    if missing_after is None or missing_after > 0:
         return "evidence incomplete: incidents without an open delivery row"
     if sent == 0:
         return "no notifications sent: verdict vacuous"
@@ -416,7 +488,8 @@ def unwanted_section(  # noqa: PLR0913
     hi: int,
     gap: str | None,
     retention: int,
-    missing_open: int | None,
+    missing_open: dict[str, Any] | None,
+    watermark: int | None,
 ) -> Section:
     """Open notifications sent (by completion time) for incidents the owner marked `expected`,
     per network-day; the network is the decision row's collector. It counts by the CURRENT
@@ -455,7 +528,7 @@ def unwanted_section(  # noqa: PLR0913
         elif status == "expected":
             unwanted[(network, row["day"])] += 1
     worst = max(unwanted.values(), default=0)
-    why = _unwanted_verdict(undecided, truncated, missing_open, len(sent))
+    why = _unwanted_verdict(undecided, truncated, _missing_after(missing_open), len(sent))
     out: Section = {
         "status": "ok" if why is None else "unknown",
         "definition": "sent open notifications for incidents marked expected",
@@ -463,7 +536,10 @@ def unwanted_section(  # noqa: PLR0913
         "truncated": truncated,
         "notifications_sent": len(sent),
         "undecided_total": undecided,
-        "incidents_without_open_delivery": missing_open,
+        "incidents_without_open_delivery": _missing_after(missing_open),
+        "incidents_before_delivery_watermark": (missing_open or {}).get("before"),
+        "delivery_watermark": iso_utc(watermark) if watermark is not None else None,
+        "missing_open_examples": (missing_open or {}).get("examples", []),
         "unwanted_total": sum(unwanted.values()),
         "worst_network_day": worst,
     }
@@ -498,7 +574,10 @@ def build_report(  # noqa: PLR0913
         family = detected or baseline
         source = "database" if detected else "flag" if baseline else "none"
         gap = evidence_gap(inv, lo, done)
-        missing_open = incidents_missing_open(inv, lo, hi)
+        watermark = delivery_watermark(inv)
+        missing_open = incidents_missing_open(inv, lo, hi, watermark)
+        engine_last, ingest_last = liveness(inv)
+        stale = stale_reason(engine_last, ingest_last, done)
         return {
             "schema": SCHEMA,
             "generated_at": iso_utc(now),
@@ -509,13 +588,21 @@ def build_report(  # noqa: PLR0913
             },
             "assumed_delivery_retention_s": delivery_retention_s,
             "inventory": "present" if inv is not None else "unknown: file missing",
-            "incidents": incidents_section(inv, lo, hi, gap),
+            "engine_last_hour": None if engine_last is None else iso_utc(engine_last),
+            "ingest_last_hour": None if ingest_last is None else iso_utc(ingest_last),
+            "incidents": _degrade(incidents_section(inv, lo, hi, gap), stale),
             "decisions": decisions_section(ov, lo, hi),
-            "deliveries": deliveries_section(inv, lo, hi, gap, delivery_retention_s, missing_open),
+            "deliveries": _degrade(
+                deliveries_section(inv, lo, hi, gap, delivery_retention_s, missing_open), stale
+            ),
             "coverage": coverage_section(inv, lo, done),
             "profiles": profiles_section(inv, lo, family, source, detected),
-            "unwanted_notifications": unwanted_section(
-                inv, ov, lo, hi, gap, delivery_retention_s, missing_open
+            "unwanted_notifications": _degrade(
+                unwanted_section(
+                    inv, ov, lo, hi, gap, delivery_retention_s, missing_open, watermark
+                ),
+                stale,
+                "within_target",
             ),
         }
     finally:

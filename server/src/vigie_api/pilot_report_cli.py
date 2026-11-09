@@ -105,6 +105,8 @@ def render_text(report: dict) -> str:
         f"pooled {report['gate']['pooled_min_hours']} eligible hours",
         f"inventory: {report['inventory']}",
         f"assumed delivery retention: {report['assumed_delivery_retention_s']}s",
+        f"engine_last_hour: {report['engine_last_hour']}",
+        f"ingest_last_hour: {report['ingest_last_hour']}",
     ]
     for name in ("incidents", "decisions", "deliveries", "coverage", "profiles"):
         lines += _section_lines(name, report[name])
