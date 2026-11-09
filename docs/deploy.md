@@ -108,17 +108,27 @@ Losing `overrides.db` loses human labels, group intents and API tokens; the cont
 enforcement state.
 
 The `vigie-backup` CLI (inside the server image, or `uv run vigie-backup` from `server/`) does this
-safely: it opens each source read-only, copies with SQLite's online backup, writes 0600 files plus a
-`manifest.json` (sizes, `user_version`, sha256, UTC time) into an existing directory you own that is
-not group/world-writable and not a symlink, and never overwrites. Any failure removes what it wrote.
+safely. It opens each source read-only, copies with SQLite's online backup, checks the copy (schema
+`user_version`, `integrity_check`, pipeline schema), and writes 0600 files plus a `manifest.json`
+(sizes, `user_version`, sha256, UTC time) into an existing directory you own. The directory must not
+be a symlink or group/world-writable, and no parent may be writable by others (a sticky `/tmp`-style
+parent is fine). It never overwrites, removes only what it created on failure, and refuses an empty
+or swapped source.
 
 ```sh
 vigie-backup backup --dest <backup-dir> --overrides <overrides.db> --inventory <inventory.db>
-vigie-backup verify <backup-dir>     # read-only; checks user_version, integrity_check, sha256
+vigie-backup verify <backup-dir>     # read-only; manifest, user_version, integrity_check, sha256
+vigie-backup verify <dir> --no-manifest   # only for a manual copy that has no manifest
 ```
 
-Run `verify` after every backup, and restore onto a scratch directory before you rely on one. (The
-CLI has not yet been exercised against the live volumes.) The manual alternative follows.
+- **Run as the service user, or inside the container.** Reading a WAL database creates `-wal`/`-shm`
+  beside it, so a source owned by another user is refused, and the service must keep `-shm`
+  writable for the backup to read it while the service runs.
+- **Verify with the same build that took the backup.** The `user_version` must match exactly, so an
+  older backup fails `verify` after a release adds a migration.
+- **There is no restore command.** Run `verify`, then restore by hand as described below, and test
+  a restore onto a scratch directory before you rely on a backup.
+- The CLI has not yet been exercised against the live volumes. The manual alternative follows.
 
 Use SQLite's online backup, not a file copy (the database is in WAL mode). The slim image has no
 `sqlite3` CLI, so run it from the host against the volume (*unverified*):

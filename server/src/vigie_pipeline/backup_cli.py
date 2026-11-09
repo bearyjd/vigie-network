@@ -21,6 +21,8 @@ def _parser() -> argparse.ArgumentParser:
     b.add_argument("--overrides", type=Path, help="path of overrides.db")
     v = sub.add_parser("verify", help="check a backup directory (schema version, integrity)")
     v.add_argument("directory", type=Path)
+    v.add_argument("--no-manifest", action="store_true",
+                   help="accept a manual copy that has no manifest.json")  # fmt: skip
     return parser
 
 
@@ -33,9 +35,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "backup":
             result = backup.backup(args.dest, inventory=args.inventory, overrides=args.overrides)
         else:
-            result = backup.verify(args.directory)
+            result = backup.verify(args.directory, require_manifest=not args.no_manifest)
     except (backup.BackupError, backup.VerifyError) as exc:
         print(f"vigie-backup: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("vigie-backup: interrupted; partial files were removed", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001 - fixed message, never a traceback or a path
+        print(f"vigie-backup: unexpected error ({type(exc).__name__})", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
     return 0

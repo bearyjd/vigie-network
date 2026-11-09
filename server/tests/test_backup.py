@@ -164,7 +164,7 @@ def test_refuses_group_or_world_writable_dest(sources, dest: Path, mode: int) ->
 
 def test_refuses_dest_not_owned_by_caller(sources, dest: Path, monkeypatch) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: os.stat(dest).st_uid + 1)
-    with pytest.raises(backup.BackupError):
+    with pytest.raises(backup.BackupError, match="not owned"):
         backup.backup(dest, inventory=sources[0], overrides=None)
 
 
@@ -222,6 +222,7 @@ def test_partial_files_removed_when_backup_fails_midway(
         backup.backup(dest, inventory=sources[0], overrides=sources[1])
     assert list(dest.iterdir()) == []
     assert str(dest) not in str(exc.value)
+    assert "overrides.db" in str(exc.value) and "OperationalError" in str(exc.value)
 
 
 def test_missing_source_fails_closed_and_does_not_create_it(sources, dest: Path, tmp_path) -> None:
@@ -244,6 +245,7 @@ def test_verify_accepts_fresh_backup_and_restores_onto_scratch(sources, dest, tm
     scratch.mkdir(mode=0o700)
     for name in ("inventory.db", "overrides.db"):
         (scratch / name).write_bytes((dest / name).read_bytes())
+    (scratch / "manifest.json").write_bytes((dest / "manifest.json").read_bytes())
     # The restored copy opens with the repo's own openers and is writable and migrated.
     open_overrides(scratch / "overrides.db").close()
     inv = open_inventory(scratch / "inventory.db")
@@ -251,7 +253,9 @@ def test_verify_accepts_fresh_backup_and_restores_onto_scratch(sources, dest, tm
     assert inv.execute("SELECT count(*) FROM probe").fetchone()[0] == 1
     assert inv.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     inv.close()
-    assert [r["name"] for r in backup.verify(scratch)] == ["inventory.db", "overrides.db"]
+    # Opened for write by the repo's openers since, so it no longer matches the manifest.
+    results = backup.verify(scratch, require_manifest=False)
+    assert [r["name"] for r in results] == ["inventory.db", "overrides.db"]
 
 
 def test_verify_rejects_corrupted_copy(sources, dest: Path) -> None:
@@ -262,30 +266,28 @@ def test_verify_rejects_corrupted_copy(sources, dest: Path) -> None:
     c.close()
     backup.backup(dest, inventory=None, overrides=sources[1])
     p = dest / "overrides.db"
-    (dest / "manifest.json").unlink()  # prove the integrity check itself, not the sha256
     raw = bytearray(p.read_bytes())
     for off in range(4096, len(raw), 4096):
         raw[off : off + 64] = b"\xff" * 64
     p.write_bytes(bytes(raw))
     with pytest.raises(backup.VerifyError):
-        backup.verify(dest)
+        backup.verify(dest, require_manifest=False)  # the integrity check itself, not the sha256
 
 
 def test_verify_rejects_garbage_and_truncated_files(dest: Path) -> None:
     (dest / "overrides.db").write_bytes(b"not a database at all" * 100)
     with pytest.raises(backup.VerifyError):
-        backup.verify(dest)
+        backup.verify(dest, require_manifest=False)
 
 
 def test_verify_rejects_wrong_user_version(sources, dest: Path) -> None:
     backup.backup(dest, inventory=None, overrides=sources[1])
-    (dest / "manifest.json").unlink()
     c = sqlite3.connect(dest / "overrides.db")
     c.execute(f"PRAGMA user_version={len(OVERRIDES_MIGRATIONS) + 1}")
     c.commit()
     c.close()
     with pytest.raises(backup.VerifyError, match="user_version"):
-        backup.verify(dest)
+        backup.verify(dest, require_manifest=False)
 
 
 def test_verify_rejects_sha_mismatch_against_manifest(sources, dest: Path) -> None:
