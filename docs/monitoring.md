@@ -4,16 +4,17 @@ This slice derives collector-scoped hourly activity, a frozen pooled-median uplo
 read-only incidents, and conservative service-based device hints. It does not establish malicious
 activity, identity trust, enforcement, calibrated classification accuracy, or production readiness.
 A baseline cannot mature before real qualifying history exists; synthetic fixtures prove arithmetic,
-not detection accuracy. A local monitoring UI and notifications remain subsequent product work.
+not detection accuracy. A read-only local monitoring GUI and opt-in, off-by-default notification
+senders are merged; GUI writes and live notification acceptance remain open.
 
 Source is merged through the reviewed DNS-probe fixes. The
 [2026-10-25 field status](monitoring-field-status-2026-10-25.md) records healthy server deployment
 and actual router logging/parsed-DNS and collector privilege evidence. A LAN correction produced
 fresh source flags 0; flagged history is retained and controlled drain reached backlog0.
 PR12 processing-age API is deployed and verified. Bounded outage, drop-in repair and reconciled
-helper respawn passed; natural rotation and cold boot remain pending. The
-48-hour run has not started. No fourteen-date mature
-field reference is claimed.
+helper respawn passed; natural rotation and cold boot remain pending. Real-router 48-hour soaks
+1-4 have since been run; soak 4 was still running on 2026-11-09, so no outcome is claimed. Merged
+source since then (#86-#92) is not deployed. No fourteen-date mature field reference is claimed.
 
 ## Rollout and ownership
 
