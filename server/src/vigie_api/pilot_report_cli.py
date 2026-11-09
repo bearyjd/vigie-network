@@ -1,25 +1,31 @@
-"""`vigie-api pilot-report --since T [--json]`: read-only pilot gate report."""
+"""`vigie-api pilot-report --since T [--json]`: read-only pilot gate report.
+
+Run as the service user that owns the databases; any other user is refused (exit 2). Database
+errors exit 3 with a fixed message.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import sqlite3
 import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 from vigie_api.config import Settings
-from vigie_api.pilot_report import build_report
+from vigie_api.pilot_report import NotDatabaseOwner, build_report
+from vigie_pipeline.config import PipelineConfig
 
 MAX_LOOKBACK_S = 366 * 86400
-_RELATIVE = re.compile(r"^([1-9][0-9]{0,3})([dh])$")
+_RELATIVE = re.compile(r"([1-9][0-9]{0,3})([dh])")
 
 
 def parse_since(text: str, now: float) -> float:
     """`7d`, `36h`, an ISO date or an ISO datetime (UTC when naive); within the last 366 days."""
-    match = _RELATIVE.match(text)
+    match = _RELATIVE.fullmatch(text)
     if match:
         value = float(now - int(match.group(1)) * (86400 if match.group(2) == "d" else 3600))
     else:
@@ -34,7 +40,11 @@ def parse_since(text: str, now: float) -> float:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vigie-api pilot-report")
+    parser = argparse.ArgumentParser(
+        prog="vigie-api pilot-report",
+        description="Read-only pilot gate report. Run as the service user that owns the "
+        "databases. Collector date counts are an upper bound; --since 7d can never reach 14 dates.",
+    )
     parser.add_argument("--data-dir", default=None, help="default: $VIGIE_DATA_DIR")
     parser.add_argument("--since", required=True, help="7d, 36h, ISO date or ISO datetime (UTC)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
@@ -73,6 +83,19 @@ def main(argv: list[str]) -> int:
     settings = Settings.from_env()
     if args.data_dir:
         settings = Settings(data_dir=Path(args.data_dir))
-    report = build_report(settings.inventory_path, settings.overrides_path, since, now)
+    try:
+        baseline = PipelineConfig.from_env().monitoring_baseline
+    except ValueError:
+        baseline = "unknown"  # unreadable config: the gate is reported as not derivable
+    try:
+        report = build_report(
+            settings.inventory_path, settings.overrides_path, since, now, baseline
+        )
+    except NotDatabaseOwner:
+        print("vigie-api: pilot report must run as the database owner", file=sys.stderr)
+        return 2
+    except (sqlite3.Error, OSError):
+        print("vigie-api: pilot report failed: database unreadable", file=sys.stderr)
+        return 3
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_text(report))
     return 0
