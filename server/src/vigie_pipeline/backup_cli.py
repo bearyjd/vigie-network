@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import resource
+import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -24,6 +26,21 @@ def _parser() -> argparse.ArgumentParser:
     v.add_argument("--no-manifest", action="store_true",
                    help="accept a manual copy that has no manifest.json")  # fmt: skip
     return parser
+
+
+CPU_SOFT_S = 120  # a check stuck in one SQLite step cannot be interrupted: the rlimit bounds it
+CPU_HARD_MARGIN_S = 10  # then the kernel kills us at soft + margin
+
+
+def _on_cpu_limit(signum: int, frame: object) -> None:
+    raise backup.VerifyError("check exceeded its CPU budget")
+
+
+def run() -> int:
+    """Console-script entry: bound CPU time (about 2 minutes), then dispatch to `main`."""
+    resource.setrlimit(resource.RLIMIT_CPU, (CPU_SOFT_S, CPU_SOFT_S + CPU_HARD_MARGIN_S))
+    signal.signal(signal.SIGXCPU, _on_cpu_limit)
+    return main()
 
 
 def _print_notes(exc: BaseException) -> None:

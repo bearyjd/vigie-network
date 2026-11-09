@@ -13,7 +13,7 @@ dependencies = [
 [project.scripts]
 vigie-pipeline = "vigie_pipeline.cli:main"
 vigie-api = "vigie_api.cli:main"
-vigie-backup = "vigie_pipeline.backup_cli:main"
+vigie-backup = "vigie_pipeline.backup_cli:run"
 
 [dependency-groups]
 dev = [

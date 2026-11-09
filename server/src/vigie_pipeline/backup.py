@@ -13,8 +13,9 @@ written with the rollback-journal header (bytes 18/19 == 1/1) and `verify` refus
 and any -wal/-shm/-journal sidecar. Any failure removes what this run created. Messages name
 databases by logical name only, never by path.
 
-Memory: copies are held in memory (peak about 3x the database for `backup`, about 2x for `verify`,
-see MAX_DB_BYTES): larger databases need a host-level backup.
+Memory: copies are held in memory (measured peak about 2.7-3.1x the database for `backup`, about
+1.6-2.0x for `verify`, see MAX_DB_BYTES): larger databases need a host-level backup. CPU is bounded
+by the CLI's RLIMIT_CPU, not by the in-process time budget.
 
 The pipeline tables live inside inventory.db (`pipeline_schema`); there is no separate pipeline DB.
 Run as the user that owns the live databases (the service user, or inside the container): the
@@ -27,6 +28,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -42,9 +44,9 @@ INVENTORY = "inventory.db"
 OVERRIDES = "overrides.db"
 MANIFEST = "manifest.json"
 SOURCE_TIMEOUT_S = 5.0
-MAX_DB_BYTES = 128 * 1024 * 1024  # copies are held in memory: bounded (container limit 512 MiB)
+MAX_DB_BYTES = 96 * 1024 * 1024  # copies are held in memory: bounded (container limit 512 MiB)
 MAX_MANIFEST_BYTES = 1024 * 1024
-CHECK_BUDGET_S = 30.0  # time budget for the checks on one image
+CHECK_BUDGET_S = 30.0  # cheap first line of defence only; the CPU rlimit is the real bound
 VALUE_LIMIT_BYTES = 16 * 1024 * 1024  # SQLITE_LIMIT_LENGTH while checking
 HEADER_BYTES = 100
 TOO_LARGE = "database too large for the in-memory backup: use a host-level backup"
@@ -52,6 +54,8 @@ _CHUNK = 1 << 20
 _SIDECARS = ("-wal", "-shm", "-journal")
 _EXPECTED = {INVENTORY: len(INVENTORY_MIGRATIONS), OVERRIDES: len(OVERRIDES_MIGRATIONS)}
 _NAMES = (INVENTORY, OVERRIDES)
+_SENTINEL_TABLE = {INVENTORY: "devices", OVERRIDES: "device_overrides"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 _WRITABLE_BY_OTHERS = stat.S_IWGRP | stat.S_IWOTH
 
 
@@ -63,12 +67,35 @@ class VerifyError(Exception):
     """A backup copy is not a valid restore candidate."""
 
 
+class BudgetError(VerifyError):
+    """A check ran out of its time budget."""
+
+
+def _read_uid_map() -> str:
+    return Path("/proc/self/uid_map").read_text()
+
+
+def _overflow_uid() -> int:
+    return int(Path("/proc/sys/kernel/overflowuid").read_text())
+
+
+def _in_user_namespace() -> bool:
+    """True only for a real user-namespace mapping (not the identity map of the host)."""
+    try:
+        return not any(
+            line.split() == ["0", "0", "4294967295"] for line in _read_uid_map().splitlines()
+        )
+    except OSError:
+        return False
+
+
 def _trusted_owners() -> set[int]:
     owners = {0, os.geteuid(), os.stat("/").st_uid}
-    try:  # the uid a user namespace shows for an unmapped (root) owner
-        owners.add(int(Path("/proc/sys/kernel/overflowuid").read_text()))
-    except (OSError, ValueError):
-        pass
+    if _in_user_namespace():  # the uid shown for an unmapped (root) owner, e.g. /tmp here
+        try:
+            owners.add(_overflow_uid())
+        except (OSError, ValueError):
+            pass
     return owners
 
 
@@ -191,13 +218,14 @@ def _copy_db(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
     src.backup(dst)  # one step: a single consistent snapshot of the WAL database
 
 
-def _harden(conn: sqlite3.Connection) -> list[bool]:
+def _harden(conn: sqlite3.Connection, budget_s: float) -> list[bool]:
     """Make a connection to an untrusted image safe to query: defensive mode, untrusted schema, a
-    value-size limit and a time budget. The returned flag turns True if the budget was hit."""
+    value-size limit and a time budget between VM steps (it cannot interrupt a single step; the
+    CLI's CPU rlimit does). The returned flag turns True if the budget was hit."""
     conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
     conn.execute("PRAGMA trusted_schema=OFF")
     conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, VALUE_LIMIT_BYTES)
-    deadline = time.monotonic() + CHECK_BUDGET_S
+    deadline = time.monotonic() + budget_s
     hit = [False]
 
     def over_budget() -> int:
@@ -216,6 +244,10 @@ def _check_conn(conn: sqlite3.Connection, name: str, hit: list[bool]) -> int:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version != _EXPECTED[name]:
             raise VerifyError(f"{name} user_version {version}, expected {_EXPECTED[name]}")
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_SENTINEL_TABLE[name],)
+        ).fetchone():
+            raise VerifyError(f"{name} has no {_SENTINEL_TABLE[name]} table (wrong database?)")
         if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
             raise VerifyError(f"{name} failed integrity_check")
         row = conn.execute("SELECT type FROM sqlite_master WHERE name='pipeline_schema'").fetchone()
@@ -229,7 +261,7 @@ def _check_conn(conn: sqlite3.Connection, name: str, hit: list[bool]) -> int:
                 )
     except sqlite3.Error as exc:
         if hit[0]:
-            raise VerifyError(f"{name} check exceeded its {CHECK_BUDGET_S:.0f} s budget") from exc
+            raise BudgetError(f"{name} check exceeded its time budget") from exc
         raise VerifyError(f"{name} is unreadable or corrupt ({type(exc).__name__})") from exc
     return version
 
@@ -301,7 +333,7 @@ def _check_image(image: bytearray, name: str) -> int:
             conn.deserialize(image)
         except (sqlite3.Error, ValueError, OverflowError) as exc:
             raise VerifyError(f"{name} is not a database ({type(exc).__name__})") from exc
-        return _check_conn(conn, name, _harden(conn))
+        return _check_conn(conn, name, _harden(conn, CHECK_BUDGET_S))
     finally:
         conn.close()
 
@@ -330,7 +362,10 @@ def _open_source(name: str, source: Path) -> sqlite3.Connection:
         raise BackupError(f"{name} source is not owned by the current user; run as its owner")
     try:
         return sqlite3.connect(
-            f"file:{quote(os.path.abspath(source))}?mode=ro", uri=True, timeout=SOURCE_TIMEOUT_S
+            f"file:{quote(os.path.abspath(source))}?mode=ro",
+            uri=True,
+            timeout=SOURCE_TIMEOUT_S,
+            isolation_level=None,  # explicit BEGIN below: one read transaction for check and copy
         )
     except sqlite3.Error as exc:
         raise BackupError(f"{name} source cannot be opened ({type(exc).__name__})") from exc
@@ -341,14 +376,17 @@ def _snapshot(name: str, source: Path) -> tuple[bytes, int]:
     src = _open_source(name, source)
     dst = sqlite3.connect(":memory:")
     try:
+        src.execute("BEGIN")  # the size we check is the snapshot we copy (backup reuses it)
         if _source_size(src) > MAX_DB_BYTES:
             raise BackupError(f"{name}: {TOO_LARGE}")
         _copy_db(src, dst)
         src.close()
-        if _source_size(dst) > MAX_DB_BYTES:  # it may have grown since the check above
+        if _source_size(dst) > MAX_DB_BYTES:  # the copy's length is the serialized length
             raise BackupError(f"{name}: {TOO_LARGE}")
-        try:
-            version = _check_conn(dst, name, _harden(dst))
+        try:  # our own live source is trusted: ten times the budget
+            version = _check_conn(dst, name, _harden(dst, 10 * CHECK_BUDGET_S))
+        except BudgetError as exc:
+            raise BackupError(str(exc)) from exc
         except VerifyError as exc:
             raise BackupError(f"{exc}; refusing to back it up (wrong or empty source?)") from exc
         image = dst.serialize()  # its length is the page count x page size checked above
@@ -422,11 +460,22 @@ def backup(dest: Path, *, inventory: Path | None, overrides: Path | None) -> dic
         os.close(dfd)
 
 
-def _load_manifest(dfd: int, present: list[str]) -> dict[str, str]:
+def _manifest_entry(entry: Any) -> tuple[str, tuple[str, int]]:
+    """(name, (sha256, size)) of one entry; anything but a str name, 64 lowercase hex digits and
+    a non-negative int size (not a bool) is rejected, so no field can be skipped."""
+    name, sha, size = entry["name"], entry["sha256"], entry["size"]
+    if not isinstance(name, str) or not isinstance(sha, str) or not _SHA256.fullmatch(sha):
+        raise ValueError("bad name or sha256")
+    if type(size) is not int or size < 0:
+        raise ValueError("bad size")
+    return name, (sha, size)
+
+
+def _load_manifest(dfd: int, present: list[str]) -> dict[str, tuple[str, int]]:
     raw, _ = _read_image(dfd, MANIFEST, MAX_MANIFEST_BYTES, VerifyError)
     try:
         entries = json.loads(raw)["files"]
-        listed = {e["name"]: e["sha256"] for e in entries}
+        listed = dict(_manifest_entry(e) for e in entries)
         if len(listed) != len(entries):
             raise ValueError("duplicate")
     except (ValueError, KeyError, TypeError, RecursionError) as exc:
@@ -436,15 +485,17 @@ def _load_manifest(dfd: int, present: list[str]) -> dict[str, str]:
     return listed
 
 
-def _verify_one(dfd: int, name: str, expected_sha: str | None) -> dict[str, Any]:
+def _verify_one(dfd: int, name: str, expected: tuple[str, int] | None) -> dict[str, Any]:
     """One file at a time: sidecars refused, hash checked, then validated in memory."""
     for suffix in _SIDECARS:
         if _exists(dfd, name + suffix):
             raise VerifyError(f"{name}{suffix} exists: a copy that needs it is refused")
     image, sha = _read_image(dfd, name, MAX_DB_BYTES, VerifyError)
-    if expected_sha is not None and sha != expected_sha:
-        raise VerifyError(f"{name} sha256 does not match the manifest")
     size = len(image)
+    if expected is not None and sha != expected[0]:
+        raise VerifyError(f"{name} sha256 does not match the manifest")
+    if expected is not None and size != expected[1]:
+        raise VerifyError(f"{name} size does not match the manifest")
     version = _check_image(image, name)
     return {"name": name, "size": size, "user_version": version, "status": "ok"}
 
@@ -458,11 +509,11 @@ def verify(directory: Path, *, require_manifest: bool = True) -> list[dict[str, 
         present = [n for n in _NAMES if _exists(dfd, n)]
         if not present:
             raise VerifyError("no inventory.db or overrides.db found to verify")
-        listed: dict[str, str] = {}
+        listed: dict[str, tuple[str, int]] = {}
         if require_manifest:
             if not _exists(dfd, MANIFEST):
                 raise VerifyError("manifest.json is missing (--no-manifest is for manual copies)")
             listed = _load_manifest(dfd, present)
-        return [_verify_one(dfd, n, listed.get(n)) for n in present]
+        return [_verify_one(dfd, n, listed[n] if require_manifest else None) for n in present]
     finally:
         os.close(dfd)

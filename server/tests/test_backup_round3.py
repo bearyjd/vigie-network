@@ -3,8 +3,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -15,8 +13,6 @@ from vigie_ingest.db import INVENTORY_MIGRATIONS, open_inventory
 from vigie_pipeline import backup
 from vigie_pipeline.backup_cli import main
 from vigie_pipeline.schema import apply_pipeline_migrations
-
-SRC = str(Path(backup.__file__).resolve().parents[1])
 
 
 @pytest.fixture
@@ -52,55 +48,7 @@ def _patch_header(path: Path, b18: int, b19: int) -> None:
     path.write_bytes(bytes(raw))
 
 
-# --- A: bounded memory ---
-
-_MEASURE = """
-import os, resource, sys
-sys.path.insert(0, {src!r})
-from pathlib import Path
-from vigie_pipeline import backup
-mode, work = sys.argv[1], Path(sys.argv[2])
-dest = work / "dest"
-before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-if mode == "backup":
-    backup.backup(dest, inventory=None, overrides=work / "overrides.db")
-else:
-    backup.verify(dest)
-after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print((after - before) * 1024)
-"""
-
-
-def _measure(mode: str, work: Path) -> tuple[float, int]:
-    out = subprocess.run(  # noqa: S603 - fixed argv, our own interpreter
-        [sys.executable, "-c", _MEASURE.format(src=SRC), mode, str(work)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert out.returncode == 0, out.stderr[-300:]
-    return float(out.stdout.strip()), (work / "overrides.db").stat().st_size
-
-
-def test_peak_memory_is_a_small_multiple_of_the_database(tmp_path: Path) -> None:
-    work = tmp_path / "w"
-    work.mkdir()
-    (work / "dest").mkdir(mode=0o700)
-    conn = open_overrides(work / "overrides.db")
-    conn.execute("CREATE TABLE pad (b BLOB)")
-    conn.execute(
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 32000) "
-        "INSERT INTO pad SELECT randomblob(1000) FROM n"
-    )
-    conn.close()
-    grown, size = _measure("backup", work)
-    assert size > 30 * 1024 * 1024
-    # Measured: backup about 2.7x (the in-memory copy plus serialize()'s buffer and bytes object),
-    # verify about 1.6x. MAX_DB_BYTES (128 MiB) x 3 + interpreter stays under the 512 MiB limit.
-    assert grown < 3.0 * size, f"backup peak {grown / size:.2f}x the database"
-    grown, _ = _measure("verify", work)
-    assert grown < 2.0 * size, f"verify peak {grown / size:.2f}x the database"
+# --- A: bounded memory (the measurement lives in test_backup_round4) ---
 
 
 def test_cap_is_well_under_the_container_limit() -> None:
@@ -166,6 +114,7 @@ def _fresh_copy(sources, dest: Path) -> Path:
 def test_verify_rejects_pipeline_schema_that_is_a_view(dest: Path) -> None:
     path = dest / "inventory.db"
     c = sqlite3.connect(path)
+    c.execute("CREATE TABLE devices (mac TEXT)")
     c.execute(
         "CREATE VIEW pipeline_schema AS WITH RECURSIVE r(n) AS "
         "(SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT max(n) AS version FROM r"
@@ -207,7 +156,7 @@ def test_hardened_connection_budget_defensive_and_untrusted_schema(
 ) -> None:
     monkeypatch.setattr(backup, "CHECK_BUDGET_S", 0.3)
     conn = sqlite3.connect(":memory:")
-    hit = backup._harden(conn)
+    hit = backup._harden(conn, backup.CHECK_BUDGET_S)
     assert conn.execute("PRAGMA trusted_schema").fetchone()[0] == 0
     conn.execute("CREATE TABLE t (x)")
     with pytest.raises(sqlite3.Error):
