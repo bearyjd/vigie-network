@@ -115,6 +115,12 @@ def beyond_incident_retention(lo: int, hi: int) -> bool:
     return lo < hi // 3600 * 3600 - INCIDENT_RETENTION_S + 3600
 
 
+def beyond_coverage_retention(lo: int, hi: int) -> bool:
+    """The engine deletes coverage hour < floor_h(now) - retention; the query reads hour >=
+    floor_h(lo) with no look-back, so only a window starting before that cutoff loses rows."""
+    return lo // 3600 * 3600 < hi // 3600 * 3600 - INCIDENT_RETENTION_S
+
+
 def evidence_gap(inv: sqlite3.Connection | None, lo: int, done: int) -> str | None:
     """Why zero events in the window would not be real: no ingest, or no engine pass."""
     if inv is None or not _has_table(inv, "coverage_hourly"):
@@ -259,6 +265,14 @@ def coverage_section(inv: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
     for row in rows[:ROW_LIMIT]:
         if _reasons_clear(row["reasons"]):
             hours[row["collector_id"]].append(row["hour"])
+    truncated = len(rows) > ROW_LIMIT
+    if not hours and truncated:  # the scan stopped early: absence is not established
+        return {
+            **_status(True),
+            "truncated": True,
+            "note": COVERAGE_NOTE,
+            "per_collector": {},
+        }
     if not hours:
         return _unknown("no qualified hours in the window")
     per_collector = {}
@@ -271,11 +285,11 @@ def coverage_section(inv: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
             "collector_dates_met_upper_bound": dates >= _GATE.minimum_days,
         }
     old = ""
-    if beyond_incident_retention(lo, hi):  # coverage is pruned on the same 90-day edge
+    if beyond_coverage_retention(lo, hi):
         old = "window exceeds coverage retention: counts are a lower bound"
     return {
-        **_status(len(rows) > ROW_LIMIT, old),
-        "truncated": len(rows) > ROW_LIMIT,
+        **_status(truncated, old),
+        "truncated": truncated,
         "note": COVERAGE_NOTE,
         "per_collector": per_collector,
     }

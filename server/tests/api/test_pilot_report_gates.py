@@ -159,3 +159,26 @@ def test_reasons_that_the_engine_does_not_treat_as_clear_do_not(reasons, env, ca
 
 def test_report_json_roundtrips(seeded, capsys, monkeypatch):
     assert json.dumps(report(seeded, capsys, monkeypatch))  # every field is plain JSON
+
+
+def test_truncated_scan_never_claims_no_qualified_hours(env, capsys, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(pilot_report, "ROW_LIMIT", 2)
+    for i in range(1, 4):  # the first rows scanned all carry reasons ...
+        cover(env, "c1", HOUR0 - 3600 * (10 - i), reasons='["gap"]')
+    cover(env, "c1", HOUR0 - 3600)  # ... a clear qualified hour comes after the limit
+    c = report(env, capsys, monkeypatch)["coverage"]
+    assert c["status"] == "partial" and c["truncated"] is True
+    assert "truncated" in c["reason"]
+
+
+def test_complete_scan_with_no_clear_hours_is_unknown(env, capsys, monkeypatch):  # noqa: F811
+    cover(env, "c1", HOUR0 - 3600, reasons='["gap"]')
+    assert report(env, capsys, monkeypatch)["coverage"]["status"] == "unknown"
+
+
+@pytest.mark.parametrize(("since", "status"), [("89d", "ok"), ("90d", "ok"), ("91d", "partial")])
+def test_coverage_retention_edge_is_the_exact_prune_cutoff(  # noqa: F811
+    since, status, env, capsys, monkeypatch
+):
+    cover(env, "c1", HOUR0 - 3600)
+    assert report_since(env, capsys, monkeypatch, since)["coverage"]["status"] == status
