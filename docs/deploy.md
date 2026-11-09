@@ -107,6 +107,19 @@ up the raw shards** (`raw-YYYYMMDD.db`): they hold per-client DNS history and ar
 Losing `overrides.db` loses human labels, group intents and API tokens; the control app keeps its own
 enforcement state.
 
+The `vigie-backup` CLI (inside the server image, or `uv run vigie-backup` from `server/`) does this
+safely: it opens each source read-only, copies with SQLite's online backup, writes 0600 files plus a
+`manifest.json` (sizes, `user_version`, sha256, UTC time) into an existing directory you own that is
+not group/world-writable and not a symlink, and never overwrites. Any failure removes what it wrote.
+
+```sh
+vigie-backup backup --dest <backup-dir> --overrides <overrides.db> --inventory <inventory.db>
+vigie-backup verify <backup-dir>     # read-only; checks user_version, integrity_check, sha256
+```
+
+Run `verify` after every backup, and restore onto a scratch directory before you rely on one. (The
+CLI has not yet been exercised against the live volumes.) The manual alternative follows.
+
 Use SQLite's online backup, not a file copy (the database is in WAL mode). The slim image has no
 `sqlite3` CLI, so run it from the host against the volume (*unverified*):
 
