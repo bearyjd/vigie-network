@@ -732,13 +732,24 @@ pipeline's deliveries run out their attempts, so the file needs attention before
 
 1. The file belongs to the container's subuid, so truncate it inside the namespace
    (`podman unshare`), and stop the timer first (`systemctl --user stop ntfy-sender.timer`).
+   Stopping a timer does not stop a run already in progress: wait until the sender service is
+   inactive (`systemctl --user is-active ntfy-sender.service` must not print `active`). Also
+   stop the pipeline (the process that appends to the delivery file) BEFORE the check in step 2,
+   or a record can arrive between the check and the truncate and be lost.
 2. Truncate ONLY when the cursor offset equals the file size, that is when the sender has
-   delivered everything. Check:
-   `podman unshare stat -c %s /ABSOLUTE/PATH/TO/delivery-messages.jsonl` prints the size; the
-   `offset` in `cat /ABSOLUTE/PATH/TO/CURSOR_DIRECTORY/ntfy-cursor.json` must be the same number.
-   Truncating while the sender is behind (for example after exit 3) drops the pending alerts.
-3. Then `podman unshare truncate -s 0 /ABSOLUTE/PATH/TO/delivery-messages.jsonl` and start the
-   timer again; the sender notices the shorter file and restarts from the beginning.
+   delivered everything. Check with the read-only helper (it reads each sender config only for
+   `cursor_file` and `delivery_file`, writes nothing and prints no path). Run it from the
+   repository root (or give the absolute script path), as `python3 -I`:
+   `podman unshare python3 -I deploy/persistent/senders_caught_up.py --ntfy-config /ABSOLUTE/PATH/TO/private/ntfy-sender.json`
+   prints `ntfy: offset=N size=M caught_up|behind`; exit 0 means caught up, 1 behind, 2 an
+   unreadable or invalid config, cursor or delivery file. Truncate only on exit 0.
+   If the HA sender is also enabled, add `--ha-config` and follow "Two senders, one delivery
+   file" in the Home Assistant section instead. The helper only proves the state at the moment
+   it ran. Truncating while the sender is behind (for example after exit 3) drops the pending
+   alerts.
+3. Run the helper again right before the truncate, and only on exit 0 run
+   `podman unshare truncate -s 0 /ABSOLUTE/PATH/TO/delivery-messages.jsonl`. Start the timer
+   (and the pipeline) again; the sender notices the shorter file and restarts from the beginning.
 
 Requests are verified TLS (system trust store), proxy environment variables are ignored, redirects
 are never followed, the response is read up to 4 KiB and discarded, and only HTTP 200 counts as
@@ -943,10 +954,24 @@ Logs and the summary line (`ha_sender sent=N skipped=M exit=C`) never contain th
 webhook id, the host, the response body or record text.
 
 **Two senders, one delivery file.** With ntfy and HA both enabled, the truncate procedure in the
-ntfy section changes: stop BOTH timers, and truncate only when the cursor `offset` of EVERY enabled
-sender equals the delivery file size; truncating while either is behind drops its pending
-messages. (The read-only helper check proposed in PRP-004 H4 is not built yet; compare the numbers
-by hand.)
+ntfy section changes: stop BOTH timers, wait until BOTH sender services are inactive (a stopped
+timer does not stop a run in progress), stop the pipeline (the process that appends to the
+delivery file), and truncate only when the cursor `offset` of EVERY enabled sender equals the delivery file
+size; truncating while either is behind drops its pending messages. Check both at once with the
+read-only helper (exit 0 only when every named sender is caught up; any other exit means do not
+truncate). Run it from the repository root (or give the absolute script path), as `python3 -I`,
+after the pipeline is stopped, and run it again right before the `truncate`; it only proves the
+state at the moment it ran:
+
+```
+podman unshare python3 -I deploy/persistent/senders_caught_up.py \
+  --ntfy-config /ABSOLUTE/PATH/TO/private/ntfy-sender.json \
+  --ha-config /ABSOLUTE/PATH/TO/private/ha-sender.json
+```
+
+It prints one `<name>: offset=N size=M caught_up|behind` line per sender. A cursor whose inode or
+first-line hash no longer matches the file counts as behind, because the sender would restart
+from the beginning.
 
 **Enabling (owner actions, nothing here is installed for you).** Create the URL file with
 `umask 077`, write the config and the dedicated cursor directory, dry-run by hand with the command
