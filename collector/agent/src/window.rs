@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::builder::MAX_WINDOW_S;
 use crate::model::{ConntrackSummary, DnsQuery, Lease, Neighbor, Sections, Sighting};
 
 /// (mac, kind, name, service, ua)
@@ -25,27 +26,119 @@ pub const SIGHTINGS_ADMIT_PER_WINDOW: usize = 1024;
 /// MACs whose fingerprint is remembered across windows (memory bound).
 pub const MAX_FP_MEMORY: usize = 1024;
 
+/// Largest tolerated disagreement (s) between the wall span since the previous window's end and
+/// the monotonic time since the previous flush before the previous end is no longer trusted.
+const END_REUSE_SLACK_S: u64 = 2;
+/// Monotonic seconds a flush may be deferred while the wall clock is behind the previous end.
+pub const MAX_DEFER_S: u64 = 600;
+
 /// Window start derived from the monotonic clock. The router has no RTC, so NTP can jump the
 /// wall clock by days mid-window; a start taken from the wall clock at the last flush would then
 /// span the jump and the server would reject the whole batch (window > 24 h).
+///
+/// Consecutive windows must tile exactly (`start_n == end_{n-1}`): re-deriving the start from two
+/// independently truncated clocks overlaps them by up to 1 s, which the server rejects. So the
+/// previous window's end is remembered and reused when it agrees with the monotonic clock.
 #[derive(Debug, Default)]
 pub struct WindowClock {
     last_flush_mono_s: u64,
+    prev_end: Option<u64>,
+    /// The current deferral: (monotonic second it began, lowest wall second polled so far).
+    deferral: Option<(u64, u64)>,
+    /// Lowest wall second polled by the deferral that just ended because the wall clock caught
+    /// up; kept until the window it deferred is built (see `deferral_min_wall`).
+    deferred_floor: Option<u64>,
 }
 
 impl WindowClock {
     pub fn new(mono_s: u64) -> Self {
         Self {
             last_flush_mono_s: mono_s,
+            prev_end: None,
+            deferral: None,
+            deferred_floor: None,
         }
     }
     /// Wall time the current window started, given the current wall and monotonic clocks.
     pub fn start(&self, wall_s: u64, mono_s: u64) -> u64 {
         wall_s.saturating_sub(mono_s.saturating_sub(self.last_flush_mono_s))
     }
-    /// Call after every flush attempt, including one skipped because the clock is not sane.
+    /// Start of the window ending at `wall_s`: the previous window's end when it is consistent
+    /// (not in the future, within `END_REUSE_SLACK_S` of the monotonic elapsed time, and at most
+    /// `MAX_WINDOW_S` long), else the monotonic arithmetic of `start`, bounded to `MAX_WINDOW_S` and
+    /// never earlier than a previous end that is not in the future.
+    pub fn window_start(&self, wall_s: u64, mono_s: u64) -> u64 {
+        let elapsed = mono_s.saturating_sub(self.last_flush_mono_s);
+        let reusable = self.prev_end.filter(|&p| {
+            wall_s >= p
+                && wall_s - p <= MAX_WINDOW_S
+                && (wall_s - p).abs_diff(elapsed) <= END_REUSE_SLACK_S
+        });
+        reusable.unwrap_or_else(|| {
+            let computed = self
+                .start(wall_s, mono_s)
+                .max(wall_s.saturating_sub(MAX_WINDOW_S));
+            // After a small wall correction the arithmetic can land before the previous end:
+            // never overlap it (a small forward gap is acceptable).
+            match self.prev_end {
+                Some(p) if wall_s >= p => computed.max(p),
+                _ => computed,
+            }
+        })
+    }
+    /// Whether a flush at `wall_s` must wait: the wall clock is behind the previous window's end
+    /// (it stepped back), so a window ending now would overlap the previous one.
+    ///
+    /// Deferral is bounded: after `MAX_DEFER_S` of monotonic time the remembered end is dropped
+    /// (returns `false`), so a permanent backward step cannot stall uploads; the window then comes
+    /// from the monotonic arithmetic. The caller keeps the window's data and retries later.
+    pub fn should_defer(&mut self, wall_s: u64, mono_s: u64) -> bool {
+        match self.prev_end {
+            Some(p) if wall_s < p => {
+                let (since, min) = match self.deferral {
+                    Some((since, min)) => (since, min.min(wall_s)),
+                    None => {
+                        // A new deferral starts clean: a catch-up still pending from an earlier
+                        // one (its window was never built) must not leak into this one.
+                        self.deferred_floor = None;
+                        (mono_s, wall_s)
+                    }
+                };
+                if mono_s.saturating_sub(since) >= MAX_DEFER_S {
+                    self.prev_end = None;
+                    self.deferral = None;
+                    return false;
+                }
+                self.deferral = Some((since, min));
+                true
+            }
+            _ => {
+                if let Some((_, min)) = self.deferral.take() {
+                    self.deferred_floor = Some(min);
+                }
+                false
+            }
+        }
+    }
+    /// Call after a flush attempt that produced no window (skipped because the clock is not
+    /// sane): the next window cannot continue from a previous end.
     pub fn mark_flush(&mut self, mono_s: u64) {
         self.last_flush_mono_s = mono_s;
+        self.prev_end = None;
+        self.deferral = None;
+        self.deferred_floor = None;
+    }
+    /// Call after a window ending at wall second `end_s` was built at monotonic `mono_s`.
+    pub fn mark_window(&mut self, mono_s: u64, end_s: u64) {
+        self.last_flush_mono_s = mono_s;
+        self.prev_end = Some(end_s);
+        self.deferred_floor = None;
+    }
+    /// The lowest wall second polled during the deferral that just ended, when the window about
+    /// to be built was deferred past a backward wall step (it now starts at the previous end).
+    /// Rows stamped at or after it were stamped during the deferral (see `Window::raise_dns_floor`).
+    pub fn deferral_min_wall(&self) -> Option<u64> {
+        self.deferred_floor
     }
 }
 
@@ -186,6 +279,19 @@ impl Window {
     pub fn rebase_dns(&mut self, offset: u64) {
         for q in &mut self.dns {
             q.ts = q.ts.saturating_add(offset).min(crate::model::MAX_EPOCH);
+        }
+    }
+
+    /// Raises DNS timestamps in `min_ts..floor` to `floor`. Provenance rule: only rows stamped
+    /// DURING a deferral (at or after `min_ts`, the lowest wall second polled while deferring)
+    /// carry the stepped-back clock and belong to the window that starts at `floor`. Rows older
+    /// than `min_ts` are left alone, so the builder still drops and counts them as out of window.
+    /// Not a general out-of-window fix.
+    pub fn raise_dns_floor(&mut self, min_ts: u64, floor: u64) {
+        for q in &mut self.dns {
+            if q.ts >= min_ts {
+                q.ts = q.ts.max(floor);
+            }
         }
     }
 

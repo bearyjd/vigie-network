@@ -3,15 +3,17 @@
 //! The helper reports per source IP; the batch wants per MAC. The neighbor table maps IP to MAC
 //! (IPv4 and IPv6, every address a device uses, so privacy addresses map as long as the kernel
 //! still has the entry). A source with no entry cannot become a row (the schema requires a MAC),
-//! so its bytes and flows are folded into the window's `unmapped` counters instead. The helper's
-//! global remainder record (`other_global`, src `0.0.0.0`) is folded the same way.
+//! so its bytes and flows are folded into the window's counters instead. Two pairs, by cause:
+//! `unmapped` is EXPECTED (the helper's global remainder record, `other_global`, and the router's
+//! own addresses); `lan_unmapped` is a genuine attribution failure (any other source without a MAC).
 //!
 //! Semantics: `bytes_*` are deltas per helper interval, so they add up over a window. `flows` is
 //! the number of live flows in that sample, so the same flow seen in two samples must not be
 //! counted twice: across samples of one window `flows` takes the maximum, within one sample the
 //! rows of different IPs of one device add.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::ctparse::{Kind, Snapshot};
 use crate::model::{ConntrackSummary, Proto};
@@ -48,6 +50,8 @@ pub struct CtAccum {
     rows: BTreeMap<Key, Val>,
     pub unmapped_bytes: u64,
     pub unmapped_flows: u64,
+    pub lan_unmapped_bytes: u64,
+    pub lan_unmapped_flows: u64,
     pub snapshots: u64,
 }
 
@@ -56,18 +60,32 @@ fn other_key(mac: &str) -> Key {
 }
 
 impl CtAccum {
+    /// `add_snapshot_with_own` with no known router addresses (nothing is treated as own).
     pub fn add_snapshot(&mut self, snap: &Snapshot, ip_to_mac: &HashMap<String, String>) {
+        self.add_snapshot_with_own(snap, ip_to_mac, &HashSet::new());
+    }
+
+    /// `own` holds the router's own addresses: unmapped traffic from them is expected.
+    pub fn add_snapshot_with_own(
+        &mut self,
+        snap: &Snapshot,
+        ip_to_mac: &HashMap<String, String>,
+        own: &HashSet<IpAddr>,
+    ) {
         self.snapshots += 1;
         let mut sample: BTreeMap<Key, Val> = BTreeMap::new();
         for r in &snap.records {
             let mac = match (r.kind, ip_to_mac.get(&r.src.to_string())) {
                 (Kind::Tuple | Kind::Other, Some(m)) => m,
                 _ => {
-                    self.unmapped_bytes = self
-                        .unmapped_bytes
-                        .saturating_add(r.bytes_up)
-                        .saturating_add(r.bytes_down);
-                    self.unmapped_flows = self.unmapped_flows.saturating_add(r.flows);
+                    let bytes = r.bytes_up.saturating_add(r.bytes_down);
+                    let (b, f) = if r.kind == Kind::OtherGlobal || own.contains(&r.src) {
+                        (&mut self.unmapped_bytes, &mut self.unmapped_flows)
+                    } else {
+                        (&mut self.lan_unmapped_bytes, &mut self.lan_unmapped_flows)
+                    };
+                    *b = b.saturating_add(bytes);
+                    *f = f.saturating_add(r.flows);
                     continue;
                 }
             };
@@ -102,7 +120,15 @@ impl CtAccum {
         }
     }
 
-    /// Rows of the window so far; leaves the accumulator empty.
+    /// The window's attribution failures `(bytes, flows)`; resets them.
+    pub fn take_lan_unmapped(&mut self) -> (u64, u64) {
+        (
+            std::mem::take(&mut self.lan_unmapped_bytes),
+            std::mem::take(&mut self.lan_unmapped_flows),
+        )
+    }
+
+    /// Rows and expected-unmapped counters of the window so far; leaves them empty.
     pub fn take(&mut self) -> (Vec<ConntrackSummary>, u64, u64) {
         let rows = std::mem::take(&mut self.rows)
             .into_iter()

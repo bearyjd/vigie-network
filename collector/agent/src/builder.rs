@@ -73,8 +73,12 @@ pub const OTHER_KEY: &str = "truncated_other";
 /// Keys that yield first when the map is over the key cap, whatever their count: the redundant
 /// companions of a kept signal (`ct_unmapped_flows` accompanies `ct_unmapped_bytes`).
 const YIELD_FIRST: [&str; 1] = ["ct_unmapped_flows"];
+/// Keys kept before any other count, whatever its size: the attribution-failure pair
+/// (`ct_lan_unmapped_*`) is the signal the server judges the hour by.
+const KEEP_FIRST: [&str; 2] = ["ct_lan_unmapped_bytes", "ct_lan_unmapped_flows"];
 
-/// At most `MAX_TRUNCATED_KEYS` keys: the `YIELD_FIRST` keys go first, then the smallest counts;
+/// At most `MAX_TRUNCATED_KEYS` keys: the `YIELD_FIRST` keys go first, then the smallest counts
+/// (the `KEEP_FIRST` keys are never merged while room remains);
 /// the removed counts are summed into `truncated_other`. The `source_flags` bitmask is always kept verbatim.
 fn cap_truncated_keys(t: &mut BTreeMap<String, u64>) {
     if t.len() <= MAX_TRUNCATED_KEYS {
@@ -83,9 +87,13 @@ fn cap_truncated_keys(t: &mut BTreeMap<String, u64>) {
     let flags = t.remove(FLAGS_KEY);
     let mut rows: Vec<(String, u64)> = std::mem::take(t).into_iter().collect();
     rows.sort_by(|a, b| {
-        let yields = |k: &str| YIELD_FIRST.contains(&k);
-        yields(&a.0)
-            .cmp(&yields(&b.0))
+        let rank = |k: &str| match (KEEP_FIRST.contains(&k), YIELD_FIRST.contains(&k)) {
+            (true, _) => 0,
+            (_, true) => 2,
+            _ => 1,
+        };
+        rank(&a.0)
+            .cmp(&rank(&b.0))
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });

@@ -22,6 +22,41 @@ pub fn parse_ip_neigh(text: &str) -> Vec<Neighbor> {
     out
 }
 
+/// A neighbor read: the usable entries plus the addresses the kernel currently reports as
+/// FAILED or INCOMPLETE (no usable link-layer address). A failed address must not be attributed
+/// from any memory of an earlier pairing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NeighTable {
+    pub neighbors: Vec<Neighbor>,
+    pub failed: HashSet<String>,
+}
+
+impl From<Vec<Neighbor>> for NeighTable {
+    fn from(neighbors: Vec<Neighbor>) -> Self {
+        Self {
+            neighbors,
+            failed: HashSet::new(),
+        }
+    }
+}
+
+pub fn parse_ip_neigh_table(text: &str) -> NeighTable {
+    NeighTable {
+        neighbors: parse_ip_neigh(text),
+        failed: text.lines().filter_map(failed_ip).collect(),
+    }
+}
+
+/// The address of a unicast entry whose state is FAILED or INCOMPLETE.
+fn failed_ip(line: &str) -> Option<String> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let ip: IpAddr = toks.first()?.parse().ok()?;
+    if ip.is_multicast() || ip.is_unspecified() {
+        return None;
+    }
+    matches!(*toks.last()?, "FAILED" | "INCOMPLETE").then(|| ip.to_string())
+}
+
 fn parse_entry(line: &str) -> Option<Neighbor> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     let ip: IpAddr = toks.first()?.parse().ok()?;

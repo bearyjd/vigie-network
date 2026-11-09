@@ -63,6 +63,7 @@ fn mapped_rows_carry_the_mac_and_unmapped_bytes_fold_into_counters() {
         ]),
         &t,
     );
+    let lan = acc.take_lan_unmapped();
     let (rows, ub, uf) = acc.take();
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -70,10 +71,11 @@ fn mapped_rows_carry_the_mac_and_unmapped_bytes_fold_into_counters() {
         (A, 10, 20)
     );
     assert_eq!(rows[0].dst_ip.as_deref(), Some("1.1.1.1"));
+    assert_eq!((ub, uf), (300, 5), "the global remainder is expected");
     assert_eq!(
-        (ub, uf),
-        (310, 7),
-        "unmapped host (10) plus the global remainder (300)"
+        lan,
+        (10, 2),
+        "the unmapped LAN host is an attribution failure"
     );
     let (again, ub, uf) = acc.take();
     assert!(
@@ -137,9 +139,11 @@ fn a_privacy_address_missing_from_the_table_folds_to_unmapped() {
         &snap(vec![rec("fd00::dead:beef", "1.1.1.1", 443, 9, 1, 1)]),
         &t,
     );
+    let lan = acc.take_lan_unmapped();
     let (rows, ub, uf) = acc.take();
     assert!(rows.is_empty());
-    assert_eq!((ub, uf), (10, 1));
+    assert_eq!((ub, uf), (0, 0));
+    assert_eq!(lan, (10, 1));
 }
 
 #[test]
@@ -186,9 +190,10 @@ fn counters_saturate_instead_of_wrapping() {
             &t,
         );
     }
-    let (rows, ub, uf) = acc.take();
+    let lan = acc.take_lan_unmapped();
+    let (rows, ..) = acc.take();
     assert_eq!(rows[0].bytes_up, u64::MAX);
-    assert_eq!((ub, uf), (u64::MAX, u64::MAX));
+    assert_eq!(lan, (u64::MAX, u64::MAX));
 }
 
 #[test]

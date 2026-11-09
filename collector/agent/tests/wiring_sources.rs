@@ -129,12 +129,16 @@ fn snapshot_rows_and_flags_reach_the_batch_per_mac() {
     assert_eq!(t["ct_recounted"], 7);
     assert_eq!(t["ct_dropped_keys"], 9);
     assert_eq!(
-        t["ct_unmapped_bytes"], 10,
+        t["ct_lan_unmapped_bytes"], 10,
         "the unmapped host's bytes are counted, not lost"
     );
     assert_eq!(
-        t["ct_unmapped_flows"], 1,
+        t["ct_lan_unmapped_flows"], 1,
         "and so are its flows (summed over the window's samples)"
+    );
+    assert!(
+        t.get("ct_unmapped_bytes").is_none(),
+        "not an expected exclusion"
     );
     assert!(j["truncated"].as_object().unwrap().len() <= 16);
 }
@@ -645,13 +649,14 @@ impl Neigh {
     fn new(tables: Vec<Vec<(&'static str, &'static str)>>) -> Self {
         Self { tables, calls: 0 }
     }
-    fn read(&mut self) -> Vec<vigie_agent::model::Neighbor> {
+    fn read(&mut self) -> vigie_agent::neigh::NeighTable {
         let i = self.calls.min(self.tables.len() - 1);
         self.calls += 1;
         self.tables[i]
             .iter()
             .map(|(ip, mac)| vigie_agent::model::Neighbor::new(ip, mac).unwrap())
-            .collect()
+            .collect::<Vec<_>>()
+            .into()
     }
 }
 
@@ -718,7 +723,7 @@ fn snapshot_refreshes_are_rate_limited() {
         .pump_refreshing(&mut w, &HashMap::new(), Some(&mut || n.read()), 50);
     assert_eq!(n.calls, 1);
     // A refresh by the agent counts too: the next snapshot in the same second does not re-read.
-    f.sources.note_refresh(60);
+    f.sources.note_refresh(60, Default::default());
     f.ct_tx
         .send(snap(vec![rec("192.168.8.77", 1, 0, 1)]))
         .unwrap();

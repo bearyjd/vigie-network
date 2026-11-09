@@ -116,12 +116,12 @@ struct Agent {
     mono: u64,
     sources: Sources,
     /// `read_neighbors` in production; tests substitute a fake table.
-    neigh_source: fn() -> Vec<vigie_agent::model::Neighbor>,
+    neigh_source: fn() -> vigie_agent::neigh::NeighTable,
 }
 
 impl Agent {
     /// `None` when no random batch id can be had; the caller keeps its data and retries later.
-    fn meta(&mut self, now: u64) -> Option<Meta> {
+    fn meta(&mut self, now: u64, mono_s: u64) -> Option<Meta> {
         let rand = match random::<10>() {
             Ok(r) => r,
             Err(e) => {
@@ -136,7 +136,7 @@ impl Agent {
             boot_id: self.boot_id.clone(),
             seq: self.seq,
             batch_id: ids::uuid7(wall_ms(), rand),
-            window_start: self.clock.start(now, self.started.elapsed().as_secs()),
+            window_start: self.clock.window_start(now, mono_s),
             window_end: now,
         })
     }
@@ -151,9 +151,9 @@ impl Agent {
     }
 
     fn refresh_neighbors(&mut self) {
-        let all = (self.neigh_source)();
-        self.sources.note_refresh(self.mono);
-        self.adopt_neighbors(&all);
+        let table = (self.neigh_source)();
+        self.sources.note_refresh(self.mono, table.failed);
+        self.adopt_neighbors(&table.neighbors);
     }
 
     /// Makes `all` the attribution map and reports its entries that are new since the last read.
@@ -187,7 +187,9 @@ impl Agent {
         {
             return;
         }
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono) else {
+            return;
+        };
         let sections = self.window.take_identity();
         let b = build(&meta, sections, &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded.as_probe());
@@ -195,21 +197,26 @@ impl Agent {
 
     /// Before the first server `Date` the only thing sent is an empty probe: its reply, accepted
     /// or rejected, tells us the time. Data stays in the window (bounded) with monotonic stamps.
-    fn queue_probe(&mut self, now: u64) {
+    fn queue_probe(&mut self, now: u64, mono_s: u64) {
         if !self.engine.spool.is_empty() {
             return;
         }
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono_s) else {
+            return;
+        };
         let b = build(&meta, Sections::default(), &self.health(false), BATCH_CAP);
         self.engine.enqueue(b.encoded.as_probe());
     }
 
-    fn flush_window(&mut self, now: u64, mono_s: u64) {
+    /// Returns `false` when the flush was deferred (the wall clock is behind the previous
+    /// window's end, so a window ending now would overlap it): nothing is consumed and the
+    /// caller retries on a later step.
+    fn flush_window(&mut self, now: u64, mono_s: u64) -> bool {
         self.mono = mono_s;
         let plan = self.sync.plan(self.engine.gate.is_sane(now, mono_s));
         if plan == FlushPlan::Probe {
-            self.queue_probe(now);
-            return;
+            self.queue_probe(now, mono_s);
+            return true;
         }
         if plan == FlushPlan::Hold {
             // No sane clock: batches would carry wrong times. Drop the window and count it.
@@ -217,7 +224,10 @@ impl Agent {
             drop(self.window.take());
             self.engine.spool.note_dropped(1);
             self.clock.mark_flush(mono_s);
-            return;
+            return true;
+        }
+        if self.clock.should_defer(now, mono_s) {
+            return false;
         }
         self.refresh_neighbors();
         match std::fs::read_to_string(&self.cfg.leases_file) {
@@ -235,11 +245,17 @@ impl Agent {
         let quiet = self
             .quiet
             .observe(self.window.dns_count(), self.window.flow_count(), state);
-        let Some(meta) = self.meta(now) else { return };
+        let Some(meta) = self.meta(now, mono_s) else {
+            return true;
+        };
+        if let Some(min_ts) = self.clock.deferral_min_wall() {
+            self.window.raise_dns_floor(min_ts, meta.window_start);
+        }
         let (sections, drops): (Sections, _) = self.window.take_with_drops();
         let b = build_with_drops(&meta, sections, &self.health(quiet), BATCH_CAP, &drops);
-        self.clock.mark_flush(mono_s);
+        self.clock.mark_window(mono_s, now);
         self.engine.enqueue(b.encoded);
+        true
     }
 }
 
@@ -274,8 +290,7 @@ impl Agent {
         if self.urgent.take_pending(started_ms(self.started)) {
             self.push_identity();
         }
-        if mono.saturating_sub(*last_flush) >= window_s {
-            self.flush_window(wall, mono);
+        if mono.saturating_sub(*last_flush) >= window_s && self.flush_window(wall, mono) {
             *last_flush = mono;
         }
         let tick = self.engine.tick(transport, wall, mono, jitter);
@@ -426,7 +441,7 @@ mod tests {
             started: Instant::now(),
             mono: 0,
             sources: Sources::inert(),
-            neigh_source: Vec::new,
+            neigh_source: Default::default,
         }
     }
 
@@ -461,6 +476,141 @@ mod tests {
         assert_eq!(a.window.dns_count(), 1);
         let kept = a.window.take_identity();
         assert_eq!(kept.leases.len(), 1, "lease kept too");
+    }
+
+    fn pop_window(a: &mut Agent, now: u64) -> (u64, u64) {
+        let b = a.engine.spool.pop_front().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b.body(now, 0)).unwrap();
+        (
+            v["window_start"].as_u64().unwrap(),
+            v["window_end"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_flush_behind_the_previous_end_is_deferred_with_its_data_then_contiguous() {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        assert!(a.flush_window(t0 + 60, 60));
+        let (_, first_end) = pop_window(&mut a, t0 + 60);
+        assert_eq!(first_end, t0 + 60);
+
+        add_row(&mut a);
+        // the wall clock stepped back 70 s: deferred, nothing consumed, nothing queued
+        assert!(!a.flush_window(t0 + 50, 120));
+        assert!(!a.flush_window(t0 + 55, 125));
+        assert!(a.engine.spool.is_empty());
+        assert_eq!(a.window.dns_count(), 1, "data retained");
+
+        assert!(a.flush_window(t0 + 65, 135));
+        let (start, end) = pop_window(&mut a, t0 + 65);
+        assert_eq!((start, end), (first_end, t0 + 65), "contiguous, no overlap");
+        assert_eq!(a.window.dns_count(), 0, "consumed by the flush");
+    }
+
+    /// When the DNS row of `next_batch_with_old_dns` is read.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Row {
+        BeforeDeferral,
+        DuringDeferral,
+    }
+
+    /// A synced agent whose first window ended at `t0 + 300` (the wall clock running at the
+    /// time gate's +240 s skew limit). A flush at `defer_at` (offset from `t0`, monotonic) is
+    /// refused, if given. A DNS row stamped `t0 + row_ts` is read at `row`. Returns the batch
+    /// flushed at wall `t0 + wall2`, monotonic `mono2`.
+    fn next_batch_with_old_dns(
+        row_ts: i64,
+        row: Row,
+        defer_at: Option<(i64, u64)>,
+        wall2: i64,
+        mono2: u64,
+    ) -> serde_json::Value {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        assert!(a.flush_window(t0 + 300, 60));
+        a.engine.spool.pop_front().unwrap();
+        let add = |a: &mut Agent| {
+            let ts = (t0 as i64 + row_ts) as u64;
+            a.window
+                .add_dns(DnsQuery::new(ts, MAC, "a.example.com", "A", None).unwrap());
+        };
+        if row == Row::BeforeDeferral {
+            add(&mut a);
+        }
+        if let Some((w, m)) = defer_at {
+            assert!(!a.flush_window((t0 as i64 + w) as u64, m), "deferred");
+        }
+        if row == Row::DuringDeferral {
+            add(&mut a);
+        }
+        let wall2 = (t0 as i64 + wall2) as u64;
+        assert!(a.flush_window(wall2, mono2));
+        let b = a.engine.spool.pop_front().unwrap();
+        serde_json::from_slice(&b.body(wall2, 0)).unwrap()
+    }
+
+    #[test]
+    fn dns_read_during_a_deferral_is_clamped_to_the_window_start_not_dropped() {
+        // The wall clock stepped from +240 s to -240 s of the server's: 420 s behind the
+        // previous window's end (t0 + 300), so a row stamped 410 s before it is further back
+        // than DNS_TS_SLACK_S from the deferred window's start.
+        let j = next_batch_with_old_dns(-110, Row::DuringDeferral, Some((-120, 120)), 370, 130);
+        let t0 = BUILD_TS + 1000;
+        assert_eq!(j["window_start"], t0 + 300);
+        let dns = j["dns"].as_array().unwrap();
+        assert_eq!(dns.len(), 1, "no row lost: {j}");
+        assert_eq!(dns[0]["ts"], t0 + 300, "clamped up to the window start");
+        assert!(j["truncated"].get("dns_out_of_window").is_none());
+    }
+
+    #[test]
+    fn a_row_stamped_before_the_deferral_began_is_not_rewritten_and_is_counted_as_dropped() {
+        // stamped at t0 - 130, before the first deferred poll (wall t0 - 120)
+        let j = next_batch_with_old_dns(-130, Row::BeforeDeferral, Some((-120, 120)), 370, 130);
+        assert!(j["dns"].as_array().is_none_or(|d| d.is_empty()), "{j}");
+        assert_eq!(j["truncated"]["dns_out_of_window"], 1);
+    }
+
+    #[test]
+    fn without_a_deferral_a_genuinely_old_dns_row_is_still_dropped() {
+        let j = next_batch_with_old_dns(-110, Row::BeforeDeferral, None, 360, 120);
+        assert_eq!(j["window_start"], BUILD_TS + 1000 + 300);
+        assert!(j["dns"].as_array().is_none_or(|d| d.is_empty()));
+        assert_eq!(j["truncated"]["dns_out_of_window"], 1);
+    }
+
+    #[test]
+    fn the_loop_retries_a_deferred_flush_on_the_next_step_not_a_window_later() {
+        let mut a = agent();
+        let t0 = BUILD_TS + 1000;
+        a.engine.gate.observe_server_date(t0, 0);
+        assert!(a.sync.observe(&a.engine.gate).is_some());
+        let mut tr = Recorder(Vec::new());
+        let mut last = (0u64, 0u64);
+        let mut step = |a: &mut Agent, wall: u64, mono: u64, tr: &mut Recorder| {
+            let when = Clock {
+                wall,
+                mono,
+                jitter: 0,
+            };
+            a.step(when, 60, (&mut last.0, &mut last.1), tr);
+        };
+        step(&mut a, t0 + 60, 60, &mut tr);
+        assert_eq!(tr.0.len(), 1);
+        // wall stepped back 70 s: deferred, nothing sent
+        step(&mut a, t0 + 50, 120, &mut tr);
+        assert_eq!(tr.0.len(), 1);
+        // the very next step after the wall caught up flushes (not 60 s later)
+        step(&mut a, t0 + 65, 121, &mut tr);
+        assert_eq!(tr.0.len(), 2);
+        let v: serde_json::Value = serde_json::from_slice(&tr.0[1]).unwrap();
+        assert_eq!(v["window_start"], t0 + 60);
+        assert_eq!(v["window_end"], t0 + 65);
     }
 
     #[test]
@@ -588,8 +738,8 @@ mod tests {
     static NEIGH: std::sync::Mutex<Vec<vigie_agent::model::Neighbor>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn fake_neighbors() -> Vec<vigie_agent::model::Neighbor> {
-        NEIGH.lock().unwrap().clone()
+    fn fake_neighbors() -> vigie_agent::neigh::NeighTable {
+        NEIGH.lock().unwrap().clone().into()
     }
 
     /// The loop with fake sources, a fake clock, a fake neighbor table and a recording transport.
@@ -705,13 +855,14 @@ mod tests {
         static TL_READS: RefCell<usize> = const { RefCell::new(0) };
     }
 
-    fn tl_fake_neigh() -> Vec<Neighbor> {
+    fn tl_fake_neigh() -> vigie_agent::neigh::NeighTable {
         TL_READS.with(|r| *r.borrow_mut() += 1);
         TL_NEIGH.with(|n| {
             n.borrow()
                 .iter()
                 .map(|(ip, mac)| Neighbor::new(ip, mac).unwrap())
-                .collect()
+                .collect::<Vec<_>>()
+                .into()
         })
     }
 

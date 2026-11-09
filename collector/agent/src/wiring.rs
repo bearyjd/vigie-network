@@ -11,7 +11,7 @@
 //! `ct_*`/`mcast_*` and the bitmask `source_flags` (see `flag`). The server accepts any
 //! `[a-z_]{1,32}` key with a non-negative integer, at most 16 keys (the builder enforces that).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -20,8 +20,11 @@ use crate::config::Config;
 use crate::ctfold::CtAccum;
 use crate::ctparse::Snapshot;
 use crate::ctsock::{trusted_uids, CtConfig, CtReader, CtShared};
+use crate::ipmemory::IpMemory;
 use crate::mcast::{McConfig, McMsg, McReader, McShared, Pkt};
 use crate::model::Neighbor;
+use crate::neigh::NeighTable;
+use crate::ownaddr::{read_local, OwnAddrs};
 use crate::sightings::{from_mdns, from_ssdp};
 use crate::window::Window;
 
@@ -94,6 +97,12 @@ pub struct Sources {
     ct: Option<CtSide>,
     mc: Option<McSide>,
     acc: CtAccum,
+    /// Last-known IP -> MAC pairings, for flows that outlive their neighbor entry.
+    memory: IpMemory,
+    /// The router's own addresses (expected unmapped sources).
+    own: OwnAddrs,
+    /// Addresses the latest neighbor read reports FAILED/INCOMPLETE (never served from memory).
+    failed: HashSet<String>,
     /// `flag::CT_TABLE_PRESSURE`/`CT_ACCT_OFF` seen in this window.
     window_flags: u64,
     ct_last_mono: u64,
@@ -143,6 +152,7 @@ impl Sources {
     pub fn start(cfg: &Config, mono_s: u64) -> Self {
         let mut s = Self {
             ct_last_mono: mono_s,
+            own: OwnAddrs::new(cfg.lan_addr, read_local),
             ..Self::default()
         };
         let ct = trusted_uids()
@@ -170,9 +180,17 @@ impl Sources {
         s
     }
 
-    /// Records that the agent read the neighbor table at `mono_s`.
-    pub fn note_refresh(&mut self, mono_s: u64) {
+    /// Replaces the router-address source (tests inject a fake reader).
+    pub fn with_own_addrs(mut self, own: OwnAddrs) -> Self {
+        self.own = own;
+        self
+    }
+
+    /// Records that the agent read the neighbor table at `mono_s`; `failed` are the addresses it
+    /// reported FAILED or INCOMPLETE.
+    pub fn note_refresh(&mut self, mono_s: u64, failed: HashSet<String>) {
         self.last_refresh = Some(mono_s);
+        self.failed = failed;
     }
 
     /// Whether a data-triggered neighbor read is allowed now (see `REFRESH_MIN_S`).
@@ -196,7 +214,7 @@ impl Sources {
         &mut self,
         w: &mut Window,
         ip_to_mac: &HashMap<String, String>,
-        mut refresh: Option<&mut dyn FnMut() -> Vec<Neighbor>>,
+        mut refresh: Option<&mut dyn FnMut() -> NeighTable>,
         mono_s: u64,
     ) -> Option<Vec<Neighbor>> {
         let mut fresh: Option<(Vec<Neighbor>, HashMap<String, String>)> = None;
@@ -204,14 +222,20 @@ impl Sources {
             while let Ok(snap) = ct.rx().try_recv() {
                 if let Some(read) = refresh.as_deref_mut() {
                     if refresh_ok(self.last_refresh, mono_s) {
-                        let all = read();
+                        let table = read();
+                        let all = table.neighbors;
+                        self.failed = table.failed;
                         self.last_refresh = Some(mono_s);
                         fresh = Some((all.clone(), crate::neigh::ip_to_mac(&all)));
                     }
                 }
                 let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
                 self.ct_last_mono = mono_s;
-                self.acc.add_snapshot(&snap, map);
+                self.own.refresh(mono_s);
+                self.memory.observe(map, mono_s);
+                let attributed = self.memory.overlay(map, &self.failed, mono_s);
+                self.acc
+                    .add_snapshot_with_own(&snap, &attributed, self.own.set());
                 if snap.table_pressure {
                     self.window_flags |= flag::CT_TABLE_PRESSURE;
                 }
@@ -270,6 +294,7 @@ impl Sources {
     /// batch is built (after a final `pump`). Resets the per-window state.
     pub fn finish_window(&mut self, w: &mut Window, mono_s: u64) {
         let (rows, unmapped_bytes, unmapped_flows) = self.acc.take();
+        let (lan_bytes, lan_flows) = self.acc.take_lan_unmapped();
         for r in rows {
             w.add_conntrack(r);
         }
@@ -287,6 +312,8 @@ impl Sources {
             ("ct_dropped_keys", std::mem::take(&mut self.ct_dropped_keys)),
             ("ct_unmapped_bytes", unmapped_bytes),
             ("ct_unmapped_flows", unmapped_flows),
+            ("ct_lan_unmapped_bytes", lan_bytes),
+            ("ct_lan_unmapped_flows", lan_flows),
             ("mcast_unmapped", std::mem::take(&mut self.mc_unmapped)),
             ("mcast_dropped", std::mem::take(&mut self.mc_dropped)),
         ];

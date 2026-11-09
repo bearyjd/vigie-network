@@ -112,6 +112,48 @@ receipt replay does neither (it is rejected by `batch_id`). Hours already marked
 `overlapping_window` stay disqualified. A healthy endpoint or a clock probe is never observation coverage. DNS-specific source
 quietness is reported separately; it does not establish traffic completeness.
 
+### Collector window and attribution behaviour
+
+- **Window continuity.** The collector remembers the previous window's end and starts the next
+  window exactly there (`start_n == end_{n-1}`), so consecutive windows neither overlap nor leave
+  a gap. When the remembered end disagrees with the monotonic clock by more than 2 s (first
+  window, a held flush, a wall-clock jump) it falls back to monotonic arithmetic, never longer
+  than 24 h; a fallback never starts before the previous end. If the wall clock steps back
+  behind the previous end, the flush is deferred (data kept, retried each loop step) until the
+  clock catches up, for at most 600 s of monotonic time, after which the monotonic arithmetic is
+  used so a permanent step cannot stall uploads. DNS rows read during a deferral carry the
+  stepped-back clock; the deferred window raises those below its start up to the start (the
+  server rejects rows outside the window), while a row stamped before the deferral began, or
+  outside any deferral, is still dropped and counted when it is out of the window. A deferred batch shares one window's caps (the per-window
+  sightings admission and the batch size cap) across up to about eight windows of data, so
+  more counted drops are possible. A Hold during a deferral drops the whole accumulated
+  window but counts it as one dropped window. A spooled or retried batch keeps its original window.
+- **Sticky IP to MAC.** An IPv6 conntrack source whose neighbor entry expired while its flow
+  lives on is still attributed from a bounded memory (4096 pairings, 2 h of monotonic time since
+  the neighbor table last held the address). IPv4 is never remembered (DHCP reuses addresses),
+  and an address the current table reports FAILED or INCOMPLETE is never served from memory. A
+  current table entry always wins, so a reassigned address is billed to its new owner; nothing is
+  attributed from memory after the 2 h. Residual risk: another device taking over the same IPv6
+  address inside the 2 h while the table has no entry for it would be billed to the previous
+  owner; for privacy/temporary and per-device ULA addresses this is negligible.
+- **Split unmapped counters.** `ct_unmapped_bytes` / `ct_unmapped_flows` count only EXPECTED
+  exclusions: the helper's global remainder and the router's own addresses (read from
+  `/proc/net/fib_trie`, `/proc/net/if_inet6` and the configured LAN address, every 5 minutes; a
+  read failure treats nothing as own). `ct_lan_unmapped_bytes` / `ct_lan_unmapped_flows` count
+  any other source still without a MAC, a genuine attribution failure. Collectors that predate
+  the new pair send everything in the legacy pair. When the `truncated` map exceeds 16 keys the
+  `ct_lan_unmapped_*` pair is kept ahead of all other counts and `ct_unmapped_flows` is merged first.
+  Accepted, bounded risk: a source equal to one of the router's own addresses is treated as
+  expected even though conntrack tuples cannot prove the packet came from the router. It only
+  affects whether an hour qualifies (the traffic is not hidden from the totals), and needs spoofed
+  packets to reach conntrack despite source validation. A source that currently has a MAC mapping
+  is never classified as own. The procfs reads are bounded (1 MiB for `fib_trie`, 64 KiB for
+  `if_inet6`); a file over its bound counts as a read failure.
+
+Deployment order: the server must learn a share-of-bytes threshold for `ct_lan_unmapped_*`
+before this collector is deployed; until then any hour with a non-zero `ct_lan_unmapped_*` count
+degrades under the fail-closed unmapped rule above.
+
 Each stored per-MAC hourly counter saturates at `(2**63-1)//64`; saturation marks the entire hour
 `counter_overflow`. At most64 MACs may contribute to one identity, so SQLite sums remain integer
 and cannot overflow. Values remain capped displays, not training samples. Identity components
