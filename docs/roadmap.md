@@ -56,6 +56,8 @@ proposed acceptance targets to calibrate with owner-labeled data, not demonstrat
 | M3 — richer optional visibility | Approved multi-network adapters and external Zeek/Suricata metadata sensor on a capable host, with suitable TAP/SPAN placement | Fixture/replay contracts; malformed/flooded inputs bounded; missing sensor flagged; duplicate overlapping observations do not inflate totals. Demonstrate exactly which traffic is observable before enabling scan/beacon claims. | L |
 | M4 — measured learning | Robust per-device drift first; optional classifier/AI explanations only if rules leave a useful residual | Compare against deterministic baseline on owner-labeled chronological holdout; predeclare false-alert budget; no regression in explainability, privacy or resource bounds. Cancel models that add no measurable value. | M–L, conditional |
 
+*Dated note, 2026-11-09: the paragraph below is the 2026-10-25 snapshot. Soaks 1-4 have been run since (soak 4 was running on 2026-11-09, no outcome claimed), and the read-only GUI and the opt-in senders are merged.*
+
 The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. This historical result motivated the merged coverage/characterization source. The [current field status](monitoring-field-status-2026-10-25.md) records actual parsed-DNS delivery and corrected LAN scope while retaining the earlier flagged windows and pending recovery, long-duration and accuracy gates; M1a source delivery does not complete the UI/feedback stages or the full monitoring MVP.
 
 M1 includes network health, not only identity. Passive DNS error-rate/latency analysis is outside M1's existing

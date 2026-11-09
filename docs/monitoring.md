@@ -306,8 +306,9 @@ class, UA or randomized-MAC OUI is turned into an asserted manufacturer or numer
 Delivery is **off by default** and the local inbox works without any publisher. The pipeline (not
 the API) owns the planner and the outbox and reads decisions read-only from `overrides.db`. While
 delivery is disabled the runner is not called, so nothing is created and nothing expires. The
-real network adapter (topic, ownership: D5) is a later unit; no code here names a topic or opens a
-socket.
+real network adapter (topic, ownership: D5) is not in the pipeline: the standalone ntfy and Home
+Assistant senders (#49, #71; see below) ship the delivery file and are off by default. No pipeline
+code names a topic or opens a socket.
 
 **What is wired (unit 4b).** After `analyze_monitoring`, when `VIGIE_DELIVERY_ENABLED` is set,
 each pipeline pass (`--loop` and `--once` alike) calls `delivery_runner.run_delivery`:

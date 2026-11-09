@@ -8,8 +8,9 @@ mount boundaries, private creation modes and individual service restarts; see th
 server roles, real router logging/signed parsed-DNS delivery and actual collector privileges.
 The LAN correction now yields fresh source flags 0 while retaining earlier degraded history.
 Controlled drain, portable stop/restart, API-only processing-age deployment, drop-in repair and
-read-only-reconciled helper respawn passed. Natural rotation, host reboot/restore and the
-not-yet-started 48-hour soak remain pending. A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
+read-only-reconciled helper respawn passed. Natural rotation and host reboot/restore remain pending. That status
+is historical: 48-hour soaks 1-4 have been run since, and soak 4 was running on 2026-11-09 (no
+outcome claimed). A [bounded real-router pilot](router-validation-2026-10-24.md) separately validated temporary collection, ingest and inventory. Other commands
 marked *unverified* still require their own operational validation.
 
 ## Collector LAN scope
