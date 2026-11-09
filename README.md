@@ -59,9 +59,9 @@ reviewer (PRP section 17), not run in production.
 |---|---|---|
 | Ingest service (`vigie_ingest`) | `server/` | Built, 4 review rounds, tests pass |
 | Pipeline core (`vigie_pipeline`) | `server/` | Bounded identity stitching, conservative service characterization, hourly coverage, pooled upload baselines and explainable incidents are merged; field accuracy remains unmeasured; no LLM/ML stage |
-| App API (`vigie_api`) | `server/` | Inventory/identity writes plus authenticated coverage, activity and incident reads, and a redacted per-device evidence-pack export (`POST /devices/{id}/evidence-pack`). See `docs/api.md` and `docs/monitoring.md`; monitoring UI and notification lifecycle remain queued |
-| Container image, compose, cert and provisioning scripts | `deploy/` | Three owned rootless server roles are healthy with verified mounts, TLS and API scopes; see [current field status](docs/monitoring-field-status-2026-10-25.md). Cold boot/restore remain pending; 48-hour soaks 1-4 have been run, and soak 4 was running on 2026-11-09 (no outcome claimed) |
-| Router collector agent (`vigie-collector`) | `collector/agent/` | Running with actual privilege checks and signed parsed-DNS delivery; LAN correction yields source flags 0, with earlier degraded history retained. Controlled drain and portable stop/restart passed; processing-age API is deployed and verified. See [field status](docs/monitoring-field-status-2026-10-25.md); soaks 1-4 have been run since, and soak 4 was running on 2026-11-09 (no outcome claimed) |
+| App API (`vigie_api`) | `server/` | Inventory/identity writes plus authenticated coverage, activity and incident reads, and a redacted per-device evidence-pack export (`POST /devices/{id}/evidence-pack`). See `docs/api.md` and `docs/monitoring.md`; the read-only GUI (#17, #31, #65) and the opt-in notification senders (#49, #71) are merged, while GUI writes and live notification acceptance remain open |
+| Container image, compose, cert and provisioning scripts | `deploy/` | Three owned rootless server roles are healthy with verified mounts, TLS and API scopes; see [current field status](docs/monitoring-field-status-2026-10-25.md). Cold boot/restore remain pending; 48-hour soaks 1-3 have run; soak 4 was running on 2026-11-09 (no outcome claimed) |
+| Router collector agent (`vigie-collector`) | `collector/agent/` | Running with actual privilege checks and signed parsed-DNS delivery; LAN correction yields source flags 0, with earlier degraded history retained. Controlled drain and portable stop/restart passed; processing-age API is deployed and verified. See [field status](docs/monitoring-field-status-2026-10-25.md); soaks 1-3 have run; soak 4 was running on 2026-11-09 (no outcome claimed) |
 | Conntrack root helper (`vigie-conntrack`) | `collector/conntrack-helper/` | Live helper/socket path exercised; it remains a separate root service. Lifecycle, boot and long-soak acceptance remain separate gates |
 | DHCP log, conntrack and `ubus` output formats | router | Leases, neighbors, conntrack, selected procd metadata and parsed DNS have been observed. DHCP option 55/60 capture and remaining firmware cases await field verification |
 | Router-side scripts (dnsmasq drop-in, watchdog, procd init) | `collector/agent/deploy/` | Real logging, renewed privilege checks, portable UID scan and controlled stop/restart passed; 20 MiB logfs capacity proof passed before writers. Boot links and scoped cron installation passed; drop-in repair and read-only-reconciled helper respawn passed; natural rotation and cold boot remain pending |
@@ -72,7 +72,7 @@ reviewer (PRP section 17), not run in production.
 The real collector, ingest, pipeline and API can be exercised together on localhost with
 [`tests/e2e/run_e2e.sh`](tests/e2e/run_e2e.sh). The [2026-10-25 field status](docs/monitoring-field-status-2026-10-25.md)
 separates merged source, live server/router evidence and remaining quality/recovery gates. That
-snapshot is historical: soaks 1-4 have been run since, and soak 4 was running on 2026-11-09 (no
+snapshot is historical: soaks 1-3 have run since; soak 4 was running on 2026-11-09 (no
 outcome claimed). No mature field baseline, cold-boot acceptance or classification accuracy is claimed.
 
 ## Server quick start

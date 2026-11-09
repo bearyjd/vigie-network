@@ -13,8 +13,9 @@ and actual router logging/parsed-DNS and collector privilege evidence. A LAN cor
 fresh source flags 0; flagged history is retained and controlled drain reached backlog0.
 PR12 processing-age API is deployed and verified. Bounded outage, drop-in repair and reconciled
 helper respawn passed; natural rotation and cold boot remain pending. Real-router 48-hour soaks
-1-4 have since been run; soak 4 was still running on 2026-11-09, so no outcome is claimed. Merged
-source since then (#86-#92) is not deployed. No fourteen-date mature field reference is claimed.
+1-3 have run since; soak 4 was running on 2026-11-09 (no outcome claimed). #86-#92 (merged
+2026-11-08/09) are not deployed; the deployment state of earlier merges is not recorded here. No
+fourteen-date mature field reference is claimed.
 
 ## Rollout and ownership
 

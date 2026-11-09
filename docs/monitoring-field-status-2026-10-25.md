@@ -1,8 +1,9 @@
 # Monitoring field status — 2026-10-25
 
 > **Historical; superseded as of 2026-11-09.** This is the 2026-10-25 snapshot, kept unchanged
-> below. Real-router 48-hour soaks 1-4 have run since (soak 4 was still running on 2026-11-09), so
-> "has not started" below no longer holds. Merged source since then (#86-#92) is not deployed.
+> below. Real-router 48-hour soaks 1-3 have run since; soak 4 was running on 2026-11-09 (no outcome
+> claimed), so "has not started" below no longer holds. #86-#92 (merged 2026-11-08/09) are not
+> deployed; the deployment state of earlier merges is not recorded here.
 > For current status see the [roadmap](roadmap.md) and [monitoring](monitoring.md).
 
 Source for the five-area monitoring build is merged through `fad5d01` (PR12), including the
