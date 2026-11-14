@@ -119,8 +119,7 @@ def build_report(
     labelled = {(x.device, x.hour): x.verdict for x in labels}
     devices = {o.device for o in outcomes}
     kinds = Counter(x.verdict for x in labels)
-    ordered = sorted(outcomes, key=lambda o: (o.device, o.hour, o.detector))
-    names = sorted({o.detector for o in ordered} | set(DETECTORS))
+    names = sorted({o.detector for o in outcomes} | set(DETECTORS))
     return {
         "policy": {"algorithm": algorithm, "config_version": config_version},
         "labels": {
@@ -131,6 +130,6 @@ def build_report(
             "unknown_device": sum(1 for x in labels if x.device not in devices),
         },
         "detectors": {
-            name: _detector([o for o in ordered if o.detector == name], labelled) for name in names
+            name: _detector([o for o in outcomes if o.detector == name], labelled) for name in names
         },
     }
