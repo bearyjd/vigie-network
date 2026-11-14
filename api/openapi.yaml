@@ -3820,7 +3820,7 @@
     },
     "/events": {
       "get": {
-        "description": "Paged by insertion order, so an event that arrives late with an older `ts` is never skipped. Items within a page are sorted by `ts` for display only. `since` is the opaque `page.next_cursor` of a previous response: the resume point, i.e. the last row included per source. An empty page returns the `since` you sent.",
+        "description": "Paged by insertion order, so an event that arrives late with an older `ts` is never skipped. Items within a page are sorted by `ts` for display only. `since` is the opaque `page.next_cursor` of a previous response: the resume point, i.e. the last row included per source. An empty page returns the `since` you sent. `device_id` keeps only events whose `device_id` equals it (exact match). `order=desc` pages newest first; its cursors are only valid with `order=desc`.",
         "operationId": "get_events_events_get",
         "parameters": [
           {
@@ -3872,6 +3872,38 @@
                 }
               ],
               "title": "Severity"
+            }
+          },
+          {
+            "in": "query",
+            "name": "device_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
             }
           },
           {
