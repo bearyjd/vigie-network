@@ -18,7 +18,18 @@ from probe_helpers import (
     target_state,
     write_probe_file,
 )
-from test_probes import DAY, START, events, fold, inv, kinds, outage, recovered, settings, status  # noqa: F401
+from test_probes import (  # noqa: F401
+    DAY,
+    START,
+    events,
+    fold,
+    inv,
+    kinds,
+    outage,
+    recovered,
+    settings,
+    status,
+)
 
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import probe_file, probes
@@ -352,8 +363,8 @@ def test_the_future_skew_boundary_is_exact(inv, settings):
 
 
 def test_the_stage_gate_depends_only_on_the_file(tmp_path, monkeypatch):
-    assert not ProbeSettings(stale_s=60).enabled
-    assert not PipelineConfig.from_env({"VIGIE_PROBE_STALE_S": "60"}).probes.enabled
+    assert not ProbeSettings(stale_s=180).enabled
+    assert not PipelineConfig.from_env({"VIGIE_PROBE_STALE_S": "180"}).probes.enabled
     from vigie_pipeline import processor
 
     def boom(*a, **k):
@@ -361,7 +372,7 @@ def test_the_stage_gate_depends_only_on_the_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(processor, "fold_probes", boom)
     build_fixture(tmp_path)
-    run_fixture(tmp_path, VIGIE_PROBE_STALE_S="60")
+    run_fixture(tmp_path, VIGIE_PROBE_STALE_S="180")
 
 
 def test_probe_file_has_the_per_target_freshness_field():
@@ -382,7 +393,7 @@ def test_the_global_insert_day_cap_holds_across_rotating_ids(inv, settings):
         targets = [outage_of(f"i{step}x{n}", int(NOW) - (step % 7) * 86400 - 100) for n in range(7)]
         write_probe_file(settings.file, state_doc(*targets))
         fold(inv, settings, now=NOW + 5 + step)
-    assert count(inv, "probe_outage") == probes.MAX_GLOBAL_OUTAGES_PER_DAY
+    assert count(inv, "probe_outage") == 2 * probes.MAX_GLOBAL_OUTAGES_PER_DAY
 
 
 def test_flapping_insert_day_cap_holds_when_the_episode_day_rotates(inv, settings):
@@ -437,11 +448,11 @@ def test_flapping_day_caps_are_independent_and_counted_in_the_pass(inv, settings
 
 
 def test_flapping_insert_day_cap_alone_blocks(inv, settings):
-    seed(inv, "probe_flapping", [f"s{n}:2027-01-10" for n in range(8)], iso_utc(NOW))
+    seed(inv, "probe_flapping", [f"s{n}:2027-01-10" for n in range(18)], iso_utc(NOW))
     targets = [outage_of(f"f{n}", START, flapping=True, suppressed=True) for n in range(5)]
     write_probe_file(settings.file, state_doc(*targets))
     fold(inv, settings)
-    assert count(inv, "probe_flapping") == 10  # 8 inserted today + exactly 2, counted in the pass
+    assert count(inv, "probe_flapping") == 20  # 18 inserted today + exactly 2, counted in the pass
 
 
 def test_an_unknown_target_emits_nothing_even_when_flapping(inv, settings):

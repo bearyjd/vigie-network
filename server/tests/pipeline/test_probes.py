@@ -20,7 +20,7 @@ DAY = "2027-01-15"
 
 @pytest.fixture
 def inv(tmp_path):
-    probes._last_invalid = None  # the once-per-change log memory is module state
+    probes._reset_log_memory()  # the once-per-change log memory is module state
     conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     yield conn
     conn.close()
@@ -60,10 +60,17 @@ def test_settings_default_disabled_and_from_env():
     assert not ProbeSettings.from_env({}).enabled
     on = ProbeSettings.from_env({"VIGIE_PROBE_FILE": "/probe/probe-state.json"})
     assert on.enabled and on.stale_s == 300
-    assert ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": "60"}).stale_s == 60
-    for bad in ("29", "86401", "abc"):
+    assert (
+        ProbeSettings.from_env(
+            {"VIGIE_PROBE_FILE": "/probe/probe-state.json", "VIGIE_PROBE_STALE_S": "180"}
+        ).stale_s
+        == 180
+    )
+    for bad in ("179", "86401", "abc"):
         with pytest.raises(ValueError):
-            ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": bad})
+            ProbeSettings.from_env(
+                {"VIGIE_PROBE_FILE": "/probe/probe-state.json", "VIGIE_PROBE_STALE_S": bad}
+            )
 
 
 # ---------------------------------------------------------------- untrusted input
