@@ -24,6 +24,7 @@ from vigie_api.evidence_types import (
     sensitive,
     when,
 )
+from vigie_api.models import TOD_BUCKET_HOURS, TOD_MAX_COHORT_BUCKET
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -54,6 +55,10 @@ EVIDENCE_FIELDS = {
     "minimum_bytes": _INT,
     "sample_hours": _INT,
     "distinct_days": _INT,
+    "bucket_hours": "tod_bucket_hours",
+    "cohort_is_weekend": "bool",
+    "cohort_bucket": "tod_cohort_bucket",
+    "cap_applied": "bool",
 }
 
 
@@ -66,6 +71,12 @@ def _evidence_value(kind: str, value: Any) -> Any:
         return value if _is_int(value) else None
     if kind == "number":
         return value if _is_int(value) or isinstance(value, float) else None
+    if kind == "bool":
+        return value if isinstance(value, bool) else None
+    if kind == "tod_bucket_hours":
+        return value if _is_int(value) and value in TOD_BUCKET_HOURS else None
+    if kind == "tod_cohort_bucket":
+        return value if _is_int(value) and 0 <= value <= TOD_MAX_COHORT_BUCKET else None
     if kind == "true":
         return True if value is True else None
     if kind in ("lineage", "baseline"):

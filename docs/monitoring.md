@@ -236,7 +236,8 @@ hour and open incidents are superseded (expected; flip it deliberately).
 - **Intermittent devices and incidents.** Because the freeze needs every cohort mature, a device with
   intermittent data stays in `learning` and only the fixed detector runs. A fixed `large_upload` and an
   `upload_deviation` can both open for the same hours; duplicate incidents are by design. tod evidence
-  also carries `bucket_hours`, the cohort and `cap_applied` (the read API's allowlist drops them today).
+  also carries `bucket_hours`, the cohort (`cohort_is_weekend`, `cohort_bucket`) and `cap_applied`. The read API
+  and the evidence pack expose these four keys (typed and bounded, only when stored; pooled incidents omit them).
 - **Persistence, no schema change.** The baseline row stores `algorithm=tod-median-v1`,
   `trained_until`, the used `training_hours`, and in `config_json` the policy (including
   `bucket_hours`) plus `training_bytes` (the byte value of each used hour). Every pass refits
