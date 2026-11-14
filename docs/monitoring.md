@@ -1033,17 +1033,32 @@ all of the user's volumes, so that rests on the runner's code and config, not on
 - **Pipeline side.** Set `VIGIE_PROBE_FILE` (render does this when `probes_enabled` is set) and the
   pipeline reads the runner's state file read-only on every pass and writes only
   `pipeline_meta['probe_status']` plus events of kind `probe_outage`, `probe_recovered`,
-  `probe_flapping` and `probe_stale` (no device, one event per episode). `probe_stale` is at most
-  one event per UTC day for any cause: a start-up race can use that day's warning, and the status
-  still shows the failure. The reader does not trust the writer's caps: it rejects an
-  `episode_start` more than a day after `written_at`, reports only episodes of the day of `written_at`, and
-  records at most 3 outage events per target and 30 in total per UTC day, counted by the episode's own
-  day (flapping events: 10 per day). A backward clock step is tolerated up to a day: an episode may
-  start after `written_at` by at most that. An outage whose target was removed, or
-  whose episode a newer one superseded, is closed with a `probe_recovered` event. The file is untrusted
-  input: over 64 KiB, malformed, malformed ids or enum values, out-of-range numbers, a future
-  `written_at`, or older than `VIGIE_PROBE_STALE_S` (default 300 s) all mean "probes unavailable"
-  and never "ok" or an outage. Probes are not an incident and are not delivered.
+  `probe_flapping` and `probe_stale` (no device, one event per episode). The file is untrusted
+  input: over 64 KiB, malformed ids or enum values, out-of-range numbers, an `episode_start` more
+  than a day after `written_at`, a future `written_at`, or older than `VIGIE_PROBE_STALE_S`
+  (default 300 s) all mean "probes unavailable" and never "ok" or an outage. The reader has no id
+  allowlist, so the spec's unknown-target-id acceptance test is intentionally not implemented.
+  Probes are not an incident and are not delivered.
+- **Status fails safe.** `probe_status` carries `valid_until` (`written_at` plus the stale limit):
+  a consumer such as S3 `/probes` must treat the status as unavailable once now passes it,
+  because a stopped pipeline cannot rewrite a status that says ok. A fold that fails marks the
+  status unavailable (`reason` `error`) instead of leaving the old one. Turning the flag off
+  writes one `disabled` unavailable status, once, if a status had been stored; with none stored
+  nothing is written. A target not probed within the stale limit of `written_at` (or never) is
+  `unknown`, and nothing is derived from it.
+- **Event bounds** (the reader does not trust the writer's caps). Per target, at most 3
+  `probe_outage` events per UTC day of the episode (derived from `episode_start`), at most 6 per
+  target per day the pipeline inserts them, and at most 30 in total per episode day and per insert
+  day; at most 10 `probe_flapping` events per day. An episode older than 7 days is never
+  reported, so at most 7 days of buckets can be filled. A drop is logged once per kind and day
+  (`probe_event_capped`). `probe_stale` is at most one event per UTC day for any cause: a start-up
+  race can use that day's warning, and the status still shows the failure. An episode first seen
+  already recovered (within 7 days) is announced as an outage then a recovery. An open outage is
+  closed with a `probe_recovered` event (`removed` or `superseded`) when its target is gone or its
+  current `episode_start` is a different one (newer, older after a clock step, or none after a
+  fresh runner start); the scan covers 30 days and 100 rows per pass. A backward clock step is
+  tolerated up to a day (`episode_start` may exceed `written_at` by at most that); the runner
+  repairs a larger one itself.
 - **Freeze.** Probe settings are their own `ProbeSettings`, outside the monitoring policy version,
   the detectors, `/coverage` and every existing table. Disabled, the rendered units and the
   pipeline's tables are byte-identical to a build without probes (`server/tests/pipeline/test_probe_freeze.py`,
