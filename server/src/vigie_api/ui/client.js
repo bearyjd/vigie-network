@@ -63,5 +63,8 @@ export class ApiClient {
   coverage(collector, range) { const requested = this.#range(range); return this.#get('/coverage', {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
   activity(id, collector, range) { const requested = this.#range(range); return this.#get(`/devices/${segment(id)}/activity`, {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
   incidents(collector, cursor = null) { if (cursor !== null) bounded(cursor, 1024); return this.#get('/incidents', {collector_id: this.#scope(collector), limit: 25, cursor}); }
+  // Newest first, fixed page size. since/kind/device_id are bounded here to the server's own limits; limit is never caller-chosen.
+  events({deviceId = '', kind = ''} = {}, cursor = null) { if (cursor !== null) bounded(cursor, 256); return this.#get('/events', {order: 'desc', limit: 25, since: cursor, kind: kind ? bounded(kind, 64) : null, device_id: deviceId ? (segment(deviceId), deviceId) : null}); }
+  deviceTimeline(id) { return this.#get('/events', {order: 'desc', limit: 10, device_id: (segment(id), id)}); }
   incident(id, collector) { return this.#get(`/incidents/${segment(id)}`, {collector_id: this.#scope(collector)}); }
 }

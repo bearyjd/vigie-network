@@ -142,4 +142,24 @@ try {
   await assert.rejects(pending, error => error.code === 'timeout');
   assert.equal(deadlineCleared, true);
 } finally { globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout; }
+// Events: a fixed GET route, fixed page sizes, bounded and URL-encoded filters; nothing else ever reaches the query string.
+{
+  const c = new ApiClient(); c.setToken('synthetic-only'); const seen = [];
+  globalThis.fetch = async (url, options) => { seen.push({url: new URL(String(url)), options}); return new Response(JSON.stringify({ok: true, data: [], page: {next_cursor: null}})); };
+  await c.events(); await c.events({kind: 'a&b=c#d', deviceId: 'dev&x=1 ?'}, 'cursor-1'); await c.events({limit: 500, order: 'asc'}); await c.deviceTimeline('dev-1');
+  assert.deepEqual(seen.map(s => s.url.pathname), ['/events', '/events', '/events', '/events']);
+  assert.ok(seen.every(s => s.options.method === 'GET' && s.options.body === undefined && s.options.credentials === 'omit'), 'events requests are GET without a body');
+  assert.deepEqual([...seen[0].url.searchParams.keys()].sort(), ['limit', 'order'], 'an unfiltered first page sends only order and limit');
+  assert.equal(seen[1].url.searchParams.get('kind'), 'a&b=c#d'); assert.equal(seen[1].url.searchParams.get('device_id'), 'dev&x=1 ?'); assert.equal(seen[1].url.searchParams.get('since'), 'cursor-1');
+  assert.deepEqual([...seen[1].url.searchParams.keys()].sort(), ['device_id', 'kind', 'limit', 'order', 'since'], 'a hostile filter value adds no extra parameter');
+  assert.equal(seen[1].url.hash, '', 'a # in a filter never becomes a fragment');
+  assert.equal(seen[2].url.searchParams.get('limit'), '25'); assert.equal(seen[2].url.searchParams.get('order'), 'desc', 'page size and order are not caller-chosen');
+  assert.equal(seen[3].url.searchParams.get('limit'), '10'); assert.equal(seen[3].url.searchParams.get('device_id'), 'dev-1'); assert.equal(seen[3].url.searchParams.get('order'), 'desc');
+  const before = seen.length;
+  for (const bad of [() => c.events({kind: 'k'.repeat(65)}), () => c.events({deviceId: 'd'.repeat(65)}), () => c.events({deviceId: '..'}), () => c.events({deviceId: 'a/b'}), () => c.events({deviceId: 'a\nb'}), () => c.events({}, 'c'.repeat(257)), () => c.deviceTimeline(''), () => c.deviceTimeline('a\\b')]) assert.throws(bad, error => error instanceof ApiError && error.code === 'invalid_input');
+  assert.equal(seen.length, before, 'refused filters send nothing');
+  const out = new ApiClient(); await assert.rejects(out.events(), error => error.status === 401);
+  const source = (await import('node:fs')).readFileSync(new URL('../../server/src/vigie_api/ui/client.js', import.meta.url), 'utf8');
+  assert.ok(!/\b(POST|PUT|PATCH|DELETE)\b/.test(source), 'no write verb appears in the client');
+}
 console.log('PASS: fixed GET/generation/auth/backlog contracts; complete UTC grids with null gaps; bounded/cancelled bodies and deadlines; numeric/HTTP-date Retry-After.');
