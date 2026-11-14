@@ -1,11 +1,11 @@
 import {ApiClient, ApiError, StaleResult} from './client.js';
-import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc} from './views.js';
+import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc, eventsView, eventFilterForm, timelineSection, EVENT_PAGE, EVENT_MAX_PAGES} from './views.js';
 
 const byId = id => document.getElementById(id);
 const client = new ApiClient();
-const state = {connected: false, collector: '', hours: 24, view: 'overview', selectedDevice: null, selectedIncident: null, cursors: [null], page: 0, next: null, generation: 0, loading: false, updated: null, coverage: {phase: 'loading'}};
+const state = {connected: false, collector: '', hours: 24, view: 'overview', selectedDevice: null, selectedIncident: null, eventFilter: {deviceId: '', kind: ''}, cursors: [null], page: 0, next: null, generation: 0, loading: false, updated: null, coverage: {phase: 'loading'}};
 let timer = null;
-const titles = {overview: 'Overview', inventory: 'Inventory', activity: 'Activity', incidents: 'Incidents'};
+const titles = {overview: 'Overview', inventory: 'Inventory', activity: 'Activity', incidents: 'Incidents', events: 'Events'};
 const preview = new URLSearchParams(location.search).get('preview') === 'synthetic';
 byId('preview-banner').hidden = !preview;
 if (preview) byId('connect-collector').value = 'synthetic-preview';
@@ -63,7 +63,7 @@ function chrome() {
   byId('connection-state').textContent = state.connected ? 'Connected · read-only view' : 'Disconnected';
   document.querySelectorAll('nav button[data-view]').forEach(button => { button.disabled = !state.connected; if (button.dataset.view === state.view && state.connected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
   byId('view-title').textContent = titles[state.view]; setBanner();
-  byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
+  byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : state.view === 'events' ? 'Events span all sources, newest first · UTC · read-only' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
   byId('refresh').setAttribute('aria-disabled', String(state.loading || Date.now() < client.retryAt));
   byId('content').setAttribute('aria-busy', String(state.loading));
   const retryButton = byId('notice').querySelector('button'); if (retryButton) retryButton.disabled = Date.now() < client.retryAt;
@@ -72,14 +72,20 @@ function chrome() {
 }
 function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false, null, true), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
 function disconnected(message = '') {
-  client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; resetPage(); clearTimeout(timer);
+  client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; state.eventFilter = {deviceId: '', kind: ''}; resetPage(); clearTimeout(timer);
   byId('token').value = ''; byId('content').replaceChildren(); byId('collector').value = ''; chrome(); notice(message); byId('token').focus();
 }
 function selectDevice(id) { state.selectedDevice = id; load(true, '[aria-label="Identity detail"]'); }
 function activity(id) { state.selectedDevice = id; navigate('activity'); }
 function setInboxFilter(name) { location.hash = `#filter=${name}`; }
 function selectIncident(id) { state.selectedIncident = id; load(true, '[aria-label="Incident evidence"]'); }
+function eventsFor(id) { state.eventFilter = {deviceId: id, kind: ''}; navigate('events'); }
+function filterEvents(filter) {
+  if (filter.deviceId.length > 64 || filter.kind.length > 64) { notice('Filters are limited to 64 characters.'); return; }
+  state.eventFilter = {deviceId: filter.deviceId, kind: filter.kind}; resetPage(); load(true, '#view-title');
+}
 function page(direction) {
+  if (direction > 0 && state.view === 'events' && state.page + 1 >= EVENT_MAX_PAGES) return;  // hard bound, independent of the button state
   if (direction > 0 && state.next) { state.cursors[state.page + 1] = state.next; state.page++; }
   else if (direction < 0 && state.page > 0) state.page--; else return;
   state.selectedIncident = null; load(true, '#view-title');
@@ -92,6 +98,12 @@ function failure(error) {
   notice(`${reason}${state.updated ? ` Showing the previous snapshot from ${utc(state.updated)}; it may be stale.` : ' No current observations are displayed.'}`, true);
   if (!state.updated) byId('content').replaceChildren(empty('Data unavailable', 'The interface will retry without treating missing observations as healthy.'));
 }
+// A failed timeline never fails the identity page, but a refused token must still disconnect (the client has already cleared it).
+async function timelineFor(id) {
+  try { return (await client.deviceTimeline(id)).data; }
+  catch (error) { if (!(error instanceof ApiError) || error.status === 401) throw error; return null; }
+}
+function withTimeline(panel, events, id) { panel.append(timelineSection(events, id, eventsFor)); return panel; }
 async function load(clear = false, focus = null, automatic = false) {
   if (!state.connected) return;
   if (!clear && document.hidden) return;
@@ -109,14 +121,21 @@ async function load(clear = false, focus = null, automatic = false) {
     banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
     if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); coverage = {phase: 'ready', data: result.data}; if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
     if (state.view === 'inventory') {
-      const [list, detail] = await Promise.all([client.devices(cursor), state.selectedDevice ? client.device(state.selectedDevice) : Promise.resolve(null)]);
+      const [list, detail, timeline] = await Promise.all([client.devices(cursor), state.selectedDevice ? client.device(state.selectedDevice) : Promise.resolve(null), state.selectedDevice ? timelineFor(state.selectedDevice) : Promise.resolve(null)]);
       next = list.page?.next_cursor || null;
       const inventory = node('section', {}, heading('Tracked identities', 'Human labels are optional · unknown is a neutral classification'), inventoryView(list.data, selectDevice), pager(state.page, list.data.length, next, page), node('p', {class: 'table-note'}, 'Select an identity for DHCP names and evidence. IPs show the last observed association and time, not a current-address guarantee.'));
-      content = node('div', {class: 'split'}, inventory, detail ? deviceView(detail.data, activity) : empty('Select an identity', 'Open a row to see the observed DHCP names, classification evidence and activity. Full IDs identify inventory records, not guaranteed physical devices.'));
+      content = node('div', {class: 'split'}, inventory, detail ? withTimeline(deviceView(detail.data, activity), timeline, detail.data.id) : empty('Select an identity', 'Open a row to see the observed DHCP names, classification evidence and activity. Full IDs identify inventory records, not guaranteed physical devices.'));
     }
     if (state.view === 'activity') {
       if (!state.selectedDevice) content = empty('Choose an identity to inspect', 'Open Inventory, select an identity, then choose View activity. Activity is scoped to the selected collector.');
       else { const result = await client.activity(state.selectedDevice, state.collector, range()); content = activityView(result.data); if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
+    }
+    if (state.view === 'events') {
+      const list = await client.events(state.eventFilter, cursor);
+      const rows = eventsView(list.data);  // validates the page before anything is shown
+      const more = list.data.length === EVENT_PAGE && state.page + 1 < EVENT_MAX_PAGES ? list.page?.next_cursor || null : null;  // next_cursor is also sent on the last page
+      next = more;
+      content = node('section', {}, heading('Recent events', 'Newest first · text only · events without a device show as "No device"'), eventFilterForm(state.eventFilter, filterEvents), rows, pager(state.page, list.data.length, next, page), node('p', {class: 'table-note'}, `Showing at most ${EVENT_PAGE * EVENT_MAX_PAGES} recent events; narrow with a device or kind filter.`));
     }
     if (state.view === 'incidents') {
       const [list, detail] = await Promise.all([client.incidents(state.collector, cursor), state.selectedIncident ? client.incident(state.selectedIncident, state.collector) : Promise.resolve(null)]);
@@ -142,7 +161,7 @@ async function load(clear = false, focus = null, automatic = false) {
 byId('connect-form').addEventListener('submit', event => {
   event.preventDefault(); const token = byId('token').value.trim(); const collector = byId('connect-collector').value.trim(); byId('token').value = '';
   if (!token || !collector || collector.length > 64) { notice('Enter a collector ID and a dedicated read-only token.'); return; }
-  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
+  try { client.setToken(token); state.connected = true; state.collector = collector; state.view = 'overview'; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; state.eventFilter = {deviceId: '', kind: ''}; resetPage(); byId('collector').value = collector; byId('range').value = '24'; state.hours = 24; load(true, '#view-title'); }
   catch { disconnected('The connection inputs were invalid.'); }
 });
 byId('scope-form').addEventListener('submit', event => {

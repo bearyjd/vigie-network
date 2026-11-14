@@ -33,7 +33,7 @@ const elements = Object.fromEntries(ids.map(id => [id, new FakeElement('div')]))
 for (const id of ['content', 'notice']) elements[id].parent = null;
 elements.refresh.tag = 'button';
 const body = new FakeElement('body');
-const navButtons = ['overview', 'inventory', 'activity', 'incidents'].map(view => Object.assign(new FakeElement('button'), {dataset: {view}}));
+const navButtons = ['overview', 'inventory', 'activity', 'incidents', 'events'].map(view => Object.assign(new FakeElement('button'), {dataset: {view}}));
 const documentListeners = {};
 globalThis.Node = FakeNode;
 globalThis.document = {
@@ -70,6 +70,7 @@ function coverageBody(url) {
   const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: unavailable, monitoring_unavailable_capped: false, ...collectorOver};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
+let eventsReply = null; let deviceReply = null; let inventoryRows = [];  // optional stubs for the events and identity routes
 let gate = null;  // when set, responses wait for it: a slow manual refresh
 const requests = [];  // every request the page makes, for the read-only contract
 globalThis.fetch = async (url, options) => {
@@ -80,7 +81,9 @@ globalThis.fetch = async (url, options) => {
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
   if (target.pathname === '/coverage' && coverageDown) return new Response('{}', {status: 503});
-  if (target.pathname === '/devices') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: []}));
+  if (target.pathname === '/events' && eventsReply) { const reply = eventsReply(target); if (reply) return reply; }
+  if (/^\/devices\/[^/]+$/.test(target.pathname) && deviceReply) return deviceReply(target);
+  if (target.pathname === '/devices') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: inventoryRows}));
   if (target.pathname.startsWith('/incidents/')) return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {id: target.pathname.slice(11), device_id: 'dev-1', detector: 'large_upload', state: 'open', current_lineage: true, evidence: {}}}));
   if (target.pathname === '/incidents' && incidentsDown) return new Response('{}', {status: 503});
   if (target.pathname === '/incidents' && incidentPages) { const at = Number((target.searchParams.get('cursor') || 'c0').slice(1)); return new Response(JSON.stringify({ok: true, page: {next_cursor: at + 25 < incidentPages.length ? `c${at + 25}` : null}, data: incidentPages.slice(at, at + 25)})); }
@@ -545,6 +548,99 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   for (const bad of ['surprise', null, 'ELIGIBLE']) assert.throws(() => views.coverageView(mk(5, [{hour: thisHour, state: bad, reasons: []}])), /Malformed monitoring response/);
   assert.deepEqual(violations, []);
 }
+// F10: events view and device timeline. GET-only, text-only, bounded pager, encoded filters, token never in the DOM or a URL.
+{
+  const json = (data, next = null, status = 200) => new Response(JSON.stringify(status === 200 ? {ok: true, page: {next_cursor: next}, data} : {}), {status});
+  const ev = (n, over = {}) => ({id: `e${n}`, device_id: null, ts: '2026-10-25T11:00:00Z', kind: 'rule_malformed', severity: 'info', summary: `summary ${n}`, source: 'inventory', ...over});
+  const eventReqs = () => requests.filter(r => new URL(r.url).pathname === '/events').map(r => new URL(r.url));
+  const lastEvents = () => eventReqs().at(-1);
+  const buttons = label => content.querySelectorAll('button').filter(b => b.textContent === label);
+  const hostile = ['<img src=x onerror=alert(1)>', '</script><script>alert(1)</script>', '"><svg onload=alert(1)>', 'javascript:alert(1)', '&lt;b&gt;', '{{7*7}}'];
+  const sets = {}; let calls = 0;
+  eventsReply = url => { calls++; return sets.reply ? sets.reply(url) : null; };
+
+  // 1. List rendering: hostile strings are text; device-less rows say so; odd shapes never reach markup or class.
+  sets.reply = () => json([ev(1, {summary: hostile[0], kind: hostile[1], severity: hostile[2]}), ev(2, {summary: {toString() { return 'LEAK'; }}, kind: {x: 1}}), ev(3, {device_id: 'dev-1', severity: 'warn', summary: 'x'.repeat(1000)}), ev(4, {summary: hostile[3], device_id: hostile[4], ts: 'not a date'}), ev(5, {severity: 'constructor', summary: hostile[5]})]);
+  violations.length = 0; view('events'); await flush();
+  assert.equal(elements['view-title'].textContent, 'Events'); assert.equal(elements.workspace.hidden, false);
+  const first = lastEvents(); assert.equal(first.searchParams.get('order'), 'desc'); assert.equal(first.searchParams.get('limit'), '25'); assert.deepEqual([...first.searchParams.keys()].sort(), ['limit', 'order']);
+  const text1 = content.textContent;
+  for (const h of hostile.slice(0, 4)) assert.ok(text1.includes(h), `hostile string ${h} is shown verbatim as text`);
+  for (const tag of ['img', 'script', 'svg', 'b', 'a', 'iframe']) assert.equal(content.querySelectorAll(tag).length, 0, `no <${tag}> element was created from API text`);
+  assert.ok(!text1.includes('LEAK'), 'an object never uses its own toString'); const cells = row => row.querySelectorAll('td').map(td => td.textContent); const rows1 = content.querySelectorAll('tr').slice(1);
+  assert.equal(cells(rows1[0])[3], 'No device', 'a device-less event says so in its Device cell'); assert.equal(cells(rows1[2])[3], 'dev-1');
+  assert.deepEqual([cells(rows1[1])[1], cells(rows1[1])[4]], ['Unavailable', 'Unavailable'], 'objects render as Unavailable, never [object Object]'); assert.ok(!text1.includes('[object Object]'));
+  assert.equal(cells(rows1[3])[0], 'Unavailable', 'an unparseable time is Unavailable');
+  assert.ok(!text1.includes('x'.repeat(600)), 'long summaries are clipped');
+  for (const el of content.querySelectorAll('*')) { for (const [k, v] of el.attrs) { assert.ok(!/[<>"]/.test(v), `attribute ${k} carries API markup`); assert.ok(!k.startsWith('on'), 'no inline handler attribute'); } assert.ok(!/[<>]/.test(el.getAttribute('class') || ''), 'API text never reaches a class'); }
+  assert.deepEqual(content.querySelectorAll('span').filter(e => (e.getAttribute('class') || '').startsWith('badge')).map(e => e.getAttribute('class')), ['badge ', 'badge ', 'badge warn', 'badge ', 'badge '], 'severity maps through an allowlist, including prototype names');
+  assert.ok(content.querySelectorAll('div').some(d => d.getAttribute('role') === 'region' && /Scrollable table/.test(d.getAttribute('aria-label'))), 'the table is a labelled, focusable region');
+  assert.deepEqual(violations, [], 'no HTML sink was touched');
+
+  // 2. Filters: a real <form> whose submit never navigates; values are encoded, bounded, and reset the pager.
+  const form = content.querySelectorAll('form')[0]; assert.equal(form.getAttribute('aria-label'), 'Event filters');
+  const field = id => form.querySelectorAll('input').find(i => i.getAttribute('id') === id);
+  for (const id of ['event-device', 'event-kind']) assert.ok(form.querySelectorAll('label').some(l => l.getAttribute('for') === id), `${id} has a label`);
+  field('event-device').value = '  dev&x=1 '; field('event-kind').value = 'a&b=c#d';
+  let prevented = false; form.fire('submit', {preventDefault() { prevented = true; }}); await flush();
+  assert.equal(prevented, true, 'submit is intercepted: a native GET form would navigate away and wipe the token');
+  const filtered = lastEvents(); assert.equal(filtered.searchParams.get('device_id'), 'dev&x=1'); assert.equal(filtered.searchParams.get('kind'), 'a&b=c#d'); assert.deepEqual([...filtered.searchParams.keys()].sort(), ['device_id', 'kind', 'limit', 'order']); assert.equal(filtered.hash, '');
+  assert.equal(content.querySelectorAll('form')[0].querySelectorAll('input').find(i => i.getAttribute('id') === 'event-kind').value, 'a&b=c#d', 'the filter survives the re-render');
+  const sent = requests.length; { const f = content.querySelectorAll('form')[0]; f.querySelectorAll('input').find(i => i.getAttribute('id') === 'event-kind').value = 'k'.repeat(65); f.fire('submit'); await flush(); }
+  assert.equal(requests.length, sent, 'an over-long filter sends nothing'); assert.match(notice.textContent, /64 characters/);
+  buttons('Clear filters')[0].fire('click'); await flush(); assert.deepEqual([...lastEvents().searchParams.keys()].sort(), ['limit', 'order'], 'Clear returns to the unfiltered first page');
+
+  // 3. Pager: 25 rows per page, a hard cap of 40 pages, Next only for a full page; the cap holds even when Next is forced.
+  sets.reply = url => json(Array.from({length: 25}, (_, i) => ev(i)), `c${Number((url.searchParams.get('since') || 'c0').slice(1)) + 1}`);
+  view('events'); await flush();
+  assert.match(content.textContent, /Page 1 · 25 rows shown/); assert.equal(buttons('Previous')[0].disabled, true);
+  for (let n = 1; n < 40; n++) { assert.equal(buttons('Next')[0].disabled, false, `Next is live on page ${n}`); buttons('Next')[0].fire('click'); await flush(); }
+  assert.match(content.textContent, /Page 40 · 25 rows shown/); assert.equal(lastEvents().searchParams.get('since'), 'c39');
+  assert.equal(buttons('Next')[0].disabled, true, 'Next is disabled at the last permitted page');
+  const atCap = requests.length; buttons('Next')[0].fire('click'); await flush(); assert.equal(requests.length, atCap, 'a forced Next past the cap sends nothing'); assert.match(content.textContent, /Page 40 /);
+  buttons('Previous')[0].fire('click'); await flush(); assert.match(content.textContent, /Page 39 /); assert.equal(lastEvents().searchParams.get('since'), 'c38');
+  sets.reply = () => json([ev(1), ev(2)], 'c-last-page-still-sends-a-cursor'); view('events'); await flush();
+  assert.equal(buttons('Next')[0].disabled, true, 'a short page is the last page even though next_cursor is present');
+  sets.reply = url => json(Array.from({length: 25}, (_, i) => ev(i)), 'c1'); view('events'); await flush(); buttons('Next')[0].fire('click'); await flush(); assert.equal(lastEvents().searchParams.get('since'), 'c1');
+  { const f = content.querySelectorAll('form')[0]; f.querySelectorAll('input').find(i => i.getAttribute('id') === 'event-kind').value = 'new_device'; f.fire('submit'); await flush(); assert.equal(lastEvents().searchParams.get('since'), null, 'changing a filter restarts from the first page'); assert.match(content.textContent, /Page 1 /); }
+  buttons('Clear filters')[0].fire('click'); await flush();
+  sets.reply = () => json(Array.from({length: 26}, (_, i) => ev(i))); view('events'); await flush();
+  assert.match(notice.textContent, /could not return valid data/, 'an oversized page is refused whole'); assert.equal(content.querySelectorAll('tr').length, 0);
+  for (const bad of [{}, [{device_id: 'x'}], [null], 'text']) { sets.reply = () => json(bad); view('events'); await flush(); assert.match(notice.textContent, /could not return valid data/); }
+
+  // 4. Empty and error states.
+  sets.reply = () => json([]); view('events'); await flush(); assert.ok(content.textContent.includes('No events match')); assert.equal(notice.hidden, true);
+  sets.reply = () => json(null, null, 503); view('events'); await flush(); assert.match(notice.textContent, /temporarily unavailable/); assert.ok(content.textContent.includes('Data unavailable'));
+  sets.reply = () => json(null, null, 403); view('events'); await flush(); assert.match(notice.textContent, /cannot read/);
+
+  // 5. Device timeline: a labelled section inside the identity page; failures degrade it, a refused token still disconnects.
+  inventoryRows = [{id: 'dev-1', name: 'Synthetic device', type: 'unknown'}];
+  deviceReply = () => json({id: 'dev-1', name: 'Synthetic device', macs: [], status: 'active', identity_state: 'ok'});
+  sets.reply = url => url.searchParams.get('device_id') === 'dev-1' ? json([ev(1, {device_id: 'dev-1', summary: hostile[0], kind: 'device.patch'}), ev(2, {device_id: 'dev-1', severity: hostile[2]})]) : json([]);
+  const openDevice = async () => { view('inventory'); await flush(); content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'identity:dev-1').fire('click'); await flush(); };
+  await openDevice();
+  const timelineReq = lastEvents(); assert.equal(timelineReq.searchParams.get('device_id'), 'dev-1'); assert.equal(timelineReq.searchParams.get('limit'), '10'); assert.equal(timelineReq.searchParams.get('order'), 'desc');
+  const section = content.querySelectorAll('section').find(n => n.getAttribute('aria-label') === 'Device timeline'); assert.ok(section, 'the identity page has a labelled timeline');
+  assert.ok(section.textContent.includes(hostile[0])); assert.equal(section.querySelectorAll('img').length, 0); assert.equal(section.querySelectorAll('li').length, 2); assert.ok(content.textContent.includes('Synthetic device'));
+  sets.reply = () => json([]); await openDevice(); assert.ok(content.textContent.includes('No events recorded for this identity'));
+  for (const status of [503, 403, 404]) { sets.reply = () => json(null, null, status); await openDevice(); assert.ok(content.textContent.includes('Timeline unavailable'), `timeline degrades on ${status}`); assert.ok(content.textContent.includes('Synthetic device'), 'the identity page still renders'); assert.equal(notice.hidden, true, 'a timeline failure raises no page-level error'); }
+  sets.reply = () => json([]); await openDevice();
+  buttons('View all events')[0].fire('click'); await flush();
+  assert.equal(elements['view-title'].textContent, 'Events'); assert.equal(lastEvents().searchParams.get('device_id'), 'dev-1', 'View all events opens the filtered list');
+  assert.equal(content.querySelectorAll('form')[0].querySelectorAll('input').find(i => i.getAttribute('id') === 'event-device').value, 'dev-1');
+  sets.reply = () => json(null, null, 401); view('inventory'); await flush();
+  assert.equal(elements.workspace.hidden, true, 'a 401 on the timeline disconnects instead of showing a tokenless connected page'); assert.equal(elements['connection-state'].textContent, 'Disconnected');
+
+  // 6. Token hygiene across everything above.
+  const everyUrl = requests.map(r => r.url).join('\n'); assert.ok(!everyUrl.includes('synthetic-token'), 'the token is never in a URL');
+  assert.ok(requests.every(r => r.options.headers.Authorization === 'Bearer synthetic-token'), 'the token travels only in the Authorization header');
+  assert.ok(!JSON.stringify(location).includes('synthetic-token')); assert.equal(elements.token.value, ''); assert.equal(storageTouched, false);
+  eventsReply = null; deviceReply = null; inventoryRows = [];
+  elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1'; elements['connect-form'].fire('submit'); await flush();
+  assert.ok(calls > 20 && eventReqs().length >= 50, 'the suite drove filtered and paged /events traffic');
+  const walk = n => [n, ...n.children.filter(c => c instanceof FakeElement).flatMap(walk)];
+  for (const el of walk(content)) { for (const v of el.attrs.values()) assert.ok(!v.includes('synthetic-token')); assert.ok(!el.textContent.includes('synthetic-token')); }
+}
 // Behavioural read-only (addendum B), sinks (C) and timers (D).
 await reload(); const doubleCheck = refreshTimers();
 for (const name of ['overview', 'inventory', 'activity', 'incidents', 'overview', 'incidents']) { view(name); await flush(); hashchange(); }
@@ -553,7 +649,7 @@ assert.equal(doubleCheck, 1); assert.equal(refreshTimers(), 1, 'exactly one refr
 assert.equal((windowListeners.hashchange || []).length, 1, 'exactly one hashchange listener'); assert.equal((documentListeners.visibilitychange || []).length, 1); assert.equal((windowListeners.pagehide || []).length, 1);
 elements.disconnect.fire('click'); assert.equal(refreshTimers(), 0, 'disconnect leaves no refresh timer behind');
 assert.ok(requests.length > 25, 'the suite drove real traffic');
-for (const {url, options} of requests) { assert.ok([undefined, 'GET'].includes(options?.method), `${url} uses ${options?.method}`); assert.equal(options?.body, undefined, `${url} sends no body`); assert.ok(/^\/(coverage|incidents(\/[^/]+)?|devices)$/.test(new URL(url).pathname), `unexpected endpoint ${url}`); }
+for (const {url, options} of requests) { assert.ok([undefined, 'GET'].includes(options?.method), `${url} uses ${options?.method}`); assert.equal(options?.body, undefined, `${url} sends no body`); assert.ok(/^\/(coverage|incidents(\/[^/]+)?|devices(\/[^/]+)?|events)$/.test(new URL(url).pathname), `unexpected endpoint ${url}`); }
 assert.deepEqual(violations, [], 'no HTML sink, document.write or storage access happened'); assert.equal(storageTouched, false);
 // Static guard on the shipped sources: a cheap tripwire (quote-agnostic), NOT a guarantee; the behavioural checks above are the contract.
 const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${name}`, import.meta.url), 'utf8');

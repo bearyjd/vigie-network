@@ -214,3 +214,29 @@ export function incidentView(d, onActivity) {
   if (!d || !d.evidence || typeof d.id !== 'string') throw new Error('Malformed incident response'); const e = d.evidence;
   return node('aside', {class: 'detail-panel', 'aria-label': 'Incident evidence', tabindex: '-1'}, node('span', {class: 'eyebrow'}, 'EVIDENCE RECORD'), node('h2', {}, detector(d.detector)), badge(d.state, d.state === 'open' ? 'warn' : ''), node('div', {class: 'callout'}, 'Unusual does not mean malicious. This observation is evidence to review, not a safety verdict.'), facts([['Observed upload', bytes(e.observed_bytes)], ['Threshold', bytes(e.threshold_bytes)], ['Observed hour', utc(e.hour)], ['Previous hour', utc(e.previous_hour)], ['Quality required', finite(e.coverage_required_seconds) ? `${e.coverage_required_seconds}s per hour` : 'Unavailable'], ['Reason', text(e.reason_code)], ['Algorithm', text(e.algorithm)], ['Config version', text(e.config_version)], ['Baseline', e.baseline_id || 'No mature baseline'], ['Reference median', e.baseline_id ? bytes(e.baseline_median_upload_bytes) : 'Not used'], ['Qualified hours', finite(e.sample_hours) ? String(e.sample_hours) : 'Unavailable'], ['Distinct dates', finite(e.distinct_days) ? String(e.distinct_days) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']]), node('code', {class: 'identity-id'}, d.device_id), node('button', {type: 'button', 'data-focus-key': `activity:${d.device_id}`, onclick: () => onActivity(d.device_id)}, 'View activity'), node('details', {}, node('summary', {}, 'Provenance identifiers'), facts([['Incident ID', d.id], ['Baseline ID', text(e.baseline_id)], ['Lineage', text(e.lineage)]])));
 }
+/* Events: every API string is shown through text(); severity reaches `class` only via this allowlist. */
+export const EVENT_PAGE = 25; export const EVENT_TIMELINE = 10; export const EVENT_MAX_PAGES = 40;
+const SEVERITY_TONE = {info: '', warn: 'warn', warning: 'warn', error: 'bad', critical: 'bad'};
+const clip = (value, size = 500) => { const s = text(value); return s.length > size ? `${s.slice(0, size)}…` : s; };
+function checkEvents(data, limit) { if (!Array.isArray(data) || data.length > limit || data.some(e => !e || typeof e !== 'object' || typeof e.id !== 'string')) throw new Error('Malformed events response'); }
+const eventDevice = e => typeof e.device_id === 'string' && e.device_id ? node('code', {class: 'mono'}, clip(e.device_id, 64)) : node('span', {class: 'muted'}, 'No device');
+const eventSeverity = e => badge(e.severity, typeof e.severity === 'string' && Object.hasOwn(SEVERITY_TONE, e.severity) ? SEVERITY_TONE[e.severity] : '');
+export function eventsView(data) {
+  checkEvents(data, EVENT_PAGE);
+  if (!data.length) return empty('No events match', 'Nothing was recorded for this filter. An empty list does not establish that nothing happened.');
+  return table(['Time · UTC', 'Kind', 'Severity', 'Device', 'Summary'], data.map(e => node('tr', {}, node('td', {}, utc(e.ts)), node('td', {}, clip(e.kind, 64)), node('td', {}, eventSeverity(e)), node('td', {}, eventDevice(e)), node('td', {class: 'event-summary'}, clip(e.summary)))));
+}
+/* Filters are view state: they live in memory and are sent only as encoded query parameters. */
+export function eventFilterForm(filter, onApply) {
+  const device = node('input', {id: 'event-device', name: 'device', maxlength: 64, autocomplete: 'off', spellcheck: 'false'}); const kind = node('input', {id: 'event-kind', name: 'kind', maxlength: 64, autocomplete: 'off', spellcheck: 'false'});
+  device.value = filter.deviceId; kind.value = filter.kind;
+  const apply = () => onApply({deviceId: device.value.trim(), kind: kind.value.trim()});
+  return node('form', {class: 'scope-bar', 'aria-label': 'Event filters', onsubmit: event => { event.preventDefault(); apply(); }}, node('label', {for: 'event-device'}, 'Device ID', device), node('label', {for: 'event-kind'}, 'Event kind', kind), node('button', {type: 'submit', 'data-focus-key': 'events:apply'}, 'Apply filters'), node('button', {type: 'button', 'data-focus-key': 'events:clear', onclick: () => onApply({deviceId: '', kind: ''})}, 'Clear filters'));
+}
+/* Per-device timeline on the identity page. `events` is the API data, or null when the fetch failed. */
+export function timelineSection(events, deviceId, onAll) {
+  const body = events === null ? node('p', {class: 'small muted'}, 'Timeline unavailable. The identity details above are unaffected.')
+    : (checkEvents(events, EVENT_TIMELINE), !events.length ? node('p', {class: 'small muted'}, 'No events recorded for this identity.')
+      : node('ol', {class: 'plain-list'}, events.map(e => node('li', {}, `${utc(e.ts)} · ${clip(e.kind, 64)} · `, eventSeverity(e), ` · ${clip(e.summary, 200)}`))));
+  return node('section', {class: 'timeline', 'aria-label': 'Device timeline'}, node('h3', {}, 'Recent events'), body, node('button', {type: 'button', 'data-focus-key': `events:all:${deviceId}`, onclick: () => onAll(deviceId)}, 'View all events'));
+}
