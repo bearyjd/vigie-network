@@ -43,14 +43,79 @@ _MOUNTS = {
 }
 
 
+# Probe unit (disabled by default; see docs/monitoring.md "Probes"). The private-address policy
+# mirrors deploy/persistent/probe_runner.py (a test keeps them equal): RFC 1918 and ULA only.
+_PROBE_NETS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+_PROBE_DENIED = (ipaddress.ip_network("fd00:ec2::/32"),)
+_PROBE_MAX_TARGETS = 10
+_PROBE_TOKEN = "@PROBE_TARGET_IPS@"
+_OPTIONAL = {
+    "monitoring_large_upload_bytes",
+    "monitoring_baseline",
+    "probes_enabled",
+    "probe_allow",
+}
+
+
+def private_probe_address(value: object) -> str | None:
+    if not isinstance(value, str) or "%" in value:
+        return None
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    allowed = any(ip in n for n in _PROBE_NETS) and not any(
+        ip in n for n in _PROBE_DENIED
+    )
+    return str(ip) if allowed else None
+
+
+def _probe_allow(config: dict) -> tuple[str, ...] | None:
+    """None when probes are disabled (the default); else the validated addresses."""
+    enabled = config.get("probes_enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("probes_enabled must be a boolean")
+    allow = config.get("probe_allow")
+    if not enabled:
+        if allow is not None:
+            raise ValueError("probe_allow requires probes_enabled")
+        return None
+    if not isinstance(allow, list) or not 1 <= len(allow) <= _PROBE_MAX_TARGETS:
+        raise ValueError(
+            f"probe_allow must list 1..{_PROBE_MAX_TARGETS} private addresses"
+        )
+    addresses = tuple(a for a in map(private_probe_address, allow) if a is not None)
+    if len(addresses) != len(allow) or len(set(addresses)) != len(addresses):
+        raise ValueError(
+            "probe_allow must hold distinct literal private (RFC 1918/ULA) addresses"
+        )
+    return addresses
+
+
+def _probe_units(ns: str, addresses: tuple[str, ...]) -> dict[str, str]:
+    here = Path(__file__).parent
+    service = (here / "probe.service").read_text(encoding="utf-8")
+    timer = (here / "probe.timer").read_text(encoding="utf-8")
+    return {
+        f"{ns}-probe.volume": f"[Volume]\nVolumeName={ns}_probe\n",
+        f"{ns}-probe.service": service.replace(_PROBE_TOKEN, " ".join(addresses)),
+        f"{ns}-probe.timer": timer.replace(
+            "Unit=probe.service", f"Unit={ns}-probe.service"
+        ),
+    }
+
+
 def render(config: dict) -> dict[str, str]:
     if (
         not isinstance(config, dict)
         or not _FIELDS <= set(config)
-        or set(config)
-        - (_FIELDS | {"monitoring_large_upload_bytes", "monitoring_baseline"})
+        or set(config) - (_FIELDS | _OPTIONAL)
     ):
         raise ValueError("configuration must contain only the documented fields")
+    probe_addresses = _probe_allow(config)
     threshold = config.get("monitoring_large_upload_bytes", 1073741824)
     if type(threshold) is not int or not 1 <= threshold <= 2**50:
         raise ValueError("monitoring_large_upload_bytes must be an integer in 1..2**50")
@@ -90,7 +155,11 @@ def render(config: dict) -> dict[str, str]:
     result = {}
     for volume in ("raw", "inv", "overrides"):
         result[f"{ns}-{volume}.volume"] = f"[Volume]\nVolumeName={ns}_{volume}\n"
+    if probe_addresses is not None:
+        result.update(_probe_units(ns, probe_addresses))
     for role, mounts in _MOUNTS.items():
+        if probe_addresses is not None and role == "pipeline":
+            mounts = (*mounts, ("probe", "ro"))
         lines = [
             "[Unit]",
             f"Description=Vigie owned {role}",
@@ -142,6 +211,8 @@ def render(config: dict) -> dict[str, str]:
         if role == "pipeline":
             lines += [f"Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES={threshold}"]
             lines += [f"Environment=VIGIE_MONITORING_BASELINE={baseline}"]
+            if probe_addresses is not None:
+                lines += ["Environment=VIGIE_PROBE_FILE=/probe/probe-state.json"]
             lines += [
                 "Environment=VIGIE_PIPELINE_INTERVAL_S=30",
                 "Environment=VIGIE_HEALTH_FILE=/tmp/vigie-pipeline.ok",

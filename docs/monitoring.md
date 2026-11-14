@@ -1007,6 +1007,51 @@ connection error); 5 TLS verification failed (including not yet valid or expired
 would retry); 6 DNS failure. Record the codes for a wrong id, a disabled automation and so on in
 the PRP-004 H0 table.
 
+## Probes (built, off by default, not deployed)
+
+Bounded DNS and TCP reachability probes run in a separate host unit, never in the pipeline (which
+stays `Network=none`). The unit mounts only its own output volume, so inventory, raw shards,
+overrides and device names never reach probe traffic or probe logs.
+
+- **Runner.** `deploy/persistent/probe_runner.py` (standard library only) reads a private JSON
+  config and does one locked pass per timer tick (`probe.service` and `probe.timer` templates,
+  every 60 s). Targets are at most 10 literal private addresses (RFC 1918 or ULA), never
+  hostnames: nothing is resolved. Kinds are `dns_local`, `dns_upstream` (at most one) and
+  `tcp_lan`. A DNS probe is one UDP query on a connected socket, so only the configured resolver
+  can answer, with a 2 s timeout, no retry and a 4096-byte reply cap. A TCP probe is a connect with
+  no payload. A result is `ok`, a latency and a fixed error class, never response content. Logs
+  carry the target id and error class only, never an address, name or port.
+- **Hysteresis.** An outage opens after 3 consecutive failed attempts and recovers after 3
+  successes. At most 3 outage episodes per target per UTC day are reported; after that the target
+  is `flapping` and its further episodes emit no open or recover event.
+- **Outbound statement.** `dns_upstream` queries the household resolver for an owner-chosen
+  canary name. On a resolver cache miss that one query is forwarded to the upstream the household
+  already uses, about once a minute. While the name is cached an upstream outage is masked for up
+  to its TTL. It is off unless the owner configures it.
+- **Pipeline side.** Set `VIGIE_PROBE_FILE` (render does this when `probes_enabled` is set) and the
+  pipeline reads the runner's state file read-only on every pass and writes only
+  `pipeline_meta['probe_status']` plus events of kind `probe_outage`, `probe_recovered`,
+  `probe_flapping` and `probe_stale` (no device, one event per episode). The file is untrusted
+  input: over 64 KiB, malformed, unknown ids or enum values, out-of-range numbers, a future
+  `written_at`, or older than `VIGIE_PROBE_STALE_S` (default 300 s) all mean "probes unavailable"
+  and never "ok" or an outage. Probes are not an incident and are not delivered.
+- **Freeze.** Probe settings are their own `ProbeSettings`, outside the monitoring policy version,
+  the detectors, `/coverage` and every existing table. Disabled, the rendered units and the
+  pipeline's tables are byte-identical to a build without probes (`server/tests/pipeline/test_probe_freeze.py`,
+  `deploy/tests/test_probe_render.py`).
+- **Render.** Optional `probes_enabled` (default false) and `probe_allow` (the target addresses)
+  add the probe volume, a read-only pipeline mount, the env var and the probe service/timer units.
+  `IPAddressDeny=any` with `IPAddressAllow=` for the targets is defense in depth and best-effort:
+  a systemd user manager may not be allowed to load the cgroup BPF programs it needs.
+- **Self-contamination.** The server's own probe queries pass through the household resolver and
+  can be attributed to the server host as DNS volume (about 1 to 2 per minute); keep the rate
+  fixed and account for it before any DNS-volume detector.
+
+Config fields (all values are placeholders): `enabled`, `state_file` (absolute path inside the
+probe volume), optional `state_world_readable` (mode 0644 so the pipeline's uid can read it; the
+document holds ids, error classes and counters only) and `targets`, each with `id`, `kind`,
+`resolver` plus `qname` (DNS) or `address` plus `port` (TCP), and an optional `timeout_s` up to 2.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
