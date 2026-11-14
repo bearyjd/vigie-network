@@ -20,6 +20,7 @@ DAY = "2027-01-15"
 
 @pytest.fixture
 def inv(tmp_path):
+    probes._last_invalid = None  # the once-per-change log memory is module state
     conn = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     yield conn
     conn.close()
@@ -211,12 +212,13 @@ START = int(NOW) - 200
 
 
 def outage(**over):
-    return target_state(state="outage", consecutive_fail=3, consecutive_ok=0, episode_start=START,
-                        last_error_class="timeout", **over)  # fmt: skip
+    base = {"state": "outage", "consecutive_fail": 3, "consecutive_ok": 0,
+            "episode_start": START, "last_error_class": "timeout"}  # fmt: skip
+    return target_state(**{**base, **over})
 
 
 def recovered(**over):
-    return target_state(state="ok", consecutive_ok=3, episode_start=START, **over)
+    return target_state(**{"state": "ok", "consecutive_ok": 3, "episode_start": START, **over})
 
 
 def test_outage_then_recovery_is_one_event_each_even_replayed(inv, settings):
@@ -277,10 +279,9 @@ def test_flapping_event_once_per_target_day(inv, settings):
         ("probe_flapping", "warn", "probe router-dns: repeated outages today, further episodes "
          "are not reported", f"router-dns:{DAY}", None)
     ]  # fmt: skip
-    write_probe_file(
-        settings.file, state_doc(outage(suppressed=True, flapping=True, episodes_day="2027-01-16"))
-    )
-    fold(inv, settings)
+    tomorrow = outage(suppressed=True, flapping=True, episodes_day="2027-01-16")
+    write_probe_file(settings.file, state_doc(tomorrow, written_at=NOW + 86400))
+    fold(inv, settings, now=NOW + 86405)
     assert kinds(inv) == ["probe_flapping", "probe_flapping"]
 
 
@@ -290,8 +291,8 @@ def test_new_episode_after_a_suppressed_one_is_reported_again(inv, settings):
     later = START + 5000
     fresh = target_state(state="outage", consecutive_fail=3, episode_start=later,
                          last_error_class="refused")  # fmt: skip
-    write_probe_file(settings.file, state_doc(fresh))
-    fold(inv, settings)
+    write_probe_file(settings.file, state_doc(fresh, written_at=NOW + 6000))
+    fold(inv, settings, now=NOW + 6005)
     assert kinds(inv).count("probe_outage") == 1
     assert events(inv)[-1][3] == f"router-dns:{later}"
 

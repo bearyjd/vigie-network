@@ -6,7 +6,7 @@ GOLDEN_SHA256 was captured from origin/main (73bd7f6) with the same fixture; do 
 import hashlib
 import json
 
-from api_helpers import NOW, Env, env  # noqa: F401
+from api_helpers import NOW, Env, env, ts  # noqa: F401
 from test_api_monitoring import HOUR, seed
 
 from vigie_pipeline.config import ProbeSettings
@@ -31,7 +31,7 @@ def test_coverage_bytes_are_unchanged_by_probe_rows(env: Env, tmp_path):
         "id": "router-dns", "state": "outage", "consecutive_fail": 3, "consecutive_ok": 0,
         "last_ok_at": None, "last_error_class": "timeout", "last_latency_ms": None,
         "episode_start": int(NOW) - 100, "last_attempt": NOW, "ring": [],
-        "episodes_day": None, "episodes_today": 1, "flapping": False, "suppressed": False,
+        "episodes_day": ts()[:10], "episodes_today": 1, "flapping": False, "suppressed": False,
         "note": None,
     }  # fmt: skip
     probe_file.write_text(json.dumps({"v": 1, "written_at": NOW, "targets": [target]}))

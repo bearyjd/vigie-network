@@ -21,6 +21,7 @@ from probe_helpers import (
     write_probe_file,
 )
 
+from vigie_ingest.db import iso_utc
 from vigie_pipeline.baselines import BaselineConfig
 from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.config import PipelineConfig
@@ -72,7 +73,7 @@ def test_enabled_with_an_outage_file_changes_only_probe_rows(tmp_path):
     build_fixture(tmp_path)
     outage = target_state(
         state="outage", consecutive_fail=3, episode_start=int(CURRENT) - 100,
-        last_error_class="timeout",
+        last_error_class="timeout", episodes_day=iso_utc(CURRENT + 3600)[:10],
     )  # fmt: skip
     probe_file = write_probe_file(
         tmp_path / "probe-state.json", state_doc(outage, written_at=CURRENT + 3600)

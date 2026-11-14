@@ -66,6 +66,11 @@ class ProbeFileInvalid(Exception):
     """Fixed-message: the file is not exactly the documented state document."""
 
 
+def _member(value: object, allowed: frozenset[str]) -> bool:
+    """Membership of an untrusted value: a list or dict must be False, never a TypeError."""
+    return isinstance(value, str) and value in allowed
+
+
 def _num(value: object, high: float, *, integer: bool = False, none_ok: bool = False) -> None:
     if value is None and none_ok:
         return
@@ -86,7 +91,7 @@ def _ring(ring: object) -> Ring:
         minute, ok, latency, error = entry
         _num(minute, MAX_EPOCH, integer=True)
         _num(latency, MAX_LATENCY_MS, integer=True, none_ok=True)
-        if type(ok) is not bool or (error is not None and error not in ERROR_CLASSES):
+        if type(ok) is not bool or (error is not None and not _member(error, ERROR_CLASSES)):
             raise ProbeFileInvalid("bad ring entry")
         out.append((minute, ok, latency, error))
     return tuple(out)
@@ -105,11 +110,11 @@ def _target(doc: object) -> ProbeTarget:
     valid = (
         isinstance(ident, str)
         and ID_RE.fullmatch(ident) is not None
-        and doc["state"] in STATES
+        and _member(doc["state"], STATES)
         and type(doc["flapping"]) is bool
         and type(doc["suppressed"]) is bool
-        and (doc["note"] is None or doc["note"] in NOTES)
-        and (error is None or error in ERROR_CLASSES)
+        and (doc["note"] is None or _member(doc["note"], NOTES))
+        and (error is None or _member(error, ERROR_CLASSES))
         and (day is None or (isinstance(day, str) and DAY_RE.fullmatch(day) is not None))
     )
     if not valid:
@@ -124,7 +129,17 @@ def _target(doc: object) -> ProbeTarget:
 
 
 def parse_probe_doc(data: bytes) -> ProbeDoc:
-    """Raise ProbeFileInvalid unless `data` is exactly a state document (size checked first)."""
+    """Raise ProbeFileInvalid, and nothing else, unless `data` is exactly a state document
+    (size checked first)."""
+    try:
+        return _parse(data)
+    except ProbeFileInvalid:
+        raise
+    except (TypeError, ValueError, KeyError, AttributeError, RecursionError):
+        raise ProbeFileInvalid("malformed document") from None
+
+
+def _parse(data: bytes) -> ProbeDoc:
     if len(data) > MAX_FILE_BYTES:
         raise ProbeFileInvalid("file too large")
     try:
@@ -141,6 +156,8 @@ def parse_probe_doc(data: bytes) -> ProbeDoc:
     targets = tuple(_target(t) for t in doc["targets"])
     if len({t.id for t in targets}) != len(targets):
         raise ProbeFileInvalid("duplicate target id")
+    if any(t.episode_start is not None and t.episode_start > doc["written_at"] for t in targets):
+        raise ProbeFileInvalid("episode starts after the file was written")
     return ProbeDoc(float(doc["written_at"]), targets)
 
 
