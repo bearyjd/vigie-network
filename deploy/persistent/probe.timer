@@ -5,6 +5,7 @@ Description=Run the Vigie probe every minute
 [Timer]
 OnActiveSec=60s
 OnUnitActiveSec=60s
+AccuracySec=1s
 Persistent=no
 Unit=probe.service
 

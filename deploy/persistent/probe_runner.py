@@ -18,13 +18,10 @@ after recovery; `suppressed` marks an episode that opened over the per-day cap a
 that episode (also across UTC midnight and its recovery) until the next episode opens. Emit
 probe_outage/probe_recovered only when `suppressed` is false.
 
-S2 adapter contract (the real `dns` and `connect` functions must):
-- use a connected UDP socket, so replies are accepted only from the configured resolver;
-- call recv(4097), so an oversize reply is detectable (the parser rejects more than 4096);
-- set per-operation socket timeouts from the timeout_s argument;
-- log only str(exc) of an error, never an address, qname or port.
-The pass deadline is checked before each probe only: a probe that overruns its own timeout can
-push a pass past 25 s, bounded by the number of targets times the adapter's real timeout.
+Adapter contract (real_dns, real_connect): a connected UDP socket (replies only from the
+resolver), recv(4097) (an oversize reply is detectable), per-operation timeouts from timeout_s,
+and only str(exc) logged, never an address, qname or port. The pass deadline is checked before
+each probe only: an overrunning probe can push a pass past 25 s (targets x the real timeout).
 """
 
 from __future__ import annotations
@@ -544,6 +541,9 @@ def _step(
     connect: ConnectFn,
 ) -> TargetState:
     t = now()
+    if ts.episode_start is not None and ts.episode_start > t + 86400:
+        keep = ts.state == "outage"  # the clock was set back by more than a day
+        ts = replace(ts, episode_start=int(t) if keep else None, suppressed=keep and ts.suppressed)
     due, note = _due(ts, t)
     if not due:
         return ts

@@ -209,6 +209,7 @@ def test_enabled_bundle_hashes_every_file(tmp_path):
         {"probes_enabled": True, "probe_allow": ["10.0.0.7\nExecStart=/bin/sh"]},
         {"probes_enabled": True, "probe_allow": [7]},
         {"probes_enabled": False, "probe_allow": ["10.0.0.7"]},  # no half-configured probes
+        {"probes_enabled": False, "probe_allow": []},
         {"probe_allow": ["10.0.0.7"]},
         {"probes_enabled": True, "probe_allow": ["10.0.0.7"], "unknown": 1},
     ],
@@ -259,4 +260,22 @@ def test_docs_state_data_flow_not_guarantees():
     assert "never reach" not in section and "unknown ids" not in section
     assert "mounts only" not in section and "not isolated from other Vigie volumes" in section
     for needle in ("malformed ids", "probe_allow", "common, widely used canary", "any cause"):
+        assert needle in section, needle
+
+
+def test_timer_is_accurate_to_a_second():
+    timer = (PERSISTENT / "probe.timer").read_text()
+    assert "AccuracySec=1s" in timer  # the default 1 min would make the cadence 60-120 s
+
+
+def test_env_example_marks_probe_vars_as_quadlet_only():
+    env = (Path(__file__).parents[1] / ".env.example").read_text()
+    block = env[env.index("# --- Probes") :]
+    assert "Quadlet/render.py deployments only" in block
+
+
+def test_docs_describe_the_final_bounds():
+    docs = (Path(__file__).parents[2] / "docs" / "monitoring.md").read_text()
+    section = docs[docs.index("## Probes") : docs.index("## Retention and verification limits")]
+    for needle in ("valid_until", "unknown-target-id", "disabled", "probe_event_capped", "7 days"):
         assert needle in section, needle
