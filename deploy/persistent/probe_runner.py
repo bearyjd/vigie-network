@@ -12,6 +12,19 @@ hostnames). A result is `ok`, `latency_ms` and an error class from a fixed set: 
 content. Log lines and error messages carry the target id and error class only, never an address,
 qname or port. The reply parser is a ported copy of run_soak.dns_probe (a parity test keeps them
 equal); the soak's retry and hard-coded question are deliberately not ported.
+
+State contract for the pipeline reader (S2): `episode_start` identifies an episode and is kept
+after recovery; `suppressed` marks an episode that opened over the per-day cap and stays set for
+that episode (also across UTC midnight and its recovery) until the next episode opens. Emit
+probe_outage/probe_recovered only when `suppressed` is false.
+
+S2 adapter contract (the real `dns` and `connect` functions must):
+- use a connected UDP socket, so replies are accepted only from the configured resolver;
+- call recv(4097), so an oversize reply is detectable (the parser rejects more than 4096);
+- set per-operation socket timeouts from the timeout_s argument;
+- log only str(exc) of an error, never an address, qname or port.
+The pass deadline is checked before each probe only: a probe that overruns its own timeout can
+push a pass past 25 s, bounded by the number of targets times the adapter's real timeout.
 """
 
 from __future__ import annotations
@@ -64,6 +77,10 @@ TOP_KEYS = frozenset({"enabled", "state_file", "targets"})
 DNS_KEYS = frozenset({"id", "kind", "resolver", "qname", "timeout_s"})
 TCP_KEYS = frozenset({"id", "kind", "address", "port", "timeout_s"})
 
+ALLOWED_NETS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+DENIED_NETS = (ipaddress.ip_network("fd00:ec2::/32"),)
 DnsFn = Callable[[str, bytes, float], bytes]  # (resolver, query packet, timeout_s) -> reply
 ConnectFn = Callable[[str, int, float], None]  # (address, port, timeout_s); raises OSError
 Ring = tuple[tuple[int, bool, int | None, str | None], ...]
@@ -105,6 +122,7 @@ class TargetState:
     episodes_day: str | None = None
     episodes_today: int = 0
     flapping: bool = False
+    suppressed: bool = False  # the episode at episode_start opened capped: emit no events for it
     note: str | None = None
 
 
@@ -135,18 +153,18 @@ def _bad(index: int, what: str) -> ProbeError:
 
 
 def _private_ip(value: object) -> str | None:
-    """Literal private unicast IP only: no hostname, scope id, v4-mapped, loopback, link-local
-    (incl. cloud metadata), unspecified, multicast or reserved address."""
+    """Literal address inside RFC 1918 (10/8, 172.16/12, 192.168/16) or ULA fc00::/7, except the
+    AWS IPv6 metadata range fd00:ec2::/32. Everything else (hostnames, scoped, v4-mapped,
+    loopback, link-local, 0/8, 6to4, Teredo, documentation, benchmark, 192.0.0.0/24, CGNAT,
+    multicast, reserved) is rejected. Subnet-broadcast addresses are not detectable here."""
     if not isinstance(value, str) or "%" in value:
         return None
     try:
         ip = ipaddress.ip_address(value)
     except ValueError:
         return None
-    if getattr(ip, "ipv4_mapped", None) is not None:
-        return None
-    unsafe = (ip.is_loopback, ip.is_unspecified, ip.is_multicast, ip.is_link_local, ip.is_reserved)
-    return str(ip) if ip.is_private and not any(unsafe) else None
+    allowed = any(ip in net for net in ALLOWED_NETS) and not any(ip in n for n in DENIED_NETS)
+    return str(ip) if allowed else None
 
 
 def _qname(value: object) -> str | None:
@@ -228,19 +246,36 @@ def parse_config(raw: object) -> ProbeConfig:
     return ProbeConfig(enabled, state_file, targets)
 
 
-def load_config(path: str) -> ProbeConfig:
+def _read_regular(path: str, limit: int, what: str, *, missing_ok: bool = False) -> bytes | None:
+    """Read at most limit+1 bytes of a regular file. O_NONBLOCK|O_NOFOLLOW so a FIFO without a
+    writer cannot hang the open and a symlink is refused; the fd must be a regular file."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        with os.fdopen(fd, "rb") as stream:
-            data = stream.read(MAX_CONFIG_BYTES + 1)
-    except OSError as exc:
-        raise ProbeError("cannot read the probe config") from exc
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ProbeError(f"cannot open the {what}") from None
+    except OSError:
+        raise ProbeError(f"cannot open the {what}") from None
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ProbeError(f"the {what} must be a regular file")
+        try:
+            return stream.read(limit + 1)
+        except OSError:
+            raise ProbeError(f"cannot read the {what}") from None
+
+
+def load_config(path: str) -> ProbeConfig:
+    data = _read_regular(path, MAX_CONFIG_BYTES, "probe config")
+    assert data is not None  # noqa: S101  (missing_ok is False)
     if len(data) > MAX_CONFIG_BYTES:
         raise ProbeError("probe config is too large")
     try:
         raw = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise ProbeError("probe config is not valid JSON") from exc
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ProbeError("probe config is not valid JSON") from None
     return parse_config(raw)
 
 
@@ -441,6 +476,7 @@ def _on_fail(ts: TargetState, error: str | None, t: float) -> TargetState:
         state="outage",
         episode_start=int(t),
         flapping=capped,
+        suppressed=capped,
         episodes_today=ts.episodes_today if capped else ts.episodes_today + 1,
     )
 
@@ -554,6 +590,8 @@ def _check_ring(ring: object) -> Ring:
 
 
 def _target_from_doc(doc: object) -> TargetState:
+    if isinstance(doc, dict) and "suppressed" not in doc:
+        doc = {**doc, "suppressed": False}  # documents written before the key existed
     if not isinstance(doc, dict) or set(doc) != _TARGET_KEYS:
         raise ValueError("bad target")
     _num(doc["consecutive_fail"], MAX_COUNT, integer=True)
@@ -568,6 +606,7 @@ def _target_from_doc(doc: object) -> TargetState:
         isinstance(doc["id"], str)
         and doc["state"] in STATES
         and type(doc["flapping"]) is bool
+        and type(doc["suppressed"]) is bool
         and (doc["note"] is None or doc["note"] in NOTES)
         and (error is None or error in ERROR_CLASSES)
         and (day is None or (isinstance(day, str) and DAY_RE.fullmatch(day) is not None))
@@ -586,7 +625,11 @@ def state_from_bytes(data: bytes, cfg: ProbeConfig) -> State | None:
         doc = json.loads(data.decode("utf-8"))
         if not isinstance(doc, dict) or set(doc) != {"v", "written_at", "targets"}:
             return None
-        if doc["v"] != STATE_VERSION or not isinstance(doc["targets"], list):
+        if (
+            type(doc["v"]) is not int
+            or doc["v"] != STATE_VERSION
+            or not isinstance(doc["targets"], list)
+        ):
             return None
         if len(doc["targets"]) > MAX_TARGETS:
             return None
@@ -603,16 +646,9 @@ def state_from_bytes(data: bytes, cfg: ProbeConfig) -> State | None:
 # ---------------------------------------------------------------- files, lock, one run
 def read_state(path: str, cfg: ProbeConfig) -> State:
     """Fresh state when the file is missing or invalid; ProbeError if it cannot be opened safely."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except FileNotFoundError:
+    data = _read_regular(path, MAX_STATE_READ, "state file", missing_ok=True)
+    if data is None:
         return empty_state()
-    except OSError as exc:
-        raise ProbeError("cannot open the state file") from exc
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ProbeError("state file must be a regular file")
-        data = stream.read(MAX_STATE_READ + 1)
     state = state_from_bytes(data, cfg)
     if state is None:
         log.warning("probe_state_invalid; starting fresh")
@@ -648,8 +684,8 @@ def write_state(path: str, state: State) -> None:
                 log.debug("temporary state file already gone")
             raise
         _fsync_directory(os.path.dirname(path) or ".")
-    except OSError as exc:
-        raise ProbeError("cannot write the state file") from exc
+    except OSError:
+        raise ProbeError("cannot write the state file") from None
 
 
 def acquire_lock(path: str) -> int | None:
@@ -657,8 +693,8 @@ def acquire_lock(path: str) -> int | None:
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
         fd = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise ProbeError("cannot open the lock file") from exc
+    except OSError:
+        raise ProbeError("cannot open the lock file") from None
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
         os.close(fd)
@@ -668,9 +704,9 @@ def acquire_lock(path: str) -> int | None:
     except BlockingIOError:
         os.close(fd)
         return None
-    except OSError as exc:
+    except OSError:
         os.close(fd)
-        raise ProbeError("cannot lock the lock file") from exc
+        raise ProbeError("cannot lock the lock file") from None
     return fd
 
 

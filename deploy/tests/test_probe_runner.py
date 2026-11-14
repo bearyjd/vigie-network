@@ -94,6 +94,9 @@ def vectors():
         "rcode_nxdomain": reply(flags=0x8183, an=0, body=b""),
         "no_answer": reply(an=0, body=b""),
         "not_response": reply(flags=0x0100),
+        "ptr_mid_label": reply(
+            body=b"\xc0\x0d" + struct.pack("!HHIH", 1, 1, 60, 4) + b"\x0a\0\0\x01"
+        ),
         "type_28_len4": reply(body=rr(b"\xc0\x0c", kind=28)),
         "class_ch": reply(body=rr(b"\xc0\x0c", cls=3)),
         "a_only_in_authority": reply(
@@ -241,6 +244,30 @@ BAD_ADDRESSES = [
     "::ffff:10.0.0.1",  # v4-mapped
     "100.64.0.1",  # CGNAT, not private
     "255.255.255.255",
+    "240.0.0.1",
+    "0.0.0.1",  # 0.0.0.0/8
+    "0.1.2.3",
+    "192.0.0.1",  # 192.0.0.0/24
+    "192.0.2.1",  # documentation
+    "198.51.100.1",
+    "203.0.113.1",
+    "198.18.0.1",  # benchmark
+    "198.19.255.254",
+    "172.15.255.255",  # just outside 172.16/12
+    "172.32.0.1",
+    "192.167.255.255",
+    "192.169.0.1",
+    "11.0.0.1",
+    "2002::1",  # 6to4
+    "2002:c0a8:101::1",
+    "2001::1",  # Teredo
+    "2001:db8::1",  # documentation
+    "fd00:ec2::254",  # AWS IPv6 metadata
+    "fd00:ec2::1",
+    "fd00:ec2:1::1",  # inside the /32, outside a /48
+    "fd00:ec2:ffff:ffff::1",
+    "fe00::1",
+    "fbff::1",
     "fd00::1%eth0",  # scoped
     "router.lan",  # hostname: no rebinding
     "10.0.0.1.example.com",
@@ -267,7 +294,20 @@ def test_rejects_bad_dns_resolver(address):
         pr.parse_config(raw)
 
 
-@pytest.mark.parametrize("address", ["10.1.2.3", "172.16.0.1", "192.168.1.1", "fd00::1", "fc00::5"])
+@pytest.mark.parametrize(
+    "address",
+    [
+        "10.1.2.3",
+        "10.255.255.254",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.1.1",
+        "fd00::1",
+        "fc00::5",
+        "fd00:ec3::1",
+        "fdff::1",
+    ],
+)
 def test_accepts_private_addresses(address):
     assert pr.parse_config(with_targets(target(address=address))).targets[0].host == address
 
@@ -784,6 +824,10 @@ def test_state_roundtrip_and_hostile_bytes_are_rejected():
         b"[]",
         b"x" * 70000,
         mutated(lambda d: d.update(v=2)),
+        mutated(lambda d: d.update(v=1.0)),
+        mutated(lambda d: d.update(v=True)),
+        mutated(lambda d: d["targets"][0].update(suppressed="no")),
+        mutated(lambda d: d["targets"][0].update(suppressed=1)),
         mutated(lambda d: d.update(extra=1)),
         mutated(lambda d: d["targets"][0].update(state="weird")),
         mutated(lambda d: d["targets"][0].update(consecutive_fail=-1)),
@@ -950,6 +994,7 @@ def test_vector_expectations_are_the_documented_classes():
         "rcode_nxdomain": "rcode",
         "no_answer": "no_answer",
         "not_response": "malformed",
+        "ptr_mid_label": "malformed",
         "type_28_len4": "no_answer",
         "class_ch": "no_answer",
         "a_only_in_authority": "no_answer",
@@ -1031,3 +1076,153 @@ def test_import_opens_no_network_and_creates_no_files(tmp_path):
     )
     assert done.returncode == 0, done.stderr
     assert list(tmp_path.iterdir()) == []
+
+
+# ================================================================ review round 1
+def test_pointer_into_the_middle_of_a_label_is_rejected():
+    # The question's one label is b"\x03com\x00" (5 bytes); a pointer to its inner length byte
+    # would decode as a valid shorter name if pointer targets were not restricted to name starts.
+    labels = (b"\x03com\x00",)
+    question = b"\x05\x03com\x00\x00" + b"\0\1\0\1"
+    answer = b"\xc0\x0d" + struct.pack("!HHIH", 1, 1, 60, 4) + b"\x0a\0\0\x01"
+    packet = QID + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + answer
+    assert pr.classify_reply(packet, QID, labels) == "malformed"
+    own = packet[:23] + b"\xc0\x0c" + answer[2:]  # pointer to the real name start: accepted
+    assert pr.classify_reply(own, QID, labels) is None
+
+
+class Hung(BaseException):  # noqa: N818
+    pass
+
+
+def alarm_guard(seconds=5):
+    import signal
+
+    def boom(*_):
+        raise Hung("blocked in open/read")  # BaseException: an `except OSError` cannot hide it
+
+    signal.signal(signal.SIGALRM, boom)
+    signal.alarm(seconds)
+
+
+def alarm_off():
+    import signal
+
+    signal.alarm(0)
+
+
+def test_load_config_does_not_hang_on_fifo_and_rejects_non_regular(tmp_path):
+    fifo = tmp_path / "cfg.fifo"
+    os.mkfifo(fifo)
+    alarm_guard()
+    try:
+        with pytest.raises(pr.ProbeError):
+            pr.load_config(str(fifo))
+        with pytest.raises(pr.ProbeError):
+            pr.load_config("/dev/zero")
+    finally:
+        alarm_off()
+
+
+def test_load_config_refuses_symlink(tmp_path):
+    real = tmp_path / "real.json"
+    real.write_text(json.dumps(raw_config()))
+    link = tmp_path / "link.json"
+    os.symlink(real, link)
+    with pytest.raises(pr.ProbeError):
+        pr.load_config(str(link))
+
+
+def test_read_state_and_lock_refuse_fifo(tmp_path):
+    cfg = file_cfg(tmp_path)
+    os.mkfifo(cfg.state_file)
+    os.mkfifo(cfg.state_file + ".lock")
+    alarm_guard()
+    try:
+        with pytest.raises(pr.ProbeError):
+            pr.read_state(cfg.state_file, cfg)
+        with pytest.raises(pr.ProbeError):
+            pr.acquire_lock(cfg.state_file + ".lock")
+    finally:
+        alarm_off()
+
+
+def test_lock_refuses_hardlinked_and_foreign_owned_lock_file(tmp_path, monkeypatch):
+    lock = tmp_path / "x.lock"
+    lock.write_text("")
+    os.link(lock, tmp_path / "other")
+    with pytest.raises(pr.ProbeError):
+        pr.acquire_lock(str(lock))
+    solo = tmp_path / "solo.lock"
+    solo.write_text("")
+    other_uid = os.geteuid() + 1
+    monkeypatch.setattr(pr.os, "geteuid", lambda: other_uid)
+    with pytest.raises(pr.ProbeError):
+        pr.acquire_lock(str(solo))
+
+
+def test_errors_carry_no_path_in_message_repr_cause_or_traceback(tmp_path):
+    import traceback
+
+    secret = "secret-dir-name"
+    missing = str(tmp_path / secret / "x.json")
+    cfg = pr.parse_config(raw_config(state_file=missing))
+    link = tmp_path / (secret + "-link")
+    os.symlink(tmp_path, link)
+    calls = [
+        lambda: pr.load_config(missing),
+        lambda: pr.read_state(str(link), cfg),
+        lambda: pr.write_state(missing, pr.empty_state()),
+        lambda: pr.acquire_lock(missing + ".lock"),
+    ]
+    for call in calls:
+        with pytest.raises(pr.ProbeError) as info:
+            call()
+        err = info.value
+        text = str(err) + repr(err) + "".join(traceback.format_exception(err))
+        assert secret not in text and str(tmp_path) not in text
+        assert err.__cause__ is None and err.__suppress_context__
+
+
+def test_suppressed_marks_capped_episodes_and_survives_recovery_and_midnight():
+    states = drive(episodes(5), clock=Clock(MIDNIGHT))
+    assert [s.suppressed for s in states[:20]] == [False] * 20
+    assert states[20].suppressed and states[26].suppressed
+    assert states[23].state == "ok" and states[23].suppressed  # recovery of a suppressed episode
+    assert states[23].episode_start == states[20].episode_start
+    assert states[26].episode_start != states[20].episode_start
+
+
+def test_suppressed_survives_utc_midnight_while_the_outage_continues():
+    seq = episodes(3) + [FAIL] * 4 + [None] * 3
+    states = drive(seq, clock=Clock(MIDNIGHT), gaps={20: 86400})
+    assert states[20].state == "outage" and states[20].suppressed
+    assert (
+        states[21].flapping is False and states[21].suppressed
+    )  # flapping resets, suppressed stays
+    assert states[21].state == "outage" and states[21].episode_start == states[20].episode_start
+    assert states[-1].state == "ok" and states[-1].suppressed
+    assert states[-1].episode_start == states[20].episode_start
+
+
+def test_every_capped_outage_gets_a_fresh_episode_start_and_is_suppressed():
+    states = drive(episodes(6), clock=Clock(MIDNIGHT))
+    opens = [states[6 * i + 2] for i in range(6)]
+    assert [o.suppressed for o in opens] == [False, False, False, True, True, True]
+    starts = [o.episode_start for o in opens]
+    assert starts == sorted(set(starts)) and len(starts) == 6
+
+
+def test_a_new_uncapped_episode_next_day_is_not_suppressed():
+    seq = episodes(4) + [FAIL] * 3
+    states = drive(seq, clock=Clock(MIDNIGHT), gaps={23: 86400})
+    assert states[-1].state == "outage" and states[-1].suppressed is False
+
+
+def test_state_without_suppressed_key_is_accepted_as_false():
+    cfg, clock = tcp_cfg(1), Clock()
+    state = run(cfg, pr.empty_state(), clock, FakeNet(clock, [FAIL]))
+    doc = json.loads(pr.serialize_state(state))
+    del doc["targets"][0]["suppressed"]
+    out = pr.state_from_bytes(json.dumps(doc).encode(), cfg)
+    assert out is not None and out.targets[0].suppressed is False
