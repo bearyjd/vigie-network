@@ -108,22 +108,90 @@ up the raw shards** (`raw-YYYYMMDD.db`): they hold per-client DNS history and ar
 Losing `overrides.db` loses human labels, group intents and API tokens; the control app keeps its own
 enforcement state.
 
-Use SQLite's online backup, not a file copy (the database is in WAL mode). The slim image has no
-`sqlite3` CLI, so run it from the host against the volume (*unverified*):
+The `vigie-backup` CLI (inside the server image, or `uv run vigie-backup` from `server/`) does this
+safely. It opens each source read-only, copies with SQLite's online backup, checks the copy (schema
+`user_version`, expected tables, `integrity_check`, pipeline schema), and writes 0600 files plus a
+`manifest.json` (sizes, `user_version`, sha256, UTC time) into an existing directory you own. The
+directory must not be a symlink or group/world-writable, and no parent may be writable by others (a
+sticky `/tmp`-style parent is fine). It never overwrites, removes only what it created on failure,
+and refuses an empty or swapped source. **It has no restore command**: restore is the manual
+procedure below.
+
+Run it as a one-shot container, never `podman exec` into the API container (that would share the
+API's 512 MiB cgroup). Placeholders only; mount the real volumes yourself:
+
+```sh
+podman run --rm --user 10001:10001 --memory 512m \
+  -v <overrides-volume>:/ov -v <inventory-volume>:/inv -v <backup-dir>:/out:U \
+  <server-image> vigie-backup backup --dest /out --overrides /ov/overrides.db --inventory /inv/inventory.db
+podman run --rm --user 10001:10001 --memory 512m -v <backup-dir>:/out:U \
+  <server-image> vigie-backup verify /out   # read-only: manifest, user_version, tables, integrity
+# add --no-manifest to `verify` only for a manual copy that has no manifest
+```
+
+A host directory you own appears as uid 0 inside the container, so the owner check would refuse
+it: the `:U` option gives the directory to uid 10001 for the run (or run `podman unshare chown
+10001:10001 <backup-dir>` once). The files it writes then belong to a host subuid, so `verify` also
+has to run the same way (a one-shot container as above, or under `podman unshare`); a plain host-side
+`vigie-backup verify` refuses them. A SIGKILL (OOM, `kill -9`) during `backup` can leave 0600 partial
+files: the next run refuses to overwrite them (fail closed), so remove them by hand.
+
+- **Run as the service user, or inside the container.** Reading a WAL database creates `-wal`/`-shm`
+  beside it, so a source owned by another user is refused, and the service must keep `-shm`
+  writable for the backup to read it while the service runs.
+- **Memory is bounded, and bigger databases need a host-level backup.** Copies are held in memory.
+  Measured peak growth is about 2.7x to 3.1x the database for `backup` and about 1.6x to 2.0x for
+  `verify`, on top of a 20 to 30 MiB baseline. The CLI therefore refuses a database above 96 MiB
+  (about 300 to 330 MiB peak, under the 512 MiB limit) with "database too large for the in-memory
+  backup: use a host-level backup". Use `VACUUM INTO` (below) for anything larger.
+- **CPU is bounded to about 2 minutes** by a process limit (a check stuck inside one SQLite step
+  cannot be interrupted any other way, so the kernel stops the CLI then). The 30 s in-process budget
+  is only a cheap first line of defence against runaway queries, not a hard bound.
+- **`verify` is strict about hostile or leftover files.** It refuses a copy whose header is not the
+  rollback-journal format the CLI writes, any `-wal`/`-shm`/`-journal` file next to it, a manifest
+  entry without a lowercase 64-hex sha256 and an exact size, and an image that exceeds a value-size
+  limit. A copy the apps have since opened (and switched to WAL) no longer verifies: verify first.
+- **Verify with the same build that took the backup.** The `user_version` must match exactly, so an
+  older backup fails `verify` after a release adds a migration.
+- The CLI has not yet been exercised against the live volumes.
+
+**Host-level fallback (and anything above the cap).** Use `VACUUM INTO`, which writes a rollback
+journal copy that `verify --no-manifest` accepts. Do not use `.backup`: on a WAL database it keeps the
+WAL header, which `verify` refuses. The slim image has no `sqlite3` CLI, so run it from the host
+against the volume (*unverified*):
 
 ```sh
 podman volume ls | grep vigie-overrides                     # project prefix depends on the directory name
 V=$(podman volume inspect deploy_vigie-overrides --format '{{.Mountpoint}}')
-sqlite3 "$V/overrides.db" ".backup '/safe/place/overrides-$(date +%F).db'"
+sqlite3 "$V/overrides.db" "VACUUM INTO '<safe path>/overrides-$(date +%F).db'"
 ```
 
-Rootless volume paths are under your home directory and usually readable by your user; if not, use
-`podman unshare`. Alternative from inside the stack with Python's `Connection.backup`, mounting a
-backup directory with `run -v` (*unverified*).
+A copy above the cap can only be checked by hand: `sqlite3 <copy> 'PRAGMA integrity_check; PRAGMA
+user_version'` (expect `ok` and the schema version of the build you will restore onto).
 
-Encrypt backups at rest (for example `age` or `gpg`); they contain token hashes and your labels.
-Restore: stop `api` and `pipeline`, copy the backup over `overrides.db` in the volume (as uid 10001,
-mode 0600), start them. Never `podman-compose down -v` without a backup: it deletes this volume.
+Rootless volume paths are under your home directory and usually readable by your user; if not, use
+`podman unshare`. Encrypt backups at rest (for example `age` or `gpg`); they contain token hashes and
+your labels. Never `podman-compose down -v` without a backup: it deletes this volume.
+
+**Restore (manual, there is no restore command).** The compose services use the volumes like this:
+`ingest` writes `vigie-inv` (`inventory.db`) and `vigie-raw`; `pipeline` writes `vigie-inv` and reads
+`vigie-overrides`; `api` writes `vigie-overrides` (`overrides.db`) and reads `vigie-inv`.
+
+1. Take a fresh backup of the live files you are about to overwrite, so the restore can be undone.
+2. Restore onto a **copy** first: put the verified backup in a scratch directory, open it with the
+   same build (for example run `vigie-backup verify` on it, then start the API against it), and only
+   then swap it in.
+3. Stop **every service that uses the file you are replacing**. For `overrides.db`: `api` and
+   `pipeline`. For `inventory.db`: `ingest`, `pipeline` and `api` (ingest keeps a WAL connection to
+   it open; deleting its sidecars under a running ingest can lose committed data or corrupt it).
+4. **Delete that database's sidecars first, and only that database's**: when replacing
+   `overrides.db`, delete `overrides.db-wal`, `overrides.db-shm` and `overrides.db-journal`; when
+   replacing `inventory.db`, delete `inventory.db-wal`, `inventory.db-shm` and `inventory.db-journal`.
+   An overrides-only restore leaves the inventory sidecars untouched. A stale `-wal` left by a crash
+   or an OOM kill is replayed onto the restored copy on first open and silently replaces it with the
+   old live rows (the backup is lost; `integrity_check` still says `ok`).
+5. Copy the verified backup over the database, then `chown 10001` and `chmod 0600` it.
+6. Start the services you stopped.
 
 ## Retention
 
