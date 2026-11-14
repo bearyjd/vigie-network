@@ -23,6 +23,7 @@ from vigie_pipeline.config import ProbeSettings
 from vigie_pipeline.logs import log
 from vigie_pipeline.probe_file import (
     FUTURE_SKEW_S,
+    MAX_TARGETS,
     ProbeDoc,
     ProbeFileInvalid,
     ProbeTarget,
@@ -41,6 +42,7 @@ MAX_ORPHANS_PER_PASS = 100
 ORPHAN_WINDOW_S = 30 * 86400  # only recent unclosed outages are scanned
 # An episode older than this is never reported: the writer picks episode_start, and with it the cap
 # bucket, so only the last week's buckets (7 x the per-day caps) can ever be filled.
+MAX_CAPPED_IDS_LOGGED = 2 * MAX_TARGETS  # distinct capped ids named per (kind, day)
 EMIT_MAX_AGE_S = 7 * 86400
 LEDGER_WINDOW_S = EMIT_MAX_AGE_S + 3 * 86400  # every bucket an emittable episode can fall in
 MAX_OUTAGES_PER_DAY = 3  # the runner caps episodes at 3 per day; the reader enforces it too
@@ -49,13 +51,16 @@ EVENT_KINDS = ("probe_outage", "probe_recovered", "probe_flapping", "probe_stale
 # Log memory (module state): a persistent fault logs once per change, not on every 30 s pass.
 _last_invalid: str | None = None
 _last_unavailable: str | None = None
-_capped_logged: set[tuple[str, str, str]] = set()
+# (kind, UTC day) -> ids already named; the first MAX_CAPPED_IDS_LOGGED per key, then one summary.
+_capped_logged: dict[tuple[str, str], set[str]] = {}
+_capped_suppressed: set[tuple[str, str]] = set()
 
 
 def _reset_log_memory() -> None:
     global _last_invalid, _last_unavailable
     _last_invalid = _last_unavailable = None
     _capped_logged.clear()
+    _capped_suppressed.clear()
 
 
 def _remember_invalid(reason: str | None) -> None:
@@ -73,12 +78,23 @@ def _remember_unavailable(reason: str | None) -> None:
 
 
 def _note_capped(kind: str, ident: str, now: float) -> None:
-    key = (kind, ident, iso_utc(now)[:10])
-    if key not in _capped_logged:
-        if len(_capped_logged) > 64:
-            _capped_logged.clear()
-        _capped_logged.add(key)
+    """Names each capped id once per (kind, day), up to MAX_CAPPED_IDS_LOGGED ids, then logs one
+    'suppressed' line: a writer rotating ids cannot make the log or this memory grow."""
+    day = iso_utc(now)[:10]
+    for old in [k for k in _capped_logged if k[1] != day]:
+        del _capped_logged[old]
+    for old_key in [k for k in _capped_suppressed if k[1] != day]:
+        _capped_suppressed.discard(old_key)
+    key = (kind, day)
+    named = _capped_logged.setdefault(key, set())
+    if ident in named:
+        return
+    if len(named) < MAX_CAPPED_IDS_LOGGED:
+        named.add(ident)
         log(logger, logging.WARNING, "probe_event_capped", kind=kind, id=ident)
+    elif key not in _capped_suppressed:
+        _capped_suppressed.add(key)
+        log(logger, logging.WARNING, "probe_event_capped_suppressed", kind=kind)
 
 
 def load_probe_doc(settings: ProbeSettings, now: float) -> tuple[ProbeDoc | None, str | None]:

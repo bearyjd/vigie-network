@@ -166,8 +166,10 @@ class ProbeSettings:
     stale_s: int = PROBE_STALE_DEFAULT_S
 
     def __post_init__(self) -> None:
-        if not 180 <= self.stale_s <= 86400:
-            raise ValueError("VIGIE_PROBE_STALE_S must be in 180..86400")
+        if self.file is None:
+            return  # off: a probe-only value must never stop the main services
+        if type(self.stale_s) is not int or not 180 <= self.stale_s <= 86400:
+            raise ValueError("VIGIE_PROBE_STALE_S must be an integer in 180..86400")
 
     @property
     def enabled(self) -> bool:
@@ -175,8 +177,11 @@ class ProbeSettings:
 
     @classmethod
     def from_env(cls, source: dict[str, str]) -> ProbeSettings:
+        file = _opt_path(source.get("VIGIE_PROBE_FILE"))
+        if file is None:
+            return cls()  # disabled: VIGIE_PROBE_STALE_S is not read
         return cls(
-            file=_opt_path(source.get("VIGIE_PROBE_FILE")),
+            file=file,
             stale_s=_env_int(source, "VIGIE_PROBE_STALE_S", PROBE_STALE_DEFAULT_S),
         )
 

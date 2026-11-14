@@ -1036,7 +1036,7 @@ all of the user's volumes, so that rests on the runner's code and config, not on
   `probe_flapping` and `probe_stale` (no device, one event per episode). The file is untrusted
   input: over 64 KiB, malformed ids or enum values, out-of-range numbers, an `episode_start` more
   than a day after `written_at`, a future `written_at`, or older than `VIGIE_PROBE_STALE_S`
-  (default 300 s, allowed 180 to 86400: a healthy file can be about 115 s old, about 175 s after one skipped tick) all mean "probes unavailable" and never "ok" or an outage. The reader has no id
+  (default 300 s, allowed 180 to 86400: a healthy file can be about 115 s old, about 175 s after one skipped tick; ignored while `VIGIE_PROBE_FILE` is unset) all mean "probes unavailable" and never "ok" or an outage. The reader has no id
   allowlist, so the spec's unknown-target-id acceptance test is intentionally not implemented.
   Probes are not an incident and are not delivered.
 - **Status fails safe.** `probe_status` carries `valid_until` (`written_at` plus the stale limit):

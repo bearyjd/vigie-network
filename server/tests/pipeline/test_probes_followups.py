@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 from probe_helpers import NOW, state_doc, target_state, write_probe_file
@@ -18,8 +19,8 @@ from test_probes import (  # noqa: F401
     status,
 )
 
-from vigie_pipeline import probes
-from vigie_pipeline.config import ProbeSettings
+from vigie_pipeline import probe_file, probes
+from vigie_pipeline.config import PipelineConfig, ProbeSettings
 
 MIDNIGHT = int(NOW) + 16 * 3600  # 2027-01-16T00:00:00Z
 
@@ -59,9 +60,21 @@ def test_a_midnight_spanning_flapping_event_is_not_dropped_by_the_insert_day_cap
 def test_stale_s_floor_is_180():
     for bad in ("179", "86401", "abc"):
         with pytest.raises(ValueError):
-            ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": bad})
-    assert ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": "180"}).stale_s == 180
-    assert ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": "86400"}).stale_s == 86400
+            ProbeSettings.from_env(
+                {"VIGIE_PROBE_FILE": "/probe/probe-state.json", "VIGIE_PROBE_STALE_S": bad}
+            )
+    assert (
+        ProbeSettings.from_env(
+            {"VIGIE_PROBE_FILE": "/probe/probe-state.json", "VIGIE_PROBE_STALE_S": "180"}
+        ).stale_s
+        == 180
+    )
+    assert (
+        ProbeSettings.from_env(
+            {"VIGIE_PROBE_FILE": "/probe/probe-state.json", "VIGIE_PROBE_STALE_S": "86400"}
+        ).stale_s
+        == 86400
+    )
 
 
 # ---------------------------------------------------------------- 3: late report wording
@@ -107,3 +120,83 @@ def test_retiring_the_status_emits_no_event(inv, settings):
     assert status(inv)["reason"] == "disabled"
     assert events(inv) == before
     assert inv.execute("SELECT COUNT(*) FROM events").fetchone()[0] == total
+
+
+# ---------------------------------------------------------------- round 2: bounded capped-id log
+def _capped_lines(caplog, event="probe_event_capped"):
+    return [r for r in caplog.records if r.getMessage() == event]
+
+
+def test_rotating_capped_ids_log_a_bounded_number_of_lines(caplog):
+    probes._reset_log_memory()
+    cap = 2 * probe_file.MAX_TARGETS
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        probes._note_capped("probe_outage", "router-dns", NOW)  # a real target, before the flood
+        for step in range(100):
+            for n in range(10):
+                probes._note_capped("probe_outage", f"i{step}x{n}", NOW)
+    named = [r.fields["id"] for r in _capped_lines(caplog)]
+    assert len(named) == cap and named[0] == "router-dns"
+    assert len(_capped_lines(caplog, "probe_event_capped_suppressed")) == 1
+
+
+def test_the_capped_log_memory_is_pruned_by_day_and_strictly_bounded(caplog):
+    probes._reset_log_memory()
+    cap = 2 * probe_file.MAX_TARGETS
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        for day in range(30):
+            for n in range(500):
+                for kind in ("probe_outage", "probe_flapping"):
+                    probes._note_capped(kind, f"d{day}x{n}", NOW + day * 86400)
+            assert sum(len(v) for v in probes._capped_logged.values()) <= 2 * cap
+    assert len(_capped_lines(caplog)) == 30 * 2 * cap  # a new day starts a fresh allowance
+    assert len(_capped_lines(caplog, "probe_event_capped_suppressed")) == 30 * 2
+
+
+def test_an_already_logged_id_is_not_logged_again_after_the_flood(caplog):
+    probes._reset_log_memory()
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        for n in range(200):
+            probes._note_capped("probe_outage", f"x{n}", NOW)
+        before = len(_capped_lines(caplog))
+        probes._note_capped("probe_outage", "x0", NOW)
+    assert len(_capped_lines(caplog)) == before
+
+
+# ---------------------------------------------------------------- round 2: probe-only settings
+def test_a_bad_stale_s_is_ignored_while_probes_are_disabled():
+    assert not ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": "60"}).enabled
+    assert not ProbeSettings.from_env({"VIGIE_PROBE_STALE_S": "abc"}).enabled
+    cfg = PipelineConfig.from_env({"VIGIE_PROBE_STALE_S": "60", "VIGIE_DATA_DIR": "/x"})
+    assert cfg.probes == ProbeSettings()
+
+
+def test_a_disabled_settings_object_accepts_any_stale_s():
+    assert not ProbeSettings(stale_s=60).enabled
+
+
+def test_the_env_config_path_survives_a_bad_stale_s_with_probes_off(monkeypatch):
+    monkeypatch.setenv("VIGIE_PROBE_STALE_S", "60")
+    monkeypatch.delenv("VIGIE_PROBE_FILE", raising=False)
+    monkeypatch.setenv("VIGIE_DATA_DIR", "/x")
+    assert not PipelineConfig.from_env().probes.enabled
+
+
+def test_the_range_is_strict_when_enabled():
+    f = "/probe/probe-state.json"
+    for bad in ("60", "179", "86401"):
+        with pytest.raises(ValueError):
+            ProbeSettings.from_env({"VIGIE_PROBE_FILE": f, "VIGIE_PROBE_STALE_S": bad})
+        with pytest.raises(ValueError):
+            PipelineConfig.from_env(
+                {"VIGIE_PROBE_FILE": f, "VIGIE_PROBE_STALE_S": bad, "VIGIE_DATA_DIR": "/x"}
+            )
+    for good in ("180", "86400"):
+        cfg = ProbeSettings.from_env({"VIGIE_PROBE_FILE": f, "VIGIE_PROBE_STALE_S": good})
+        assert cfg.stale_s == int(good)
+
+
+def test_a_non_int_stale_s_is_rejected_when_enabled_by_construction():
+    for bad in (200.5, True):
+        with pytest.raises(ValueError):
+            ProbeSettings(file=Path("/p"), stale_s=bad)
