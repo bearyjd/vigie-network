@@ -7,6 +7,7 @@ vigie_pipeline, by running the same fixture. They must never be regenerated to m
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import fields
 
 import pytest
@@ -59,10 +60,26 @@ def test_disabled_run_is_byte_identical_to_main(tmp_path):
     run_fixture(tmp_path)
     snap = dump(tmp_path)
     assert digest(tables(snap)) == GOLDEN_TABLES
-    assert digest(snap["pipeline_meta"]) == GOLDEN_META
     assert snap["monitoring_incidents"], "the fixture must exercise a real incident"
     assert snap["events"] == []
     assert not any(r[0] == "probe_status" for r in snap["pipeline_meta"])
+
+
+# GOLDEN_META includes pipeline_meta.fold_version, which embeds unicodedata.unidata_version. That is
+# 15.0.0 under the CI interpreter (Python 3.12) and differs under others (3.14 gives 16.0.0). It is
+# NOT a probe regression: do not "fix" the digest, run it under Python 3.12 (server/.venv).
+META_UNIDATA = "15.0.0"
+needs_ci_unicode = pytest.mark.skipif(
+    unicodedata.unidata_version != META_UNIDATA,
+    reason="GOLDEN_META embeds the Unicode data version of the CI interpreter (3.12)",
+)
+
+
+@needs_ci_unicode
+def test_disabled_pipeline_meta_is_byte_identical_to_main(tmp_path):
+    build_fixture(tmp_path)
+    run_fixture(tmp_path)
+    assert digest(dump(tmp_path)["pipeline_meta"]) == GOLDEN_META
 
 
 def without_events(snap):
@@ -84,7 +101,9 @@ def test_enabled_with_an_outage_file_changes_only_probe_rows(tmp_path):
     assert [e[0] for e in snap["events"]] == ["probe_outage"]
     assert snap["events"][0][5] == 1  # device_id IS NULL
     others = [r for r in snap["pipeline_meta"] if r[0] != "probe_status"]
-    assert digest(others) == GOLDEN_META
+    if unicodedata.unidata_version == META_UNIDATA:  # see the note at GOLDEN_META's test
+        assert digest(others) == GOLDEN_META
+    assert [r[0] for r in others] == ["characterization_cursor", "fold_version", "veto_generation"]
     status = json.loads(dict(snap["pipeline_meta"])["probe_status"])
     assert status["stale"] is False and status["targets"][0]["state"] == "outage"
 

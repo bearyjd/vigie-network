@@ -48,7 +48,9 @@ def target_state(ident="router-dns", **over):
 
 
 def state_doc(*targets, written_at=NOW, **over):
-    return {"v": 1, "written_at": written_at, "targets": list(targets), **over}
+    """A target with the default last_attempt (NOW) was probed when the file was written."""
+    fresh = [{**t, "last_attempt": written_at} if t["last_attempt"] == NOW else t for t in targets]
+    return {"v": 1, "written_at": written_at, "targets": fresh, **over}
 
 
 def write_probe_file(path: Path, doc) -> Path:

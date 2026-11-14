@@ -54,6 +54,7 @@ class ProbeTarget:
     last_error_class: str | None
     last_latency_ms: int | None
     episode_start: int | None
+    last_attempt: float | None
     episodes_day: str | None
     flapping: bool
     suppressed: bool
@@ -127,7 +128,8 @@ def _target(doc: object) -> ProbeTarget:
         id=ident, state=doc["state"], consecutive_fail=doc["consecutive_fail"],
         consecutive_ok=doc["consecutive_ok"], last_ok_at=doc["last_ok_at"],
         last_error_class=error, last_latency_ms=doc["last_latency_ms"],
-        episode_start=doc["episode_start"], episodes_day=day, flapping=doc["flapping"],
+        episode_start=doc["episode_start"], last_attempt=doc["last_attempt"],
+        episodes_day=day, flapping=doc["flapping"],
         suppressed=doc["suppressed"], ring=_ring(doc["ring"]),
     )  # fmt: skip
 

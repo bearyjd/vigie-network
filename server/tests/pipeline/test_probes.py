@@ -250,10 +250,13 @@ def test_events_carry_no_address_or_qname_and_a_null_device(inv, settings):
         assert "." not in summary and "." not in dedup
 
 
-def test_recovery_without_a_seen_outage_is_not_announced(inv, settings):
+def test_an_episode_first_seen_already_recovered_is_announced_as_open_then_recovered(inv, settings):
+    # Reversed from "never announced": an episode that opened and closed between two folds (or
+    # while the pipeline was down) would otherwise leave no trace at all. Old episodes stay silent
+    # (EMIT_MAX_AGE_S) and so do suppressed ones; see test_probes_final.py.
     write_probe_file(settings.file, state_doc(recovered()))
     fold(inv, settings)
-    assert events(inv) == []  # a past episode the pipeline never saw open: no backfill
+    assert kinds(inv) == ["probe_outage", "probe_recovered"]
 
 
 def test_first_ever_ok_and_unknown_emit_nothing(inv, settings):
@@ -313,9 +316,13 @@ def test_a_failing_fold_never_raises_and_rolls_back(inv, settings, monkeypatch, 
     monkeypatch.setattr(probes, "emit_once", boom)
     with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
         fold(inv, settings)
-    assert status(inv) is None and events(inv) == []  # one transaction: nothing half-written
-    [record] = caplog.records
-    assert record.fields == {"error": "RuntimeError"} and "10.0.0.7" not in caplog.text
+    assert status(inv) is None and events(inv) == []  # both folds failed: nothing half-written
+    assert [r.getMessage() for r in caplog.records] == [
+        "probe_stage_failed",
+        "probe_status_unmarked",
+    ]
+    assert all(r.fields == {"error": "RuntimeError"} for r in caplog.records)
+    assert "10.0.0.7" not in caplog.text
     assert not inv.in_transaction
 
 

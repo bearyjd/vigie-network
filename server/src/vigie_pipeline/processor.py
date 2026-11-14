@@ -27,7 +27,7 @@ from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
-from vigie_pipeline.probes import fold_probes
+from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
@@ -83,6 +83,8 @@ def run_once(
         prune_monitoring(inv, clock)
         if config.probes.enabled:  # needs no overrides; contains its own errors
             fold_probes(inv, config.probes, live or (lambda: clock))
+        else:  # a status stored while it was on must not keep saying ok (a read when none exists)
+            retire_status(inv, live or (lambda: clock))
     finally:
         inv.close()
         if overrides is not None:
