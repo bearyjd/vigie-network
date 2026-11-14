@@ -1007,6 +1007,47 @@ connection error); 5 TLS verification failed (including not yet valid or expired
 would retry); 6 DNS failure. Record the codes for a wrong id, a disabled automation and so on in
 the PRP-004 H0 table.
 
+## Replay and evaluation
+
+`python -m vigie_pipeline.replay --series SERIES.json --labels LABELS.json [--strategy pooled|tod]`
+is an offline, chronological replay of owner-labelled hours through the real `analyze_monitoring`,
+one pass per hour from an injected clock. It prints one JSON report on stdout. It never opens the
+live data directory, configuration or the network: the engine runs against a throwaway database in
+a private temp directory that is removed afterwards, the inputs are opened read-only, and an error
+prints one fixed message (no paths, no input values) and exits 2. It changes no policy, no
+detector output and no schema, so it does not restart the pilot clock.
+
+- **Series file** (a copy exported by the owner, or a synthetic fixture):
+  `{"version":1,"devices":[{"device":"dev-1","samples":[{"hour":H,"bytes_up":N,
+  "qualified_seconds":0-3600,"degraded":false}]}]}`. `hour` is the UTC hour start in epoch seconds.
+  Device ids are placeholders such as `dev-1` or `2001:db8::1`. An hour with no row is absent, never
+  zero. At most 20 devices, 2160 samples per device, 4 MiB per file.
+- **Label file**: `{"version":1,"labels":[{"device":"dev-1","hour":H,"verdict":"normal"|"anomalous"|
+  "ignore","note":"at most 200 printable characters"}]}`. Unknown fields, duplicates, non-integer or
+  off-boundary hours and over-size files are rejected. `ignore` is tallied and left out of every
+  denominator.
+- **Determinism.** Devices, samples and labels are sorted before use, so input order cannot change
+  the report.
+- **Per detector** (`large_upload`, `upload_deviation`) the report gives TP, FP, FN, TN on labelled
+  hours where the detector evaluated; precision = TP/(TP+FP); recall = TP/(TP+FN); coverage (hours
+  with qualified evidence over all hours); false alert episodes per device-day and per network-day
+  against the budget of 1 unwanted notification per network per day. An episode is one engine
+  incident; it is false when its labelled hours are all `normal`.
+- **Abstentions are separate.** A detector abstains, with a reason, on hours it cannot judge:
+  `no_sample`, `unqualified`, `clock_gap`, `learning`, `in_training`, `previous_unavailable`,
+  `cohort_abstain` (tod). Abstained hours are counted by reason and never as misses or negatives.
+  `large_upload` judges any qualified hour, even while the profile is learning;
+  `upload_deviation` needs a frozen baseline and a qualified previous hour.
+- **`unknown`, never zero.** A ratio with no evidence behind it (no alert, no labelled positive, no
+  qualified hour) is the string `"unknown"`.
+- **No single accuracy score.** The report is per detector and deliberately has none.
+
+Limits: coverage is per synthetic collector (one per device), so a shared-collector coverage
+outage is not modelled; hours without a tick of the injected clock are `clock_gap`; false-alert
+episodes are a lower bound while unlabelled episodes exist; no output is meaningful before the
+baseline matures (14 distinct dates for `pooled-median-v1`), so run it on the owner's labels at day
+14 or later.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
