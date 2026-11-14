@@ -567,7 +567,10 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   const text1 = content.textContent;
   for (const h of hostile.slice(0, 4)) assert.ok(text1.includes(h), `hostile string ${h} is shown verbatim as text`);
   for (const tag of ['img', 'script', 'svg', 'b', 'a', 'iframe']) assert.equal(content.querySelectorAll(tag).length, 0, `no <${tag}> element was created from API text`);
-  assert.ok(!text1.includes('LEAK'), 'an object never uses its own toString'); assert.ok(text1.includes('No device'), 'device-less events are labelled'); assert.ok(text1.includes('Unavailable'));
+  assert.ok(!text1.includes('LEAK'), 'an object never uses its own toString'); const cells = row => row.querySelectorAll('td').map(td => td.textContent); const rows1 = content.querySelectorAll('tr').slice(1);
+  assert.equal(cells(rows1[0])[3], 'No device', 'a device-less event says so in its Device cell'); assert.equal(cells(rows1[2])[3], 'dev-1');
+  assert.deepEqual([cells(rows1[1])[1], cells(rows1[1])[4]], ['Unavailable', 'Unavailable'], 'objects render as Unavailable, never [object Object]'); assert.ok(!text1.includes('[object Object]'));
+  assert.equal(cells(rows1[3])[0], 'Unavailable', 'an unparseable time is Unavailable');
   assert.ok(!text1.includes('x'.repeat(600)), 'long summaries are clipped');
   for (const el of content.querySelectorAll('*')) { for (const [k, v] of el.attrs) { assert.ok(!/[<>"]/.test(v), `attribute ${k} carries API markup`); assert.ok(!k.startsWith('on'), 'no inline handler attribute'); } assert.ok(!/[<>]/.test(el.getAttribute('class') || ''), 'API text never reaches a class'); }
   assert.deepEqual(content.querySelectorAll('span').filter(e => (e.getAttribute('class') || '').startsWith('badge')).map(e => e.getAttribute('class')), ['badge ', 'badge ', 'badge warn', 'badge ', 'badge '], 'severity maps through an allowlist, including prototype names');
