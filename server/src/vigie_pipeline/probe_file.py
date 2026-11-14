@@ -21,6 +21,10 @@ RING = 60
 MAX_COUNT = 1000
 MAX_EPOCH = 1e11
 MAX_LATENCY_MS = 5000
+# The runner keeps an episode's original episode_start (the dedup token) across a backward clock
+# step while writing the corrected written_at, so episode_start may exceed written_at by the size of
+# the step. A day covers an NTP or manual correction; anything further out is not a real step.
+MAX_CLOCK_STEP_S = 86400
 FUTURE_SKEW_S = 10.0  # host and container share one clock: a bigger lead is not a real write time
 STATE_VERSION = 1
 ID_RE = re.compile(r"[a-z0-9_-]{1,32}")
@@ -156,8 +160,9 @@ def _parse(data: bytes) -> ProbeDoc:
     targets = tuple(_target(t) for t in doc["targets"])
     if len({t.id for t in targets}) != len(targets):
         raise ProbeFileInvalid("duplicate target id")
-    if any(t.episode_start is not None and t.episode_start > doc["written_at"] for t in targets):
-        raise ProbeFileInvalid("episode starts after the file was written")
+    limit = doc["written_at"] + MAX_CLOCK_STEP_S
+    if any(t.episode_start is not None and t.episode_start > limit for t in targets):
+        raise ProbeFileInvalid("episode starts too far after the file was written")
     return ProbeDoc(float(doc["written_at"]), targets)
 
 

@@ -1010,9 +1010,10 @@ the PRP-004 H0 table.
 ## Probes (built, off by default, not deployed)
 
 Bounded DNS and TCP reachability probes run in a separate host unit, never in the pipeline (which
-stays `Network=none`). Data flow: the unit mounts only its own output volume and the runner opens
-only its config and state files, so no inventory, raw shard, override or device name is read by,
-or written into, probe traffic or probe logs.
+stays `Network=none`). Data flow: the runner opens only its config and state files and sends only the probe queries and
+connects; no inventory, raw shard, override or device name is read into probe traffic or probe
+logs. It is not isolated from other Vigie volumes: a host process under `podman unshare` can reach
+all of the user's volumes, so that rests on the runner's code and config, not on a mount boundary.
 
 - **Runner.** `deploy/persistent/probe_runner.py` (standard library only) reads a private JSON
   config and does one locked pass per timer tick (`probe.service` and `probe.timer` templates,
@@ -1035,8 +1036,10 @@ or written into, probe traffic or probe logs.
   `probe_flapping` and `probe_stale` (no device, one event per episode). `probe_stale` is at most
   one event per UTC day for any cause: a start-up race can use that day's warning, and the status
   still shows the failure. The reader does not trust the writer's caps: it rejects an
-  `episode_start` after `written_at`, reports only episodes of the day of `written_at`, and
-  records at most 3 outage events per target per UTC day. An outage whose target was removed, or
+  `episode_start` more than a day after `written_at`, reports only episodes of the day of `written_at`, and
+  records at most 3 outage events per target and 30 in total per UTC day, counted by the episode's own
+  day (flapping events: 10 per day). A backward clock step is tolerated up to a day: an episode may
+  start after `written_at` by at most that. An outage whose target was removed, or
   whose episode a newer one superseded, is closed with a `probe_recovered` event. The file is untrusted
   input: over 64 KiB, malformed, malformed ids or enum values, out-of-range numbers, a future
   `written_at`, or older than `VIGIE_PROBE_STALE_S` (default 300 s) all mean "probes unavailable"

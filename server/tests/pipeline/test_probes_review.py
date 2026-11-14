@@ -152,7 +152,7 @@ def test_oscillating_episodes_each_get_one_open_and_one_close(inv, settings):
 
 # ---------------------------------------------------------------- 4: reader-side bounds
 def test_episode_start_after_written_at_is_invalid():
-    future = raw(episode_start=int(NOW) + 1)
+    future = raw(episode_start=int(NOW) + 10 * 86400)
     with pytest.raises(ProbeFileInvalid):
         parse_probe_doc(future)
     parse_probe_doc(raw(episode_start=int(NOW)))  # equal is fine

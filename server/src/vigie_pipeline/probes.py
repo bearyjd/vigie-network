@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 
 from vigie_ingest.db import immediate, iso_utc
@@ -33,6 +34,11 @@ logger = logging.getLogger("vigie_pipeline")
 STATUS_KEY = "probe_status"
 STATUS_VERSION = 1
 MAX_STATUS_BYTES = 32 * 1024
+MAX_GLOBAL_OUTAGES_PER_DAY = 30  # MAX_TARGETS * 3: ids rotating through a writer cannot exceed it
+MAX_FLAPPING_PER_DAY = 10
+MAX_ORPHANS_PER_PASS = 100
+ORPHAN_WINDOW_S = 30 * 86400  # only recent unclosed outages are scanned
+LEDGER_WINDOW_S = 3 * 86400
 MAX_OUTAGES_PER_DAY = 3  # the runner caps episodes at 3 per day; the reader enforces it too
 EVENT_KINDS = ("probe_outage", "probe_recovered", "probe_flapping", "probe_stale")
 
@@ -106,36 +112,68 @@ def _emit(inv: sqlite3.Connection, kind: str, severity: str, summary: str, token
         emit_once(inv, None, kind, severity, summary, token, now)
 
 
-def _outages_today(inv: sqlite3.Connection, ident: str, now: float) -> int:
-    prefix = f"{ident}:"
-    row = inv.execute(
-        "SELECT COUNT(*) FROM events WHERE kind='probe_outage' AND substr(dedup, 1, ?)=?"
-        " AND substr(ts, 1, 10)=?",
-        (len(prefix), prefix, iso_utc(now)[:10]),
-    ).fetchone()
-    return int(row[0])
+def _episode_day(start: int) -> str:
+    return iso_utc(start)[:10]
 
 
-def _emit_outage(inv: sqlite3.Connection, t: ProbeTarget, token: str, now: float) -> None:
+def _ledger(inv: sqlite3.Connection, now: float) -> Counter[tuple[str, ...]]:
+    """Recent outage and flapping events counted by the EPISODE's own UTC day (not the day the
+    pipeline inserted the row): ('o', id, day), ('O', day) and ('f', day) keys."""
+    counts: Counter[tuple[str, ...]] = Counter()
+    rows = inv.execute(
+        "SELECT kind, dedup FROM events WHERE kind IN ('probe_outage', 'probe_flapping')"
+        " AND ts >= ?",
+        (iso_utc(now - LEDGER_WINDOW_S),),
+    )
+    for kind, token in rows:
+        ident, _, tail = str(token).rpartition(":")
+        if kind == "probe_flapping":
+            counts["f", tail] += 1
+        elif tail.isdecimal():
+            day = _episode_day(int(tail))
+            counts["o", ident, day] += 1
+            counts["O", day] += 1
+    return counts
+
+
+def _emit_outage(inv: sqlite3.Connection, t: ProbeTarget, token: str, now: float,
+                 ledger: Counter[tuple[str, ...]]) -> None:  # fmt: skip
     if event_exists(inv, "probe_outage", token):
         return
-    if _outages_today(inv, t.id, now) >= MAX_OUTAGES_PER_DAY:
-        return  # the writer's own cap is not trusted: at most 3 reported per target per day
+    day = _episode_day(int(t.episode_start or 0))
+    if (
+        ledger["o", t.id, day] >= MAX_OUTAGES_PER_DAY
+        or ledger["O", day] >= MAX_GLOBAL_OUTAGES_PER_DAY
+    ):
+        return  # the writer's own caps are not trusted
     summary = f"probe {t.id} failing ({t.last_error_class or 'unknown'})"
     emit_once(inv, None, "probe_outage", "warn", summary, token, now)
+    ledger["O", day] += 1
 
 
-def _emit_target_events(inv: sqlite3.Connection, t: ProbeTarget, day: str, now: float) -> None:
+def _emit_flapping(inv: sqlite3.Connection, t: ProbeTarget, now: float,
+                   ledger: Counter[tuple[str, ...]]) -> None:  # fmt: skip
+    token = f"{t.id}:{t.episodes_day}"
+    if event_exists(inv, "probe_flapping", token):
+        return
+    if ledger["f", str(t.episodes_day)] >= MAX_FLAPPING_PER_DAY:
+        return
+    summary = f"probe {t.id}: repeated outages today, further episodes are not reported"
+    emit_once(inv, None, "probe_flapping", "warn", summary, token, now)
+    ledger["f", str(t.episodes_day)] += 1
+
+
+def _emit_target_events(inv: sqlite3.Connection, t: ProbeTarget, day: str, now: float,
+                        ledger: Counter[tuple[str, ...]]) -> None:  # fmt: skip
     if t.episodes_day != day:
         return  # not today's data (relative to written_at): the writer's day cannot be trusted
     if t.flapping:
-        summary = f"probe {t.id}: repeated outages today, further episodes are not reported"
-        _emit(inv, "probe_flapping", "warn", summary, f"{t.id}:{t.episodes_day}", now)
+        _emit_flapping(inv, t, now, ledger)
     if t.suppressed or t.episode_start is None:
         return  # a suppressed episode never emits open or recover
     token = _token(t)
     if t.state == "outage":
-        _emit_outage(inv, t, token, now)
+        _emit_outage(inv, t, token, now, ledger)
     elif t.state == "ok" and event_exists(inv, "probe_outage", token):
         _emit(inv, "probe_recovered", "info", f"probe {t.id} recovered", token, now)
 
@@ -152,8 +190,10 @@ def _close_orphans(inv: sqlite3.Connection, doc: ProbeDoc, now: float) -> None:
     one the pipeline never saw recover, is closed so the history always ends."""
     present = {t.id: t for t in doc.targets}
     open_tokens = inv.execute(
-        "SELECT o.dedup FROM events o WHERE o.kind='probe_outage' AND NOT EXISTS"
+        "SELECT o.dedup FROM events o WHERE o.kind='probe_outage' AND o.ts >= ? AND NOT EXISTS"
         " (SELECT 1 FROM events r WHERE r.kind='probe_recovered' AND r.dedup=o.dedup)"
+        " ORDER BY o.ts LIMIT ?",
+        (iso_utc(now - ORPHAN_WINDOW_S), MAX_ORPHANS_PER_PASS),
     ).fetchall()
     for (token,) in open_tokens:
         ident, _, start = str(token).rpartition(":")
@@ -193,8 +233,9 @@ def _fold(inv: sqlite3.Connection, doc: ProbeDoc | None, reason: str | None, now
             return
         _close_orphans(inv, doc, now)
         day = iso_utc(doc.written_at)[:10]
+        ledger = _ledger(inv, now)
         for target in doc.targets:
-            _emit_target_events(inv, target, day, now)
+            _emit_target_events(inv, target, day, now, ledger)
 
 
 def fold_probes(

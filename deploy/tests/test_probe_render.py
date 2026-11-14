@@ -248,12 +248,15 @@ def test_the_state_file_name_matches_the_pipeline_env():
 
 def test_unit_header_states_data_flow_not_guarantees():
     text = (PERSISTENT / "probe.service").read_text()
-    assert "never sees" not in text and "mounts only" in text
+    assert "never sees" not in text and "mounts only" not in text
+    assert "not isolated from other Vigie volumes" in text
+    assert "opens only its config and state files" in text
 
 
 def test_docs_state_data_flow_not_guarantees():
     docs = (Path(__file__).parents[2] / "docs" / "monitoring.md").read_text()
     section = docs[docs.index("## Probes") : docs.index("## Retention and verification limits")]
     assert "never reach" not in section and "unknown ids" not in section
+    assert "mounts only" not in section and "not isolated from other Vigie volumes" in section
     for needle in ("malformed ids", "probe_allow", "common, widely used canary", "any cause"):
         assert needle in section, needle
