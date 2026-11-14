@@ -51,7 +51,9 @@ _PROBE_NETS = tuple(
 )
 _PROBE_DENIED = (ipaddress.ip_network("fd00:ec2::/32"),)
 _PROBE_MAX_TARGETS = 10
-_PROBE_TOKEN = "@PROBE_TARGET_IPS@"
+# the directive only, so a mention of the token in the unit comments is never replaced
+_PROBE_TOKEN = "IPAddressAllow=@PROBE_TARGET_IPS@"
+_PROBE_STATE_NAME = "probe-state.json"  # must match VIGIE_PROBE_FILE below
 _OPTIONAL = {
     "monitoring_large_upload_bytes",
     "monitoring_baseline",
@@ -95,13 +97,28 @@ def _probe_allow(config: dict) -> tuple[str, ...] | None:
     return addresses
 
 
+def _probe_config_skeleton() -> str:
+    """A runner config the owner completes. state_world_readable is on because the pipeline
+    container runs as another uid and could not read the runner's default 0600 file."""
+    skeleton = {
+        "enabled": False,
+        "state_file": f"/ABSOLUTE/PATH/TO/probe-volume/{_PROBE_STATE_NAME}",
+        "state_world_readable": True,
+        "targets": [],
+    }
+    return json.dumps(skeleton, indent=2) + "\n"
+
+
 def _probe_units(ns: str, addresses: tuple[str, ...]) -> dict[str, str]:
     here = Path(__file__).parent
     service = (here / "probe.service").read_text(encoding="utf-8")
     timer = (here / "probe.timer").read_text(encoding="utf-8")
     return {
         f"{ns}-probe.volume": f"[Volume]\nVolumeName={ns}_probe\n",
-        f"{ns}-probe.service": service.replace(_PROBE_TOKEN, " ".join(addresses)),
+        f"{ns}-probe.service": service.replace(
+            _PROBE_TOKEN, "IPAddressAllow=" + " ".join(addresses)
+        ),
+        f"{ns}-probe-config.json": _probe_config_skeleton(),
         f"{ns}-probe.timer": timer.replace(
             "Unit=probe.service", f"Unit={ns}-probe.service"
         ),
@@ -212,7 +229,7 @@ def render(config: dict) -> dict[str, str]:
             lines += [f"Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES={threshold}"]
             lines += [f"Environment=VIGIE_MONITORING_BASELINE={baseline}"]
             if probe_addresses is not None:
-                lines += ["Environment=VIGIE_PROBE_FILE=/probe/probe-state.json"]
+                lines += [f"Environment=VIGIE_PROBE_FILE=/probe/{_PROBE_STATE_NAME}"]
             lines += [
                 "Environment=VIGIE_PIPELINE_INTERVAL_S=30",
                 "Environment=VIGIE_HEALTH_FILE=/tmp/vigie-pipeline.ok",

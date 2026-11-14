@@ -1010,8 +1010,9 @@ the PRP-004 H0 table.
 ## Probes (built, off by default, not deployed)
 
 Bounded DNS and TCP reachability probes run in a separate host unit, never in the pipeline (which
-stays `Network=none`). The unit mounts only its own output volume, so inventory, raw shards,
-overrides and device names never reach probe traffic or probe logs.
+stays `Network=none`). Data flow: the unit mounts only its own output volume and the runner opens
+only its config and state files, so no inventory, raw shard, override or device name is read by,
+or written into, probe traffic or probe logs.
 
 - **Runner.** `deploy/persistent/probe_runner.py` (standard library only) reads a private JSON
   config and does one locked pass per timer tick (`probe.service` and `probe.timer` templates,
@@ -1031,8 +1032,13 @@ overrides and device names never reach probe traffic or probe logs.
 - **Pipeline side.** Set `VIGIE_PROBE_FILE` (render does this when `probes_enabled` is set) and the
   pipeline reads the runner's state file read-only on every pass and writes only
   `pipeline_meta['probe_status']` plus events of kind `probe_outage`, `probe_recovered`,
-  `probe_flapping` and `probe_stale` (no device, one event per episode). The file is untrusted
-  input: over 64 KiB, malformed, unknown ids or enum values, out-of-range numbers, a future
+  `probe_flapping` and `probe_stale` (no device, one event per episode). `probe_stale` is at most
+  one event per UTC day for any cause: a start-up race can use that day's warning, and the status
+  still shows the failure. The reader does not trust the writer's caps: it rejects an
+  `episode_start` after `written_at`, reports only episodes of the day of `written_at`, and
+  records at most 3 outage events per target per UTC day. An outage whose target was removed, or
+  whose episode a newer one superseded, is closed with a `probe_recovered` event. The file is untrusted
+  input: over 64 KiB, malformed, malformed ids or enum values, out-of-range numbers, a future
   `written_at`, or older than `VIGIE_PROBE_STALE_S` (default 300 s) all mean "probes unavailable"
   and never "ok" or an outage. Probes are not an incident and are not delivered.
 - **Freeze.** Probe settings are their own `ProbeSettings`, outside the monitoring policy version,
@@ -1046,6 +1052,15 @@ overrides and device names never reach probe traffic or probe logs.
 - **Self-contamination.** The server's own probe queries pass through the household resolver and
   can be attributed to the server host as DNS volume (about 1 to 2 per minute); keep the rate
   fixed and account for it before any DNS-volume detector.
+
+Operating notes. `probe_allow` in the render config must list exactly the addresses of the probe
+config's targets: a target missing from it is blocked by `IPAddressAllow` and shows up as a
+timeout outage. The probe config's `state_file` must end in `probe-state.json` to match the
+pipeline's `VIGIE_PROBE_FILE`, and `render.py` writes a `<namespace>-probe-config.json` skeleton
+with `state_world_readable` already true (the runner's own default, 0600, cannot be read by the
+pipeline uid). Pick a common, widely used canary name for `dns_upstream`: an unusual name is
+visible upstream on every cache miss. Adding a target `kind` to the state document in S3 needs a
+runner and pipeline upgrade together, or a state version bump.
 
 Config fields (all values are placeholders): `enabled`, `state_file` (absolute path inside the
 probe volume), optional `state_world_readable` (mode 0644 so the pipeline's uid can read it; the

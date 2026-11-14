@@ -89,6 +89,7 @@ def test_enabled_adds_only_the_probe_artifacts():
         "vigie_test-probe.volume",
         "vigie_test-probe.service",
         "vigie_test-probe.timer",
+        "vigie_test-probe-config.json",
     }
     assert files["vigie_test-probe.volume"] == "[Volume]\nVolumeName=vigie_test_probe\n"
     for name in ("api", "ingest"):
@@ -136,10 +137,14 @@ def test_service_unit_is_filled_from_the_template_with_the_allowed_targets():
     service = render.render({**BASE, **PROBE})["vigie_test-probe.service"]
     assert "IPAddressDeny=any\n" in service
     assert "IPAddressAllow=10.0.0.7 10.0.0.9 fd12::7\n" in service
-    assert "@PROBE_TARGET_IPS@" not in service
+    assert "IPAddressAllow=@PROBE_TARGET_IPS@" not in service
     assert "TimeoutStartSec=45" in service and "Type=oneshot" in service
     template = (PERSISTENT / "probe.service").read_text()
-    assert service == template.replace("@PROBE_TARGET_IPS@", "10.0.0.7 10.0.0.9 fd12::7")
+    lines = template.replace(
+        "IPAddressAllow=@PROBE_TARGET_IPS@", "IPAddressAllow=10.0.0.7 10.0.0.9 fd12::7"
+    )
+    assert service == lines
+    assert service.count("10.0.0.7") == 1  # the addresses appear on the directive only
 
 
 def test_timer_unit_targets_the_namespaced_service():
@@ -173,9 +178,12 @@ def test_unit_templates_follow_the_podman_unshare_hardening_rules():
 def test_enabled_bundle_hashes_every_file(tmp_path):
     render.write_bundle({**BASE, **PROBE}, tmp_path / "out")
     plan = json.loads((tmp_path / "out" / "plan.json").read_text())
-    assert {"vigie_test-probe.service", "vigie_test-probe.timer", "vigie_test-probe.volume"} <= set(
-        plan["files"]
-    )
+    assert {
+        "vigie_test-probe.service",
+        "vigie_test-probe.timer",
+        "vigie_test-probe.volume",
+        "vigie_test-probe-config.json",
+    } <= set(plan["files"])
 
 
 # ---------------------------------------------------------------- validation
@@ -220,3 +228,32 @@ def test_render_address_policy_matches_the_runner_policy():
     for value in vectors:
         accepted = render.private_probe_address(value) is not None
         assert accepted == (runner._private_ip(value) is not None), value
+
+
+def test_rendered_probe_config_skeleton_is_runner_valid_and_pipeline_readable():
+    skeleton = json.loads(render.render({**BASE, **PROBE})["vigie_test-probe-config.json"])
+    assert skeleton["state_world_readable"] is True  # uid 10001 must be able to read the file
+    assert skeleton["state_file"].endswith("/probe-state.json")  # matches VIGIE_PROBE_FILE
+    assert skeleton["enabled"] is False and skeleton["targets"] == []  # the owner fills it in
+    cfg = runner.parse_config(skeleton)
+    assert cfg.state_world_readable is True and cfg.state_file == skeleton["state_file"]
+
+
+def test_the_state_file_name_matches_the_pipeline_env():
+    files = render.render({**BASE, **PROBE})
+    env = [x for x in files["vigie_test-pipeline.container"].splitlines() if "PROBE_FILE" in x]
+    name = env[0].rsplit("/", 1)[1]
+    assert json.loads(files["vigie_test-probe-config.json"])["state_file"].endswith("/" + name)
+
+
+def test_unit_header_states_data_flow_not_guarantees():
+    text = (PERSISTENT / "probe.service").read_text()
+    assert "never sees" not in text and "mounts only" in text
+
+
+def test_docs_state_data_flow_not_guarantees():
+    docs = (Path(__file__).parents[2] / "docs" / "monitoring.md").read_text()
+    section = docs[docs.index("## Probes") : docs.index("## Retention and verification limits")]
+    assert "never reach" not in section and "unknown ids" not in section
+    for needle in ("malformed ids", "probe_allow", "common, widely used canary", "any cause"):
+        assert needle in section, needle

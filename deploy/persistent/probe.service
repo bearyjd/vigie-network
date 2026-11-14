@@ -10,9 +10,11 @@
 # CapabilityBoundingSet=/SystemCallFilter=: they can break `podman unshare`
 # (deploy/tests/test_probe_render.py enforces this).
 #
-# The probe mounts no Vigie volume except its own output volume, so it never sees inventory, raw
-# shards, overrides or device names. IPAddressDeny/IPAddressAllow is defense in depth and
-# BEST-EFFORT: it needs cgroup BPF, which a systemd USER manager may not be allowed to load. The
+# Data flow: this unit mounts only the probe output volume; no Vigie data volume is mounted into
+# it, and the runner opens only its config and state files. `podman unshare` is kept because who
+# owns the probe volume after the pipeline first mounts it is unverified; as the namespace root
+# the runner can write the state file either way. IPAddressDeny/IPAddressAllow is defense in depth
+# and BEST-EFFORT: it needs cgroup BPF, which a systemd USER manager may not be allowed to load. The
 # hard limits are the validated config (at most 10 literal private IPs, no hostnames), the
 # connected UDP socket and RestrictAddressFamilies.
 [Unit]
