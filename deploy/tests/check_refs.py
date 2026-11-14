@@ -39,7 +39,7 @@ THIRD_PARTY_FLAGS = {
     "--cacert", "--format", "--release", "--locked", "--target", "--permanent", "--add-rich-rule", "--dport",
     "--to-destination", "--rm", "--no-deps", "--env-file", "--force-recreate", "--out-file",
     "--test", "--check", "--config", "--sport", "--once", "--file", "--secret",
-    "--now", "--reload", "--restart", "--user", "--remove-rich-rule", "--list-rich-rules",
+    "--now", "--reload", "--restart", "--user", "--network", "--remove-rich-rule", "--list-rich-rules",
 }
 # Generated locally by the quick start, never committed (deploy/.gitignore).
 GENERATED = {"deploy/.env", "deploy/certs/server.crt", "deploy/certs-api/server.crt"}
