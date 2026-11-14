@@ -5,7 +5,14 @@ from __future__ import annotations
 import unicodedata
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from vigie_api.textsafe import has_forbidden
 
@@ -377,6 +384,13 @@ class ActivityResponse(_Envelope):
     data: ActivityData
 
 
+# Mirrors vigie_pipeline.baselines_tod.BUCKET_HOURS (a test pins the equality).
+TOD_BUCKET_HOURS = (1, 2, 3, 4, 6, 8, 12, 24)
+TOD_MAX_COHORT_BUCKET = 23
+_is_none = lambda value: value is None  # noqa: E731
+_TOD_KEYS = ("bucket_hours", "cohort_is_weekend", "cohort_bucket", "cap_applied")
+
+
 class IncidentEvidence(BaseModel):
     reason_code: Literal[
         "large_upload_threshold",
@@ -398,6 +412,28 @@ class IncidentEvidence(BaseModel):
     minimum_bytes: int | None = None
     sample_hours: int | None = None
     distinct_days: int | None = None
+    # tod keys appear only when stored (exclude_if), so pooled responses stay byte-identical.
+    bucket_hours: Annotated[
+        Literal[1, 2, 3, 4, 6, 8, 12, 24] | None, Field(exclude_if=_is_none)
+    ] = None
+    cohort_is_weekend: Annotated[bool | None, Field(exclude_if=_is_none)] = None
+    cohort_bucket: Annotated[
+        int | None, Field(ge=0, le=TOD_MAX_COHORT_BUCKET, exclude_if=_is_none)
+    ] = None
+    cap_applied: Annotated[bool | None, Field(exclude_if=_is_none)] = None
+
+    @field_validator(*_TOD_KEYS, mode="before")
+    @classmethod
+    def _tod_value_or_none(cls, value: Any, info: Any) -> Any:
+        "A malformed stored tod value is dropped instead of failing the whole response."
+        name = info.field_name
+        if name in ("cohort_is_weekend", "cap_applied"):
+            return value if isinstance(value, bool) else None
+        if type(value) is not int:
+            return None
+        if name == "bucket_hours":
+            return value if value in TOD_BUCKET_HOURS else None
+        return value if 0 <= value <= TOD_MAX_COHORT_BUCKET else None
 
 
 class IncidentReview(BaseModel):

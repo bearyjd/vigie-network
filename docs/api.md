@@ -215,6 +215,12 @@ covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers
 A snooze on an incident that later resolves stays as history with `attention` false. `GET /incidents`
 also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
 
+The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
+`bucket_hours` (one of 1, 2, 3, 4, 6, 8, 12, 24), `cohort_is_weekend` (boolean), `cohort_bucket` (integer 0 to 23,
+the UTC hour-of-day bucket) and `cap_applied` (boolean, whether the cohort line was capped at the fixed large-upload
+line). They are additive: a pooled incident omits all four, so its response is unchanged. A stored value outside
+those types or bounds is dropped, never echoed. The evidence pack's `incidents` section applies the same rule.
+
 Actions are `POST /incidents/{incident_id}/{action}?collector_id=...` with action `acknowledge`,
 `snooze`, `mark-expected` or `clear` (removes the decision, which un-snoozes; a tombstone row keeps the version). Any status can move to
 any other. The body is strict (unknown fields are 422; there is no free-text note):
