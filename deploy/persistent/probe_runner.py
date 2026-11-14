@@ -29,6 +29,7 @@ push a pass past 25 s, bounded by the number of targets times the adapter's real
 
 from __future__ import annotations
 
+import argparse
 import errno
 import fcntl
 import ipaddress
@@ -38,8 +39,11 @@ import math
 import os
 import re
 import secrets
+import socket
 import stat
 import struct
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -73,7 +77,10 @@ NOTES = frozenset({"skipped_deadline", "clock_step"})
 ID_RE = re.compile(r"[a-z0-9_-]{1,32}")
 LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-TOP_KEYS = frozenset({"enabled", "state_file", "targets"})
+TOP_KEYS = frozenset({"enabled", "state_file", "state_world_readable", "targets"})
+DNS_PORT = 53
+EXIT_OK, EXIT_INTERNAL, EXIT_CONFIG, EXIT_IO = 0, 1, 2, 3
+PRIVATE_MODE, READABLE_MODE = 0o600, 0o644
 DNS_KEYS = frozenset({"id", "kind", "resolver", "qname", "timeout_s"})
 TCP_KEYS = frozenset({"id", "kind", "address", "port", "timeout_s"})
 
@@ -105,6 +112,8 @@ class ProbeConfig:
     enabled: bool
     state_file: str
     targets: tuple[Target, ...]
+    # ids, classes and counters only; the pipeline runs as another uid, so 0644 is an opt-in
+    state_world_readable: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,7 +252,10 @@ def parse_config(raw: object) -> ProbeConfig:
         state_file = ""
     if enabled and not targets:
         raise ProbeError("an enabled config needs at least one target")
-    return ProbeConfig(enabled, state_file, targets)
+    readable = raw.get("state_world_readable", False)
+    if not isinstance(readable, bool):
+        raise ProbeError("state_world_readable must be a boolean")
+    return ProbeConfig(enabled, state_file, targets, readable)
 
 
 def _read_regular(path: str, limit: int, what: str, *, missing_ok: bool = False) -> bytes | None:
@@ -398,6 +410,33 @@ def classify_reply(reply: bytes, query_id: bytes, labels: tuple[bytes, ...]) -> 
         return _scan_records(reply, labels, (answers, authority, additional))
     except ValueError:
         return "malformed"
+
+
+# ---------------------------------------------------------------- real adapters
+def _family(host: str) -> socket.AddressFamily:
+    """Address family of a LITERAL address. A hostname is refused: no name resolution, ever."""
+    try:
+        version = ipaddress.ip_address(host).version
+    except ValueError:
+        raise OSError(errno.EINVAL, "not a literal address") from None
+    return socket.AF_INET6 if version == 6 else socket.AF_INET
+
+
+def real_dns(resolver: str, packet: bytes, timeout_s: float, *, port: int = DNS_PORT) -> bytes:
+    """One UDP query over a CONNECTED socket: the kernel drops replies from any other source.
+    recv(MAX_REPLY + 1) so an oversize reply is seen as such. Raises OSError (TimeoutError)."""
+    with socket.socket(_family(resolver), socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout_s)
+        sock.connect((resolver, port))
+        sock.send(packet)
+        return sock.recv(MAX_REPLY + 1)
+
+
+def real_connect(address: str, port: int, timeout_s: float) -> None:
+    """TCP connect, no payload, closed at once. Raises OSError (TimeoutError, refused, ...)."""
+    with socket.socket(_family(address), socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout_s)
+        sock.connect((address, port))
 
 
 # ---------------------------------------------------------------- one probe
@@ -664,15 +703,16 @@ def _fsync_directory(path: str) -> None:
         os.close(dir_fd)
 
 
-def write_state(path: str, state: State) -> None:
-    """Atomic: unique temp file (O_EXCL) + fsync + rename + directory fsync. Mode 0600."""
+def write_state(path: str, state: State, mode: int = PRIVATE_MODE) -> None:
+    """Atomic: unique temp file (O_EXCL) + fsync + rename + directory fsync. Mode 0600 default."""
     payload = serialize_state(state)
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        fd = os.open(tmp, flags, 0o600)
+        fd = os.open(tmp, flags, mode)
         try:
             with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), mode)  # the umask must not narrow an opted-in mode
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -722,7 +762,38 @@ def run_once(
         return None
     try:
         state = run_pass(cfg, read_state(cfg.state_file, cfg), now=now, dns=dns, connect=connect)
-        write_state(cfg.state_file, state)
+        mode = READABLE_MODE if cfg.state_world_readable else PRIVATE_MODE
+        write_state(cfg.state_file, state, mode)
         return state
     finally:
         os.close(lock)
+
+
+def main(
+    argv: list[str] | None = None, *, dns: DnsFn | None = None, connect: ConnectFn | None = None
+) -> int:
+    """One locked pass, then exit; output carries ids/classes only."""
+    parser = argparse.ArgumentParser(description="Run one bounded Vigie probe pass.")
+    parser.add_argument("config")
+    parser.add_argument("--once", action="store_true", help="one pass and exit (the default)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    try:
+        cfg = load_config(args.config)
+    except ProbeError as exc:
+        log.error("configuration error: %s", exc)
+        return EXIT_CONFIG
+    try:
+        state = run_once(cfg, now=time.time, dns=dns or real_dns, connect=connect or real_connect)
+    except ProbeError as exc:
+        log.error("probe run failed: %s", exc)
+        return EXIT_IO
+    except Exception as exc:  # noqa: BLE001 -- last resort; class name only, never the message
+        log.error("unexpected error: %s", type(exc).__name__)
+        return EXIT_INTERNAL
+    print(f"probe_runner targets={len(state.targets) if state else 0} exit={EXIT_OK}")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
