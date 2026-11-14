@@ -1007,6 +1007,84 @@ connection error); 5 TLS verification failed (including not yet valid or expired
 would retry); 6 DNS failure. Record the codes for a wrong id, a disabled automation and so on in
 the PRP-004 H0 table.
 
+## Probes (built, off by default, not deployed)
+
+Bounded DNS and TCP reachability probes run in a separate host unit, never in the pipeline (which
+stays `Network=none`). Data flow: the runner opens only its config and state files and sends only the probe queries and
+connects; no inventory, raw shard, override or device name is read into probe traffic or probe
+logs. It is not isolated from other Vigie volumes: a host process under `podman unshare` can reach
+all of the user's volumes, so that rests on the runner's code and config, not on a mount boundary.
+
+- **Runner.** `deploy/persistent/probe_runner.py` (standard library only) reads a private JSON
+  config and does one locked pass per timer tick (`probe.service` and `probe.timer` templates,
+  every 60 s). Targets are at most 10 literal private addresses (RFC 1918 or ULA), never
+  hostnames: nothing is resolved. Kinds are `dns_local`, `dns_upstream` (at most one) and
+  `tcp_lan`. A DNS probe is one UDP query on a connected socket, so only the configured resolver
+  can answer, with a 2 s timeout, no retry and a 4096-byte reply cap. A TCP probe is a connect with
+  no payload. A result is `ok`, a latency and a fixed error class, never response content. Logs
+  carry the target id and error class only, never an address, name or port.
+- **Hysteresis.** An outage opens after 3 consecutive failed attempts and recovers after 3
+  successes. At most 3 outage episodes per target per UTC day are reported; after that the target
+  is `flapping` and its further episodes emit no open or recover event.
+- **Outbound statement.** `dns_upstream` queries the household resolver for an owner-chosen
+  canary name. On a resolver cache miss that one query is forwarded to the upstream the household
+  already uses, about once a minute. While the name is cached an upstream outage is masked for up
+  to its TTL. It is off unless the owner configures it.
+- **Pipeline side.** Set `VIGIE_PROBE_FILE` (render does this when `probes_enabled` is set) and the
+  pipeline reads the runner's state file read-only on every pass and writes only
+  `pipeline_meta['probe_status']` plus events of kind `probe_outage`, `probe_recovered`,
+  `probe_flapping` and `probe_stale` (no device, one event per episode). The file is untrusted
+  input: over 64 KiB, malformed ids or enum values, out-of-range numbers, an `episode_start` more
+  than a day after `written_at`, a future `written_at`, or older than `VIGIE_PROBE_STALE_S`
+  (default 300 s) all mean "probes unavailable" and never "ok" or an outage. The reader has no id
+  allowlist, so the spec's unknown-target-id acceptance test is intentionally not implemented.
+  Probes are not an incident and are not delivered.
+- **Status fails safe.** `probe_status` carries `valid_until` (`written_at` plus the stale limit):
+  a consumer such as S3 `/probes` must treat the status as unavailable once now passes it,
+  because a stopped pipeline cannot rewrite a status that says ok. A fold that fails marks the
+  status unavailable (`reason` `error`) instead of leaving the old one. Turning the flag off
+  writes one `disabled` unavailable status, once, if a status had been stored; with none stored
+  nothing is written. A target not probed within the stale limit of `written_at` (or never) is
+  `unknown`, and nothing is derived from it.
+- **Event bounds** (the reader does not trust the writer's caps). Per target, at most 3
+  `probe_outage` events per UTC day of the episode (derived from `episode_start`), at most 6 per
+  target per day the pipeline inserts them, and at most 30 in total per episode day and per insert
+  day; at most 10 `probe_flapping` events per day. An episode older than 7 days is never
+  reported, so at most 7 days of buckets can be filled. A drop is logged once per kind and day
+  (`probe_event_capped`). `probe_stale` is at most one event per UTC day for any cause: a start-up
+  race can use that day's warning, and the status still shows the failure. An episode first seen
+  already recovered (within 7 days) is announced as an outage then a recovery. An open outage is
+  closed with a `probe_recovered` event (`removed` or `superseded`) when its target is gone or its
+  current `episode_start` is a different one (newer, older after a clock step, or none after a
+  fresh runner start); the scan covers 30 days and 100 rows per pass. A backward clock step is
+  tolerated up to a day (`episode_start` may exceed `written_at` by at most that); the runner
+  repairs a larger one itself.
+- **Freeze.** Probe settings are their own `ProbeSettings`, outside the monitoring policy version,
+  the detectors, `/coverage` and every existing table. Disabled, the rendered units and the
+  pipeline's tables are byte-identical to a build without probes (`server/tests/pipeline/test_probe_freeze.py`,
+  `deploy/tests/test_probe_render.py`).
+- **Render.** Optional `probes_enabled` (default false) and `probe_allow` (the target addresses)
+  add the probe volume, a read-only pipeline mount, the env var and the probe service/timer units.
+  `IPAddressDeny=any` with `IPAddressAllow=` for the targets is defense in depth and best-effort:
+  a systemd user manager may not be allowed to load the cgroup BPF programs it needs.
+- **Self-contamination.** The server's own probe queries pass through the household resolver and
+  can be attributed to the server host as DNS volume (about 1 to 2 per minute); keep the rate
+  fixed and account for it before any DNS-volume detector.
+
+Operating notes. `probe_allow` in the render config must list exactly the addresses of the probe
+config's targets: a target missing from it is blocked by `IPAddressAllow` and shows up as a
+timeout outage. The probe config's `state_file` must end in `probe-state.json` to match the
+pipeline's `VIGIE_PROBE_FILE`, and `render.py` writes a `<namespace>-probe-config.json` skeleton
+with `state_world_readable` already true (the runner's own default, 0600, cannot be read by the
+pipeline uid). Pick a common, widely used canary name for `dns_upstream`: an unusual name is
+visible upstream on every cache miss. Adding a target `kind` to the state document in S3 needs a
+runner and pipeline upgrade together, or a state version bump.
+
+Config fields (all values are placeholders): `enabled`, `state_file` (absolute path inside the
+probe volume), optional `state_world_readable` (mode 0644 so the pipeline's uid can read it; the
+document holds ids, error classes and counters only) and `targets`, each with `id`, `kind`,
+`resolver` plus `qname` (DNS) or `address` plus `port` (TCP), and an optional `timeout_s` up to 2.
+
 ## Retention and verification limits
 
 Raw shards and ingest batch detail retain the existing7-day policy. Derived receipt detail is
