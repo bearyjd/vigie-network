@@ -331,3 +331,19 @@ this uncapped total; it is `false` (all four sums `0`) if SQLite reports an oper
 as integer overflow. A caller must treat `false`, or an absent field from an older server, as
 unknown. Coverage hour `reasons` is a free list of strings; `lan_unmapped_share` marks an hour
 disqualified by the LAN-unmapped threshold (`docs/monitoring.md`).
+
+## Events feed filters
+
+`GET /events` pages on insertion order and returns inventory events plus human actions. Two optional
+query parameters are additive; a request without them returns exactly what it did before.
+
+- `device_id` (1-64 characters) keeps only events whose `device_id` equals it (exact match, not a
+  pattern). Events with `device_id: null` (rule, incident and evidence-export actions) never match it.
+- `order=desc` pages newest first (`asc` is the default). Its `next_cursor` is the lowest row served per
+  source and carries a direction tag, so a cursor is only valid with the order that produced it; the
+  other order answers an enveloped 400 `invalid_cursor`. Rows inserted after the first page are not
+  repeated or skipped by later pages. `kind` and `severity` combine with both.
+
+The GUI uses `order=desc` with `device_id` and `kind` for its Events view and device timeline.
+
+Example: `GET /events?order=desc&limit=25&device_id=<device-id>&kind=<kind>`.
