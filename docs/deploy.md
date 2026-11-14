@@ -153,7 +153,16 @@ files: the next run refuses to overwrite them (fail closed), so remove them by h
   limit. A copy the apps have since opened (and switched to WAL) no longer verifies: verify first.
 - **Verify with the same build that took the backup.** The `user_version` must match exactly, so an
   older backup fails `verify` after a release adds a migration.
-- The CLI has not yet been exercised against the live volumes.
+- **The production image has an older SQLite than dev/CI.** The first run against the real volumes
+  (`python:3.12-slim-bookworm`, libsqlite3 3.40.1) failed `integrity_check` with "unsafe use of
+  json_extract()": before SQLite 3.45 that function is not innocuous, so `PRAGMA trusted_schema=OFF`
+  rejects the inventory's expression indexes. The CLI therefore leaves `trusted_schema` at its
+  default. The hostile-image bound is defensive mode + value-size limit + progress-handler budget + CLI CPU rlimit + memory cap. Dev
+  and CI run SQLite 3.50, so tests cannot see this class of bug: after **any image rebuild**, smoke-test
+  in the production image against a copy (never the live files):
+  `podman run --rm --user 10001:10001 --memory 512m -v <copy-dir>:/in:ro -v <scratch-dir>:/out:U
+  <server-image> vigie-backup backup --dest /out --inventory /in/inventory.db --overrides /in/overrides.db`,
+  then verify the output with `podman run --rm --user 10001:10001 --memory 512m --network none -v <backup-dir>:/out:ro <image> vigie-backup verify /out` (a one-shot container; do not run it on the host).
 
 **Host-level fallback (and anything above the cap).** Use `VACUUM INTO`, which writes a rollback
 journal copy that `verify --no-manifest` accepts. Do not use `.backup`: on a WAL database it keeps the

@@ -12,7 +12,7 @@ from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_ingest.db import INVENTORY_MIGRATIONS, open_inventory
 from vigie_pipeline import backup
 from vigie_pipeline.backup_cli import main
-from vigie_pipeline.schema import apply_pipeline_migrations
+from vigie_pipeline.schema import apply_pipeline_migrations, open_pipeline_inventory
 
 
 @pytest.fixture
@@ -151,13 +151,12 @@ def test_legitimate_large_value_still_verifies(sources, dest: Path) -> None:
     assert backup.verify(dest, require_manifest=False)[0]["status"] == "ok"
 
 
-def test_hardened_connection_budget_defensive_and_untrusted_schema(
+def test_hardened_connection_budget_and_defensive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(backup, "CHECK_BUDGET_S", 0.3)
     conn = sqlite3.connect(":memory:")
     hit = backup._harden(conn, backup.CHECK_BUDGET_S)
-    assert conn.execute("PRAGMA trusted_schema").fetchone()[0] == 0
     conn.execute("CREATE TABLE t (x)")
     with pytest.raises(sqlite3.Error):
         conn.execute("PRAGMA writable_schema=ON")
@@ -434,3 +433,46 @@ def test_cli_reports_a_failed_cleanup_without_paths(
     assert main(["backup", "--dest", str(dest), "--inventory", str(sources[0])]) == 1
     err = capsys.readouterr().err
     assert "could not remove: inventory.db" in err and str(dest) not in err
+
+
+# --- SQLite < 3.45: trusted_schema=OFF breaks integrity_check on the real (json_extract) schema ---
+
+
+def _real_schema_sources(tmp_path: Path) -> tuple[Path, Path]:
+    src = tmp_path / "real"
+    src.mkdir()
+    inv = open_pipeline_inventory(src / "inventory.db", migrate=True)
+    ov = open_overrides(src / "overrides.db")
+    inv.close()
+    ov.close()
+    return src / "inventory.db", src / "overrides.db"
+
+
+def test_real_schema_backup_and_verify_never_turn_trusted_schema_off(
+    tmp_path: Path, dest: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inv, ov = _real_schema_sources(tmp_path)
+    seen: list[int] = []
+    real_harden = backup._harden
+
+    def spy(conn: sqlite3.Connection, budget_s: float) -> list[bool]:
+        hit = real_harden(conn, budget_s)
+        seen.append(conn.execute("PRAGMA trusted_schema").fetchone()[0])
+        return hit
+
+    monkeypatch.setattr(backup, "_harden", spy)
+    backup.backup(dest, inventory=inv, overrides=ov)
+    assert all(r["status"] == "ok" for r in backup.verify(dest))
+    assert seen and set(seen) == {1}  # SQLite's default; OFF fails on 3.40 for json_extract indexes
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info >= (3, 45), reason="json_extract innocuous in 3.45+"
+)
+def test_requires_old_sqlite_off_breaks_real_schema(tmp_path: Path) -> None:
+    inv, _ = _real_schema_sources(tmp_path)
+    conn = sqlite3.connect(inv)
+    conn.execute("PRAGMA trusted_schema=OFF")
+    with pytest.raises(sqlite3.OperationalError, match="unsafe use"):
+        conn.execute("PRAGMA integrity_check").fetchall()
+    conn.close()
