@@ -219,11 +219,16 @@ def _copy_db(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
 
 
 def _harden(conn: sqlite3.Connection, budget_s: float) -> list[bool]:
-    """Make a connection to an untrusted image safe to query: defensive mode, untrusted schema, a
-    value-size limit and a time budget between VM steps (it cannot interrupt a single step; the
-    CLI's CPU rlimit does). The returned flag turns True if the budget was hit."""
+    """Make a connection to an untrusted image safe to query: defensive mode, a value-size limit
+    and a time budget between VM steps (it cannot interrupt a single step; the CLI's CPU rlimit and
+    memory cap bound the rest). The returned flag turns True if the budget was hit.
+
+    Deliberately NOT PRAGMA trusted_schema=OFF: before SQLite 3.45 json_extract is not
+    SQLITE_INNOCUOUS, so integrity_check on the real inventory schema (json_extract expression
+    indexes) raised "unsafe use of json_extract()" on the production image's 3.40.1. It also
+    never stopped the hostile schemas (printf/instr are innocuous); the bound is defensive mode +
+    value limit + progress budget + CPU rlimit + memory cap."""
     conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
-    conn.execute("PRAGMA trusted_schema=OFF")
     conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, VALUE_LIMIT_BYTES)
     deadline = time.monotonic() + budget_s
     hit = [False]
