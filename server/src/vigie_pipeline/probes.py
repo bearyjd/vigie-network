@@ -49,7 +49,7 @@ EVENT_KINDS = ("probe_outage", "probe_recovered", "probe_flapping", "probe_stale
 # Log memory (module state): a persistent fault logs once per change, not on every 30 s pass.
 _last_invalid: str | None = None
 _last_unavailable: str | None = None
-_capped_logged: set[tuple[str, str]] = set()
+_capped_logged: set[tuple[str, str, str]] = set()
 
 
 def _reset_log_memory() -> None:
@@ -73,7 +73,7 @@ def _remember_unavailable(reason: str | None) -> None:
 
 
 def _note_capped(kind: str, ident: str, now: float) -> None:
-    key = (kind, iso_utc(now)[:10])
+    key = (kind, ident, iso_utc(now)[:10])
     if key not in _capped_logged:
         if len(_capped_logged) > 64:
             _capped_logged.clear()
@@ -186,7 +186,7 @@ def _ledger(inv: sqlite3.Connection, now: float) -> Counter[tuple[str, ...]]:
 
 
 def _emit_outage(inv: sqlite3.Connection, t: ProbeTarget, token: str, now: float,
-                 ledger: Counter[tuple[str, ...]]) -> None:  # fmt: skip
+                 ledger: Counter[tuple[str, ...]], late: bool = False) -> None:  # fmt: skip
     if event_exists(inv, "probe_outage", token):
         return
     start = int(t.episode_start or 0)
@@ -198,11 +198,16 @@ def _emit_outage(inv: sqlite3.Connection, t: ProbeTarget, token: str, now: float
         # insert-day backstop: twice the per-day cap, so an episode opened just before midnight
         # and folded just after it (counted on both days) is never refused by a legitimate day
         or ledger["oi", t.id, today] >= 2 * MAX_OUTAGES_PER_DAY
-        or ledger["Oi", today] >= MAX_GLOBAL_OUTAGES_PER_DAY
+        or ledger["Oi", today] >= 2 * MAX_GLOBAL_OUTAGES_PER_DAY
     ):
         _note_capped("probe_outage", t.id, now)  # the writer's own caps are not trusted
         return
-    summary = f"probe {t.id} failing ({t.last_error_class or 'unknown'})"
+    cls = t.last_error_class or "unknown"
+    summary = (
+        f"probe {t.id} was failing ({cls}), reported late"
+        if late
+        else f"probe {t.id} failing ({cls})"
+    )
     emit_once(inv, None, "probe_outage", "warn", summary, token, now)
     # only the global counters need updating inside a pass: ids are unique within one document
     ledger["O", day] += 1
@@ -217,7 +222,7 @@ def _emit_flapping(inv: sqlite3.Connection, t: ProbeTarget, now: float,
     today = iso_utc(now)[:10]
     if (
         ledger["f", str(t.episodes_day)] >= MAX_FLAPPING_PER_DAY
-        or ledger["fi", today] >= MAX_FLAPPING_PER_DAY
+        or ledger["fi", today] >= 2 * MAX_FLAPPING_PER_DAY
     ):
         _note_capped("probe_flapping", t.id, now)
         return
@@ -240,7 +245,7 @@ def _emit_target_events(inv: sqlite3.Connection, t: ProbeTarget, day: str, now: 
         _emit_outage(inv, t, token, now, ledger)
     elif t.state == "ok":
         if t.episode_start >= now - EMIT_MAX_AGE_S:  # an episode first seen already recovered
-            _emit_outage(inv, t, token, now, ledger)
+            _emit_outage(inv, t, token, now, ledger, late=True)
         if event_exists(inv, "probe_outage", token):
             _emit(inv, "probe_recovered", "info", f"probe {t.id} recovered", token, now)
 

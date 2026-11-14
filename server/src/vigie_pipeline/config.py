@@ -166,8 +166,8 @@ class ProbeSettings:
     stale_s: int = PROBE_STALE_DEFAULT_S
 
     def __post_init__(self) -> None:
-        if not 30 <= self.stale_s <= 86400:
-            raise ValueError("VIGIE_PROBE_STALE_S must be in 30..86400")
+        if not 180 <= self.stale_s <= 86400:
+            raise ValueError("VIGIE_PROBE_STALE_S must be in 180..86400")
 
     @property
     def enabled(self) -> bool:
