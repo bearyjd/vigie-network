@@ -15,7 +15,7 @@ from pathlib import Path
 
 import uvicorn
 
-from vigie_api import dataset_cli, evidence_cli, pilot_report_cli, tokens
+from vigie_api import dataset_cli, essential_cli, evidence_cli, pilot_report_cli, tokens
 from vigie_api.app import VERSION, create_app
 from vigie_api.config import Settings
 from vigie_api.schema import open_overrides
@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
             return _tokens_main(args_list[1:])
         if args_list[:1] == ["evidence"]:
             return evidence_cli.main(args_list[1:], VERSION)
+        if args_list[:1] == ["essential"]:
+            return essential_cli.main(args_list[1:])
         if args_list[:1] == ["dataset"]:
             return dataset_cli.main(args_list[1:])
         if args_list[:1] == ["pilot-report"]:

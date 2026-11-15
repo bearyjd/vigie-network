@@ -401,3 +401,44 @@ query parameters are additive; a request without them returns exactly what it di
 The GUI uses `order=desc` with `device_id` and `kind` for its Events view and device timeline.
 
 Example: `GET /events?order=desc&limit=25&device_id=<device-id>&kind=<kind>`.
+
+## Essential devices (owner opt-in, record only)
+
+The owner can mark devices that matter, with a per-device absence threshold. **This slice only
+records the choice**: no sweep, detector, incident or notification uses it yet, and nothing is
+marked by default. Marking is API/CLI only; the GUI stays read-only.
+
+- `GET /devices/{device_id}/essential` returns `essential`, `absent_after_s`, `version`,
+  `updated_at`, `updated_by` with `ETag: "<version>"` (`0` when never marked). 404 for an unknown
+  device.
+- `PUT /devices/{device_id}/essential` with `{"absent_after_s": <int>}` marks the device. The value
+  has **no default** and must be an integer from 3600 (1 h) to 604800 (7 d); booleans, floats,
+  strings and anything else are 422. Suggested for battery devices: 86400 (24 h).
+- `DELETE /devices/{device_id}/essential` unmarks it (the stored value becomes null; the row and
+  its version are kept).
+- `GET /essential-devices` lists the marked devices (at most 32).
+
+Both writes need a write token (read-only, service and integration tokens get 403), an `If-Match`
+with the current essential `version` (428 missing, 400 malformed, 412 stale, so replaying a PUT
+fails), the usual body and rate limits, and write an `audit_log` row (`device.essential.set` or
+`.clear`). At most 32 devices can be marked (409 `too_many_essential`, enforced under the write
+lock). A merged alias is 409 `device_merged` (mark the canonical device). Unmarking a device that is
+not marked is 409 `not_essential`. The version is independent of `device_overrides.version`, so
+marking never invalidates a pending merge suggestion.
+
+Example: `PUT /devices/<device-id>/essential` with `If-Match: "0"` and `{"absent_after_s": 86400}`.
+
+CLI (same rules, audited as `cli:local`): `python -m vigie_api essential list`,
+`essential set <device-id> <seconds>`, `essential clear <device-id>`.
+The CLI never creates or migrates `overrides.db`: a mistyped `--data-dir` creates nothing, a
+missing, locked or newer database is a one-line error, and a database older than the build is
+refused ("run the API image once to migrate it"). See the upgrade order in `docs/deploy.md`.
+
+Unmarking works for a device that was merged after it was marked (it only needs to exist), which
+frees its slot of the 32. Marking requires the canonical device. The essential ETag is its own
+counter (`essential_devices.version`); it is not interchangeable with the `device_overrides` ETag of
+`GET`/`PATCH /devices/{device_id}`.
+
+Stored in `overrides.db` (migration to user_version 10). **Take a `vigie-backup` before deploying:**
+the migration applies even with nothing marked, and an older api image refuses the newer database.
+Known limitation for the later detector: a spoofed MAC of an essential device keeps it "seen".

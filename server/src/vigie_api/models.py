@@ -11,10 +11,12 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     field_validator,
     model_validator,
 )
 
+from vigie_api.essential import MAX_S, MIN_S
 from vigie_api.textsafe import has_forbidden
 
 DeviceType = Literal["phone", "tv", "iot", "camera", "laptop", "console", "unknown"]
@@ -190,6 +192,35 @@ class PatchResult(BaseModel):
     version: int
 
 
+class EssentialPut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    absent_after_s: StrictInt = Field(
+        ge=MIN_S,
+        le=MAX_S,
+        description=f"Seconds of qualified coverage without seeing it ({MIN_S} to {MAX_S}).",
+    )
+
+
+class EssentialResult(BaseModel):
+    device_id: str
+    absent_after_s: int | None
+    version: int
+
+
+class EssentialState(EssentialResult):
+    essential: bool
+    updated_at: str | None
+    updated_by: str | None
+
+
+class EssentialListItem(BaseModel):
+    device_id: str
+    absent_after_s: int
+    version: int
+    updated_at: str
+
+
 class MacResolution(BaseModel):
     mac: str
     device_id: str
@@ -242,6 +273,18 @@ class DeviceResponse(_Envelope):
 
 class PatchResponse(_Envelope):
     data: PatchResult
+
+
+class EssentialResultResponse(_Envelope):
+    data: EssentialResult
+
+
+class EssentialStateResponse(_Envelope):
+    data: EssentialState
+
+
+class EssentialListResponse(_Envelope):
+    data: list[EssentialListItem]
 
 
 class MacResponse(_Envelope):

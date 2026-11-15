@@ -50,12 +50,14 @@ def _validate(conn: sqlite3.Connection, changes: dict[str, Any]) -> None:
         raise ApiError(422, "unknown_group", "group does not exist")
 
 
-def _check_target(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str) -> None:
+def check_target(
+    inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str, action: str = "patch"
+) -> None:
     if not rows(inv, "SELECT 1 FROM devices WHERE id=?", (device_id,)):
         raise ApiError(404, "not_found", "device not found")
     into = link_map(ov).get(device_id)
     if into is not None:
-        raise ApiError(409, "device_merged", f"device was merged into {into}; patch that device")
+        raise ApiError(409, "device_merged", f"device was merged into {into}; {action} that device")
 
 
 def patch_override(
@@ -73,7 +75,7 @@ def patch_override(
     ov.execute("BEGIN IMMEDIATE")
     try:
         # inside the write lock: a merge or group change cannot land between check and write
-        _check_target(inv, ov, device_id)
+        check_target(inv, ov, device_id)
         _validate(ov, changes)
         current = _current_version(ov, device_id)
         if current != expected_version:
