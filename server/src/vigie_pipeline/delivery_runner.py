@@ -152,6 +152,8 @@ def _message(inv, ro, claimed: DeliveryView, include_label: bool) -> Message | N
     if row is None:
         return None
     device = row[0]
+    if claimed.kind != "open" and row[1] in OPEN_ONLY_DETECTORS:
+        return None  # defence in depth: the planner never claims one, and none is ever built
     label = None  # only a name from device_overrides may be offered; never the raw device id
     if include_label and ro is not None:  # default: the label is not even read
         try:

@@ -276,6 +276,16 @@ def _row_action(
     return None
 
 
+def _open_only_recover(iid: str, d: DeliveryView, now: float) -> Action | None:
+    """A recover row of an open-only incident must never go out: a pending one, or a sending one
+    whose lease lapsed, expires (a live lease belongs to its sender); other states are inert."""
+    if d.state == "pending" or (
+        d.state == "sending" and _num(d.next_attempt_at) and d.next_attempt_at <= tick_floor(now)
+    ):
+        return Expire(iid, d.kind, "open_only", _exp(d))
+    return None
+
+
 def _recover_action(
     iid: str, ds: Mapping[str, DeliveryView], now: float, config: DeliveryConfig
 ) -> Action | None:
@@ -318,7 +328,12 @@ def _plan_incident(
             return []
         return _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
-    rows = (_row_action(iid, d, state, review, now, config) for _, d in sorted(ds.items()))
+    rows = (
+        _open_only_recover(iid, d, now)
+        if open_only and k == "recover"
+        else _row_action(iid, d, state, review, now, config)
+        for k, d in sorted(ds.items())
+    )
     actions = [a for a in rows if a]
     if "open" not in {a.kind for a in actions}:
         opened = _open_action(iid, state, review, ds.get("open"), now, config)

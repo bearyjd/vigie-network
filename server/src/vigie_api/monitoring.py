@@ -341,8 +341,13 @@ def baseline_view(inv, collector, device, key):
 
 
 def _evidence(detector, stored):
-    parsed = json.loads(stored)
-    return new_device_evidence(parsed) if detector == "new_device" else parsed
+    if detector != "new_device":
+        return json.loads(stored)
+    try:
+        parsed = json.loads(stored)
+    except (ValueError, RecursionError):  # malformed stored text: serve the null-dwell shape
+        parsed = None
+    return new_device_evidence(parsed)
 
 
 def incident_row(inv, ov, row, review, now):

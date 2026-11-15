@@ -390,6 +390,13 @@ are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
 **Retention of incidents.** Incidents older than 90 days (by `last_hour`) are pruned, except an
 `open` incident of a non-upload detector (e.g. `new_device`), which is kept for as long as it is
 `open` (an acknowledgement does not close it). Upload incidents are pruned exactly as before.
+An open `new_device` incident, and its sent `open` delivery row (rows of an open incident are never
+forgotten), therefore stay indefinitely: the per-day cap of the sweep that creates them (a later
+slice) is the only bound on their number.
+
+The pilot report counts `new_device` incidents under their own key in `incidents.per_detector` only:
+they are excluded from `incidents.total`, `incidents.per_day`, the delivery counts and the
+unwanted-notification verdict, which stay evidence about the upload detectors.
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is

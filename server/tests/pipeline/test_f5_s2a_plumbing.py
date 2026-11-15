@@ -172,3 +172,45 @@ def test_new_device_text_is_sanitised_and_bounded(label):
     clean = m.title.removeprefix("New device on your network: ")
     assert clean == alias("dev-x") or (clean == label and len(clean) <= MAX_LABEL)
     assert json.dumps({"t": m.title, "b": m.body})
+
+
+# ---- delivery: a pre-existing recover row of an open-only incident is never sent ---------------
+def seed_row(world, iid, kind, state, nxt=None, created=T0, attempts=0):
+    from vigie_pipeline.delivery_plan import delivery_id
+
+    world.inv.execute(
+        "INSERT INTO incident_deliveries(delivery_id,incident_id,kind,state,attempts,"
+        "next_attempt_at,created_at,updated_at,version) VALUES (?,?,?,?,?,?,?,?,0)",
+        (delivery_id(iid, kind), iid, kind, state, attempts, nxt, created, created),
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "nxt"),
+    [("pending", T0), ("sending", T0 + 5), ("withdrawn", None)],
+)
+@pytest.mark.parametrize("closed", ["resolved", "superseded", "open"])
+def test_existing_recover_row_of_an_open_only_incident_is_never_sent(world, state, nxt, closed):
+    world.incident("n", state=closed, detector="new_device")
+    seed_row(world, "n", "open", "sent")
+    seed_row(world, "n", "recover", state, nxt)
+    pub, clock = FakePublisher(), Clock(T0 + 100)
+    for _ in range(3):
+        go(world, pub, clock)
+        clock.t += 100
+    assert pub.attempted == []
+    assert world.states()["open"] == "sent"
+    assert world.states()["recover"] in ("expired", "withdrawn")
+
+
+def test_a_live_recover_lease_of_an_open_only_incident_is_left_to_its_sender(world):
+    world.incident("n", state="resolved", detector="new_device")
+    seed_row(world, "n", "open", "sent")
+    seed_row(world, "n", "recover", "sending", T0 + 1000)
+    go(world, FakePublisher(), Clock(T0 + 10))
+    assert world.states()["recover"] == "sending"
+
+
+def test_build_message_refuses_a_new_device_recover():
+    with pytest.raises(ValueError, match="open-only"):
+        build("recover", "Phone")

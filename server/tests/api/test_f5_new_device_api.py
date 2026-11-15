@@ -33,7 +33,7 @@ def store(env: Env, evidence) -> None:
     incident(env, "n1", detector="new_device")
     env.inv.execute(
         "UPDATE monitoring_incidents SET evidence=?,observed_bytes=0,threshold_bytes=0",
-        (json.dumps(evidence),),
+        (evidence if isinstance(evidence, str) else json.dumps(evidence),),
     )
 
 
@@ -72,14 +72,33 @@ def test_new_device_state_filter_and_upload_rows_still_work(env: Env):
     assert upload["reason_code"] == "large_upload_threshold" and "randomized" not in upload
 
 
-@pytest.mark.parametrize("evidence", [GOOD, *HOSTILE[:3]], ids=range(4))
-def test_evidence_pack_lists_new_device_with_the_same_evidence(env: Env, evidence):
-    store(env, evidence)
+NULL_DWELL = {"reason_code": "new_device_first_seen", "randomized": False, "dwell_hours": None}
+# stored text -> the exact sanitised dict both the API and the pack must serve
+EXACT = [
+    (GOOD, GOOD),
+    (HOSTILE[0], GOOD),
+    ({**GOOD, "dwell_hours": True}, NULL_DWELL),
+    ({**GOOD, "dwell_hours": 999_999}, {**GOOD, "dwell_hours": 999_999}),
+    ({**GOOD, "dwell_hours": 1_000_000}, NULL_DWELL),
+    ({**GOOD, "dwell_hours": 0}, {**GOOD, "dwell_hours": 0}),
+    ({**GOOD, "dwell_hours": -1}, NULL_DWELL),
+    ("{", NULL_DWELL),
+    ("", NULL_DWELL),
+    ("5", NULL_DWELL),
+    ("1" * 5000, NULL_DWELL),
+    ("[" * 200_000, NULL_DWELL),
+]
+
+
+@pytest.mark.parametrize(("stored", "want"), EXACT, ids=range(len(EXACT)))
+def test_api_and_pack_serve_the_exact_sanitised_evidence(env: Env, stored, want):
+    store(env, stored)
+    assert served(env) == want
     pack = section(env, "incidents")
     assert pack["status"] == "present"
     item = next(i for i in pack["items"] if i["id"] == "n1")
     assert item["detector"] == "new_device"
-    assert set(item["evidence"]) <= ALLOWED
+    assert item["evidence"] == want
     assert "aa:bb" not in json.dumps(item) and "10.0.0.9" not in json.dumps(item)
 
 

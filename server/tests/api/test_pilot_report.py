@@ -131,15 +131,34 @@ def test_counts_per_detector_and_day(seeded, capsys, monkeypatch):
     assert sum(sum(d.values()) for d in r["incidents"]["per_day"].values()) == 3
 
 
-def test_new_device_incidents_are_counted_under_their_own_detector(seeded, capsys, monkeypatch):
+def test_new_device_is_reported_separately_and_leaves_upload_numbers_alone(
+    seeded, capsys, monkeypatch
+):
+    before = report(seeded, capsys, monkeypatch)
+    incident(seeded, "nd1", device="d1", detector="new_device", episode=HOUR0 - 3600)
+    set_detected(seeded, "nd1", -3600)  # open, no delivery row (never allowlisted)
+    after = report(seeded, capsys, monkeypatch)
+    assert after["incidents"]["per_detector"] == {
+        "large_upload": 2, "new_device": 1, "pooled_upload": 1
+    }  # fmt: skip
+    assert after["incidents"]["total"] == before["incidents"]["total"] == 3
+    assert after["incidents"]["per_day"] == before["incidents"]["per_day"]
+    assert after["deliveries"] == before["deliveries"]
+    assert after["unwanted_notifications"] == before["unwanted_notifications"]
+    assert after["deliveries"]["status"] != "unknown"
+
+
+def test_an_expected_new_device_with_a_sent_open_is_not_an_unwanted_notification(
+    seeded, capsys, monkeypatch
+):
+    before = report(seeded, capsys, monkeypatch)
     incident(seeded, "nd1", device="d1", detector="new_device", episode=HOUR0 - 3600)
     set_detected(seeded, "nd1", -3600)
-    r = report(seeded, capsys, monkeypatch)
-    assert r["incidents"]["per_detector"] == {
-        "large_upload": 2,
-        "new_device": 1,
-        "pooled_upload": 1,
-    }
+    delivery(seeded, 20, "sent", NOW - 1800, "nd1")
+    decide(seeded, "nd1", "expected", 20)
+    after = report(seeded, capsys, monkeypatch)
+    assert after["unwanted_notifications"] == before["unwanted_notifications"]
+    assert after["deliveries"] == before["deliveries"]
 
 
 def test_decision_ratios(seeded, capsys, monkeypatch):

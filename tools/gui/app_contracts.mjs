@@ -334,6 +334,9 @@ assert.match(text(render(mixed.slice(0, 1), opts('attention'))), /No incidents m
 // F5: a new_device incident renders its own label and no misleading upload byte counts.
 const fresh = render([inc('n1', {detector: 'new_device', observed_bytes: 0, threshold_bytes: 0})]);
 assert.match(text(fresh), /New device/); assert.doesNotMatch(text(fresh), /0 B/, 'no upload byte counts for a new device');
+const panel = text(views.incidentView({...inc('n1', {detector: 'new_device', observed_bytes: 0, threshold_bytes: 0}), evidence: {reason_code: 'new_device_first_seen', randomized: false, dwell_hours: 3}}, () => {}));
+assert.match(panel, /New device/); assert.match(panel, /Hours present when noticed/); assert.match(panel, /new_device_first_seen/);
+assert.doesNotMatch(panel, /Observed upload|Threshold|No mature baseline/, 'a new device panel carries no upload facts');
 // XSS: hostile strings are inert text; only the expected tags exist
 const hostile = render([inc('<img src=x onerror=alert(1)>', {detector: '</script><script>alert(1)</script>', device_id: '<img onerror=alert(2)>', review: {status: '<b onmouseover=x>'}})]);
 const tags = new Set(); (function walk(el) { tags.add(el.tag); el.children.forEach(c => c instanceof FakeElement && walk(c)); })(hostile);

@@ -220,6 +220,9 @@ has `observed_bytes` and `threshold_bytes` of 0 and its `evidence` is exactly
 `{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}` (`dwell_hours` null if the
 stored value is implausible): never a MAC, hostname, vendor or IP; any other stored key is dropped. The
 same shape appears in the evidence pack. Upload evidence is unchanged.
+In `api/openapi.yaml` `evidence` is a union (`anyOf` of the upload evidence and the new-device
+evidence) with no discriminator: a typed client sees the union, so branch on the incident's `detector`
+(`new_device` means the new-device shape) rather than on the shape.
 
 The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
 `bucket_hours` (one of 1, 2, 3, 4, 6, 8, 12, 24), `cohort_is_weekend` (boolean), `cohort_bucket` (integer 0 to 23,

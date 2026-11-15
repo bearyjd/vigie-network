@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 
+from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS
+
 MAX_LABEL = 48
 MAX_DIGITS = 3
 MAX_WORD = 20  # a word this long is an opaque token, not a name
@@ -114,6 +116,8 @@ def build_message(
     device_id: object = "",
     detector: object = "",
 ) -> Message:
+    if detector in OPEN_ONLY_DETECTORS and kind != "open":
+        raise ValueError(f"{detector} is open-only: no {kind} message")
     clean, link = scrub_label(label, device_id), incident_link(incident_id)
     fields = {"label": clean, "link": link}
     key = (detector, kind)
