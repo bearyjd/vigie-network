@@ -158,6 +158,32 @@ def test_only_new_device_rows_with_an_engine_gap_stay_unknown(env, capsys, monke
     assert got == empty  # an unavailable upload count is never a measured zero
 
 
+def test_a_closed_pruned_new_device_leaves_upload_delivery_numbers_alone(
+    seeded, capsys, monkeypatch
+):
+    from vigie_pipeline.monitoring_engine import prune_monitoring
+
+    before = report(seeded, capsys, monkeypatch)
+    incident(seeded, "nd1", device="d1", detector="new_device", state="resolved")
+    seeded.inv.execute(
+        "UPDATE monitoring_incidents SET last_hour=? WHERE id='nd1'", (HOUR0 - 100 * DAY,)
+    )
+    delivery(seeded, 20, "sent", NOW - 1800, "nd1")
+    decide(seeded, "nd1", "expected", 20)
+    prune_monitoring(seeded.inv, NOW)  # the incident is 100 days old, its delivery row is not
+    after = report(seeded, capsys, monkeypatch)
+    assert after["deliveries"] == before["deliveries"]
+    assert after["unwanted_notifications"] == before["unwanted_notifications"]
+
+
+def test_upload_delivery_numbers_are_unchanged_by_the_pruning_rule(seeded, capsys, monkeypatch):
+    from vigie_pipeline.monitoring_engine import prune_monitoring
+
+    before = report(seeded, capsys, monkeypatch)
+    prune_monitoring(seeded.inv, NOW)  # nothing in the fixture is older than 90 days
+    assert report(seeded, capsys, monkeypatch) == before
+
+
 def test_an_expected_new_device_with_a_sent_open_is_not_an_unwanted_notification(
     seeded, capsys, monkeypatch
 ):

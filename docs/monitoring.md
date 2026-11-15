@@ -389,7 +389,10 @@ are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
 
 **Retention of incidents.** Incidents older than 90 days (by `last_hour`) are pruned, except an
 `open` incident of a non-upload detector (e.g. `new_device`), which is kept for as long as it is
-`open` (an acknowledgement does not close it). Upload incidents are pruned exactly as before.
+`open` (an acknowledgement does not close it), or, once closed, for as long as any of its delivery
+rows exists (rows carry no detector, so the incident row is the only way to attribute them; the
+rows are forgotten after the delivery retention, after which the incident is pruned). Upload
+incidents are pruned exactly as before.
 An open `new_device` incident, and its sent `open` delivery row (rows of an open incident are never
 forgotten), therefore stay indefinitely: the per-day cap of the sweep that creates them (a later
 slice) is the only bound on their number.

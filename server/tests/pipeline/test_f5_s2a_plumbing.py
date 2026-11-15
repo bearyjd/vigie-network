@@ -61,6 +61,28 @@ def test_prune_keeps_open_non_upload_and_prunes_everything_else_old(tmp_path):
         ov.close()
 
 
+def test_prune_keeps_a_closed_non_upload_incident_while_a_delivery_row_exists(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        put(inv, "nd-kept", "new_device", "resolved")
+        put(inv, "nd-gone", "new_device", "superseded")
+        put(inv, "up-row", "upload_deviation", "resolved")  # upload: pruned as before
+        for iid in ("nd-kept", "up-row"):
+            inv.execute(
+                "INSERT INTO incident_deliveries(delivery_id,incident_id,kind,state,"
+                "next_attempt_at,created_at,updated_at) VALUES (?,?, 'open','sent',NULL,1,1)",
+                (str(len(iid)).zfill(32), iid),
+            )
+        prune_monitoring(inv, HOUR + 100 * 86400)
+        assert ids(inv) == {"nd-kept"}
+        inv.execute("DELETE FROM incident_deliveries")  # retention forgot its rows
+        prune_monitoring(inv, HOUR + 100 * 86400)
+        assert ids(inv) == set()
+    finally:
+        inv.close()
+        ov.close()
+
+
 # ---- delivery: open-only -----------------------------------------------------------------------
 @pytest.fixture
 def world(tmp_path):
