@@ -297,8 +297,9 @@ def _plan_incident(
     ds: Mapping[str, DeliveryView],
     now: float,
     config: DeliveryConfig,
+    frozen: bool = False,
 ) -> list[Action]:
-    if incident is None:  # pruned: nothing left to announce
+    if incident is None or frozen:  # pruned, or not delivered (detector off the allowlist)
         rows = sorted(ds.items())
         live = [
             Expire(iid, k, "incident_missing", _exp(d))
@@ -308,7 +309,13 @@ def _plan_incident(
             if d.state in ("pending", "sending")
         ]
         live = [a for a in live if a]
-        return live or _forget_all(iid, ds, now, config)
+        if live:
+            return live
+        # A frozen incident that still exists and is open keeps its dedup rows: deleting them
+        # would re-announce it if its detector returns to the allowlist.
+        if incident is not None and incident.state not in CLOSED_STATES:
+            return []
+        return _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
     rows = (_row_action(iid, d, state, review, now, config) for _, d in sorted(ds.items()))
     actions = [a for a in rows if a]
@@ -333,8 +340,13 @@ def plan(
     deliveries: Iterable[DeliveryView],
     now: float,
     config: DeliveryConfig,
+    frozen: frozenset[str] = frozenset(),
 ) -> tuple[Action, ...]:
-    """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind)."""
+    """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind).
+
+    `frozen` ids are existing incidents that must not be delivered: their pending and lapsed rows
+    expire, no open/recover is ever created, and their rows are deleted only once the incident is
+    closed (or gone) and the retention rule says so."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
     grouped: dict[str, dict[str, DeliveryView]] = {}
@@ -349,7 +361,13 @@ def plan(
     for iid in sorted(by_incident.keys() | grouped.keys()):
         actions.extend(
             _plan_incident(
-                iid, by_incident.get(iid), reviews.get(iid), grouped.get(iid, {}), now, config
+                iid,
+                by_incident.get(iid),
+                reviews.get(iid),
+                grouped.get(iid, {}),
+                now,
+                config,
+                iid in frozen,
             )
         )
     return tuple(sorted(actions, key=lambda a: (a.incident_id, a.kind)))

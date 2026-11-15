@@ -364,13 +364,20 @@ other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE
 
 **Detector allowlist.** `VIGIE_DELIVERY_DETECTORS` is a comma-separated list (whitespace around commas is
 ignored) of detector ids, 1 to 8 distinct tokens matching `[a-z][a-z0-9_]{0,31}`. Unset means
-`large_upload,upload_deviation`, exactly today's behaviour. Only incidents of a listed detector are
-handed to the delivery planner: any other incident never gets a delivery row, a send, a recover or a
-forget. An empty value, an empty/duplicate/malformed token or more than 8 entries is a startup error
-(the message does not echo the value). The list only narrows what is delivered; a detector id is not
-checked against a registry. If a detector is later removed from the list, its incidents are planned
-as if pruned: pending or lease-lapsed rows expire (`incident_missing`), an already sent open is never
-followed by a recover, and terminal rows are forgotten after the retention period.
+`large_upload,upload_deviation`, exactly today's behaviour (the stock compose forwards it with
+`${VAR-default}`, so only an unset variable gets the default). An explicitly empty value, an
+empty/duplicate/malformed token or more than 8 entries is a startup error that stops the whole
+pipeline even when delivery is off, like the other `VIGIE_DELIVERY_*` settings (the message does not
+echo the value). A detector id is not checked against a registry.
+
+Only incidents of a listed detector can get a delivery row, a send or a recover. An incident of any
+other detector is *frozen*, not treated as deleted: it never gets an open or recover row, its
+pending and lease-lapsed rows expire (`incident_missing`), and its existing rows are kept for as
+long as the incident exists and is open, so putting the detector back later does not re-announce
+it. Once a frozen incident is closed (or gone) its rows are forgotten after the retention period,
+like any other. While a detector is off the list a sent open is not followed by a recover; if the
+detector is added back before the rows are forgotten and the incident resolved meanwhile, a late
+recover is sent.
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is

@@ -149,3 +149,71 @@ def test_bad_detector_values_fail_fast_without_echoing_them(value):
     with pytest.raises(ValueError, match="VIGIE_DELIVERY_DETECTORS") as err:
         det(value)
     assert len(value) < 3 or value not in str(err.value)
+
+
+NARROW = ("large_upload",)
+PAST_RETENTION = dconf().retention_seconds + 1000
+
+
+def test_remove_then_add_back_after_retention_does_not_reannounce_an_open_incident(world):
+    world.incident("u", detector="upload_deviation")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    clock.t += PAST_RETENTION
+    go(world, pub, clock, detectors=NARROW)
+    assert world.states() == {"open": "sent"}  # frozen: never deleted while the incident is open
+    go(world, pub, clock)
+    assert [m.kind for m in pub.sent] == ["open"]
+
+
+def test_frozen_open_incident_keeps_rows_and_gets_no_new_ones(world):
+    world.incident("u", detector="upload_deviation")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    before = dump(world)
+    for _ in range(3):
+        clock.t += 86400
+        go(world, pub, clock, detectors=NARROW)
+    assert dump(world) == before and len(pub.sent) == 1
+
+
+def test_frozen_incident_with_no_rows_gets_none(world):
+    world.incident("u", detector="upload_deviation")
+    go(world, FakePublisher(), Clock(T0 + 10), detectors=NARROW)
+    assert world.rows() == []
+
+
+def test_pending_row_of_a_frozen_incident_expires(world):
+    world.incident("u", detector="upload_deviation")
+    pub, clock = FakePublisher(), Clock(T0)
+    go(world, pub, clock, max_per_run=0)
+    assert world.states() == {"open": "pending"}
+    go(world, pub, clock, detectors=NARROW)
+    assert world.states() == {"open": "expired"} and pub.attempted == []
+
+
+def test_closed_non_allowlisted_incident_rows_are_deleted_after_retention_like_main(world):
+    world.incident("u", detector="upload_deviation")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    world.set_state("u", "resolved")
+    clock.t += 100
+    go(world, pub, clock, detectors=NARROW)
+    assert world.states() == {"open": "sent"}  # no recover while frozen
+    clock.t += PAST_RETENTION
+    go(world, pub, clock, detectors=NARROW)
+    assert world.rows() == []
+
+
+@pytest.mark.parametrize("bad", ["large_upload", (), [], frozenset()])
+def test_run_delivery_rejects_a_str_or_empty_detectors(world, bad):
+    world.incident("u")
+    with pytest.raises(ValueError, match="detectors"):
+        go(world, FakePublisher(), Clock(T0 + 10), detectors=bad)
+    assert world.rows() == []
+
+
+@pytest.mark.parametrize("bad", [("Bad",), (), ("a", "a")])
+def test_settings_reject_bad_detectors_directly(bad):
+    with pytest.raises(ValueError, match="VIGIE_DELIVERY_DETECTORS"):
+        DeliverySettings(detectors=bad)

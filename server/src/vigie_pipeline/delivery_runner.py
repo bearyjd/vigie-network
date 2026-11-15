@@ -108,24 +108,21 @@ def _plan_pass(
 ) -> tuple[int, float]:
     """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError.
 
-    Only incidents of an allowlisted detector are planned. A row whose incident is not listed is
-    planned as a pruned incident: pending/sending rows expire (`incident_missing`), a sent open is
-    never followed by a recover, terminal rows are forgotten after retention."""
-    allowed = sorted(set(detectors))
+    Every incident is read, but one whose detector is not allowlisted is planned as FROZEN: no
+    open/recover row is ever created for it, its pending and lapsed rows expire
+    (`incident_missing`), and its rows are deleted only once it is closed (retention rule) or gone.
+    A sent open is therefore not followed by a recover while its detector stays off the list."""
+    allowed = frozenset(detectors)
     with immediate(inv):
         now = clock()  # after BEGIN IMMEDIATE: never older than the state it plans against
-        incidents = [
-            IncidentView(r[0], r[1], _epoch(r[2]))
-            for r in inv.execute(
-                "SELECT id,state,detected_at FROM monitoring_incidents"  # noqa: S608
-                f" WHERE detector IN ({','.join('?' * len(allowed))})",
-                allowed,
-            )
-        ]
+        rows = inv.execute("SELECT id,state,detected_at,detector FROM monitoring_incidents")
+        found = [(IncidentView(r[0], r[1], _epoch(r[2])), r[3] in allowed) for r in rows]
+        incidents = [v for v, _ in found]
+        frozen = frozenset(v.id for v, ok in found if not ok)
         every = inv.execute(f"SELECT {_ROW} FROM incident_deliveries")  # noqa: S608
         deliveries = [_delivery(r) for r in every]
         reviews = _read_reviews(ro)
-        actions = plan(incidents, reviews, deliveries, now, config)
+        actions = plan(incidents, reviews, deliveries, now, config, frozen)
         apply_actions(inv, actions, now)
     return len(actions), now
 
@@ -348,6 +345,8 @@ def run_delivery(
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget."""
+    if isinstance(detectors, str) or not (detectors := frozenset(detectors)):
+        raise ValueError("detectors must be a non-empty collection of detector ids")
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
     try:
