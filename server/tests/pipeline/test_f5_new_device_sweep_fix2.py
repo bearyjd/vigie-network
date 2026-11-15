@@ -22,6 +22,7 @@ from test_f5_new_device_sweep import (
     staggered,
     start,
     ticks,
+    wide_gap,  # noqa: F401
 )
 from test_f5_new_device_sweep_fix1 import meta
 
@@ -71,8 +72,8 @@ def test_a_genuinely_held_device_drops_72h_after_it_became_noticeable(data):
 def test_a_first_run_with_the_clock_far_ahead_recovers_when_the_clock_is_corrected(data, caplog):
     caplog.set_level("INFO", logger="vigie_pipeline")
     run(data, T0 + 30 * DAY)
-    run(data, T0)  # corrected
-    assert meta(data, "f5_enabled_since") == {"f5_enabled_since": str(T0)}
+    run(data, T0)  # corrected: this pass opens nothing and re-bases the last run
+    assert meta(data, "f5_last_run") == {"f5_last_run": str(T0)}
     assert "new_device_watermark_moved" in caplog.text
     arrive(data, MAC, at=T0 + 60)
     run(data, T0 + DWELL + SK + 100)
@@ -88,12 +89,14 @@ def test_a_forward_clock_step_and_correction_does_not_disable_the_sweep(data):
     assert len(incidents(data)) == 1
 
 
-def test_a_last_run_in_the_future_resets_the_watermark(data, caplog):
+def test_a_backward_step_skips_the_pass_and_leaves_the_floor_alone(data, caplog):
     start(data)
     run(data, T0 + 5 * HOUR)  # inside the resume gap, so only last_run moved
+    floor = meta(data, "f5_floor")
     caplog.set_level("INFO", logger="vigie_pipeline")
     run(data, T0 + HOUR)  # the clock went back
-    assert meta(data, "f5_enabled_since") == {"f5_enabled_since": str(T0 + HOUR)}
+    assert meta(data, "f5_floor") == floor
+    assert meta(data, "f5_enabled_since") == {"f5_enabled_since": str(T0 - 60)}
     assert meta(data, "f5_last_run") == {"f5_last_run": str(T0 + HOUR)}
     assert "new_device_watermark_moved" in caplog.text
 
@@ -112,7 +115,7 @@ def test_the_capped_event_says_cap_reached_and_how_far_the_count_goes(data):
     run(data, T0 + DWELL + 300)
     (capped,) = events(data, "new_device_capped")
     assert "cap 3/day reached; 7 held" in capped["summary"]
-    assert "counted up to 21" in capped["summary"]
+    assert "counted up to 200" in capped["summary"]
 
 
 def test_an_unreached_cap_never_reports_held_devices(data, monkeypatch):

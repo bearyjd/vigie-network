@@ -19,6 +19,7 @@ from test_probe_freeze import POOLED_VERSION, TOD_VERSION
 
 from vigie_api.schema import open_overrides
 from vigie_ingest.db import iso_utc
+from vigie_pipeline import new_device_notice as nd
 from vigie_pipeline import processor
 from vigie_pipeline.config import ACTIVITY_SKEW_S as SK
 from vigie_pipeline.config import PipelineConfig
@@ -28,6 +29,15 @@ from vigie_pipeline.processor import monitoring_policy, run_once
 from vigie_pipeline.schema import open_pipeline_inventory
 
 DWELL = 7200  # the default transient_min_dwell_s
+REAL_GAP = nd.RESUME_GAP_S  # the production constant, before the fixture below widens it
+
+
+@pytest.fixture(autouse=True)
+def wide_gap(monkeypatch):
+    """Tests step the clock by hours; production passes every 30 s (RESUME_GAP_S is 15 min)."""
+    monkeypatch.setattr(nd, "RESUME_GAP_S", 6 * 3600)
+
+
 MAC = "00:1a:2b:00:00:01"  # universal bit: not randomized
 PRIVATE = "aa:bb:cc:00:00:01"  # locally administered: randomized
 OPAQUE = re.compile(r"[0-9a-f]{64}")

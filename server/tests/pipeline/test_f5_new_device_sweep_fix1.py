@@ -13,10 +13,10 @@ import uuid
 import pytest
 from pipeline_helpers import HOUR, T0, Data, data  # noqa: F401
 from test_f5_new_device_sweep import (
-    SK,
     DAY,
     DWELL,
     MAC,
+    SK,
     arrive,
     device_of,
     events,
@@ -27,6 +27,7 @@ from test_f5_new_device_sweep import (
     staggered,
     start,
     ticks,
+    wide_gap,  # noqa: F401
 )
 
 from vigie_api.schema import open_overrides
@@ -59,7 +60,7 @@ def test_candidate_queries_use_the_primary_key_not_a_scan_per_candidate(data):
         (nd._COLLECTOR, (MAC,)),
     ):
         plan = " | ".join(r[3] for r in data.inv.execute("EXPLAIN QUERY PLAN " + sql, params))
-        assert not re.search(r"SCAN (m|a)\b", plan), plan
+        assert not re.search(r"SCAN (m|a|e)\b", plan), plan
 
 
 def test_thousands_of_unmeasured_candidates_stay_cheap_and_do_not_starve_the_queue(data):
@@ -75,6 +76,11 @@ def test_thousands_of_unmeasured_candidates_stay_cheap_and_do_not_starve_the_que
             " VALUES (?,?,0,'self',?,?)",
             (mac, f"dev-{i}", iso_utc(T0), iso_utc(T0)),
         )
+    data.inv.executemany(
+        "INSERT INTO events (id, device_id, ts, kind, severity, summary)"
+        " VALUES (?,?,?,'new_device','info','x')",
+        [(f"ev-{i}", f"dev-{i}", iso_utc(T0)) for i in range(len(forged))],
+    )
     data.inv.executemany("INSERT INTO mac_first_received VALUES (?,?)", [(m, T0) for m in forged])
     data.inv.executemany(
         "INSERT INTO mac_activity VALUES (?,?,?)", [(m, T0, T0 + DWELL + SK) for m in forged]
@@ -117,6 +123,7 @@ def test_the_first_ever_run_sets_both_keys(data):
     assert meta(data, "f5_") == {
         "f5_enabled_since": str(T0 - 60),
         "f5_last_run": str(T0 - 60),
+        "f5_floor": "0",
     }
 
 
@@ -180,9 +187,9 @@ def test_unmeasured_devices_are_counted_in_a_log_line_without_macs(data, caplog)
 
 # ---- F: survivors ------------------------------------------------------------------------------
 def test_a_returning_pre_watermark_device_never_notifies(data):
-    """Only the d.first_seen >= watermark guard stops this: the flag goes on after the device's
+    """Only the creation-event floor stops this: the flag goes on after the device's
     activity anchor expired, so the device is never a candidate before it returns; its fresh
-    receipt anchor then looks new while the device row keeps its old first_seen."""
+    receipt anchor then looks new while its creation event keeps the old sequence."""
     arrive(data, MAC, at=T0 - 12 * DAY)
     ticks(data, T0 - 12 * DAY + DWELL + 1, T0 - 120, step=5 * HOUR, new_device_notice=False)
     assert data.q("SELECT * FROM mac_first_received") == []  # the anchor expired (7 d retention)
@@ -190,17 +197,6 @@ def test_a_returning_pre_watermark_device_never_notifies(data):
     arrive(data, MAC, at=T0)
     ticks(data, T0 + DWELL + 1, T0 + DWELL + 7 * 60, step=60)
     assert incidents(data) == [] and meta(data, "f5_skipped:") == {}
-
-
-def test_a_device_first_received_before_the_watermark_never_notifies(data):
-    """Collector stamps after the watermark cannot make a device new: its receipt anchor decides."""
-    since = T0 + 1000
-    run(data, since)
-    data.add_batch(since + 10, neigh=[MAC], received=since - 100)
-    data.add_batch(since + 10 + DWELL + SK, neigh=[MAC])
-    meas(data, MAC)
-    run(data, since + DWELL + 20)
-    assert incidents(data) == []
 
 
 def test_a_device_merged_into_an_unmeasured_newer_one_is_not_noticed(data):
@@ -224,7 +220,7 @@ def test_a_run_reads_at_most_twenty_devices_and_reports_the_held_one(data):
     run(data, T0 + DWELL + 400, new_device_max_per_day=20)
     assert len(incidents(data)) == 20
     (capped,) = events(data, "new_device_capped")
-    assert "; 1 held" in capped["summary"]  # 21 read, 20 handled: the bound is 20
+    assert "; 10 held" in capped["summary"]  # 21 read, 20 handled: the bound is 20
 
 
 def test_a_database_error_mid_sweep_is_contained_and_the_next_run_works(data, monkeypatch):

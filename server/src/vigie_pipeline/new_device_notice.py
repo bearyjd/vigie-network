@@ -6,34 +6,50 @@ randomized; it persisted like a promotion candidate (>= PROMOTE_MIN_HOURS distin
 `transient_min_dwell_s`) measured from the server-anchored `mac_first_received` to the last
 `mac_activity` end MINUS ACTIVITY_SKEW_S: a collector stamp may lead its batch's receipt by that
 much, so `end - skew` never exceeds the true receipt time and clock skew cannot manufacture dwell or
-a second server hour; it first arrived after the `f5_enabled_since` watermark; it is not stitched
-into, and has not absorbed, an older or an already-noticed device; a collector measured it. At most
-`new_device_max_per_day` notices per UTC day, at most SWEEP_MAX devices read per run, in
-(first_seen, id) order.
+a second server hour; it was created AFTER the floor (below); it is not stitched into, and has not
+absorbed, an older or an already-noticed device; a collector measured it. At most
+`new_device_max_per_day` notices per UTC day, at most SWEEP_MAX devices handled per run, in creation
+order.
 
-Watermark: set at the first enabled run and MOVED to `now` whenever the sweep has not run for
-RESUME_GAP_S (flag switched off and on again, or a pipeline outage) or the clock stepped back (the
-last run lies in the future). Devices that arrived while the sweep was not running
-never notify (a missed notice beats a spurious one). `f5_last_run` records the last run.
+Floor ("new since enable"): `f5_floor` is the highest `events.seq` ever issued when the sweep was
+(re-)enabled. Every device gets exactly one `new_device` event at creation (unique per device,
+`uq_events_new_device`), and `events.seq` is AUTOINCREMENT: server-assigned, monotonic, never
+reused or renumbered. A `devices` rowid is not safe: that table has a TEXT primary key, so VACUUM
+may renumber its rowids. A device is "new" iff its `new_device` event has seq > floor. No wall
+clock and no collector stamp takes part, so a stale collector timestamp cannot make a new device
+look old and a clock step cannot lower the floor; a returning old device keeps its old event and
+stays excluded. Processing order, not receipt time, is the definition: a device whose batch is
+processed after the floor was set counts as new even if the batch was received earlier (a lagging
+pipeline).
+
+The floor moves forward to the newest event when the sweep did not run for more than RESUME_GAP_S
+(the flag was switched off and on again, the pipeline or its overrides store was down, or the clock
+stepped forward by more than that) or its stored state is unreadable. It is NOT watertight for short
+gaps: a toggle or outage shorter than RESUME_GAP_S keeps the old floor, so devices that arrived and
+dwelled in that window are noticed. When the clock steps BACK (last run in the future) the pass
+opens nothing, changes no floor and re-bases `f5_last_run` to now. `f5_enabled_since` (epoch of the
+last floor move) is informational.
 
 Hold age: a device that is eligible but not noticed (daily cap) is dropped once it has been held
-HOLD_MAX_AGE_S. The age starts at the first pass where the device was NOTICEABLE (eligibility met,
-measured, lineage resolved, not merged), persisted as `f5_eligible:<device_id>` (only for the
-<= SWEEP_MAX devices of a run's slice; deleted when the device is noticed or skipped, cleared on a
-watermark reset). Ageing from first receipt would drop a device that only qualifies late (back
-after days, or measured after days) in the very pass where it first becomes eligible.
+HOLD_MAX_AGE_S. The age starts at the first pass where the device was among the first FETCH_MAX
+candidates (`f5_eligible:<device_id>`, written for those in one bulk statement and deleted when the
+device is noticed, skipped, backed off or no longer a candidate: a bounded scan of at most
+2 * FETCH_MAX stamps and expired backoffs per run; a floor move leaves no candidate, so it empties
+the stamps the same way). A device behind more than FETCH_MAX candidates is stamped when it enters
+that window.
 
 Once per device life: `pipeline_meta` key `f5_noticed:<device_id>` is written in the SAME
 transaction as the incident. The `new_device` event cannot be that guard: it exists for every
 device. `f5_skipped:<device_id>` marks a device that is never noticed (merged, or dropped as stale);
 it is permanent. A failing lineage is NOT a skip: `f5_retry:<device_id>` = `count|retry_after`
-backs it off (1 h doubling to 24 h) and removes it from the batch selection meanwhile. The incident
-id is random (sha256 of 16 random bytes): never derived from the MAC or the device.
+backs it off (1 h doubling to 24 h) and removes it from the candidate selection meanwhile. The
+incident id is random (sha256 of 16 random bytes): never derived from the MAC or the device.
 
 The incident row is bytes-centric: observed/threshold are 0 and the evidence carries the data. It
 holds no MAC, hostname, vendor or IP. The upload engine never touches it. Closing: a decision of
 `acknowledged` or `expected` in overrides.db resolves it here (the API never writes inventory.db).
-Nothing else closes it; no recover is ever sent (delivery_types.OPEN_ONLY_DETECTORS).
+Nothing else closes it; no recover is ever sent (delivery_types.OPEN_ONLY_DETECTORS). Per-pass cost
+is O(candidates) (at most FETCH_MAX rows) in two small write transactions (open, close).
 """
 
 from __future__ import annotations
@@ -53,20 +69,22 @@ from vigie_pipeline.stitch_db import emit_once
 logger = logging.getLogger("vigie_pipeline")
 DETECTOR = "new_device"
 SWEEP_MAX = 20  # devices handled per run
+FETCH_MAX = 200  # candidates read and hold-stamped per run
 CLOSE_MAX = 200  # open incidents examined per run for an owner decision (cursor-rotated)
 PROMOTE_MIN_HOURS = 2  # keep equal to processor.PROMOTE_MIN_HOURS (asserted by a test)
-RESUME_GAP_S = 6 * 3600  # no sweep for longer than this = re-enabled or outage: watermark moves
-HOLD_MAX_AGE_S = 72 * 3600  # a noticeable device held this long by the cap is dropped
+RESUME_GAP_S = 900  # the pipeline loops every 30 s: no sweep for 15 min = re-enabled or outage
+HOLD_MAX_AGE_S = 72 * 3600  # a candidate held this long by the cap is dropped
 RETRY_BASE_S = 3600  # first lineage backoff; doubles per failure up to RETRY_MAX_S
 RETRY_MAX_S = 86400
 REFERENCE_PROBES = 8  # devices tried to tell a store problem from a per-device lineage failure
-WATERMARK_KEY = "f5_enabled_since"
+SINCE_KEY = "f5_enabled_since"  # informational: epoch of the last floor move
+FLOOR_KEY = "f5_floor"
 LAST_RUN_KEY = "f5_last_run"
 CLOSE_CURSOR_KEY = "f5_close_cursor"
 NOTICED = "f5_noticed:"  # + device id; value = UTC ISO timestamp of the notice
 SKIPPED = "f5_skipped:"  # + device id; value = "<ISO> <reason>"; permanent
 RETRY = "f5_retry:"  # + device id; value = "<failures>|<retry after, epoch>"
-ELIGIBLE = "f5_eligible:"  # + device id; value = epoch of the first noticeable pass
+ELIGIBLE = "f5_eligible:"  # + device id; value = epoch of the first pass it was a candidate
 DROPPED = "f5_dropped:"  # + UTC day; value = stale drops that day (older days are cleaned)
 QUIET = ("acknowledged", "expected")  # incident_decisions.status values that close the incident
 
@@ -76,11 +94,13 @@ _SELECT = (
     " AS last_end"
 )
 _FROM = (
-    " FROM devices d JOIN observations o ON o.device_id=d.id AND o.mac=("
+    " FROM events e JOIN devices d ON d.id=e.device_id"
+    " JOIN observations o ON o.device_id=d.id AND o.mac=("
     "  SELECT o2.mac FROM observations o2 WHERE o2.device_id=d.id ORDER BY o2.first_seen, o2.mac"
     "  LIMIT 1)"
     " JOIN mac_first_received mf ON mf.mac=o.mac"
-    " WHERE o.is_randomized=0 AND d.status<>'retired' AND d.first_seen>=?"
+    " WHERE e.kind='new_device' AND e.seq>?"
+    " AND o.is_randomized=0 AND d.status<>'retired'"
     " AND NOT EXISTS (SELECT 1 FROM pipeline_meta p WHERE p.key IN (? || d.id, ? || d.id))"
     " AND NOT EXISTS (SELECT 1 FROM pipeline_meta r WHERE r.key = ? || d.id"
     "  AND CAST(substr(r.value, instr(r.value, '|') + 1) AS INTEGER) > ?)"
@@ -97,13 +117,22 @@ _COLLECTOR = (
     "SELECT c.id FROM collectors c WHERE EXISTS (SELECT 1 FROM measurements_hourly m"
     " WHERE m.collector_id=c.id AND m.mac=?) ORDER BY c.id LIMIT 1"
 )
-FRESH_SQL = f"{_SELECT}{_FROM} AND {_MEASURED} ORDER BY d.first_seen, d.id LIMIT ?"  # noqa: S608
+FRESH_SQL = f"{_SELECT}{_FROM} AND {_MEASURED} ORDER BY e.seq LIMIT ?"  # noqa: S608
 UNMEASURED_SQL = f"SELECT COUNT(*) FROM ({_SELECT}{_FROM} AND NOT {_MEASURED} LIMIT ?)"  # noqa: S608
 
 
 def _meta(inv: sqlite3.Connection, key: str) -> str | None:
     row = inv.execute("SELECT value FROM pipeline_meta WHERE key=?", (key,)).fetchone()
     return None if row is None else row[0]
+
+
+def _meta_int(inv: sqlite3.Connection, key: str) -> int | None:
+    """A stored integer, or None when absent or not an integer (never raises on a bad value)."""
+    raw = _meta(inv, key)
+    try:
+        return None if raw is None else int(raw)
+    except ValueError:
+        return None
 
 
 def _put(inv: sqlite3.Connection, key: str, value: str) -> None:
@@ -115,45 +144,52 @@ def _upper(prefix: str) -> str:
     return prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
-def _clear(inv: sqlite3.Connection, prefix: str) -> None:
-    inv.execute("DELETE FROM pipeline_meta WHERE key>=? AND key<?", (prefix, _upper(prefix)))
+def _issued_events(inv: sqlite3.Connection) -> int:
+    """The highest events.seq ever issued (AUTOINCREMENT keeps it even after deletions)."""
+    row = inv.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()
+    return 0 if row is None else int(row[0])
 
 
-def _watermark(inv: sqlite3.Connection, now: float) -> int:
-    """Set at the first run; moved to `now` when the sweep did not run for RESUME_GAP_S or the
-    clock stepped back, so a flag that was off, an outage or a clock step never back-fills and
-    never pins the watermark in the future. `f5_last_run` is always `now`."""
-    since, last = _meta(inv, WATERMARK_KEY), _meta(inv, LAST_RUN_KEY)
+def _floor(inv: sqlite3.Connection, now: float) -> int | None:
+    """The floor to use this pass, or None when the pass must not open anything (clock stepped
+    back). Set at the first run; moved to the newest event when the sweep did not run for more than
+    RESUME_GAP_S or its stored state is unreadable; never moved by a backward clock step."""
+    floor, last = _meta_int(inv, FLOOR_KEY), _meta_int(inv, LAST_RUN_KEY)
     reason = None
-    if since is None or last is None:
-        reason = "first_run"
-    elif int(last) > now:
-        reason = "clock_stepped_back"
-    elif now - int(last) > RESUME_GAP_S:
+    if floor is None or last is None:
+        reason = "first_run" if _meta(inv, LAST_RUN_KEY) is None else "invalid_state"
+    elif last > now:
+        _put(inv, LAST_RUN_KEY, str(int(now)))
+        log(logger, logging.WARNING, "new_device_watermark_moved", reason="clock_stepped_back")
+        return None
+    elif now - last > RESUME_GAP_S:
         reason = "resumed"
     if reason:
-        since = str(int(now))
-        _put(inv, WATERMARK_KEY, since)
-        _clear(inv, ELIGIBLE)
-        _clear(inv, RETRY)
+        floor = _issued_events(inv)
+        _put(inv, FLOOR_KEY, str(floor))
+        _put(inv, SINCE_KEY, str(int(now)))
         if reason != "first_run":
             log(logger, logging.WARNING, "new_device_watermark_moved", reason=reason)
     _put(inv, LAST_RUN_KEY, str(int(now)))
-    return int(since)
+    return floor
 
 
-def _is_new(inv: sqlite3.Connection, identity: Lineage, device_id: str, since: int) -> bool:
-    """Not stitched into another device; every MAC of its lineage first reached the server after
-    the watermark (an unanchored MAC fails closed); no member was already noticed (a merge after
+def _is_new(inv: sqlite3.Connection, identity: Lineage, device_id: str, floor: int) -> bool:
+    """Not stitched into another device; every device of its lineage was created after the floor
+    (a device without a creation event fails closed); no member was already noticed (a merge after
     a notice must not produce a second incident)."""
     if identity.device_id != device_id or not identity.macs:
         return False
     marks = ",".join("?" * len(identity.macs))
-    fresh = inv.execute(
-        f"SELECT COUNT(*) FROM mac_first_received WHERE received>=? AND mac IN ({marks})",  # noqa: S608
-        (since, *identity.macs),
-    ).fetchone()[0]
-    if fresh != len(identity.macs):
+    total, fresh = inv.execute(
+        "SELECT COUNT(DISTINCT o.device_id),"  # noqa: S608
+        " COUNT(DISTINCT CASE WHEN e.seq>? THEN o.device_id END)"
+        " FROM observations o LEFT JOIN events e"
+        " ON e.device_id=o.device_id AND e.kind='new_device'"
+        f" WHERE o.mac IN ({marks})",
+        (floor, *identity.macs),
+    ).fetchone()
+    if total != fresh:
         return False
     noticed = inv.execute(
         "SELECT COUNT(*) FROM observations o JOIN pipeline_meta p ON p.key = ? || o.device_id"  # noqa: S608
@@ -200,19 +236,36 @@ def _skip(inv: sqlite3.Connection, device_id: str, now: float, reason: str) -> N
     _forget(inv, device_id)
 
 
-def _noticeable_since(inv: sqlite3.Connection, device_id: str, now: float) -> int:
-    """Epoch of the first pass where the device was noticeable (see the module docstring)."""
-    inv.execute(
+def _stamp(inv: sqlite3.Connection, rows: list[sqlite3.Row], now: float) -> None:
+    """Hold age: one bulk write stamping every candidate read this run (at most FETCH_MAX), and a
+    bounded cleanup of stamps and expired backoffs of devices that are no longer candidates."""
+    inv.executemany(
         "INSERT OR IGNORE INTO pipeline_meta (key, value) VALUES (?, ?)",
-        (ELIGIBLE + device_id, str(int(now))),
+        [(ELIGIBLE + r["id"], str(int(now))) for r in rows],
     )
-    return int(_meta(inv, ELIGIBLE + device_id))
+    live = {r["id"] for r in rows}
+    stamps = inv.execute(
+        "SELECT key FROM pipeline_meta WHERE key>=? AND key<? LIMIT ?",
+        (ELIGIBLE, _upper(ELIGIBLE), 2 * FETCH_MAX),
+    ).fetchall()
+    gone = [(k[0],) for k in stamps if k[0][len(ELIGIBLE) :] not in live]
+    retries = inv.execute(
+        "SELECT key, CAST(substr(value, instr(value, '|') + 1) AS INTEGER) FROM pipeline_meta"
+        " WHERE key>=? AND key<? LIMIT ?",
+        (RETRY, _upper(RETRY), 2 * FETCH_MAX),
+    ).fetchall()
+    gone += [(k,) for k, until in retries if until <= now and k[len(RETRY) :] not in live]
+    inv.executemany("DELETE FROM pipeline_meta WHERE key=?", gone)
 
 
 def _lineage_failed(inv: sqlite3.Connection, device_id: str, now: float) -> None:
-    """Back the device off (never skip it): 1 h, doubling per failure, at most 24 h."""
-    raw = _meta(inv, RETRY + device_id)
-    count = int(raw.split("|")[0]) + 1 if raw else 1
+    """Back the device off (never skip it): 1 h, doubling per failure, at most 24 h. While backed
+    off it is no candidate, so `_stamp` drops its hold stamp: the age restarts when it resolves."""
+    raw = _meta(inv, RETRY + device_id) or ""
+    try:
+        count = int(raw.split("|")[0]) + 1
+    except ValueError:
+        count = 1
     delay = min(RETRY_BASE_S * 2 ** min(count - 1, 10), RETRY_MAX_S)
     _put(inv, RETRY + device_id, f"{count}|{int(now) + delay}")
 
@@ -246,7 +299,7 @@ def _record_dropped(inv: sqlite3.Connection, day: str, count: int, now: float) -
     """One `new_device_dropped` event per UTC day whose summary carries the day's running count
     (no MAC); the counter keys of older days are cleaned."""
     key = DROPPED + day
-    total = int(_meta(inv, key) or 0) + count
+    total = (_meta_int(inv, key) or 0) + count
     _put(inv, key, str(total))
     inv.execute(
         "DELETE FROM pipeline_meta WHERE key>=? AND key<? AND key<>?",
@@ -260,9 +313,9 @@ def _record_dropped(inv: sqlite3.Connection, day: str, count: int, now: float) -
     log(logger, logging.WARNING, "new_device_dropped", count=count, day=day)
 
 
-def _params(since: int, config: PipelineConfig, now: float, *extra: int) -> tuple:
+def _params(floor: int, config: PipelineConfig, now: float, *extra: int) -> tuple:
     return (
-        iso_utc(since),
+        floor,
         NOTICED,
         SKIPPED,
         RETRY,
@@ -273,64 +326,91 @@ def _params(since: int, config: PipelineConfig, now: float, *extra: int) -> tupl
     )
 
 
+def _classify(
+    inv: sqlite3.Connection,
+    ov: sqlite3.Connection | None,
+    row: sqlite3.Row,
+    floor: int,
+    now: float,
+) -> tuple[str, Lineage | None]:
+    """failed (lineage unavailable) | merged | stale (held too long) | ready."""
+    try:
+        identity = lineage(inv, ov, row["id"])
+    except LineageUnavailable:
+        return "failed", None
+    if not _is_new(inv, identity, row["id"], floor):
+        return "merged", None
+    stamp = _meta_int(inv, ELIGIBLE + row["id"])
+    if stamp is not None and now - stamp > HOLD_MAX_AGE_S:
+        return "stale", None
+    return "ready", identity
+
+
+def _report(
+    inv: sqlite3.Connection, config: PipelineConfig, now: float, counts: dict[str, int]
+) -> None:
+    """Events and logs of one pass: the cap (held), stale drops, lineage failures, unmeasured."""
+    day = iso_utc(now)[:10]
+    if counts["dropped"]:
+        _record_dropped(inv, day, counts["dropped"], now)
+    if counts["held"]:  # only a reached cap holds a device back
+        cap = config.new_device_max_per_day
+        emit_once(
+            inv,
+            None,
+            "new_device_capped",
+            "warn",
+            f"new-device notice cap {cap}/day reached; "
+            f"{counts['held']} held (counted up to {FETCH_MAX})",
+            day,
+            now,
+        )
+        log(logger, logging.INFO, "new_device_capped", held=counts["held"], day=day)
+    if counts["failed"]:
+        log(logger, logging.WARNING, "new_device_lineage_unavailable", devices=counts["failed"])
+    if counts["unmeasured"]:  # eligible but no collector measured them: they wait, with a trace
+        log(logger, logging.INFO, "new_device_unmeasured", devices=counts["unmeasured"])
+
+
 def _open_new_incidents(
     inv: sqlite3.Connection, ov: sqlite3.Connection | None, config: PipelineConfig, now: float
 ) -> int:
-    day = iso_utc(now)[:10]
     with immediate(inv):
-        since = _watermark(inv, now)
+        floor = _floor(inv, now)
+        if floor is None:
+            return 0
         used = inv.execute(
             "SELECT COUNT(*) FROM pipeline_meta WHERE key>=? AND key<? AND substr(value,1,10)=?",
-            (NOTICED, _upper(NOTICED), day),
+            (NOTICED, _upper(NOTICED), iso_utc(now)[:10]),
         ).fetchone()[0]
         room = max(0, config.new_device_max_per_day - used)
-        rows = inv.execute(FRESH_SQL, _params(since, config, now, SWEEP_MAX + 1)).fetchall()
-        opened = held = dropped = 0
+        rows = inv.execute(FRESH_SQL, _params(floor, config, now, FETCH_MAX)).fetchall()
+        _stamp(inv, rows, now)
+        counts = {"dropped": 0, "held": 0, "failed": 0, "unmeasured": 0}
         failed: list[str] = []
+        opened = 0
         for row in rows[:SWEEP_MAX]:
-            try:
-                identity = lineage(inv, ov, row["id"])
-            except LineageUnavailable:
+            verdict, identity = _classify(inv, ov, row, floor, now)
+            if verdict == "failed":
                 failed.append(row["id"])
-                continue
-            if not _is_new(inv, identity, row["id"], since):
-                _skip(inv, row["id"], now, "merged")
-                continue
-            if now - _noticeable_since(inv, row["id"], now) > HOLD_MAX_AGE_S:
-                _skip(inv, row["id"], now, "stale")  # held by the cap too long: dropped, not late
-                dropped += 1
-                continue
-            if room <= 0:
-                held += 1
-                continue
-            _open_incident(inv, row, identity, now)
-            room, opened = room - 1, opened + 1
+            elif verdict in ("merged", "stale"):
+                _skip(inv, row["id"], now, verdict)
+                counts["dropped"] += verdict == "stale"
+            elif room <= 0:
+                counts["held"] += 1
+            else:
+                _open_incident(inv, row, identity, now)
+                room, opened = room - 1, opened + 1
         if failed and not _systemic(inv, ov, failed, len(failed) < len(rows[:SWEEP_MAX])):
             for device_id in failed:
                 _lineage_failed(inv, device_id, now)
         if room <= 0:
-            held += max(0, len(rows) - SWEEP_MAX)
-        if dropped:
-            _record_dropped(inv, day, dropped, now)
-        if held:  # only a reached cap holds a device back
-            emit_once(
-                inv,
-                None,
-                "new_device_capped",
-                "warn",
-                f"new-device notice cap {config.new_device_max_per_day}/day reached; "
-                f"{held} held (counted up to {SWEEP_MAX + 1})",
-                day,
-                now,
-            )
-            log(logger, logging.INFO, "new_device_capped", held=held, day=day)
-        if failed:
-            log(logger, logging.WARNING, "new_device_lineage_unavailable", devices=len(failed))
-        unmeasured = inv.execute(UNMEASURED_SQL, _params(since, config, now, SWEEP_MAX)).fetchone()[
-            0
-        ]
-        if unmeasured:  # eligible but no collector measured them: they wait, with a trace
-            log(logger, logging.INFO, "new_device_unmeasured", devices=unmeasured)
+            counts["held"] += max(0, len(rows) - SWEEP_MAX)
+        counts["failed"] = len(failed)
+        counts["unmeasured"] = inv.execute(
+            UNMEASURED_SQL, _params(floor, config, now, SWEEP_MAX)
+        ).fetchone()[0]
+        _report(inv, config, now, counts)
     return opened
 
 
@@ -341,7 +421,7 @@ def _close_reviewed(inv: sqlite3.Connection, ov: sqlite3.Connection | None) -> i
     if ov is None:
         return 0
     with immediate(inv):
-        after = int(_meta(inv, CLOSE_CURSOR_KEY) or 0)
+        after = _meta_int(inv, CLOSE_CURSOR_KEY) or 0
         batch = inv.execute(
             "SELECT seq, id FROM monitoring_incidents WHERE detector=? AND state='open'"
             " AND seq>? ORDER BY seq LIMIT ?",
@@ -378,11 +458,22 @@ def sweep_new_devices(
     inv: sqlite3.Connection, ov: sqlite3.Connection | None, config: PipelineConfig, now: float
 ) -> int:
     """Open at most the daily allowance of new-device incidents and close the reviewed ones.
-    Returns the number opened. A database error is logged and contained: it never fails the pass."""
-    try:
-        opened = _open_new_incidents(inv, ov, config, now)
-        _close_reviewed(inv, ov)
-    except sqlite3.Error as exc:
-        log(logger, logging.ERROR, "new_device_sweep_failed", error=type(exc).__name__)
-        return 0
+    Returns the number opened. Any Exception (a database error, a bad stored value, a bug) is
+    logged by class name only and contained at this boundary: it never fails the pass, and the
+    close step still runs when the open step failed."""
+    opened = 0
+    for step in ("open", "close"):
+        try:
+            if step == "open":
+                opened = _open_new_incidents(inv, ov, config, now)
+            else:
+                _close_reviewed(inv, ov)
+        except Exception as exc:  # noqa: BLE001 - the sweep must never fail the pipeline pass
+            log(
+                logger,
+                logging.ERROR,
+                "new_device_sweep_failed",
+                step=step,
+                error=type(exc).__name__,
+            )
     return opened

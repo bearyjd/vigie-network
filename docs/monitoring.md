@@ -1244,39 +1244,61 @@ least `VIGIE_TRANSIENT_MIN_DWELL_S` (default 2 h), and those two instants lie in
 server hours (a dwell shorter than an hour still needs an hour boundary between them). A collector
 stamp may lead its batch's receipt by up to 300 s, so subtracting that skew makes the last-activity
 instant a lower bound of the true last receipt: clock skew cannot manufacture dwell or a second
-server hour. An honest collector therefore needs 300 s more than the dwell. (3) It first arrived
-after `f5_enabled_since`, a `pipeline_meta` watermark (see below): existing devices never notify.
-(4) It is not stitched into another device, has not absorbed one (every MAC of its lineage arrived
-after the watermark), and no member of its lineage was already noticed. (5) A collector has measured
-it (the incident is collector-scoped; the lowest collector id that measured the MAC is used).
-Hostnames, DHCP options and mDNS names are never signals and never appear in any text. A cloned
-known MAC is not new, so no notice is sent for it: a known gap F5 does not cover.
+server hour. An honest collector therefore needs 300 s more than the dwell. (3) It was created after
+the floor (next section): existing devices never notify. (4) It is not stitched into another
+device, has not absorbed one (every device of its lineage was created after the floor), and no member
+of its lineage was already noticed. (5) A collector has measured it (the incident is
+collector-scoped; the lowest collector id that measured the MAC is used). Hostnames, DHCP options and
+mDNS names are never signals and never appear in any text. A cloned known MAC is not new, so no
+notice is sent for it: a known gap F5 does not cover.
 
-**Watermark and re-enable.** The sweep records `f5_last_run` on every run. The first run sets
-`f5_enabled_since` to now. A run after the sweep has not run for more than 6 hours (`RESUME_GAP_S`:
-the flag was switched off and on again, or the pipeline was down), or with the clock behind the last
-run, moves it to now and logs `new_device_watermark_moved` (a reason, no device data); a clock step
-therefore never pins the watermark in the future. Because the rule is `first_seen >= watermark`,
-every device that arrived before the move never notifies, including devices that were eligible but
-still waiting (the cap backlog or an unmeasured device): the move drops the pending backlog as well
-as what arrived during the gap. This is conservative on purpose: a missed notice is preferred over a
-spurious one.
+**The floor ("new since enable").** The sweep keeps `f5_floor`, the highest `events.seq` ever issued
+when it was (re-)enabled. Every device gets exactly one `new_device` event when it is created, and
+`events.seq` is AUTOINCREMENT: server-assigned, monotonic, never reused or renumbered. (A `devices`
+rowid is not usable: that table has a text primary key, so VACUUM may renumber its rowids.) A device
+is new iff its creation event has seq above the floor; the queue is in that order. No wall clock and
+no collector timestamp takes part: a stale collector stamp (a router without a clock) cannot hide a
+new device, a backward clock step cannot lower the floor, and a returning old device keeps its old
+event and stays excluded even after its activity record was rebuilt. Processing order is the
+definition: a device whose batch is processed after the floor was set counts as new even if the
+batch was received earlier (a lagging pipeline).
+
+**When the floor moves, and what is lost.** The sweep records `f5_last_run` on every run; the first
+run sets the floor. The floor moves forward to the newest event (and `f5_enabled_since` records the
+time) in exactly these cases: (a) the sweep did not run for more than 15 minutes (`RESUME_GAP_S`,
+900 s; the pipeline loops every 30 s): the flag was switched off and on again, the pipeline was
+down, the overrides store was unreadable for that long (the pass then skips the sweep), or the clock
+stepped forward by more than that; (b) the stored floor or last-run value is unreadable. A move drops
+the pending backlog: every device created before it never notifies, including devices that were
+eligible but waiting (cap-held, unmeasured, backed off). A toggle or outage SHORTER than 15 minutes
+does not move the floor, so devices that arrived and dwelled inside that window can be noticed. The
+gap is measured on the wall clock, so a backward clock step during a flag-off or outage interval can
+make a long gap look short (the floor then does not move and devices created meanwhile can be
+noticed); with no backward step, the randomized check found no such case. A
+backward clock step (the last run lies in the future) makes that one pass open nothing, logs
+`new_device_watermark_moved` (a reason, no device data), changes no floor and re-bases the last run.
+Permanent losses, stated plainly: the pending backlog at a floor move, a device dropped as stale (see
+below), a device skipped as merged, and every device that arrived during a longer toggle or outage.
+A missed notice is preferred over a spurious one.
 
 **Cap, hold and drop.** At most `VIGIE_NEW_DEVICE_MAX_PER_DAY` (default 3; plain decimal digits,
 integer 1..20; anything else, an underscore or an explicitly empty value fails at startup without
-echoing the value) incidents per UTC day, in (first_seen, id) order, and at most 20 devices handled
-per run. Compose forwards both variables with `${VAR-default}` (`0` and `3`): only an unset variable
-gets the default. A device the cap holds back is noticed on a later day, but a device still
-unnoticed 72 hours after it FIRST BECAME NOTICEABLE (the first pass where its eligibility, a
-measurement and its lineage all held) is DROPPED for good (`f5_skipped:<id>`, reason `stale`): a late
-notice about a long-present device is worse than none. The age is counted from noticeability, not
-from first receipt, so a device that only qualifies late (back after days, or measured after days)
-is noticed, not dropped. A LAN attacker who keeps durable forged non-randomized devices present can
-use up the daily cap; at 3 a day, roughly 9 or more such devices queued ahead of a real one hold it
-past 72 hours and it is dropped permanently. The owner sees this: `new_device_capped` (once per UTC
-day, only when the cap is reached, with the held count, counted only up to 21) means devices are
-being delayed, and `new_device_dropped` (once per UTC day, its summary carries the day's running
-count of stale drops, no MAC) means notices were lost. There is no priority between devices.
+echoing the value) incidents per UTC day, in creation order, and at most 20 devices handled per run.
+Compose forwards both variables with `${VAR-default}` (`0` and `3`): only an unset variable gets the
+default. A device the cap holds back is noticed on a later day, but a device still unnoticed 72 hours
+after it was first among the candidates is DROPPED for good (`f5_skipped:<id>`, reason `stale`): a
+late notice about a long-present device is worse than none. Each run reads up to 200 candidates
+(`FETCH_MAX`) and stamps all of them in one bulk write (`f5_eligible:<id>`), so the age of a device
+behind a flood starts at its first pass, not when it reaches the front; a device behind more than
+200 candidates is stamped when it enters that window. Stamps (and expired backoffs) of devices that
+are no longer candidates (noticed, skipped, retired, backed off, gone) are removed by a scan of at
+most 400 keys per run, so a device that returns does not drop because of a leftover stamp. A LAN
+attacker who keeps durable forged non-randomized devices present can use up the daily cap; at 3 a
+day, roughly 9 or more such devices queued ahead of a real one hold it past 72 hours and it is
+dropped permanently. The owner sees this: `new_device_capped` (once per UTC day, only when the cap is
+reached, with the held count, counted only up to 200) means devices are being delayed, and
+`new_device_dropped` (once per UTC day, its summary carries the day's running count of stale drops,
+no MAC) means notices were lost. There is no priority between devices.
 
 **The incident.** Detector `new_device`, `observed_bytes=0`, `threshold_bytes=0`, evidence exactly
 `{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}`; no MAC, hostname,
@@ -1288,16 +1310,22 @@ transaction as the incident. `f5_skipped:<device id>` marks a device that is nev
 into or over another device, or dropped as stale. A skip is permanent even if the merge is later
 revoked. A re-run, a closed incident, a retired then revived device or a lineage change never
 produces a second incident for the same device; merging a noticed device into a later one does not
-notice the later one either. The existing `new_device` event cannot serve as the guard: it exists
-for every device. A lineage that cannot be resolved (too many MACs, a large identity component) is
-never a permanent skip, because an attacker could aim that at a real device: the device is backed
-off (`f5_retry:<id>`, 1 hour doubling to 24 hours), left out of the batch meanwhile so it cannot
-starve the others, and retried until it resolves. A failure that hits every device (a store
-problem, tested on up to 8 reference devices) blames and backs off nobody. Keys written per device
-(`f5_eligible`, `f5_retry`) exist only for devices in a run's 20-device slice and are removed when
-the device is noticed or skipped or the watermark moves; `f5_noticed` and `f5_skipped` are never
-pruned (at most 20 per run, only for devices that already exist, so growth is bounded by the device
-count; the daily cap reads them through a key range).
+notice the later one either. The creation event cannot serve as the guard: it exists for every
+device. A lineage that cannot be resolved (too many MACs, a large identity component) is never a
+permanent skip, because an attacker could aim that at a real device: the device is backed off
+(`f5_retry:<id>` = `count|retry-after`, 1 hour doubling to 24 hours), left out of the candidates
+meanwhile so it cannot starve the others, and retried until it resolves. A failure that hits every
+device (a store problem, tested on up to 8 reference devices) blames and backs off nobody.
+`f5_noticed` and `f5_skipped` are never pruned (at most 20 per run, only for devices that already
+exist, so growth is bounded by the device count; the daily cap reads them through a key range).
+
+**Cost and containment.** A pass costs O(candidates): one candidate query of at most 200 rows,
+a bulk stamp, a cleanup scan of at most 400 keys, at most 20 lineage lookups, in two small write
+transactions (open, then close-on-review). Any exception in the sweep (a database error, a bad
+stored value, a bug) is contained at its boundary and logged once per run as
+`new_device_sweep_failed` with the exception class only, so the pass (purge, upload monitoring,
+delivery) never fails because of F5; stored values are parsed defensively and a corrupt one resets
+the floor instead of failing.
 
 **Review and close.** An incident stays open until the owner reviews it. A decision of
 `acknowledged` or `expected` (the existing decision path) makes the sweep resolve the incident on a
@@ -1317,9 +1345,10 @@ up to twice the daily cap (at most 40, default 6). The same rule means a deliver
 24 hours can drop the notice of an incident that had no row yet (an accepted trade-off).
 
 **Silent waits.** A device no collector measured waits, however long, and is noticed once measured
-(nothing is invented as a fallback collector); the sweep logs `new_device_unmeasured` with a count
-and no MAC each run. A lineage failure is logged as `new_device_lineage_unavailable` (count only) and
-a failing decision store as `new_device_close_failed`; neither stops the pass.
+unless the floor moved or it ages out by being held (nothing is invented as a fallback collector);
+the sweep logs `new_device_unmeasured` with a count and no MAC each run. A lineage failure is logged
+as `new_device_lineage_unavailable` (count only) and a failing decision store as
+`new_device_close_failed`; neither stops the pass.
 
 **Known follow-up.** The pre-existing `new_device` event written when a device is first created
 (every new MAC, randomized included) embeds the raw MAC in its summary. F5 does not change it; the
