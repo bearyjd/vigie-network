@@ -1,0 +1,151 @@
+"""VIGIE_DELIVERY_DETECTORS: only allowlisted detectors' incidents reach the delivery planner.
+
+Default = the two upload detectors, so production behaviour is unchanged. A foreign detector
+(F5 `new_device`) opens no delivery row and never gets a recover/forget unless it is allowlisted.
+Policy versions are pinned the same way as test_engine_incident_scope.py.
+"""
+
+from __future__ import annotations
+
+import pytest
+from delivery_runner_helpers import T0, Clock, World, dconf
+from test_probe_freeze import POOLED_VERSION, TOD_VERSION
+
+from vigie_pipeline.config import DeliverySettings, PipelineConfig
+from vigie_pipeline.delivery_publish import FakePublisher
+from vigie_pipeline.delivery_runner import run_delivery
+from vigie_pipeline.processor import monitoring_policy
+
+
+@pytest.fixture
+def world(tmp_path):
+    w = World(tmp_path)
+    yield w
+    w.close()
+
+
+def go(world, pub, clock, **kw):
+    return run_delivery(world.inv, world.ro, pub, dconf(), clock, **kw)
+
+
+def dump(world):
+    keep = ("incident_id", "kind", "state", "attempts", "next_attempt_at", "created_at", "version")
+    return [tuple(r[k] for k in keep) for r in world.rows()]
+
+
+def test_policy_versions_unchanged():
+    assert monitoring_policy(PipelineConfig.from_env({})).version == POOLED_VERSION
+    tod = PipelineConfig.from_env({"VIGIE_MONITORING_BASELINE": "tod"})
+    assert monitoring_policy(tod).version == TOD_VERSION
+
+
+# Captured on main (77dcfa2) before the allowlist existed.
+GOLDEN = [
+    ("a", "open", "sent", 1, 1792000070, 1792000010, 2),
+    ("b", "open", "sent", 1, 1792000070, 1792000010, 2),
+    ("c", "open", "sent", 1, 1792000070, 1792000010, 2),
+    ("c", "recover", "sent", 1, 1792000170, 1792000110, 2),
+]
+
+
+def upload_scenario(world):
+    world.incident("a", detector="large_upload")
+    world.incident("b", detector="upload_deviation", at=T0 + 1)
+    world.incident("c", detector="large_upload", at=T0 + 2)
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    world.set_state("c", "resolved")
+    world.set_state("b", "superseded")
+    clock.t += 100
+    go(world, pub, clock)
+    clock.t += 100
+    go(world, pub, clock)
+    return pub
+
+
+def test_default_allowlist_matches_main_for_upload_incidents(world):
+    pub = upload_scenario(world)
+    assert [m.kind for m in pub.sent] == ["open", "open", "open", "recover"]
+    assert dump(world) == GOLDEN
+
+
+def foreign_scenario(world, **kw):
+    world.incident("f", detector="new_device")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock, **kw)
+    world.set_state("f", "resolved")
+    clock.t += 100
+    go(world, pub, clock, **kw)
+    return pub
+
+
+def test_foreign_detector_creates_no_row_and_no_recover_by_default(world):
+    pub = foreign_scenario(world)
+    assert world.rows() == [] and pub.attempted == []
+
+
+def test_allowlisted_foreign_detector_opens_a_row(world):
+    world.incident("f", detector="new_device")
+    pub = FakePublisher()
+    go(world, pub, Clock(T0 + 10), detectors=("large_upload", "upload_deviation", "new_device"))
+    assert world.states() == {"open": "sent"} and len(pub.sent) == 1
+
+
+def test_dropping_a_detector_from_the_allowlist_expires_pending_rows_and_sends_no_recover(world):
+    world.incident("f", detector="new_device")
+    allow = ("large_upload", "new_device")
+    pub, clock = FakePublisher(), Clock(T0)
+    go(world, pub, clock, detectors=allow, max_per_run=0)  # enqueued, nothing drained
+    assert world.states() == {"open": "pending"}
+    go(world, pub, clock, detectors=("large_upload",))
+    assert world.states() == {"open": "expired"} and pub.attempted == []
+    world.set_state("f", "resolved")
+    clock.t += 100
+    go(world, pub, clock, detectors=("large_upload",))
+    assert world.states() == {"open": "expired"}
+
+
+def test_dropping_a_detector_after_send_never_sends_recover(world):
+    world.incident("f", detector="new_device")
+    allow = ("large_upload", "new_device")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock, detectors=allow)
+    assert world.states() == {"open": "sent"}
+    world.set_state("f", "resolved")
+    clock.t += 100
+    go(world, pub, clock, detectors=("large_upload",))
+    assert world.states() == {"open": "sent"} and [m.kind for m in pub.sent] == ["open"]
+
+
+def det(value=None):
+    env = {} if value is None else {"VIGIE_DELIVERY_DETECTORS": value}
+    return PipelineConfig.from_env({"VIGIE_DATA_DIR": "/nonexistent/x", **env}).delivery.detectors
+
+
+def test_default_detectors():
+    assert det() == ("large_upload", "upload_deviation")
+    assert DeliverySettings().detectors == ("large_upload", "upload_deviation")
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [
+        ("large_upload", ("large_upload",)),
+        (" large_upload , new_device ", ("large_upload", "new_device")),
+        ("a,b,c,d,e,f,g,h", tuple("abcdefgh")),
+        ("a1_" + "b" * 28, ("a1_" + "b" * 28,)),
+    ],
+)
+def test_detector_values(value, want):
+    assert det(value) == want
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "  ", ",", "a,", ",a", "a,,b", "a,a", "Large", "1abc", "a-b", "a b", "x" * 33,
+     "a,b,c,d,e,f,g,h,i", "\u00e9", "a\nb"],
+)  # fmt: skip
+def test_bad_detector_values_fail_fast_without_echoing_them(value):
+    with pytest.raises(ValueError, match="VIGIE_DELIVERY_DETECTORS") as err:
+        det(value)
+    assert len(value) < 3 or value not in str(err.value)

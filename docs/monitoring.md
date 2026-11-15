@@ -360,7 +360,17 @@ design; delivery ids are hashes.
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
 other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
 `_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
-(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `VIGIE_DELIVERY_DETECTORS` (`large_upload,upload_deviation`: the detector allowlist, see below), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+
+**Detector allowlist.** `VIGIE_DELIVERY_DETECTORS` is a comma-separated list (whitespace around commas is
+ignored) of detector ids, 1 to 8 distinct tokens matching `[a-z][a-z0-9_]{0,31}`. Unset means
+`large_upload,upload_deviation`, exactly today's behaviour. Only incidents of a listed detector are
+handed to the delivery planner: any other incident never gets a delivery row, a send, a recover or a
+forget. An empty value, an empty/duplicate/malformed token or more than 8 entries is a startup error
+(the message does not echo the value). The list only narrows what is delivered; a detector id is not
+checked against a registry. If a detector is later removed from the list, its incidents are planned
+as if pruned: pending or lease-lapsed rows expire (`incident_missing`), an already sent open is never
+followed by a recover, and terminal rows are forgotten after the retention period.
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is

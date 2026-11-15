@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from vigie_pipeline.delivery_types import DeliveryConfig
+from vigie_pipeline.delivery_types import DEFAULT_DETECTORS, DeliveryConfig
 
 TRANSIENT_WINDOW_DEFAULT_S = 24 * 3600
 TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
@@ -88,6 +89,26 @@ def _env_flag(source: dict[str, str], name: str) -> bool:
     raise ValueError(f"{name} must be one of 1/true/yes or 0/false/no/off, not {value!r}")
 
 
+DETECTOR_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MAX_DELIVERY_DETECTORS = 8
+
+
+def _detectors(raw: str) -> tuple[str, ...]:
+    """Comma-separated detector ids; the error never echoes the value."""
+    tokens = tuple(t.strip() for t in raw.split(","))
+    bad = (
+        len(tokens) > MAX_DELIVERY_DETECTORS
+        or len(set(tokens)) != len(tokens)
+        or not all(DETECTOR_ID.fullmatch(t) for t in tokens)
+    )
+    if bad:
+        raise ValueError(
+            "VIGIE_DELIVERY_DETECTORS must be 1-8 distinct comma-separated detector ids "
+            "matching [a-z][a-z0-9_]{0,31}"
+        )
+    return tokens
+
+
 @dataclass(frozen=True)
 class DeliverySettings:
     """Incident delivery (docs/monitoring.md). DEFAULT OFF; when enabled it needs `file`."""
@@ -105,6 +126,7 @@ class DeliverySettings:
     max_abandoned: int = 2
     drain_budget_s: int = 60
     include_label: bool = False  # free text stays out of messages unless the owner opts in
+    detectors: tuple[str, ...] = DEFAULT_DETECTORS  # only these detectors' incidents are delivered
 
     def __post_init__(self) -> None:
         self.delivery_config(None)  # DeliveryConfig's own validation, at startup
@@ -114,6 +136,8 @@ class DeliverySettings:
             raise ValueError("VIGIE_DELIVERY_DRAIN_BUDGET_S must be >= the transmit deadline")
         if self.max_abandoned < 1:
             raise ValueError("VIGIE_DELIVERY_MAX_ABANDONED must be >= 1")
+        if self.detectors != _detectors(",".join(self.detectors)):
+            raise ValueError("VIGIE_DELIVERY_DETECTORS is invalid")
         if self.enabled and self.file is None:
             raise ValueError("VIGIE_DELIVERY_FILE is required when VIGIE_DELIVERY_ENABLED is set")
 
@@ -145,6 +169,9 @@ class DeliverySettings:
             "drain_budget_s": "VIGIE_DELIVERY_DRAIN_BUDGET_S",
         }
         values = {k: _env_int(source, name, d[k].default) for k, name in ints.items()}
+        raw = source.get("VIGIE_DELIVERY_DETECTORS")
+        if raw is not None:
+            values["detectors"] = _detectors(raw)
         return cls(
             enabled=_env_flag(source, "VIGIE_DELIVERY_ENABLED"),
             file=_opt_path(source.get("VIGIE_DELIVERY_FILE")),

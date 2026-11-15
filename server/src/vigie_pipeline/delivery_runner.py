@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 
@@ -46,7 +46,7 @@ from vigie_pipeline.delivery_sql import (
     completion_params,
     failure_statement,
 )
-from vigie_pipeline.delivery_types import tick_ceil, tick_floor
+from vigie_pipeline.delivery_types import DEFAULT_DETECTORS, tick_ceil, tick_floor
 from vigie_pipeline.logs import log
 
 logger = logging.getLogger("vigie_pipeline")
@@ -103,13 +103,24 @@ def _read_reviews(ro: sqlite3.Connection | None) -> dict[str, ReviewView]:
         raise DecisionsUnavailable(str(exc)) from exc
 
 
-def _plan_pass(inv, ro, config: DeliveryConfig, clock: Callable[[], float]) -> tuple[int, float]:
-    """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError."""
+def _plan_pass(
+    inv, ro, config: DeliveryConfig, clock: Callable[[], float], detectors: Iterable[str]
+) -> tuple[int, float]:
+    """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError.
+
+    Only incidents of an allowlisted detector are planned. A row whose incident is not listed is
+    planned as a pruned incident: pending/sending rows expire (`incident_missing`), a sent open is
+    never followed by a recover, terminal rows are forgotten after retention."""
+    allowed = sorted(set(detectors))
     with immediate(inv):
         now = clock()  # after BEGIN IMMEDIATE: never older than the state it plans against
         incidents = [
             IncidentView(r[0], r[1], _epoch(r[2]))
-            for r in inv.execute("SELECT id,state,detected_at FROM monitoring_incidents")
+            for r in inv.execute(
+                "SELECT id,state,detected_at FROM monitoring_incidents"  # noqa: S608
+                f" WHERE detector IN ({','.join('?' * len(allowed))})",
+                allowed,
+            )
         ]
         every = inv.execute(f"SELECT {_ROW} FROM incident_deliveries")  # noqa: S608
         deliveries = [_delivery(r) for r in every]
@@ -333,13 +344,14 @@ def run_delivery(
     monotonic: Callable[[], float] = time.monotonic,
     include_label: bool = False,
     should_stop: Callable[[], bool] = lambda: False,
+    detectors: Iterable[str] = DEFAULT_DETECTORS,
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget."""
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
     try:
-        planned, now = _plan_pass(inv, overrides, config, clock)
+        planned, now = _plan_pass(inv, overrides, config, clock, detectors)
     except DecisionsUnavailable as exc:
         log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
         return RunReport(skipped="decisions_unavailable")

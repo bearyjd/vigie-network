@@ -9,6 +9,8 @@ import math
 from dataclasses import dataclass, field
 
 KINDS = ("open", "recover")
+# Detectors whose incidents may be delivered (VIGIE_DELIVERY_DETECTORS); the default is today's set.
+DEFAULT_DETECTORS = ("large_upload", "upload_deviation")
 STATES = frozenset({"pending", "sending", "sent", "failed", "suppressed", "expired", "withdrawn"})
 TERMINAL = frozenset({"sent", "failed", "suppressed", "expired", "withdrawn"})
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})

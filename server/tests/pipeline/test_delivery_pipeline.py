@@ -141,5 +141,6 @@ def test_wiring_passes_the_abandoned_bound_to_the_runner(world, tmp_path, monkey
         "max_abandoned": 5,
         "drain_budget_seconds": 45,
         "include_label": True,
+        "detectors": ("large_upload", "upload_deviation"),
         "should_stop": stop,
     }
