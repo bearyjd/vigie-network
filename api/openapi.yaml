@@ -1634,6 +1634,7 @@
                 "type": "null"
               }
             ],
+            "description": "Cohort bucket width in UTC hours. Omitted when not stored; never null.",
             "title": "Bucket Hours"
           },
           "cap_applied": {
@@ -1645,6 +1646,7 @@
                 "type": "null"
               }
             ],
+            "description": "Whether the cohort line was capped at the fixed large-upload line; false also when no cohort fit exists. Omitted when not stored; never null.",
             "title": "Cap Applied"
           },
           "cohort_bucket": {
@@ -1658,6 +1660,7 @@
                 "type": "null"
               }
             ],
+            "description": "Cohort bucket index, hour_of_day_utc // bucket_hours (not an hour), covering UTC hours [b*bucket_hours, (b+1)*bucket_hours). Dropped when >= 24 // bucket_hours. Omitted when not stored; never null.",
             "title": "Cohort Bucket"
           },
           "cohort_is_weekend": {
@@ -1669,6 +1672,7 @@
                 "type": "null"
               }
             ],
+            "description": "Whether the cohort is the weekend one. Omitted when not stored; never null.",
             "title": "Cohort Is Weekend"
           },
           "config_version": {

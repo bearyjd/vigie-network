@@ -238,6 +238,7 @@ hour and open incidents are superseded (expected; flip it deliberately).
   `upload_deviation` can both open for the same hours; duplicate incidents are by design. tod evidence
   also carries `bucket_hours`, the cohort (`cohort_is_weekend`, `cohort_bucket`) and `cap_applied`. The read API
   and the evidence pack expose these four keys (typed and bounded, only when stored; pooled incidents omit them).
+  `cap_applied=false` also appears when no cohort fit exists, so it cannot tell not-capped from unknown.
 - **Persistence, no schema change.** The baseline row stores `algorithm=tod-median-v1`,
   `trained_until`, the used `training_hours`, and in `config_json` the policy (including
   `bucket_hours`) plus `training_bytes` (the byte value of each used hour). Every pass refits

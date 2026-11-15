@@ -105,3 +105,30 @@ def test_bucket_hours_bound_matches_pipeline():
     from vigie_pipeline.baselines_tod import BUCKET_HOURS
 
     assert TOD_BUCKET_HOURS == BUCKET_HOURS
+
+
+def test_bucket_hours_literal_matches_bound():
+    from typing import get_args
+
+    from vigie_api.models import TOD_BUCKET_HOURS, IncidentEvidence
+
+    literal = IncidentEvidence.model_fields["bucket_hours"].annotation
+    (inner,) = [a for a in get_args(literal) if a is not type(None)]
+    assert get_args(inner) == TOD_BUCKET_HOURS
+
+
+def test_api_drops_cohort_bucket_outside_bucket_hours_range(env: Env):
+    _store(env, {**EVIDENCE, **TOD, "bucket_hours": 24, "cohort_bucket": 23})
+    evidence = _api(env)
+    assert evidence["bucket_hours"] == 24
+    assert "cohort_bucket" not in evidence
+
+
+def test_pack_drops_cohort_bucket_outside_bucket_hours_range(env: Env):
+    seed_device(env)
+    incident(env, "i1")
+    stored = json.dumps({**EVIDENCE, **TOD, "bucket_hours": 24, "cohort_bucket": 23})
+    env.inv.execute("UPDATE monitoring_incidents SET evidence=?", (stored,))
+    kept = section(env, "incidents")["items"][0]["evidence"]
+    assert kept["bucket_hours"] == 24
+    assert "cohort_bucket" not in kept

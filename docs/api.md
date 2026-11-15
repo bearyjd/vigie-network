@@ -217,7 +217,8 @@ also accepts `state=open|resolved|superseded`. There is no filter on review or a
 
 The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
 `bucket_hours` (one of 1, 2, 3, 4, 6, 8, 12, 24), `cohort_is_weekend` (boolean), `cohort_bucket` (integer 0 to 23,
-the UTC hour-of-day bucket) and `cap_applied` (boolean, whether the cohort line was capped at the fixed large-upload
+the bucket index `utc_hour // bucket_hours`, covering UTC hours `[b*bucket_hours, (b+1)*bucket_hours)`; dropped when it
+is `>= 24 // bucket_hours`) and `cap_applied` (boolean, whether the cohort line was capped at the fixed large-upload
 line). They are additive: a pooled incident omits all four, so its response is unchanged. A stored value outside
 those types or bounds is dropped, never echoed. The evidence pack's `incidents` section applies the same rule.
 

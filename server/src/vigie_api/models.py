@@ -387,7 +387,22 @@ class ActivityResponse(_Envelope):
 # Mirrors vigie_pipeline.baselines_tod.BUCKET_HOURS (a test pins the equality).
 TOD_BUCKET_HOURS = (1, 2, 3, 4, 6, 8, 12, 24)
 TOD_MAX_COHORT_BUCKET = 23
-_is_none = lambda value: value is None  # noqa: E731
+
+
+def _is_none(value: Any) -> bool:
+    return value is None
+
+
+def tod_cohort_bucket_valid(bucket: Any, bucket_hours: Any = None) -> bool:
+    """An int in 0..23; with a valid bucket_hours it must also be < 24 // bucket_hours."""
+    if type(bucket) is not int or not 0 <= bucket <= TOD_MAX_COHORT_BUCKET:
+        return False
+    if type(bucket_hours) is int and bucket_hours in TOD_BUCKET_HOURS:
+        return bucket < 24 // bucket_hours
+    return True
+
+
+_TOD_OMITTED = "Omitted when not stored; never null."
 _TOD_KEYS = ("bucket_hours", "cohort_is_weekend", "cohort_bucket", "cap_applied")
 
 
@@ -414,13 +429,43 @@ class IncidentEvidence(BaseModel):
     distinct_days: int | None = None
     # tod keys appear only when stored (exclude_if), so pooled responses stay byte-identical.
     bucket_hours: Annotated[
-        Literal[1, 2, 3, 4, 6, 8, 12, 24] | None, Field(exclude_if=_is_none)
+        Literal[1, 2, 3, 4, 6, 8, 12, 24] | None,
+        Field(
+            exclude_if=_is_none,
+            description="Cohort bucket width in UTC hours. " + _TOD_OMITTED,
+        ),
     ] = None
-    cohort_is_weekend: Annotated[bool | None, Field(exclude_if=_is_none)] = None
+    cohort_is_weekend: Annotated[
+        bool | None,
+        Field(
+            exclude_if=_is_none,
+            description="Whether the cohort is the weekend one. " + _TOD_OMITTED,
+        ),
+    ] = None
+    # Bucket index hour_of_day_utc // bucket_hours: UTC hours [b*bucket_hours, (b+1)*bucket_hours).
     cohort_bucket: Annotated[
-        int | None, Field(ge=0, le=TOD_MAX_COHORT_BUCKET, exclude_if=_is_none)
+        int | None,
+        Field(
+            ge=0,
+            le=TOD_MAX_COHORT_BUCKET,
+            exclude_if=_is_none,
+            description=(
+                "Cohort bucket index, hour_of_day_utc // bucket_hours (not an hour), covering "
+                "UTC hours [b*bucket_hours, (b+1)*bucket_hours). Dropped when >= 24 // "
+                "bucket_hours. " + _TOD_OMITTED
+            ),
+        ),
     ] = None
-    cap_applied: Annotated[bool | None, Field(exclude_if=_is_none)] = None
+    cap_applied: Annotated[
+        bool | None,
+        Field(
+            exclude_if=_is_none,
+            description=(
+                "Whether the cohort line was capped at the fixed large-upload line; false "
+                "also when no cohort fit exists. " + _TOD_OMITTED
+            ),
+        ),
+    ] = None
 
     @field_validator(*_TOD_KEYS, mode="before")
     @classmethod
@@ -433,7 +478,7 @@ class IncidentEvidence(BaseModel):
             return None
         if name == "bucket_hours":
             return value if value in TOD_BUCKET_HOURS else None
-        return value if 0 <= value <= TOD_MAX_COHORT_BUCKET else None
+        return value if tod_cohort_bucket_valid(value, info.data.get("bucket_hours")) else None
 
 
 class IncidentReview(BaseModel):
