@@ -190,7 +190,7 @@ def test_status_carries_only_validated_fields(inv, settings):
     [row] = snap["targets"]
     assert row["id"] == "router-dns" and row["last_latency_ms"] == 9
     assert row["ring"] == [[5, True, 9, None], [6, False, None, "timeout"]]
-    assert set(row) == {"id", "state", "consecutive_fail", "consecutive_ok", "last_ok_at",
+    assert set(row) == {"id", "kind", "state", "consecutive_fail", "consecutive_ok", "last_ok_at",
                         "last_error_class", "last_latency_ms", "episode_start", "flapping",
                         "suppressed", "ring"}  # fmt: skip
     assert events(inv) == []
@@ -365,3 +365,16 @@ def test_runner_outage_sequence_is_visible_within_two_ticks_of_the_third_failure
     [(kind, _, summary, token, _)] = events(inv)
     assert kind == "probe_outage" and summary == "probe lan-web failing (refused)"
     assert token == f"lan-web:{int(NOW + 120)}"
+
+
+def test_kind_is_optional_validated_and_carried_into_the_status(inv, settings):
+    write_probe_file(settings.file, state_doc(target_state(kind="dns_local"), target_state("b")))
+    fold(inv, settings)
+    assert [(t["id"], t["kind"]) for t in status(inv)["targets"]] == [
+        ("router-dns", "dns_local"),
+        ("b", None),
+    ]
+    for bad in ("bogus", 7, ["dns_local"], True):
+        write_probe_file(settings.file, state_doc(target_state(kind=bad)))
+        with pytest.raises(ProbeFileInvalid):
+            parse_probe_doc(settings.file.read_bytes())

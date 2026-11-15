@@ -39,3 +39,5 @@ def test_coverage_bytes_are_unchanged_by_probe_rows(env: Env, tmp_path):
     assert env.inv.execute("SELECT COUNT(*) FROM events WHERE kind='probe_outage'").fetchone()[0]
     assert env.inv.execute("SELECT 1 FROM pipeline_meta WHERE key='probe_status'").fetchone()
     assert coverage_bytes(env) == before
+    assert env.get("/probes").status_code == 200  # reading the probe view leaves /coverage alone
+    assert hashlib.sha256(coverage_bytes(env)).hexdigest() == GOLDEN_SHA256

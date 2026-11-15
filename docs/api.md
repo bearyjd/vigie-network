@@ -339,6 +339,45 @@ as integer overflow. A caller must treat `false`, or an absent field from an old
 unknown. Coverage hour `reasons` is a free list of strings; `lan_unmapped_share` marks an hour
 disqualified by the LAN-unmapped threshold (`docs/monitoring.md`).
 
+## Probes
+
+`GET /probes` is a read-only view of the bounded DNS and reachability probes (see "Probes" in
+[monitoring](monitoring.md)). It needs the same bearer token as every other route and shares its
+rate limit (429 with `Retry-After`). It reads one `pipeline_meta` row and writes nothing.
+
+```
+{"ok": true, "data": {
+  "enabled": true, "written_at": 1790000000, "stale": false, "verdict": "normal",
+  "targets": [{"id": "<target-id>", "kind": "dns_local", "state": "ok",
+               "last_ok_at": 1790000000.5, "last_error_class": null,
+               "last_latency_ms": 4, "episode_start": null}]}, ...}
+```
+
+- `enabled` is false when probes were never folded (no stored status) or were turned off. The
+  other fields are then empty (`written_at` null, `targets` empty, `stale` false, `verdict`
+  `unknown`).
+- `stale` is true when the probe data cannot be trusted: the pipeline marked it unavailable
+  (missing, invalid, future-dated or old file), the stored `valid_until` has passed (a stopped
+  pipeline cannot rewrite an "ok"), `written_at` is more than 10 s in the future, or the status is
+  unreadable. Targets are then reported as `state: "unknown"` and the verdict is `unknown`.
+- `kind` is `dns_local`, `dns_upstream`, `tcp_lan`, or `unknown` for a status stored before the
+  runner recorded kinds. `state` is `unknown`, `ok` or `outage`. `last_error_class` is one of
+  `malformed`, `bad_id`, `rcode`, `no_answer`, `timeout`, `oserror`, `refused`, `unreachable`,
+  `other`, or null. `last_latency_ms` is 0 to 5000.
+- `verdict` is `normal`, `upstream_unreachable`, `router_resolver_down`, `vigie_blind` or `unknown`
+  (table in [monitoring](monitoring.md)). Collector freshness is the newest `observation` batch
+  received within 900 s, across all collectors.
+- The stored status is hostile data: a target with an invalid or duplicate id is dropped, at most
+  10 are returned, and any other invalid value is replaced by null or `unknown`. No stored string
+  is echoed unless it matched a fixed set or the id pattern `[a-z0-9_-]{1,32}`.
+
+Probe transitions are ordinary events with no device (`device_id` null), served by `GET /events`
+and filterable with `kind=`: `probe_outage` (3 consecutive failed attempts), `probe_recovered`
+(3 successes, or the target was removed or its episode superseded), `probe_flapping` (more than 3
+outage episodes for a target in one UTC day; further episodes of that day emit nothing) and
+`probe_stale` (probe data unavailable, at most one per UTC day). Summaries carry the target id and
+error class only. They are not incidents and are never delivered.
+
 ## Events feed filters
 
 `GET /events` pages on insertion order and returns inventory events plus human actions. Two optional

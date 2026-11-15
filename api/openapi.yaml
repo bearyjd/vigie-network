@@ -1431,6 +1431,19 @@
         "title": "Explanation",
         "type": "object"
       },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
       "HealthResponse": {
         "properties": {
           "data": {
@@ -2289,6 +2302,199 @@
         "title": "PatchResult",
         "type": "object"
       },
+      "ProbeTargetOut": {
+        "properties": {
+          "episode_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds the current/last outage began.",
+            "title": "Episode Start"
+          },
+          "id": {
+            "description": "Owner-chosen target id.",
+            "pattern": "^[a-z0-9_-]{1,32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "`unknown` for a status stored before kind existed.",
+            "enum": [
+              "dns_local",
+              "dns_upstream",
+              "tcp_lan",
+              "unknown"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error_class": {
+            "anyOf": [
+              {
+                "enum": [
+                  "malformed",
+                  "bad_id",
+                  "rcode",
+                  "no_answer",
+                  "timeout",
+                  "oserror",
+                  "refused",
+                  "unreachable",
+                  "other"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error Class"
+          },
+          "last_latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "0..5000.",
+            "title": "Last Latency Ms"
+          },
+          "last_ok_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds of the last successful probe.",
+            "title": "Last Ok At"
+          },
+          "state": {
+            "enum": [
+              "unknown",
+              "ok",
+              "outage"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "last_ok_at",
+          "last_error_class",
+          "last_latency_ms",
+          "episode_start"
+        ],
+        "title": "ProbeTargetOut",
+        "type": "object"
+      },
+      "ProbesData": {
+        "properties": {
+          "enabled": {
+            "description": "False when probes were never folded or were turned off.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "stale": {
+            "description": "True when the probe data cannot be trusted: expired, future-dated or invalid.",
+            "title": "Stale",
+            "type": "boolean"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/ProbeTargetOut"
+            },
+            "maxItems": 10,
+            "title": "Targets",
+            "type": "array"
+          },
+          "verdict": {
+            "description": "Folds probe results with collector freshness; `unknown` when stale.",
+            "enum": [
+              "normal",
+              "upstream_unreachable",
+              "router_resolver_down",
+              "vigie_blind",
+              "unknown"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          },
+          "written_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds the probe unit last wrote its state.",
+            "title": "Written At"
+          }
+        },
+        "required": [
+          "enabled",
+          "written_at",
+          "stale",
+          "targets",
+          "verdict"
+        ],
+        "title": "ProbesData",
+        "type": "object"
+      },
+      "ProbesResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ProbesData"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "page": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Page"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "error",
+          "page",
+          "data"
+        ],
+        "title": "ProbesResponse",
+        "type": "object"
+      },
       "RecentEvent": {
         "properties": {
           "id": {
@@ -2652,6 +2858,46 @@
           "confidence"
         ],
         "title": "TypeProvenance",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
         "type": "object"
       },
       "VersionedWrite": {
@@ -5667,6 +5913,90 @@
         "summary": "Resolve a MAC to its canonical device",
         "tags": [
           "devices"
+        ]
+      }
+    },
+    "/probes": {
+      "get": {
+        "operationId": "get_probes_probes_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized (uniform for every authentication failure)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limited; see Retry-After"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "inventory_unavailable: inventory.db does not exist yet"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Bounded DNS/reachability probe status (read-only)",
+        "tags": [
+          "monitoring"
         ]
       }
     },

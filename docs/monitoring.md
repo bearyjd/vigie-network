@@ -1134,6 +1134,34 @@ all of the user's volumes, so that rests on the runner's code and config, not on
   add the probe volume, a read-only pipeline mount, the env var and the probe service/timer units.
   `IPAddressDeny=any` with `IPAddressAllow=` for the targets is defense in depth and best-effort:
   a systemd user manager may not be allowed to load the cgroup BPF programs it needs.
+- **Outbound statement (verbatim).** On a dnsmasq cache miss, the query is forwarded to the
+  upstream the household already uses (D8 keeps the cloud filtering resolver upstream). That is one
+  query, about once a minute. It carries the canary name and the household's public IP, the same as
+  any household lookup. A cache hit stays on the LAN. So while the canary's TTL is cached, an
+  upstream outage is masked for up to that TTL. Detection latency is then about TTL + 3 min.
+- **Rate, timeout and hysteresis.** At most 10 targets, at most 1 attempt per target per 60 s
+  (skipped if the last attempt was under 55 s ago), a 2 s timeout per probe, a 25 s pass deadline
+  (`TimeoutStartSec=45`), no retry, an fcntl lock so two passes never overlap. Outage opens after 3
+  consecutive failures (3 min or more) and recovers after 3 consecutive successes; at most 3
+  outage episodes per target per UTC day, then one `probe_flapping` event per target-day.
+- **Not an incident, not delivered.** Probe results are events with no device and the single
+  `pipeline_meta['probe_status']` row. They never enter `monitoring_incidents`, the delivery
+  outbox, coverage or any detector, so they cannot change alert volume or the policy version.
+  `/coverage` response bytes are unchanged by probes (pinned by a golden hash in the tests).
+- **`GET /probes` and the verdict.** `/probes` ([api](api.md#probes)) folds the stored status with
+  collector freshness (newest `observation` batch within 900 s). Evaluated top to bottom:
+
+  | collector fresh | dns_local | dns_upstream | Verdict |
+  |---|---|---|---|
+  | any | probe data stale or expired, or no `dns_local` target, or its state unknown | any | `unknown`: probe unit not running, status unknown |
+  | any | outage | any | `router_resolver_down`: router resolver down (or router down) |
+  | no | ok | any | `vigie_blind`: collector or ingest path blind, network up |
+  | yes | ok | outage | `upstream_unreachable`: internet or upstream DNS broken; LAN and Vigie fine |
+  | yes | ok | ok, unknown or absent | `normal` |
+
+  A `dns_upstream` target in state `unknown` does not change the verdict. The status stores each
+  target's `kind` (optional in the state file: a file or status written before the runner recorded
+  it reads as kind `unknown` and gives verdict `unknown`).
 - **Self-contamination.** The server's own probe queries pass through the household resolver and
   can be attributed to the server host as DNS volume (about 1 to 2 per minute); keep the rate
   fixed and account for it before any DNS-volume detector.

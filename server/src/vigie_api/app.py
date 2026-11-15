@@ -20,6 +20,7 @@ from vigie_api import (
     identity_writes,
     incident_decisions,
     monitoring,
+    probes,
     tokens,
     writes,
 )
@@ -45,6 +46,7 @@ from vigie_api.models import (
     IncidentsResponse,
     MacResponse,
     PatchResponse,
+    ProbesResponse,
     RuleCreate,
     RulesResponse,
     SuggestionDecision,
@@ -280,6 +282,16 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             },
             page={"next_cursor": nxt},
         )
+
+    @app.get(
+        "/probes",
+        tags=["monitoring"],
+        summary="Bounded DNS/reachability probe status (read-only)",
+        response_model=ProbesResponse,
+        responses=_errors(401, 429, 503),
+    )
+    def get_probes(_: Principal, inv: Inv) -> dict[str, Any]:
+        return envelope(probes.probes_view(inv, clock()))
 
     @app.get(
         "/devices/{device_id}/activity",

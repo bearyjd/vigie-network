@@ -1226,3 +1226,17 @@ def test_state_without_suppressed_key_is_accepted_as_false():
     del doc["targets"][0]["suppressed"]
     out = pr.state_from_bytes(json.dumps(doc).encode(), cfg)
     assert out is not None and out.targets[0].suppressed is False
+
+
+def test_state_records_the_configured_kind_and_legacy_documents_still_load():
+    cfg, clock = tcp_cfg(2), Clock()
+    state = run(cfg, pr.empty_state(), clock, FakeNet(clock, [FAIL]))
+    assert [t.kind for t in state.targets] == ["tcp_lan", "tcp_lan"]
+    doc = json.loads(pr.serialize_state(state))
+    assert all(t["kind"] == "tcp_lan" for t in doc["targets"])
+    for t in doc["targets"]:
+        del t["kind"]  # written before kind existed
+    legacy = pr.state_from_bytes(json.dumps(doc).encode(), cfg)
+    assert legacy is not None and [t.kind for t in legacy.targets] == [None, None]
+    doc["targets"][0]["kind"] = "bogus"
+    assert pr.state_from_bytes(json.dumps(doc).encode(), cfg) is None
