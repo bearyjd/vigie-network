@@ -27,7 +27,8 @@ def _decode_event_cursor(cursor: str | None, newest_first: bool = False) -> dict
     Ascending cursors are the resume points (rowid > value, absent = 0). Newest-first cursors
     carry `"dir": "desc"` and are, per source, an exclusive upper bound (rowid < value): the
     first page pins both sources at their current max+1, later pages lower it to the lowest rowid
-    served, so rows inserted mid-traversal never appear. A bare `{"dir": "desc"}` is no cursor. Cursors never replay in the other order.
+    served, so rows inserted mid-traversal never appear. A bare `{"dir": "desc"}` is no cursor.
+    Cursors never replay in the other order.
     """
     if not cursor:
         return {} if newest_first else dict.fromkeys(_CURSOR_KEYS, 0)
