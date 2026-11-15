@@ -147,6 +147,7 @@ def _status_doc(
 def _target_doc(t: ProbeTarget) -> dict[str, object]:
     return {
         "id": t.id,
+        "kind": t.kind,
         "state": t.state,
         "consecutive_fail": t.consecutive_fail,
         "consecutive_ok": t.consecutive_ok,

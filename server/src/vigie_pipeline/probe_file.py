@@ -34,6 +34,7 @@ ERROR_CLASSES = frozenset(
     {"malformed", "bad_id", "rcode", "no_answer", "timeout", "oserror", "refused", "unreachable",
      "other"}
 )  # fmt: skip
+KINDS = frozenset({"dns_local", "dns_upstream", "tcp_lan"})
 NOTES = frozenset({"skipped_deadline", "clock_step"})
 TARGET_KEYS = frozenset(
     {"id", "state", "consecutive_fail", "consecutive_ok", "last_ok_at", "last_error_class",
@@ -59,6 +60,7 @@ class ProbeTarget:
     flapping: bool
     suppressed: bool
     ring: Ring
+    kind: str | None = None  # absent in files written before the runner recorded it
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,7 @@ def _ring(ring: object) -> Ring:
 
 
 def _target(doc: object) -> ProbeTarget:
-    if not isinstance(doc, dict) or set(doc) != TARGET_KEYS:
+    if not isinstance(doc, dict) or set(doc) - {"kind"} != TARGET_KEYS:
         raise ProbeFileInvalid("bad target")
     for key in ("consecutive_fail", "consecutive_ok", "episodes_today"):
         _num(doc[key], MAX_COUNT, integer=True)
@@ -112,10 +114,12 @@ def _target(doc: object) -> ProbeTarget:
     _num(doc["episode_start"], MAX_EPOCH, integer=True, none_ok=True)
     _num(doc["last_latency_ms"], MAX_LATENCY_MS, integer=True, none_ok=True)
     ident, error, day = doc["id"], doc["last_error_class"], doc["episodes_day"]
+    kind = doc.get("kind")
     valid = (
         isinstance(ident, str)
         and ID_RE.fullmatch(ident) is not None
         and _member(doc["state"], STATES)
+        and (kind is None or _member(kind, KINDS))
         and type(doc["flapping"]) is bool
         and type(doc["suppressed"]) is bool
         and (doc["note"] is None or _member(doc["note"], NOTES))
@@ -130,7 +134,7 @@ def _target(doc: object) -> ProbeTarget:
         last_error_class=error, last_latency_ms=doc["last_latency_ms"],
         episode_start=doc["episode_start"], last_attempt=doc["last_attempt"],
         episodes_day=day, flapping=doc["flapping"],
-        suppressed=doc["suppressed"], ring=_ring(doc["ring"]),
+        suppressed=doc["suppressed"], ring=_ring(doc["ring"]), kind=kind,
     )  # fmt: skip
 
 

@@ -93,7 +93,8 @@ def test_openapi_is_3_1_with_expected_surface() -> None:
     spec = json.loads(render())
     assert spec["openapi"].startswith("3.1")
     assert set(spec["paths"]) == {
-        "/coverage", "/devices/{device_id}/activity", "/devices/{device_id}/evidence-pack",
+        "/coverage", "/probes", "/devices/{device_id}/activity",
+        "/devices/{device_id}/evidence-pack",
         "/incidents", "/incidents/{incident_id}",
         "/incidents/{incident_id}/snooze", "/incidents/{incident_id}/{action}",
         "/healthz", "/devices", "/devices/{device_id}", "/macs/{mac}", "/events", "/suggestions",
@@ -128,6 +129,7 @@ EXPECTED_ERRORS = {
         "503",
     },  # fmt: skip
     ("get", "/macs/{mac}"): {"401", "404", "422", "429", "503"},
+    ("get", "/probes"): {"401", "429", "503"},
     ("get", "/events"): {"400", "401", "422", "429", "503"},
     ("get", "/suggestions"): {"400", "401", "422", "429", "503"},
 }

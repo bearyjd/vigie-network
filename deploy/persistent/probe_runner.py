@@ -2,26 +2,23 @@
 """Bounded DNS / reachability probe runner (slice 1: pure core, OFF by default).
 
 Runs OUTSIDE the pipeline (which stays on Network=none), like ntfy_sender.py. This module holds
-only the pure parts: strict config validation, a probe pass whose clock, resolver and connect
-functions are all injected, hysteresis, and the bounded state document a later slice writes for
-the pipeline to read. It opens no socket and reads no file at import time, and does nothing at all
-when the config is disabled. Standard library only.
+the pure parts: strict config validation, a probe pass with injected clock, resolver and connect
+functions, hysteresis, and the bounded state document the pipeline reads. It opens no socket and
+reads no file at import time, and does nothing when the config is disabled. Standard library only.
 
 Probe targets come ONLY from the validated private config (at most 10, literal private IPs, no
-hostnames). A result is `ok`, `latency_ms` and an error class from a fixed set: never response
-content. Log lines and error messages carry the target id and error class only, never an address,
-qname or port. The reply parser is a ported copy of run_soak.dns_probe (a parity test keeps them
-equal); the soak's retry and hard-coded question are deliberately not ported.
+hostnames). A result is `ok`, `latency_ms` and a fixed error class, never response content. Log
+lines and errors carry the target id and error class only, never an address, qname or port. The
+reply parser is a ported copy of run_soak.dns_probe (a parity test keeps them equal); the
+soak's retry and hard-coded question are deliberately not ported.
 
-State contract for the pipeline reader (S2): `episode_start` identifies an episode and is kept
-after recovery; `suppressed` marks an episode that opened over the per-day cap and stays set for
-that episode (also across UTC midnight and its recovery) until the next episode opens. Emit
-probe_outage/probe_recovered only when `suppressed` is false.
+State contract (S2): `episode_start` identifies an episode and survives recovery; `suppressed`
+marks one opened over the per-day cap (until the next opens): emit no events for it.
 
 Adapter contract (real_dns, real_connect): a connected UDP socket (replies only from the
 resolver), recv(4097) (an oversize reply is detectable), per-operation timeouts from timeout_s,
-and only str(exc) logged, never an address, qname or port. The pass deadline is checked before
-each probe only: an overrunning probe can push a pass past 25 s (targets x the real timeout).
+and only str(exc) logged. The pass deadline is checked before each probe only: an overrunning
+probe can push a pass past 25 s (targets x the real timeout).
 """
 
 from __future__ import annotations
@@ -130,6 +127,7 @@ class TargetState:
     flapping: bool = False
     suppressed: bool = False  # the episode at episode_start opened capped: emit no events for it
     note: str | None = None
+    kind: str | None = None  # the configured kind, so a reader can tell a router from a canary
 
 
 @dataclass(frozen=True)
@@ -541,6 +539,7 @@ def _step(
     connect: ConnectFn,
 ) -> TargetState:
     t = now()
+    ts = replace(ts, kind=target.kind)
     if ts.episode_start is not None and ts.episode_start > t + 86400:
         keep = ts.state == "outage"  # the clock was set back by more than a day
         ts = replace(ts, episode_start=int(t) if keep else None, suppressed=keep and ts.suppressed)
@@ -629,8 +628,8 @@ def _check_ring(ring: object) -> Ring:
 
 
 def _target_from_doc(doc: object) -> TargetState:
-    if isinstance(doc, dict) and "suppressed" not in doc:
-        doc = {**doc, "suppressed": False}  # documents written before the key existed
+    if isinstance(doc, dict):  # documents written before these keys existed
+        doc = {"suppressed": False, "kind": None, **doc}
     if not isinstance(doc, dict) or set(doc) != _TARGET_KEYS:
         raise ValueError("bad target")
     _num(doc["consecutive_fail"], MAX_COUNT, integer=True)
@@ -647,6 +646,7 @@ def _target_from_doc(doc: object) -> TargetState:
         and type(doc["flapping"]) is bool
         and type(doc["suppressed"]) is bool
         and (doc["note"] is None or doc["note"] in NOTES)
+        and (doc["kind"] is None or doc["kind"] in KINDS)
         and (error is None or error in ERROR_CLASSES)
         and (day is None or (isinstance(day, str) and DAY_RE.fullmatch(day) is not None))
     )

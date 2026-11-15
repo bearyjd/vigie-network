@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import unicodedata
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, get_args
 
 from pydantic import (
     AfterValidator,
@@ -557,3 +558,69 @@ class IncidentDecisionResult(BaseModel):
 
 class IncidentDecisionResponse(_Envelope):
     data: IncidentDecisionResult
+
+
+# ---- probes: GET /probes. Every stored value is hostile; a bad one is dropped, never reflected.
+PROBE_MAX_EPOCH = 1e11
+PROBE_MAX_LATENCY_MS = 5000
+ProbeKind = Literal["dns_local", "dns_upstream", "tcp_lan", "unknown"]
+ProbeState = Literal["unknown", "ok", "outage"]
+ProbeErrorClass = Literal[
+    "malformed", "bad_id", "rcode", "no_answer", "timeout", "oserror", "refused", "unreachable",
+    "other",
+]  # fmt: skip
+ProbeVerdict = Literal[
+    "normal", "upstream_unreachable", "router_resolver_down", "vigie_blind", "unknown"
+]
+
+
+def probe_number(value: Any, *, integer: bool = False, high: float = PROBE_MAX_EPOCH) -> Any:
+    """A finite non-negative number up to `high` (an int when asked), else None. Not a bool."""
+    if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if 0 <= value <= high else None
+
+
+class ProbeTargetOut(BaseModel):
+    id: Annotated[str, Field(pattern=r"^[a-z0-9_-]{1,32}$", description="Owner-chosen target id.")]
+    kind: ProbeKind = Field(description="`unknown` for a status stored before kind existed.")
+    state: ProbeState
+    last_ok_at: float | None = Field(description="Epoch seconds of the last successful probe.")
+    last_error_class: ProbeErrorClass | None
+    last_latency_ms: int | None = Field(description="0..5000.")
+    episode_start: int | None = Field(description="Epoch seconds the current/last outage began.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_bad_values(cls, raw: Any) -> Any:
+        get = raw.get if isinstance(raw, dict) else (lambda _k, _d=None: None)
+        kind, state, error = get("kind"), get("state"), get("last_error_class")
+        return {
+            "id": get("id"),
+            "kind": kind if kind in get_args(ProbeKind) else "unknown",
+            "state": state if state in get_args(ProbeState) else "unknown",
+            "last_ok_at": probe_number(get("last_ok_at")),
+            "last_error_class": error if error in get_args(ProbeErrorClass) else None,
+            "last_latency_ms": probe_number(
+                get("last_latency_ms"), integer=True, high=PROBE_MAX_LATENCY_MS
+            ),
+            "episode_start": probe_number(get("episode_start"), integer=True),
+        }
+
+
+class ProbesData(BaseModel):
+    enabled: bool = Field(description="False when probes were never folded or were turned off.")
+    written_at: int | None = Field(description="Epoch seconds the probe unit last wrote its state.")
+    stale: bool = Field(
+        description="True when the probe data cannot be trusted: expired, future-dated or invalid."
+    )
+    targets: list[ProbeTargetOut] = Field(max_length=10)
+    verdict: ProbeVerdict = Field(
+        description="Folds probe results with collector freshness; `unknown` when stale."
+    )
+
+
+class ProbesResponse(_Envelope):
+    data: ProbesData
