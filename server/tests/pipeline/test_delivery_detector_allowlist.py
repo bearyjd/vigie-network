@@ -79,6 +79,14 @@ def foreign_scenario(world, **kw):
     return pub
 
 
+def test_main_fixture_detector_upload_is_frozen_under_the_default_allowlist(world):
+    """Main's old helper value `upload` is not a real detector: unlike main, it is not delivered."""
+    world.incident("old", detector="upload")
+    pub = FakePublisher()
+    go(world, pub, Clock(T0 + 10))
+    assert world.rows() == [] and pub.attempted == []
+
+
 def test_foreign_detector_creates_no_row_and_no_recover_by_default(world):
     pub = foreign_scenario(world)
     assert world.rows() == [] and pub.attempted == []

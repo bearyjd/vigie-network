@@ -372,12 +372,14 @@ echo the value). A detector id is not checked against a registry.
 
 Only incidents of a listed detector can get a delivery row, a send or a recover. An incident of any
 other detector is *frozen*, not treated as deleted: it never gets an open or recover row, its
-pending and lease-lapsed rows expire (`incident_missing`), and its existing rows are kept for as
-long as the incident exists and is open, so putting the detector back later does not re-announce
+pending and lease-lapsed rows expire (`incident_missing`, or `lifetime` for a lapsed row past its
+lifetime), and its existing rows (at most 2 per incident: open and recover) are kept until the
+incident closes, however long that takes, so putting the detector back later does not re-announce
 it. Once a frozen incident is closed (or gone) its rows are forgotten after the retention period,
-like any other. While a detector is off the list a sent open is not followed by a recover; if the
+like any other. While a detector is off the list a sent open is not followed by a recover. If the
 detector is added back before the rows are forgotten and the incident resolved meanwhile, a late
-recover is sent.
+recover is sent only when no recover row existed: a recover row that was pending when the detector
+was removed expired and is never revived (only a withdrawn recover row is).
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
