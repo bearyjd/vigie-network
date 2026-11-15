@@ -32,7 +32,9 @@ class World:
         self.ov = open_overrides(root / "overrides.db")
         self.ro = open_overrides_ro(root / "overrides.db")
 
-    def incident(self, iid="i1", state="open", device="dev-1", at=T0, evidence="{}") -> None:
+    def incident(
+        self, iid="i1", state="open", device="dev-1", at=T0, evidence="{}", detector="large_upload"
+    ) -> None:
         self.inv.execute(
             "INSERT OR REPLACE INTO monitoring_incidents(id,collector_id,device_id,lineage,"
             "detector,state,episode_start,last_hour,detected_at,baseline_id,observed_bytes,"
@@ -42,7 +44,7 @@ class World:
                 "c1",
                 device,
                 iid,
-                "upload",
+                detector,
                 state,
                 at,
                 at,

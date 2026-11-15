@@ -360,7 +360,26 @@ design; delivery ids are hashes.
 `VIGIE_DELIVERY_ENABLED` (only `1`/`true`/`yes` enable; `0`/`false`/`no`/`off`/empty disable; any
 other value is an error), `VIGIE_DELIVERY_FILE` (required when enabled), `_LEASE_S` (300),
 `_TRANSMIT_DEADLINE_S` (30), `_MAX_ATTEMPTS` (6), `_BACKOFF_BASE_S` (60), `_BACKOFF_CAP_S`
-(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+(3600), `_TTL_S` (86400), `_RETENTION_S` (2592000), `_MAX_PER_RUN` (20), `_MAX_ABANDONED` (2, at least 1: at most this many publishes are in flight or abandoned-and-still-running at any moment across the process, so it also bounds concurrent publishes), `VIGIE_DELIVERY_INCLUDE_LABEL` (off, see above), `VIGIE_DELIVERY_DETECTORS` (`large_upload,upload_deviation`: the detector allowlist, see below), `_DRAIN_BUDGET_S` (60, at least the transmit deadline: once a drain has run this long (measured on a monotonic clock, checked before every claim attempt) it claims nothing more, so a transport that fails just under its deadline cannot hold the pass for `MAX_PER_RUN` x deadline).
+
+**Detector allowlist.** `VIGIE_DELIVERY_DETECTORS` is a comma-separated list (whitespace around commas is
+ignored) of detector ids, 1 to 8 distinct tokens matching `[a-z][a-z0-9_]{0,31}`. Unset means
+`large_upload,upload_deviation`, exactly today's behaviour (the stock compose forwards it with
+`${VAR-default}`, so only an unset variable gets the default). An explicitly empty value, an
+empty/duplicate/malformed token or more than 8 entries is a startup error that stops the whole
+pipeline even when delivery is off, like the other `VIGIE_DELIVERY_*` settings (the message does not
+echo the value). A detector id is not checked against a registry.
+
+Only incidents of a listed detector can get a delivery row, a send or a recover. An incident of any
+other detector is *frozen*, not treated as deleted: it never gets an open or recover row, its
+pending and lease-lapsed rows expire (`incident_missing`, or `lifetime` for a lapsed row past its
+lifetime), and its existing rows (at most 2 per incident: open and recover) are kept until the
+incident closes, however long that takes, so putting the detector back later does not re-announce
+it. Once a frozen incident is closed (or gone) its rows are forgotten after the retention period,
+like any other. While a detector is off the list a sent open is not followed by a recover. If the
+detector is added back before the rows are forgotten and the incident resolved meanwhile, a late
+recover is sent only when no recover row existed: a recover row that was pending when the detector
+was removed expired and is never revived (only a withdrawn recover row is).
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is

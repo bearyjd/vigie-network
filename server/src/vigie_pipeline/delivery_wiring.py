@@ -62,6 +62,7 @@ def run_delivery_stage(
             max_abandoned=settings.max_abandoned,
             drain_budget_seconds=settings.drain_budget_s,
             include_label=settings.include_label,
+            detectors=settings.detectors,
             should_stop=should_stop,
         )
     except Exception as exc:  # noqa: BLE001 - delivery must never fail the pipeline pass

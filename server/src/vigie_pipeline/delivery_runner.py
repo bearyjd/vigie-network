@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 
@@ -46,7 +46,7 @@ from vigie_pipeline.delivery_sql import (
     completion_params,
     failure_statement,
 )
-from vigie_pipeline.delivery_types import tick_ceil, tick_floor
+from vigie_pipeline.delivery_types import DEFAULT_DETECTORS, tick_ceil, tick_floor
 from vigie_pipeline.logs import log
 
 logger = logging.getLogger("vigie_pipeline")
@@ -103,18 +103,26 @@ def _read_reviews(ro: sqlite3.Connection | None) -> dict[str, ReviewView]:
         raise DecisionsUnavailable(str(exc)) from exc
 
 
-def _plan_pass(inv, ro, config: DeliveryConfig, clock: Callable[[], float]) -> tuple[int, float]:
-    """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError."""
+def _plan_pass(
+    inv, ro, config: DeliveryConfig, clock: Callable[[], float], detectors: Iterable[str]
+) -> tuple[int, float]:
+    """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError.
+
+    Every incident is read, but one whose detector is not allowlisted is planned as FROZEN: no
+    open/recover row is ever created for it, its pending and lapsed rows expire
+    (`incident_missing`), and its rows are deleted only once it is closed (retention rule) or gone.
+    A sent open is therefore not followed by a recover while its detector stays off the list."""
+    allowed = frozenset(detectors)
     with immediate(inv):
         now = clock()  # after BEGIN IMMEDIATE: never older than the state it plans against
-        incidents = [
-            IncidentView(r[0], r[1], _epoch(r[2]))
-            for r in inv.execute("SELECT id,state,detected_at FROM monitoring_incidents")
-        ]
+        rows = inv.execute("SELECT id,state,detected_at,detector FROM monitoring_incidents")
+        found = [(IncidentView(r[0], r[1], _epoch(r[2])), r[3] in allowed) for r in rows]
+        incidents = [v for v, _ in found]
+        frozen = frozenset(v.id for v, ok in found if not ok)
         every = inv.execute(f"SELECT {_ROW} FROM incident_deliveries")  # noqa: S608
         deliveries = [_delivery(r) for r in every]
         reviews = _read_reviews(ro)
-        actions = plan(incidents, reviews, deliveries, now, config)
+        actions = plan(incidents, reviews, deliveries, now, config, frozen)
         apply_actions(inv, actions, now)
     return len(actions), now
 
@@ -333,13 +341,16 @@ def run_delivery(
     monotonic: Callable[[], float] = time.monotonic,
     include_label: bool = False,
     should_stop: Callable[[], bool] = lambda: False,
+    detectors: Iterable[str] = DEFAULT_DETECTORS,
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget."""
+    if isinstance(detectors, str) or not (detectors := frozenset(detectors)):
+        raise ValueError("detectors must be a non-empty collection of detector ids")
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
     try:
-        planned, now = _plan_pass(inv, overrides, config, clock)
+        planned, now = _plan_pass(inv, overrides, config, clock, detectors)
     except DecisionsUnavailable as exc:
         log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
         return RunReport(skipped="decisions_unavailable")
