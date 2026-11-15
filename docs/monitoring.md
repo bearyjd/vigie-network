@@ -381,6 +381,30 @@ detector is added back before the rows are forgotten and the incident resolved m
 recover is sent only when no recover row existed: a recover row that was pending when the detector
 was removed expired and is never revived (only a withdrawn recover row is).
 
+**Open-only detectors.** `new_device` (the F5 new-device notice, not yet produced by any code) is
+open-only: when allowlisted its incident gets one `open` delivery whose text is "New device on your
+network: " plus the alias or label (never a MAC, hostname, vendor or IP), and NEVER a `recover`,
+whether the incident later resolves or is superseded; a sent open stays sent. The upload detectors
+are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
+
+**Retention of incidents.** Incidents older than 90 days (by `last_hour`) are pruned, except an
+`open` incident of a non-upload detector (e.g. `new_device`), which is kept for as long as it is
+`open` (an acknowledgement does not close it), or, once closed, for as long as any of its delivery
+rows exists (rows carry no detector, so the incident row is the only way to attribute them; the
+rows are forgotten after the delivery retention, after which the incident is pruned). Upload
+incidents are pruned exactly as before.
+If delivery is disabled or the decision store is unavailable, only the planner forgets delivery rows,
+so a closed non-upload incident whose rows were never forgotten is kept until they are; that set is
+static (nothing new is added while delivery is off).
+An open `new_device` incident, and its sent `open` delivery row (rows of an open incident are never
+forgotten), therefore stay indefinitely: the per-day cap of the sweep that creates them (a later
+slice) is the only bound on their number.
+
+The pilot report counts `new_device` incidents under their own key in `incidents.per_detector` only:
+they are excluded from `incidents.total`, `incidents.per_day`, the delivery counts, the
+unwanted-notification verdict and the `decisions` ratios (decisions on `new_device` incidents are
+not counted), which stay evidence about the upload detectors.
+
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
 created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a symlink, FIFO or

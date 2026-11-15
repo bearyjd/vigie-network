@@ -381,10 +381,12 @@ def prune_monitoring(inv, now):
                 (cutoff,),
             )
         inv.execute(
-            "DELETE FROM monitoring_incidents WHERE seq IN "
+            "DELETE FROM monitoring_incidents WHERE seq IN "  # noqa: S608
             "(SELECT seq FROM monitoring_incidents WHERE last_hour<? "
+            "AND NOT (detector NOT IN (" + _ENGINE_IN + ") AND (state='open' OR EXISTS "
+            "(SELECT 1 FROM incident_deliveries d WHERE d.incident_id=monitoring_incidents.id))) "
             "ORDER BY last_hour LIMIT 1000)",
-            (cutoff,),
+            (cutoff, *ENGINE_DETECTORS),
         )
         inv.execute(
             "DELETE FROM monitoring_baselines WHERE id IN "

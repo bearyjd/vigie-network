@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
+from vigie_api.models import new_device_evidence
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -339,6 +340,16 @@ def baseline_view(inv, collector, device, key):
     }
 
 
+def _evidence(detector, stored):
+    if detector != "new_device":
+        return json.loads(stored)
+    try:
+        parsed = json.loads(stored)
+    except (ValueError, RecursionError):  # malformed stored text: serve the null-dwell shape
+        parsed = None
+    return new_device_evidence(parsed)
+
+
 def incident_row(inv, ov, row, review, now):
     try:
         current = device_macs(inv, ov, row["device_id"])[2] == row["lineage"]
@@ -358,7 +369,7 @@ def incident_row(inv, ov, row, review, now):
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
         "baseline_id": row["baseline_id"],
-        "evidence": json.loads(row["evidence"]),
+        "evidence": _evidence(row["detector"], row["evidence"]),
         "review": review_view(review),
         "decision_version": review["version"] if review else 0,
         "attention": attention(row["state"], review, now),

@@ -46,7 +46,12 @@ from vigie_pipeline.delivery_sql import (
     completion_params,
     failure_statement,
 )
-from vigie_pipeline.delivery_types import DEFAULT_DETECTORS, tick_ceil, tick_floor
+from vigie_pipeline.delivery_types import (
+    DEFAULT_DETECTORS,
+    OPEN_ONLY_DETECTORS,
+    tick_ceil,
+    tick_floor,
+)
 from vigie_pipeline.logs import log
 
 logger = logging.getLogger("vigie_pipeline")
@@ -115,14 +120,17 @@ def _plan_pass(
     allowed = frozenset(detectors)
     with immediate(inv):
         now = clock()  # after BEGIN IMMEDIATE: never older than the state it plans against
-        rows = inv.execute("SELECT id,state,detected_at,detector FROM monitoring_incidents")
+        rows = inv.execute(
+            "SELECT id,state,detected_at,detector FROM monitoring_incidents"
+        ).fetchall()
         found = [(IncidentView(r[0], r[1], _epoch(r[2])), r[3] in allowed) for r in rows]
         incidents = [v for v, _ in found]
         frozen = frozenset(v.id for v, ok in found if not ok)
+        open_only = frozenset(r[0] for r in rows if r[3] in OPEN_ONLY_DETECTORS)
         every = inv.execute(f"SELECT {_ROW} FROM incident_deliveries")  # noqa: S608
         deliveries = [_delivery(r) for r in every]
         reviews = _read_reviews(ro)
-        actions = plan(incidents, reviews, deliveries, now, config, frozen)
+        actions = plan(incidents, reviews, deliveries, now, config, frozen, open_only)
         apply_actions(inv, actions, now)
     return len(actions), now
 
@@ -139,11 +147,13 @@ def _claim(inv, row: DeliveryView, config, clock) -> tuple[DeliveryView, int] | 
 
 def _message(inv, ro, claimed: DeliveryView, include_label: bool) -> Message | None:
     row = inv.execute(
-        "SELECT device_id FROM monitoring_incidents WHERE id=?", (claimed.incident_id,)
+        "SELECT device_id,detector FROM monitoring_incidents WHERE id=?", (claimed.incident_id,)
     ).fetchone()
     if row is None:
         return None
     device = row[0]
+    if claimed.kind != "open" and row[1] in OPEN_ONLY_DETECTORS:
+        return None  # defence in depth: the planner never claims one, and none is ever built
     label = None  # only a name from device_overrides may be offered; never the raw device id
     if include_label and ro is not None:  # default: the label is not even read
         try:
@@ -154,7 +164,7 @@ def _message(inv, ro, claimed: DeliveryView, include_label: bool) -> Message | N
         except sqlite3.Error:
             pass  # the label is a nicety: without it the message carries the alias
     did = delivery_id(claimed.incident_id, claimed.kind)
-    return build_message(did, claimed.kind, claimed.incident_id, label, device)
+    return build_message(did, claimed.kind, claimed.incident_id, label, device, row[1])
 
 
 def _prune() -> None:

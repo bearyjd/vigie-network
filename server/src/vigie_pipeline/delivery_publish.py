@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 
+from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS
+
 MAX_LABEL = 48
 MAX_DIGITS = 3
 MAX_WORD = 20  # a word this long is an opaque token, not a name
@@ -100,14 +102,28 @@ def incident_link(incident_id: object) -> str:
     return "/ui/#incident=" + quote(str(incident_id)[: MAX_LINK - 20], safe="")[: MAX_LINK - 14]
 
 
+# Per-detector text; any detector not listed here uses the upload text above. A new device has no
+# recover text: it is open-only (see delivery_types.OPEN_ONLY_DETECTORS).
+DETECTOR_TITLES = {("new_device", "open"): "New device on your network: {label}"}
+DETECTOR_BODIES = {("new_device", "open"): "New device on your network: {label}. Review it: {link}"}
+
+
 def build_message(
-    delivery_id: str, kind: str, incident_id: object, label: object, device_id: object = ""
+    delivery_id: str,
+    kind: str,
+    incident_id: object,
+    label: object,
+    device_id: object = "",
+    detector: object = "",
 ) -> Message:
+    if detector in OPEN_ONLY_DETECTORS and kind != "open":
+        raise ValueError(f"{detector} is open-only: no {kind} message")
     clean, link = scrub_label(label, device_id), incident_link(incident_id)
     fields = {"label": clean, "link": link}
-    return Message(
-        delivery_id, kind, TITLES[kind].format(**fields), BODIES[kind].format(**fields), link
-    )
+    key = (detector, kind)
+    title = DETECTOR_TITLES.get(key, TITLES[kind])
+    body = DETECTOR_BODIES.get(key, BODIES[kind])
+    return Message(delivery_id, kind, title.format(**fields), body.format(**fields), link)
 
 
 class FakePublisher:

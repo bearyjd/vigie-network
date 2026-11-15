@@ -276,6 +276,16 @@ def _row_action(
     return None
 
 
+def _open_only_recover(iid: str, d: DeliveryView, now: float) -> Action | None:
+    """A recover row of an open-only incident must never go out: a pending one, or a sending one
+    whose lease lapsed, expires (a live lease belongs to its sender); other states are inert."""
+    if d.state == "pending" or (
+        d.state == "sending" and _num(d.next_attempt_at) and d.next_attempt_at <= tick_floor(now)
+    ):
+        return Expire(iid, d.kind, "open_only", _exp(d))
+    return None
+
+
 def _recover_action(
     iid: str, ds: Mapping[str, DeliveryView], now: float, config: DeliveryConfig
 ) -> Action | None:
@@ -298,6 +308,7 @@ def _plan_incident(
     now: float,
     config: DeliveryConfig,
     frozen: bool = False,
+    open_only: bool = False,
 ) -> list[Action]:
     if incident is None or frozen:  # pruned, or not delivered (detector off the allowlist)
         rows = sorted(ds.items())
@@ -317,12 +328,18 @@ def _plan_incident(
             return []
         return _forget_all(iid, ds, now, config)
     state = incident.state if _num(incident.detected_at) else None
-    rows = (_row_action(iid, d, state, review, now, config) for _, d in sorted(ds.items()))
+    rows = (
+        _open_only_recover(iid, d, now)
+        if open_only and k == "recover"
+        else _row_action(iid, d, state, review, now, config)
+        for k, d in sorted(ds.items())
+    )
     actions = [a for a in rows if a]
     if "open" not in {a.kind for a in actions}:
         opened = _open_action(iid, state, review, ds.get("open"), now, config)
         actions.extend([opened] if opened else [])
-    recover = _recover_action(iid, ds, now, config) if state == "resolved" else None
+    owed = state == "resolved" and not open_only  # open-only detectors never owe a recover
+    recover = _recover_action(iid, ds, now, config) if owed else None
     actions.extend([recover] if recover else [])
     if state in CLOSED_STATES and not actions:  # nothing pending, nothing owed
         return _forget_all(iid, ds, now, config)
@@ -341,12 +358,14 @@ def plan(
     now: float,
     config: DeliveryConfig,
     frozen: frozenset[str] = frozenset(),
+    open_only: frozenset[str] = frozenset(),
 ) -> tuple[Action, ...]:
     """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind).
 
     `frozen` ids are existing incidents that must not be delivered: their pending and lapsed rows
     expire, no open/recover is ever created, and their rows are deleted only once the incident is
-    closed (or gone) and the retention rule says so."""
+    closed (or gone) and the retention rule says so. `open_only` ids get an open delivery like any
+    other but never a recover (a resolved incident is simply closed; the sent open stays sent)."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
     grouped: dict[str, dict[str, DeliveryView]] = {}
@@ -368,6 +387,7 @@ def plan(
                 now,
                 config,
                 iid in frozen,
+                iid in open_only,
             )
         )
     return tuple(sorted(actions, key=lambda a: (a.incident_id, a.kind)))

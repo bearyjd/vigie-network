@@ -34,7 +34,7 @@ from vigie_pipeline.baselines import ALGORITHM as POOLED_ALGORITHM
 from vigie_pipeline.baselines import BaselineConfig
 from vigie_pipeline.baselines_tod import ALGORITHM as TOD_ALGORITHM
 from vigie_pipeline.baselines_tod import TodConfig
-from vigie_pipeline.delivery_types import DeliveryConfig
+from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS, DeliveryConfig
 from vigie_pipeline.monitoring_engine import AGGREGATE_DAYS
 
 SCHEMA = "vigie-pilot-report/1"
@@ -65,6 +65,10 @@ COVERAGE_NOTE = (
 )
 # the engine stamps last_hour with the hour just completed: one hour before detection
 _INCIDENT_WINDOW = "last_hour>=? AND detected_at>=? AND detected_at<?"
+
+# F5 detectors are reported per detector only: they stay out of the upload totals and of the
+# delivery and unwanted-notification verdicts, which are pilot evidence about the upload detectors.
+_FOREIGN = ",".join(f"'{d}'" for d in OPEN_ONLY_DETECTORS)  # fixed internal constants
 
 Section = dict[str, Any]
 
@@ -192,17 +196,18 @@ def incidents_section(inv: sqlite3.Connection | None, lo: int, hi: int, gap: str
         f"WHERE {_INCIDENT_WINDOW} GROUP BY detector,day ORDER BY day,detector LIMIT ?",
         (*_incident_args(lo, hi), ROW_LIMIT + 1),
     ).fetchall()
-    if not rows and gap:
-        return _unknown(f"no incidents: {gap}")
+    if gap and all(r["detector"] in OPEN_ONLY_DETECTORS for r in rows[:ROW_LIMIT]):
+        return _unknown(f"no incidents: {gap}")  # no UPLOAD rows: the zero would not be real
     per_detector: dict[str, int] = defaultdict(int)
     per_day: dict[str, dict[str, int]] = defaultdict(dict)
     for row in rows[:ROW_LIMIT]:
         per_detector[row["detector"]] += row["n"]
-        per_day[row["day"]][row["detector"]] = row["n"]
+        if row["detector"] not in OPEN_ONLY_DETECTORS:
+            per_day[row["day"]][row["detector"]] = row["n"]
     return {
         **_status(len(rows) > ROW_LIMIT),
         "truncated": len(rows) > ROW_LIMIT,
-        "total": sum(per_detector.values()),
+        "total": sum(n for d, n in per_detector.items() if d not in OPEN_ONLY_DETECTORS),
         "per_detector": dict(sorted(per_detector.items())),
         "per_day": {d: per_day[d] for d in sorted(per_day)},
     }
@@ -235,7 +240,8 @@ def incidents_missing_open(
         return None
     mark = iso_utc(watermark) if watermark is not None else ""
     base = (
-        f"FROM monitoring_incidents i WHERE {_INCIDENT_WINDOW} AND NOT EXISTS "  # noqa: S608
+        f"FROM monitoring_incidents i WHERE {_INCIDENT_WINDOW} "  # noqa: S608
+        f"AND i.detector NOT IN ({_FOREIGN}) AND NOT EXISTS "
         "(SELECT 1 FROM incident_deliveries d WHERE d.incident_id=i.id AND d.kind='open')"
     )
     args = _incident_args(lo, hi)
@@ -266,8 +272,9 @@ def decisions_section(ov: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
     if beyond_incident_retention(lo, hi):
         return _unknown("window exceeds incident retention")
     rows = ov.execute(
-        "SELECT status,COUNT(*) AS n FROM incident_decisions WHERE decided_at>=? "
-        "AND decided_at<? AND status IS NOT NULL GROUP BY status LIMIT 10",
+        "SELECT status,COUNT(*) AS n FROM incident_decisions WHERE decided_at>=? "  # noqa: S608
+        f"AND decided_at<? AND status IS NOT NULL AND detector NOT IN ({_FOREIGN}) "
+        "GROUP BY status LIMIT 10",
         (iso_utc(lo), iso_utc(hi)),
     ).fetchall()
     counts = {row["status"]: row["n"] for row in rows}
@@ -281,6 +288,16 @@ def decisions_section(ov: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
         "counts": {name: counts.get(name, 0) for name in names},
         "ratios": {name: round(counts.get(name, 0) / total, 4) for name in names},
     }
+
+
+def _not_foreign(inv: sqlite3.Connection | None) -> str:
+    """SQL (with a trailing space) leaving out deliveries of F5 incidents; needs the incidents."""
+    if not _has_table(inv, "monitoring_incidents"):
+        return ""
+    return (
+        "AND incident_id NOT IN (SELECT id FROM monitoring_incidents "  # noqa: S608
+        f"WHERE detector IN ({_FOREIGN})) "
+    )
 
 
 def deliveries_section(  # noqa: PLR0913
@@ -303,8 +320,8 @@ def deliveries_section(  # noqa: PLR0913
         named = ", ".join(e["incident_id"] for e in (missing_open or {})["examples"])
         return _unknown(f"{after} incident(s) have no open delivery row: {named}")
     rows = inv.execute(
-        "SELECT strftime('%Y-%m-%d',updated_at,'unixepoch') AS day,state,COUNT(*) AS n "
-        "FROM incident_deliveries WHERE updated_at>=? AND updated_at<? "
+        "SELECT strftime('%Y-%m-%d',updated_at,'unixepoch') AS day,state,COUNT(*) AS n "  # noqa: S608
+        f"FROM incident_deliveries WHERE updated_at>=? AND updated_at<? {_not_foreign(inv)}"
         "GROUP BY day,state ORDER BY day,state LIMIT ?",
         (lo, hi, ROW_LIMIT + 1),
     ).fetchall()
@@ -513,9 +530,9 @@ def unwanted_section(  # noqa: PLR0913
     if lo < hi - retention:
         return _unknown("window exceeds delivery retention")
     rows = inv.execute(
-        "SELECT incident_id,strftime('%Y-%m-%d',updated_at,'unixepoch') AS day "
+        "SELECT incident_id,strftime('%Y-%m-%d',updated_at,'unixepoch') AS day "  # noqa: S608
         "FROM incident_deliveries WHERE updated_at>=? AND updated_at<? AND state='sent' "
-        "AND kind='open' ORDER BY updated_at,row_id LIMIT ?",
+        f"AND kind='open' {_not_foreign(inv)}ORDER BY updated_at,row_id LIMIT ?",
         (lo, hi, ROW_LIMIT + 1),
     ).fetchall()
     if not rows and gap:

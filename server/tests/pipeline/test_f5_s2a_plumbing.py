@@ -1,0 +1,250 @@
+"""F5 S2a plumbing: nothing creates a `new_device` incident yet, but every layer must be ready.
+
+Prune keeps OPEN non-upload incidents; the delivery planner is open-only for `new_device`; its
+text carries the alias only. Rows are inserted directly (cloned shape, as test_engine_incident_scope
+does). Policy versions are pinned through the shared freeze pins; never regenerate goldens.
+"""
+
+from __future__ import annotations
+
+import json
+import unicodedata
+
+import pytest
+from delivery_runner_helpers import T0, Clock, World, dconf
+from test_monitoring_engine import HOUR, seeded
+from test_probe_freeze import POOLED_VERSION, TOD_VERSION
+
+from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.delivery_publish import MAX_LABEL, FakePublisher, alias, build_message
+from vigie_pipeline.delivery_runner import run_delivery
+from vigie_pipeline.monitoring_engine import prune_monitoring
+from vigie_pipeline.processor import monitoring_policy
+
+ALLOW = ("large_upload", "upload_deviation", "new_device")
+
+
+def test_policy_versions_unchanged():
+    assert monitoring_policy(PipelineConfig.from_env({})).version == POOLED_VERSION
+    tod = PipelineConfig.from_env({"VIGIE_MONITORING_BASELINE": "tod"})
+    assert monitoring_policy(tod).version == TOD_VERSION
+
+
+# ---- prune -------------------------------------------------------------------------------------
+def put(inv, iid, detector, state, last_hour=HOUR):
+    inv.execute(
+        "INSERT INTO monitoring_incidents(id,collector_id,device_id,lineage,detector,state,"
+        "episode_start,last_hour,detected_at,baseline_id,observed_bytes,threshold_bytes,evidence)"
+        " VALUES (?,'c1','d1','L',?,?,?,?,'2026-01-01T00:00:00Z',NULL,0,0,'{}')",
+        (iid, detector, state, last_hour, last_hour),
+    )
+
+
+def ids(inv):
+    return {r[0] for r in inv.execute("SELECT id FROM monitoring_incidents")}
+
+
+def test_prune_keeps_open_non_upload_and_prunes_everything_else_old(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        put(inv, "nd-open", "new_device", "open")
+        put(inv, "nd-resolved", "new_device", "resolved")
+        put(inv, "nd-superseded", "new_device", "superseded")
+        for detector in ("large_upload", "upload_deviation"):
+            for state in ("open", "resolved", "superseded"):
+                put(inv, f"{detector}-{state}", detector, state)
+        put(inv, "nd-recent", "new_device", "resolved", HOUR + 99 * 86400)
+        prune_monitoring(inv, HOUR + 100 * 86400)
+        assert ids(inv) == {"nd-open", "nd-recent"}
+    finally:
+        inv.close()
+        ov.close()
+
+
+def test_prune_keeps_a_closed_non_upload_incident_while_a_delivery_row_exists(tmp_path):
+    inv, ov = seeded(tmp_path)
+    try:
+        put(inv, "nd-kept", "new_device", "resolved")
+        put(inv, "nd-gone", "new_device", "superseded")
+        put(inv, "up-row", "upload_deviation", "resolved")  # upload: pruned as before
+        for iid in ("nd-kept", "up-row"):
+            inv.execute(
+                "INSERT INTO incident_deliveries(delivery_id,incident_id,kind,state,"
+                "next_attempt_at,created_at,updated_at) VALUES (?,?, 'open','sent',NULL,1,1)",
+                (str(len(iid)).zfill(32), iid),
+            )
+        prune_monitoring(inv, HOUR + 100 * 86400)
+        assert ids(inv) == {"nd-kept"}
+        inv.execute("DELETE FROM incident_deliveries")  # retention forgot its rows
+        prune_monitoring(inv, HOUR + 100 * 86400)
+        assert ids(inv) == set()
+    finally:
+        inv.close()
+        ov.close()
+
+
+# ---- delivery: open-only -----------------------------------------------------------------------
+@pytest.fixture
+def world(tmp_path):
+    w = World(tmp_path)
+    yield w
+    w.close()
+
+
+def go(world, pub, clock, **kw):
+    kw.setdefault("detectors", ALLOW)
+    return run_delivery(world.inv, world.ro, pub, dconf(), clock, **kw)
+
+
+@pytest.mark.parametrize("closed", ["resolved", "superseded"])
+def test_new_device_open_is_sent_and_never_followed_by_a_recover(world, closed):
+    world.incident("n", detector="new_device")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    assert world.states() == {"open": "sent"}
+    world.set_state("n", closed)
+    for _ in range(3):
+        clock.t += 100
+        go(world, pub, clock)
+    assert world.states() == {"open": "sent"}  # an already-sent open stays sent
+    assert [m.kind for m in pub.sent] == ["open"]
+
+
+@pytest.mark.parametrize("closed", ["resolved", "superseded"])
+def test_new_device_closed_before_send_gets_no_recover_row(world, closed):
+    world.incident("n", detector="new_device")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock, max_per_run=0)
+    assert world.states() == {"open": "pending"}
+    world.set_state("n", closed)
+    clock.t += 100
+    go(world, pub, clock)
+    assert "recover" not in {r["kind"] for r in world.rows()} and pub.attempted == []
+
+
+def test_new_device_is_not_delivered_with_the_default_allowlist(world):
+    world.incident("n", detector="new_device")
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    default = ("large_upload", "upload_deviation")
+    go(world, pub, clock, detectors=default)
+    world.set_state("n", "resolved")
+    clock.t += 100
+    go(world, pub, clock, detectors=default)
+    assert world.rows() == [] and pub.attempted == []
+
+
+def test_upload_incident_still_gets_its_recover_when_new_device_is_allowlisted(world):
+    world.incident("u", detector="upload_deviation")
+    world.incident("n", detector="new_device", at=T0 + 1)
+    pub, clock = FakePublisher(), Clock(T0 + 10)
+    go(world, pub, clock)
+    world.set_state("u", "resolved")
+    world.set_state("n", "resolved")
+    clock.t += 100
+    go(world, pub, clock)
+    assert sorted((m.kind, m.title[:6]) for m in pub.sent) == [
+        ("open", "New de"),
+        ("open", "Vigie:"),
+        ("recover", "Vigie:"),
+    ]
+
+
+# ---- delivery: text ----------------------------------------------------------------------------
+def build(kind, label, device="dev-x", detector="new_device"):
+    return build_message("d" * 32, kind, "inc-1", label, device, detector)
+
+
+def test_new_device_text_uses_the_label_only():
+    m = build("open", "Kitchen tablet")
+    assert m.title == "New device on your network: Kitchen tablet"
+    assert m.body.startswith("New device on your network: Kitchen tablet.")
+    assert m.link in m.body
+
+
+def test_new_device_text_falls_back_to_the_alias():
+    assert build("open", None, "dev-x").title.endswith(alias("dev-x"))
+
+
+def test_upload_texts_are_byte_identical():
+    o = build_message("d" * 32, "open", "i", "Phone", "dev")
+    r = build_message("d" * 32, "recover", "i", "Phone", "dev")
+    assert o.title == "Vigie: check Phone"
+    assert o.body == "Phone: unusual activity detected. Review it here: /ui/#incident=i"
+    assert r.title == "Vigie: Phone is back to normal"
+    assert r.body == "Phone: the activity has returned to normal. Details: /ui/#incident=i"
+    assert build_message("d" * 32, "open", "i", "Phone", "dev", "large_upload") == o
+
+
+HOSTILE = [
+    "a\nb", "a\r\nSubject: x", "tab\there", "\x00nul", "\x1b[31mred", "‮evil", "x" * 5000,
+    "<script>alert(1)</script>", "[x](http://e.example)", "`rm -rf`", "{label}{link}", "%s%d",
+    "é́", "\U0001f600 party", "aa:bb:cc:dd:ee:ff", "aabbccddeeff", "Ａbc", "  pad  ",
+    "ntfy: Title: x", "", None, 5,
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("label", HOSTILE, ids=range(len(HOSTILE)))
+def test_new_device_text_is_sanitised_and_bounded(label):
+    m = build("open", label, "dev-x")
+    for text in (m.title, m.body):
+        assert not any(
+            unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Zl", "Zp") for c in text
+        )
+        assert len(text) < 300
+    clean = m.title.removeprefix("New device on your network: ")
+    assert clean == alias("dev-x") or (clean == label and len(clean) <= MAX_LABEL)
+    assert json.dumps({"t": m.title, "b": m.body})
+
+
+# ---- delivery: a pre-existing recover row of an open-only incident is never sent ---------------
+def seed_row(world, iid, kind, state, nxt=None, created=T0, attempts=0):
+    from vigie_pipeline.delivery_plan import delivery_id
+
+    world.inv.execute(
+        "INSERT INTO incident_deliveries(delivery_id,incident_id,kind,state,attempts,"
+        "next_attempt_at,created_at,updated_at,version) VALUES (?,?,?,?,?,?,?,?,0)",
+        (delivery_id(iid, kind), iid, kind, state, attempts, nxt, created, created),
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "nxt"),
+    [("pending", T0), ("sending", T0 + 5), ("withdrawn", None)],
+)
+@pytest.mark.parametrize("closed", ["resolved", "superseded", "open"])
+def test_existing_recover_row_of_an_open_only_incident_is_never_sent(world, state, nxt, closed):
+    world.incident("n", state=closed, detector="new_device")
+    seed_row(world, "n", "open", "sent")
+    seed_row(world, "n", "recover", state, nxt)
+    pub, clock = FakePublisher(), Clock(T0 + 100)
+    for _ in range(3):
+        go(world, pub, clock)
+        clock.t += 100
+    assert pub.attempted == []
+    assert world.states()["open"] == "sent"
+    assert world.states()["recover"] in ("expired", "withdrawn")
+
+
+def test_a_live_recover_lease_of_an_open_only_incident_is_left_to_its_sender(world):
+    world.incident("n", state="resolved", detector="new_device")
+    seed_row(world, "n", "open", "sent")
+    seed_row(world, "n", "recover", "sending", T0 + 1000)
+    go(world, FakePublisher(), Clock(T0 + 10))
+    assert world.states()["recover"] == "sending"
+
+
+def test_build_message_refuses_a_new_device_recover():
+    with pytest.raises(ValueError, match="open-only"):
+        build("recover", "Phone")
+
+
+def test_runner_message_refuses_a_new_device_recover_and_builds_the_open(world):
+    from dataclasses import replace
+
+    from vigie_pipeline.delivery_runner import _message
+    from vigie_pipeline.delivery_types import DeliveryView
+
+    world.incident("n", state="resolved", detector="new_device")
+    row = DeliveryView("n", "open", "sending", 1, T0, T0, T0, 1, 1)
+    assert _message(world.inv, None, row, False).title.startswith("New device on your network")
+    assert _message(world.inv, None, replace(row, kind="recover"), False) is None

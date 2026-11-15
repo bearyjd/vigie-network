@@ -533,13 +533,38 @@ class IncidentReview(BaseModel):
     decided_at: str
 
 
+NEW_DEVICE_MAX_DWELL_HOURS = 10**6
+
+
+class NewDeviceEvidence(BaseModel):
+    "Evidence of a `new_device` incident: no MAC, hostname, vendor or IP, ever."
+
+    reason_code: Literal["new_device_first_seen"]
+    randomized: Literal[False] = Field(description="Randomized MACs never raise this incident.")
+    dwell_hours: int | None = Field(
+        description="Whole hours the device had been present when it was noticed; null if the "
+        "stored value is not a plausible count."
+    )
+
+
+def new_device_evidence(raw: Any) -> dict[str, Any]:
+    """The only shape a `new_device` incident may expose; extras and bad values are dropped."""
+    dwell = raw.get("dwell_hours") if isinstance(raw, dict) else None
+    ok = type(dwell) is int and 0 <= dwell < NEW_DEVICE_MAX_DWELL_HOURS
+    return {
+        "reason_code": "new_device_first_seen",
+        "randomized": False,
+        "dwell_hours": dwell if ok else None,
+    }
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
     device_id: str
     lineage: str
     current_lineage: bool
-    detector: Literal["large_upload", "upload_deviation"]
+    detector: Literal["large_upload", "upload_deviation", "new_device"]
     state: Literal["open", "resolved", "superseded"]
     episode_start: int
     last_hour: int
@@ -547,7 +572,7 @@ class IncidentOut(BaseModel):
     observed_bytes: int
     threshold_bytes: int
     baseline_id: str | None
-    evidence: IncidentEvidence
+    evidence: IncidentEvidence | NewDeviceEvidence
     review: IncidentReview | None = Field(
         description="Current human decision, or null. A separate axis from `state`: `expected` "
         "is a per-incident label, not a suppression."

@@ -2091,7 +2091,8 @@
           "detector": {
             "enum": [
               "large_upload",
-              "upload_deviation"
+              "upload_deviation",
+              "new_device"
             ],
             "title": "Detector",
             "type": "string"
@@ -2105,7 +2106,15 @@
             "type": "integer"
           },
           "evidence": {
-            "$ref": "#/components/schemas/IncidentEvidence"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IncidentEvidence"
+              },
+              {
+                "$ref": "#/components/schemas/NewDeviceEvidence"
+              }
+            ],
+            "title": "Evidence"
           },
           "id": {
             "title": "Id",
@@ -2477,6 +2486,41 @@
           "retry_at"
         ],
         "title": "MonitoringUnavailableScope",
+        "type": "object"
+      },
+      "NewDeviceEvidence": {
+        "description": "Evidence of a `new_device` incident: no MAC, hostname, vendor or IP, ever.",
+        "properties": {
+          "dwell_hours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whole hours the device had been present when it was noticed; null if the stored value is not a plausible count.",
+            "title": "Dwell Hours"
+          },
+          "randomized": {
+            "const": false,
+            "description": "Randomized MACs never raise this incident.",
+            "title": "Randomized",
+            "type": "boolean"
+          },
+          "reason_code": {
+            "const": "new_device_first_seen",
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason_code",
+          "randomized",
+          "dwell_hours"
+        ],
+        "title": "NewDeviceEvidence",
         "type": "object"
       },
       "Page": {
