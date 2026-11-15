@@ -245,6 +245,11 @@ Put the data directory on an encrypted filesystem (PRP section 9).
    (`restart: on-failure`) until the schema matches. On a fresh stack the pipeline therefore
    restarts a few times until `provision-collector.sh` has created `inventory.db`; that is expected.
 5. `overrides.db` is migrated by the api at startup (it creates and migrates the file).
+   **The essential-devices release moves `overrides.db` from user_version 9 to 10** (one new table,
+   `essential_devices`, additive and forward-only). The api applies it at startup even when nothing is
+   marked essential and the feature has no effect yet, so **take a `vigie-backup backup` first**
+   (see the backup section above). An older api image refuses the newer `overrides.db` (`overrides
+   schema v10 is newer than this build`); restore the backup to go back.
 6. Roll back by restoring the previous image tag. A schema that moved forward cannot be moved back:
    keep a copy of the data volume before an upgrade that bumps a schema version
    (`podman volume export`, *unverified*).

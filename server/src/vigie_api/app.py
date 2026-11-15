@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vigie_api import (
     effective,
+    essential,
     evidence_routes,
     feeds,
     identity_writes,
@@ -36,6 +37,10 @@ from vigie_api.models import (
     DeviceStatus,
     DeviceType,
     ErrorEnvelope,
+    EssentialListResponse,
+    EssentialPut,
+    EssentialResultResponse,
+    EssentialStateResponse,
     EventsResponse,
     HealthResponse,
     IdentityState,
@@ -528,6 +533,104 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
         response.headers["ETag"] = writes.etag(result["version"])
         return envelope(result)
+
+    @app.get(
+        "/devices/{device_id}/essential",
+        tags=["devices"],
+        summary="Essential-device mark (owner opt-in)",
+        description="`version` is the ETag; send it back as If-Match on PUT/DELETE.",
+        response_model=EssentialStateResponse,
+        responses={200: ETAG_HEADER, **_errors(401, 404, 422, 429, 503)},
+    )
+    def get_essential(
+        device_id: DeviceId, _: Principal, inv: Inv, ov: Ov, response: Response
+    ) -> dict[str, Any]:
+        state = essential.get_state(inv, ov, device_id)
+        response.headers["ETag"] = writes.etag(state["version"])
+        return envelope(state)
+
+    @app.put(
+        "/devices/{device_id}/essential",
+        tags=["devices"],
+        summary="Mark a device essential",
+        description=(
+            "Records the owner's opt-in only; nothing is monitored yet. `absent_after_s` has no "
+            "default: 3600 to 604800. At most 32 devices; a merged alias is refused (mark the "
+            "canonical device). If-Match is the current essential version (0 if never marked)."
+        ),
+        response_model=EssentialResultResponse,
+        responses={
+            200: ETAG_HEADER,
+            **_errors(400, 401, 403, 404, 409, 412, 413, 422, 428, 429, 503),
+        },
+    )
+    def put_essential(
+        request: Request,
+        device_id: DeviceId,
+        body: EssentialPut,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        response: Response,
+        if_match: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        principal.require_write()
+        result = essential.set_essential(
+            inv,
+            ov,
+            device_id=device_id,
+            expected_version=writes.parse_if_match(if_match),
+            absent_after_s=body.absent_after_s,
+            principal=principal.name,
+            now_iso=iso_utc(clock()),
+            request_id=request.headers.get("x-request-id", "")[:128] or None,
+        )
+        response.headers["ETag"] = writes.etag(result["version"])
+        return envelope(result)
+
+    @app.delete(
+        "/devices/{device_id}/essential",
+        tags=["devices"],
+        summary="Unmark an essential device",
+        description="Sets the mark to null (the row is kept so the version never resets).",
+        response_model=EssentialResultResponse,
+        responses={
+            200: ETAG_HEADER,
+            **_errors(400, 401, 403, 404, 409, 412, 428, 429, 503),
+        },
+    )
+    def delete_essential(
+        request: Request,
+        device_id: DeviceId,
+        principal: Principal,
+        inv: Inv,
+        ov: Ov,
+        response: Response,
+        if_match: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        principal.require_write()
+        result = essential.set_essential(
+            inv,
+            ov,
+            device_id=device_id,
+            expected_version=writes.parse_if_match(if_match),
+            absent_after_s=None,
+            principal=principal.name,
+            now_iso=iso_utc(clock()),
+            request_id=request.headers.get("x-request-id", "")[:128] or None,
+        )
+        response.headers["ETag"] = writes.etag(result["version"])
+        return envelope(result)
+
+    @app.get(
+        "/essential-devices",
+        tags=["devices"],
+        summary="List essential devices (at most 32)",
+        response_model=EssentialListResponse,
+        responses=_errors(401, 429, 503),
+    )
+    def list_essential_devices(_: Principal, ov: Ov) -> dict[str, Any]:
+        return envelope(essential.list_essential(ov))
 
     @app.get(
         "/macs/{mac}",

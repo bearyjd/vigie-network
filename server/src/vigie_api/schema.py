@@ -353,6 +353,21 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], Non
           WHEN (SELECT status FROM dataset_imports WHERE id=NEW.import_id) IS NOT 'staged'
           BEGIN SELECT RAISE(ABORT, 'entries can only be added to a staged import'); END""",
     ),
+    (
+        # F6-a: owner-marked essential devices. A table of its own, NOT a device_overrides column:
+        # editing that row bumps its version, which is the stitching suggestion basis. NULL =
+        # not essential; rows are never deleted so `version` (the If-Match value) never resets.
+        """CREATE TABLE essential_devices (
+          device_id TEXT PRIMARY KEY,
+          absent_after_s INTEGER CHECK (absent_after_s IS NULL OR
+            (typeof(absent_after_s)='integer' AND absent_after_s BETWEEN 3600 AND 604800)),
+          updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK (typeof(version)='integer' AND version>=1)
+        )""",
+        """CREATE TRIGGER no_essential_delete BEFORE DELETE ON essential_devices
+          BEGIN SELECT RAISE(ABORT, 'essential marks are cleared by nulling, never deleted');
+          END""",
+    ),
 )
 
 

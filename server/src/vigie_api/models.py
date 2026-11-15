@@ -11,6 +11,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -190,6 +191,35 @@ class PatchResult(BaseModel):
     version: int
 
 
+class EssentialPut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    absent_after_s: StrictInt = Field(
+        ge=3600,
+        le=604800,
+        description="Seconds of qualified Vigie coverage without seeing the device (1 h to 7 d).",
+    )
+
+
+class EssentialResult(BaseModel):
+    device_id: str
+    absent_after_s: int | None
+    version: int
+
+
+class EssentialState(EssentialResult):
+    essential: bool
+    updated_at: str | None
+    updated_by: str | None
+
+
+class EssentialListItem(BaseModel):
+    device_id: str
+    absent_after_s: int
+    version: int
+    updated_at: str
+
+
 class MacResolution(BaseModel):
     mac: str
     device_id: str
@@ -242,6 +272,18 @@ class DeviceResponse(_Envelope):
 
 class PatchResponse(_Envelope):
     data: PatchResult
+
+
+class EssentialResultResponse(_Envelope):
+    data: EssentialResult
+
+
+class EssentialStateResponse(_Envelope):
+    data: EssentialState
+
+
+class EssentialListResponse(_Envelope):
+    data: list[EssentialListItem]
 
 
 class MacResponse(_Envelope):
