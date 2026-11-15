@@ -33,6 +33,15 @@ OPAQUE = re.compile(r"[0-9a-f]{64}")
 EVIDENCE = {"reason_code": "new_device_first_seen", "randomized": False}
 
 
+DAY = 86400
+
+
+def ticks(data: Data, first: int, last: int, step: int = 3 * HOUR, **kw) -> None:
+    """Pipeline passes at a steady cadence (a gap over RESUME_GAP_S would move the watermark)."""
+    for t in range(first, last + 1, step):
+        run(data, t, **kw)
+
+
 def macs(n: int, prefix: str = "00:1a:2b:01") -> list[str]:
     return [f"{prefix}:{i >> 8:02x}:{i & 255:02x}" for i in range(n)]
 
@@ -94,16 +103,23 @@ def test_config_reads_environment():
     assert cfg.new_device_notice is True and cfg.new_device_max_per_day == 20
 
 
-@pytest.mark.parametrize("bad", ["0", "21", "-1", "x", "", "3.5", "99999999999999999999"])
+@pytest.mark.parametrize("bad", ["0", "21", "-1", "x", "", "3.5", "99999999999999999999", "1_0"])
 def test_config_rejects_a_bad_cap_without_echoing_it(bad):
     with pytest.raises(ValueError, match="VIGIE_NEW_DEVICE_MAX_PER_DAY") as info:
         PipelineConfig.from_env({"VIGIE_NEW_DEVICE_MAX_PER_DAY": bad})
     assert repr(bad) not in str(info.value)
 
 
-def test_config_rejects_garbage_flag():
-    with pytest.raises(ValueError, match="VIGIE_NEW_DEVICE_NOTICE"):
-        PipelineConfig.from_env({"VIGIE_NEW_DEVICE_NOTICE": "maybe"})
+def test_config_rejects_garbage_flag_without_echoing_it():
+    with pytest.raises(ValueError, match="VIGIE_NEW_DEVICE_NOTICE") as info:
+        PipelineConfig.from_env({"VIGIE_NEW_DEVICE_NOTICE": "maybe-secret"})
+    assert "maybe-secret" not in str(info.value)
+
+
+@pytest.mark.parametrize("bad", ["1_0", " 3", "3 ", "+3", "٣", "0x3"])
+def test_config_rejects_non_plain_digit_caps(bad):
+    with pytest.raises(ValueError, match="VIGIE_NEW_DEVICE_MAX_PER_DAY"):
+        PipelineConfig.from_env({"VIGIE_NEW_DEVICE_MAX_PER_DAY": bad})
 
 
 def test_the_flag_is_in_no_policy_dataclass():
@@ -225,13 +241,18 @@ def test_a_device_seen_before_the_watermark_never_notifies(data):
 
 
 def test_a_flag_that_was_off_for_a_while_never_backfills(data):
+    """A REAL on/off/on sequence through run_once with an advanced clock (no hand-edited meta)."""
     start(data)
-    run(data, T0 - 30, new_device_notice=False)
+    run(data, T0 - 30)
     arrive(data, MAC, at=T0)
     run(data, T0 + DWELL + 1, new_device_notice=False)  # appeared while the flag was off
-    data.inv.execute("DELETE FROM pipeline_meta WHERE key='f5_enabled_since'")
-    run(data, T0 + DWELL + 10)  # re-enabled later: a fresh watermark is set now
+    run(data, T0 + 2 * DAY, new_device_notice=False)
+    run(data, T0 + 2 * DAY + 10)  # switched back on: the watermark moves to now
+    run(data, T0 + 2 * DAY + 70)
     assert incidents(data) == []
+    assert data.q("SELECT value FROM pipeline_meta WHERE key='f5_enabled_since'")[0][0] == str(
+        T0 + 2 * DAY + 10
+    )
 
 
 @pytest.mark.parametrize(("delta", "expected"), [(-1, 0), (0, 1), (1, 1)])
@@ -342,8 +363,7 @@ def test_ten_eligible_devices_give_three_incidents_and_one_capped_event(data):
 def test_the_next_utc_day_resets_the_cap(data):
     start(data)
     out = staggered(data, 10)
-    run(data, T0 + DWELL + 200)
-    run(data, T0 + DWELL + 86400)
+    ticks(data, T0 + DWELL + 200, T0 + DWELL + 200 + DAY)
     got = [r["device_id"] for r in incidents(data)]
     assert got == [device_of(data, m) for m in out[:6]]
     assert len(events(data, "new_device_capped")) == 2  # one per UTC day

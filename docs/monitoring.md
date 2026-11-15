@@ -1230,30 +1230,44 @@ document holds ids, error classes and counters only) and `targets`, each with `i
 ## New-device notice (F5)
 
 **OFF by default and not deployed** (pilot freeze: deploy only after the day-14 pilot evaluation,
-about 2026-11-28). `VIGIE_NEW_DEVICE_NOTICE=1` (only 1/true/yes enable, garbage is a startup error)
-turns on a bounded sweep, run after the transient sweep in every pipeline pass, that opens ONE
-incident of detector `new_device` for a genuinely new, durable device. With the flag off nothing is
-read, written or swept and the database is byte-identical to a build without F5. The flag and the cap
-live in `PipelineConfig`, never in a policy dataclass: the monitoring policy versions are unchanged.
+about 2026-11-28). `VIGIE_NEW_DEVICE_NOTICE=1` (only 1/true/yes enable; garbage is a startup error
+that does not echo the value) turns on a bounded sweep, run after the transient sweep in every
+pipeline pass, that opens ONE incident of detector `new_device` for a genuinely new, durable device.
+With the flag off nothing is read, written or swept and the database is byte-identical to a build
+without F5. The flag and the cap live in `PipelineConfig`, never in a policy dataclass: the
+monitoring policy versions are unchanged.
 
 **Eligibility** (all must hold). (1) The device's first MAC is not randomized; a randomized MAC never
-notifies, even after promotion. (2) It persisted like a promotion candidate: at least 2 distinct
-server hours and `VIGIE_TRANSIENT_MIN_DWELL_S` (default 2 h) between the MAC's first server receipt
-(`mac_first_received`) and its last receipt-clamped activity; collector-supplied stamps cannot fake
-this. (3) It first arrived after `f5_enabled_since`, a `pipeline_meta` watermark set once at the first
-enabled run: existing devices never notify, and a flag that was off for a while never back-fills.
-(4) It is not stitched into an older device and has not absorbed one (every MAC of its lineage
-arrived after the watermark). (5) A collector has measured it (the incident is collector-scoped).
-Hostnames, DHCP options and mDNS names are never signals and never appear in any text. A cloned
-known MAC is not new, so no notice is sent for it: a known gap F5 does not cover.
+notifies, even after promotion. (2) It persisted like a promotion candidate: its MAC was first
+received by the server (`mac_first_received`) and last active (`mac_activity`, stamps clamped to the
+receipt) at least `VIGIE_TRANSIENT_MIN_DWELL_S` (default 2 h) apart AND in at least 2 distinct server
+hours (the hour of the last activity differs from the hour of the first receipt, so a dwell shorter
+than an hour still needs an hour boundary between them); collector-supplied stamps cannot fake this.
+(3) It first arrived after `f5_enabled_since`, a `pipeline_meta` watermark (see below): existing
+devices never notify. (4) It is not stitched into another device, has not absorbed one (every MAC of
+its lineage arrived after the watermark), and no member of its lineage was already noticed. (5) A
+collector has measured it (the incident is collector-scoped; the lowest collector id that measured
+the MAC is used). Hostnames, DHCP options and mDNS names are never signals and never appear in any
+text. A cloned known MAC is not new, so no notice is sent for it: a known gap F5 does not cover.
 
-**Cap and bounds.** At most `VIGIE_NEW_DEVICE_MAX_PER_DAY` (default 3, integer 1..20, anything else
-fails at startup without echoing the value) incidents per UTC day, in (first_seen, id) order, and at
-most 20 devices handled per run. When devices are held back by the cap, ONE `new_device_capped`
-event per UTC day records the count (counted only up to 21) and no MAC; held devices are noticed on
-later days, 3 a day. Compose forwards both variables with `${VAR-default}` (`0` and `3`): only an
-unset variable gets the default, an explicitly empty `VIGIE_NEW_DEVICE_MAX_PER_DAY` is a startup
-error.
+**Watermark and re-enable.** The sweep records `f5_last_run` on every run. The first run sets
+`f5_enabled_since` to now; a run after the sweep has not run for more than 6 hours (`RESUME_GAP_S`:
+the flag was switched off and on again, or the pipeline was down) moves it to now. Devices that
+arrived while the sweep was not running therefore never notify: a missed notice is preferred over a
+spurious one. This is conservative on purpose: a pipeline outage longer than 6 hours also drops the
+notices of devices that arrived during it.
+
+**Cap and bounds.** At most `VIGIE_NEW_DEVICE_MAX_PER_DAY` (default 3; plain decimal digits, integer
+1..20; anything else, an underscore or an explicitly empty value fails at startup without echoing the
+value) incidents per UTC day, in (first_seen, id) order, and at most 20 devices handled per run.
+Compose forwards both variables with `${VAR-default}` (`0` and `3`): only an unset variable gets the
+default. Devices held back by the cap are noticed on later days, 3 a day, but a device still
+unnoticed 72 hours (plus the dwell) after its first receipt is DROPPED (`f5_skipped:<id>`, reason
+`stale`): a late notice about a long-present device is worse than none. ONE `new_device_capped`
+event per UTC day records the count of held or dropped devices (counted only up to 21) and no MAC.
+A LAN attacker who keeps durable forged non-randomized devices present can use up the daily cap
+(the delay is bounded, notices stay first-in-first-out, and the owner sees `new_device_capped`);
+there is no priority between devices.
 
 **The incident.** Detector `new_device`, `observed_bytes=0`, `threshold_bytes=0`, evidence exactly
 `{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}`; no MAC, hostname,
@@ -1261,23 +1275,35 @@ vendor or IP in the row. Its id is random (sha256 of 16 random bytes), never der
 or the device, so the notification link is unlinkable to either. The upload engine never touches it.
 
 **Once per device life.** `pipeline_meta` key `f5_noticed:<device id>` is written in the same
-transaction as the incident (`f5_skipped:<device id>` marks a merged device that is never new). A
-re-run, a closed incident, a retired then revived device or a lineage change never produces a second
-incident for the same device. The existing `new_device` event cannot serve: it exists for every
-device.
+transaction as the incident. `f5_skipped:<device id>` marks a device that is never noticed: merged
+into or over another device, stale, or whose lineage kept failing (3 consecutive failures while other
+devices read fine; a failure that also hits a reference device is a store problem and blames nobody).
+A skip is permanent even if the merge is later revoked. A re-run, a closed incident, a retired then
+revived device or a lineage change never produces a second incident for the same device; merging a
+noticed device into a later one does not notice the later one either. The existing `new_device`
+event cannot serve as the guard: it exists for every device.
 
 **Review and close.** An incident stays open until the owner reviews it. A decision of
 `acknowledged` or `expected` (the existing decision path) makes the sweep resolve the incident on a
-later pass (it examines the 200 most recent decisions per run); `snoozed` and a cleared decision keep
-it open. The API never writes inventory.db, which is why the sweep does the close. A resolved
-`new_device` incident sends NO recover (open-only) and becomes prunable under the retention rule
-above. Nothing else closes it; no auto-resolve.
+later pass (it walks the open `new_device` incidents 200 per run with a persisted cursor); `snoozed`
+and a cleared decision keep it open. The API never writes inventory.db, which is why the sweep does
+the close. A resolved `new_device` incident sends NO recover (open-only) and becomes prunable under
+the retention rule above. Nothing else closes it; no auto-resolve. With the flag OFF the sweep does
+not run, so reviews stop closing incidents (they stay open until the flag is on again); the flag-off
+path deliberately adds no reads or writes.
 
 **Delivery needs three things.** `VIGIE_DELIVERY_ENABLED=1`, `new_device` in
 `VIGIE_DELIVERY_DETECTORS` AND the flag. Backlog bound: an open-only incident that has no delivery
 row yet is announced only while it is younger than the delivery TTL (`VIGIE_DELIVERY_TTL_S`, 24 h).
 Adding `new_device` to the allowlist later therefore never replays old unreviewed incidents; at most
-the incidents of the last day (cap, so at most 20, default 3) are announced.
+the incidents of the last 24 hours are announced. A rolling 24 hours can span two UTC days, so that is
+up to twice the daily cap (at most 40, default 6). The same rule means a delivery outage longer than
+24 hours can drop the notice of an incident that had no row yet (an accepted trade-off).
+
+**Silent waits.** A device no collector measured waits (nothing is invented as a fallback collector);
+the sweep logs `new_device_unmeasured` with a count and no MAC each run. A lineage failure is logged
+as `new_device_lineage_unavailable` (count only) and a failing decision store as
+`new_device_close_failed`; neither stops the pass.
 
 **Known follow-up.** The pre-existing `new_device` event written when a device is first created
 (every new MAC, randomized included) embeds the raw MAC in its summary. F5 does not change it; the
