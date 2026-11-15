@@ -357,6 +357,8 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], Non
         # F6-a: owner-marked essential devices. A table of its own, NOT a device_overrides column:
         # editing that row bumps its version, which is the stitching suggestion basis. NULL =
         # not essential; rows are never deleted so `version` (the If-Match value) never resets.
+        # v10 was edited in place before any deploy (the version trigger was added later); no
+        # database was ever created from the earlier form, so no repair step exists or is needed.
         """CREATE TABLE essential_devices (
           device_id TEXT PRIMARY KEY,
           absent_after_s INTEGER CHECK (absent_after_s IS NULL OR

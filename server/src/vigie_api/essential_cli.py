@@ -46,12 +46,12 @@ def _fail(message: str, code: int) -> int:
     return code
 
 
-def _open_existing(path: Path) -> sqlite3.Connection:
-    """Open overrides.db read-write without creating or migrating it."""
+def _open_existing(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+    """Open overrides.db without creating or migrating it (read-only for `list`)."""
     if not path.is_file():
         raise RuntimeError(f"{path} does not exist (check --data-dir); nothing was created")
     conn = sqlite3.connect(
-        f"file:{quote(str(path.resolve()))}?mode=rw",
+        f"file:{quote(str(path.resolve()))}?mode={'ro' if readonly else 'rw'}",
         uri=True,
         timeout=BUSY_TIMEOUT_S,
         isolation_level=None,
@@ -89,7 +89,7 @@ def main(argv: list[str]) -> int:
 
 
 def _run(settings: Settings, args: argparse.Namespace) -> int:
-    ov = _open_existing(settings.overrides_path)
+    ov = _open_existing(settings.overrides_path, readonly=args.command == "list")
     try:
         if args.command == "list":
             for item in essential.list_essential(ov):

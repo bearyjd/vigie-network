@@ -109,3 +109,42 @@ def test_unreadable_location_is_a_clean_error(tmp_path: Path, capsys) -> None:
     (tmp_path / "overrides.db").mkdir()  # a directory where the file should be
     assert cli.main(["essential", "--data-dir", str(tmp_path), "list"]) == 1
     assert "Traceback" not in capsys.readouterr().err
+
+
+def test_list_works_on_a_read_only_file_and_writes_fail_cleanly(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.device("d1")
+    assert run(env, "set", "d1", "3600") == 0
+    env.ov.close()  # checkpoint and drop the WAL so the file can be opened read-only
+    env.inv.close()
+    path = env.root / "overrides.db"
+    path.chmod(0o444)
+    env.root.chmod(0o555)
+    try:
+        assert run(env, "list") == 0
+        assert "d1\t3600" in capsys.readouterr().out
+        for argv in (["set", "d1", "7200"], ["clear", "d1"]):
+            assert run(env, *argv) == 1
+        err = capsys.readouterr().err
+        assert "Traceback" not in err and err.count("\n") == 2
+    finally:
+        env.root.chmod(0o755)
+        path.chmod(0o600)
+
+
+def test_list_opens_read_only_and_writes_open_read_write(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.device("d1")
+    uris: list[str] = []
+    real = sqlite3.connect
+
+    def spy(target, *args, **kwargs):
+        uris.append(str(target))
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(essential_cli.sqlite3, "connect", spy)
+    assert run(env, "list") == 0
+    assert run(env, "set", "d1", "3600") == 0
+    assert [u.rsplit("?", 1)[1] for u in uris if "overrides.db" in u] == ["mode=ro", "mode=rw"]

@@ -260,9 +260,10 @@ Put the data directory on an encrypted filesystem (PRP section 9).
       a v10 database that the old API refuses (`overrides schema v10 is newer than this build`).
    4. Ingest never opens `overrides.db`. An old pipeline image keeps working: it opens it
       read-only and ignores the new table.
-6. Roll back by restoring the previous image tag. A schema that moved forward cannot be moved back:
-   keep a copy of the data volume before an upgrade that bumps a schema version
-   (`podman volume export`, *unverified*).
+6. Roll back by restoring the previous image tag **and** the pre-upgrade backup of the data. A schema
+   that moved forward cannot be moved back, and an older api refuses a newer `overrides.db` (see 5.3):
+   keep a verified backup or a copy of the data volume before any upgrade that bumps a schema
+   version (`podman volume export`, *unverified*).
 
 ## Rotating the server certificates (SPKI pin)
 

@@ -381,10 +381,37 @@ def test_constants_match_the_schema_check_and_the_model(env: Env) -> None:
     assert (props["minimum"], props["maximum"]) == (essential.MIN_S, essential.MAX_S)
 
 
-def test_write_waits_for_the_overrides_write_lock(env: Env) -> None:
-    """Deterministic serialisation: with the write lock held elsewhere the request cannot
-    check the cap or write until the lock is released."""
+class _SpyConnection:
+    """Delegates to the real connection; signals just before a `BEGIN IMMEDIATE` is issued."""
+
+    def __init__(self, conn, about_to_begin: threading.Event) -> None:
+        self._conn = conn
+        self._about = about_to_begin
+
+    def execute(self, sql, *args):
+        if sql.startswith("BEGIN IMMEDIATE"):
+            self._about.set()
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_write_waits_for_the_overrides_write_lock(env: Env, monkeypatch) -> None:
+    """Deterministic serialisation, no timing assumption about thread start-up: the request
+    signals just before it issues BEGIN IMMEDIATE (a plain BEGIN never signals, so that mutation
+    fails the first wait). It is then provably blocked on the lock we hold: it cannot finish
+    until we release it."""
+    from vigie_api import essential
+
     env.device("d1")
+    about_to_begin = threading.Event()
+    real = essential.set_essential
+    monkeypatch.setattr(
+        essential,
+        "set_essential",
+        lambda inv, ov, **kw: real(inv, _SpyConnection(ov, about_to_begin), **kw),
+    )
     blocker = open_overrides(env.root / "overrides.db")
     blocker.execute("BEGIN IMMEDIATE")
     done = threading.Event()
@@ -402,9 +429,12 @@ def test_write_waits_for_the_overrides_write_lock(env: Env) -> None:
 
     thread = threading.Thread(target=request)
     thread.start()
-    assert not done.wait(0.5), "the write must wait for the lock"
-    assert row(env, "d1") is None
-    blocker.execute("ROLLBACK")
-    thread.join(10)
+    try:
+        assert about_to_begin.wait(30), "the write must take the write lock with BEGIN IMMEDIATE"
+        assert not done.wait(0.3), "the write must wait for the lock"
+        assert row(env, "d1") is None
+    finally:
+        blocker.execute("ROLLBACK")
+        thread.join(30)
+        blocker.close()
     assert result == [200] and row(env, "d1")["absent_after_s"] == DAY
-    blocker.close()
