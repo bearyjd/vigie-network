@@ -80,13 +80,15 @@ def delivery(  # noqa: PLR0913
     )
 
 
-def decide(env: Env, incident_id: str, status: str, n: int) -> None:  # noqa: F811
+def decide(  # noqa: F811
+    env: Env, incident_id: str, status: str, n: int, detector: str = "large_upload"
+) -> None:
     until = int(NOW) + 3600 if status == "snoozed" else None
     env.ov.execute(
         "INSERT INTO incident_decisions(incident_id,collector_id,device_id,lineage,detector,"
         "episode_start,status,snooze_until,version,decided_by,decided_at,id) "
         "VALUES (?,?,?,?,?,?,?,?,1,'t',?,?)",
-        (incident_id, "c1", "d1", "line", "large_upload", HOUR0, status, until,
+        (incident_id, "c1", "d1", "line", detector, HOUR0, status, until,
          iso_utc(NOW - 3600), f"id{n}"),
     )  # fmt: skip
 
@@ -169,7 +171,7 @@ def test_a_closed_pruned_new_device_leaves_upload_delivery_numbers_alone(
         "UPDATE monitoring_incidents SET last_hour=? WHERE id='nd1'", (HOUR0 - 100 * DAY,)
     )
     delivery(seeded, 20, "sent", NOW - 1800, "nd1")
-    decide(seeded, "nd1", "expected", 20)
+    decide(seeded, "nd1", "expected", 20, "new_device")
     prune_monitoring(seeded.inv, NOW)  # the incident is 100 days old, its delivery row is not
     after = report(seeded, capsys, monkeypatch)
     assert after["deliveries"] == before["deliveries"]
@@ -184,6 +186,14 @@ def test_upload_delivery_numbers_are_unchanged_by_the_pruning_rule(seeded, capsy
     assert report(seeded, capsys, monkeypatch) == before
 
 
+def test_a_gap_does_not_hide_upload_incidents(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)  # no coverage evidence (a gap), but an upload incident exists
+    incident(env, "u1", device="d1", detector="large_upload", episode=HOUR0 - 3600)
+    set_detected(env, "u1", -3600)
+    got = report(env, capsys, monkeypatch)["incidents"]
+    assert got["total"] == 1 and got["per_detector"] == {"large_upload": 1}
+
+
 def test_an_expected_new_device_with_a_sent_open_is_not_an_unwanted_notification(
     seeded, capsys, monkeypatch
 ):
@@ -191,10 +201,11 @@ def test_an_expected_new_device_with_a_sent_open_is_not_an_unwanted_notification
     incident(seeded, "nd1", device="d1", detector="new_device", episode=HOUR0 - 3600)
     set_detected(seeded, "nd1", -3600)
     delivery(seeded, 20, "sent", NOW - 1800, "nd1")
-    decide(seeded, "nd1", "expected", 20)
+    decide(seeded, "nd1", "expected", 20, "new_device")
     after = report(seeded, capsys, monkeypatch)
     assert after["unwanted_notifications"] == before["unwanted_notifications"]
     assert after["deliveries"] == before["deliveries"]
+    assert after["decisions"] == before["decisions"]  # a new_device decision is not pilot evidence
 
 
 def test_decision_ratios(seeded, capsys, monkeypatch):

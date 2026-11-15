@@ -393,13 +393,17 @@ are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
 rows exists (rows carry no detector, so the incident row is the only way to attribute them; the
 rows are forgotten after the delivery retention, after which the incident is pruned). Upload
 incidents are pruned exactly as before.
+If delivery is disabled or the decision store is unavailable, only the planner forgets delivery rows,
+so a closed non-upload incident whose rows were never forgotten is kept until they are; that set is
+static (nothing new is added while delivery is off).
 An open `new_device` incident, and its sent `open` delivery row (rows of an open incident are never
 forgotten), therefore stay indefinitely: the per-day cap of the sweep that creates them (a later
 slice) is the only bound on their number.
 
 The pilot report counts `new_device` incidents under their own key in `incidents.per_detector` only:
-they are excluded from `incidents.total`, `incidents.per_day`, the delivery counts and the
-unwanted-notification verdict, which stay evidence about the upload detectors.
+they are excluded from `incidents.total`, `incidents.per_day`, the delivery counts, the
+unwanted-notification verdict and the `decisions` ratios (decisions on `new_device` incidents are
+not counted), which stay evidence about the upload detectors.
 
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is

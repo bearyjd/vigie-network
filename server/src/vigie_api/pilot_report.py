@@ -272,8 +272,9 @@ def decisions_section(ov: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
     if beyond_incident_retention(lo, hi):
         return _unknown("window exceeds incident retention")
     rows = ov.execute(
-        "SELECT status,COUNT(*) AS n FROM incident_decisions WHERE decided_at>=? "
-        "AND decided_at<? AND status IS NOT NULL GROUP BY status LIMIT 10",
+        "SELECT status,COUNT(*) AS n FROM incident_decisions WHERE decided_at>=? "  # noqa: S608
+        f"AND decided_at<? AND status IS NOT NULL AND detector NOT IN ({_FOREIGN}) "
+        "GROUP BY status LIMIT 10",
         (iso_utc(lo), iso_utc(hi)),
     ).fetchall()
     counts = {row["status"]: row["n"] for row in rows}

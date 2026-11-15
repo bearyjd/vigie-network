@@ -236,3 +236,15 @@ def test_a_live_recover_lease_of_an_open_only_incident_is_left_to_its_sender(wor
 def test_build_message_refuses_a_new_device_recover():
     with pytest.raises(ValueError, match="open-only"):
         build("recover", "Phone")
+
+
+def test_runner_message_refuses_a_new_device_recover_and_builds_the_open(world):
+    from dataclasses import replace
+
+    from vigie_pipeline.delivery_runner import _message
+    from vigie_pipeline.delivery_types import DeliveryView
+
+    world.incident("n", state="resolved", detector="new_device")
+    row = DeliveryView("n", "open", "sending", 1, T0, T0, T0, 1, 1)
+    assert _message(world.inv, None, row, False).title.startswith("New device on your network")
+    assert _message(world.inv, None, replace(row, kind="recover"), False) is None
