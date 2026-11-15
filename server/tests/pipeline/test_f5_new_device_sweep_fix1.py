@@ -13,6 +13,7 @@ import uuid
 import pytest
 from pipeline_helpers import HOUR, T0, Data, data  # noqa: F401
 from test_f5_new_device_sweep import (
+    SK,
     DAY,
     DWELL,
     MAC,
@@ -51,10 +52,9 @@ def link(data: Data, from_mac: str, into_mac: str) -> None:
 # ---- A: the candidate queries never scan the measurement or activity tables --------------------
 def test_candidate_queries_use_the_primary_key_not_a_scan_per_candidate(data):
     start(data)
-    p = (iso_utc(T0), nd.NOTICED, nd.SKIPPED, DWELL, 2, T0, 21)
+    p = (iso_utc(T0), nd.NOTICED, nd.SKIPPED, nd.RETRY, T0, DWELL, 2, 21)
     for sql, params in (
         (nd.FRESH_SQL, p),
-        (nd.STALE_SQL, p),
         (nd.UNMEASURED_SQL, p),
         (nd._COLLECTOR, (MAC,)),
     ):
@@ -77,7 +77,7 @@ def test_thousands_of_unmeasured_candidates_stay_cheap_and_do_not_starve_the_que
         )
     data.inv.executemany("INSERT INTO mac_first_received VALUES (?,?)", [(m, T0) for m in forged])
     data.inv.executemany(
-        "INSERT INTO mac_activity VALUES (?,?,?)", [(m, T0, T0 + DWELL) for m in forged]
+        "INSERT INTO mac_activity VALUES (?,?,?)", [(m, T0, T0 + DWELL + SK) for m in forged]
     )
     data.inv.executemany(
         "INSERT INTO measurements_hourly VALUES ('rtr-1',?,?,1,1,1,0)",
@@ -128,22 +128,6 @@ def test_an_outage_longer_than_the_gap_never_notifies_what_arrived_during_it(dat
 
 
 # ---- C: stale held devices are dropped, not announced late -------------------------------------
-def test_held_devices_older_than_72h_are_dropped_and_a_fresh_one_is_noticed(data):
-    start(data)
-    staggered(data, 25)
-    ticks(data, T0 + DWELL + 300, T0 + 76 * HOUR)
-    assert len(incidents(data)) == 12  # 3 a day on UTC days 1-4, all within 72 h
-    stale = [k for k, v in meta(data, "f5_skipped:").items() if v.endswith(" stale")]
-    assert len(stale) == 13  # the rest of the 25
-    fresh = "00:1a:2b:88:00:01"
-    arrive(data, fresh, at=T0 + 76 * HOUR)
-    ticks(data, T0 + 76 * HOUR + DWELL, T0 + 84 * HOUR)
-    assert len(incidents(data)) == 13
-    assert incidents(data)[-1]["device_id"] == device_of(data, fresh)
-    capped = events(data, "new_device_capped")
-    assert capped and all("held or dropped" in e["summary"] for e in capped)
-
-
 # ---- D: a merge after a notice never makes a second incident -----------------------------------
 def test_merging_a_noticed_device_into_a_held_one_does_not_notice_the_second(data):
     start(data, new_device_max_per_day=1)
@@ -159,32 +143,6 @@ def test_merging_a_noticed_device_into_a_held_one_does_not_notice_the_second(dat
 
 
 # ---- E: silent stalls --------------------------------------------------------------------------
-def test_a_device_whose_lineage_keeps_failing_is_skipped_and_never_blocks_the_others(
-    data, monkeypatch
-):
-    start(data)
-    bad = "00:1a:2b:00:02:01"
-    for i, mac in enumerate([bad, "00:1a:2b:00:02:02", "00:1a:2b:00:02:03"]):
-        arrive(data, mac, at=T0 + i * 10)
-    run(data, T0 + 10, new_device_notice=False)  # the devices exist; the sweep is off
-    bad_id = device_of(data, bad)
-    real = nd.lineage
-
-    def flaky(inv, ov, device):
-        if device == bad_id:
-            raise nd.LineageUnavailable("too large")
-        return real(inv, ov, device)
-
-    monkeypatch.setattr(nd, "lineage", flaky)
-    run(data, T0 + DWELL + 100)
-    assert len(incidents(data)) == 2  # the others were noticed in the very first run
-    assert meta(data, "f5_retry:") == {f"f5_retry:{bad_id}": "1"}
-    run(data, T0 + DWELL + 130)
-    run(data, T0 + DWELL + 160)
-    assert meta(data, "f5_skipped:")[f"f5_skipped:{bad_id}"].endswith(" lineage_unavailable")
-    assert meta(data, "f5_retry:") == {}  # bounded: the counter is dropped with the skip
-
-
 def test_a_missing_lineage_table_is_systemic_and_skips_nobody(data):
     start(data)
     arrive(data, MAC)
@@ -239,7 +197,7 @@ def test_a_device_first_received_before_the_watermark_never_notifies(data):
     since = T0 + 1000
     run(data, since)
     data.add_batch(since + 10, neigh=[MAC], received=since - 100)
-    data.add_batch(since + 10 + DWELL, neigh=[MAC])
+    data.add_batch(since + 10 + DWELL + SK, neigh=[MAC])
     meas(data, MAC)
     run(data, since + DWELL + 20)
     assert incidents(data) == []
@@ -254,7 +212,7 @@ def test_a_device_merged_into_an_unmeasured_newer_one_is_not_noticed(data):
     meas(data, b)  # A is never measured, so it is never a candidate itself
     run(data, T0 + 60)
     link(data, b, a)
-    data.add_batch(T0 + DWELL, neigh=[a, b])
+    data.add_batch(T0 + DWELL + SK, neigh=[a, b])
     run(data, T0 + DWELL + 100)
     assert incidents(data) == []
     assert meta(data, "f5_skipped:")[f"f5_skipped:{device_of(data, b)}"].endswith(" merged")
@@ -266,7 +224,7 @@ def test_a_run_reads_at_most_twenty_devices_and_reports_the_held_one(data):
     run(data, T0 + DWELL + 400, new_device_max_per_day=20)
     assert len(incidents(data)) == 20
     (capped,) = events(data, "new_device_capped")
-    assert "; 1 held or dropped" in capped["summary"]  # 21 read, 20 handled: the bound is 20
+    assert "; 1 held" in capped["summary"]  # 21 read, 20 handled: the bound is 20
 
 
 def test_a_database_error_mid_sweep_is_contained_and_the_next_run_works(data, monkeypatch):

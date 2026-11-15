@@ -20,6 +20,7 @@ from test_probe_freeze import POOLED_VERSION, TOD_VERSION
 from vigie_api.schema import open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import processor
+from vigie_pipeline.config import ACTIVITY_SKEW_S as SK
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.delivery_publish import FakePublisher
 from vigie_pipeline.delivery_runner import run_delivery
@@ -67,7 +68,7 @@ def meas(data: Data, mac: str, collector: str = "rtr-1") -> None:
 def arrive(data: Data, mac_list, at: int = T0, span: int = DWELL, measured: bool = True) -> None:
     mac_list = [mac_list] if isinstance(mac_list, str) else list(mac_list)
     data.add_batch(at, neigh=mac_list)
-    data.add_batch(at + span, neigh=mac_list)
+    data.add_batch(at + span + SK, neigh=mac_list)  # persistence is receipt-bounded: -SK
     for mac in mac_list:
         if measured:
             meas(data, mac)
@@ -186,7 +187,7 @@ def test_a_durable_non_randomized_new_device_gets_one_open_incident(data):
 def test_the_incident_row_and_marker_hold_no_mac_hostname_vendor_or_ip(data):
     start(data)
     data.add_batch(T0, leases=[(MAC, "evil-host.example", "[1,3]", "vendor-x-class")])
-    data.add_batch(T0 + DWELL, leases=[(MAC, "evil-host.example", "[1,3]", "vendor-x-class")])
+    data.add_batch(T0 + DWELL + SK, leases=[(MAC, "evil-host.example", "[1,3]", "vendor-x-class")])
     meas(data, MAC)
     run(data, T0 + DWELL + 1)
     text = json.dumps([tuple(r) for r in incidents(data)])
@@ -290,13 +291,13 @@ def test_a_device_without_any_measurement_waits_and_notifies_once_it_has_one(dat
 
 
 def test_a_device_stitched_into_an_older_one_never_notifies(data):
-    start(data)
     data.add_batch(T0 - 10 * HOUR, neigh=["00:1a:2b:00:00:09"])
-    run(data, T0 - 9 * HOUR)  # the older device (also pre-watermark)
+    run(data, T0 - 9 * HOUR, new_device_notice=False)
+    start(data)
     data.add_batch(T0, neigh=[MAC])  # first sighting only: the dwell is not met yet
     meas(data, MAC)
     run(data, T0 + 60)
-    data.add_batch(T0 + DWELL, neigh=[MAC])
+    data.add_batch(T0 + DWELL + SK, neigh=[MAC])
     ov = open_overrides(data.root / "overrides.db")
     ov.execute(
         "INSERT INTO identity_links VALUES (?,?,'m','t','u',NULL)",
@@ -311,13 +312,13 @@ def test_a_device_stitched_into_an_older_one_never_notifies(data):
 
 
 def test_an_older_device_merged_into_the_new_one_makes_it_not_new(data):
-    start(data)
     data.add_batch(T0 - 10 * HOUR, neigh=["00:1a:2b:00:00:09"])
-    run(data, T0 - 9 * HOUR)
+    run(data, T0 - 9 * HOUR, new_device_notice=False)
+    start(data)
     data.add_batch(T0, neigh=[MAC])  # first sighting only: the dwell is not met yet
     meas(data, MAC)
     run(data, T0 + 60)
-    data.add_batch(T0 + DWELL, neigh=[MAC])
+    data.add_batch(T0 + DWELL + SK, neigh=[MAC])
     ov = open_overrides(data.root / "overrides.db")
     ov.execute(
         "INSERT INTO identity_links VALUES (?,?,'m','t','u',NULL)",
@@ -529,11 +530,11 @@ def test_hostile_hostnames_and_dhcp_never_change_eligibility_or_text(data, tmp_p
     start(data)
     evil = "x'; DROP TABLE devices;--"
     data.add_batch(T0, leases=[(MAC, evil, "[1,2]", evil)])
-    data.add_batch(T0 + DWELL, leases=[(MAC, evil, "[1,2]", evil)])
+    data.add_batch(T0 + DWELL + SK, leases=[(MAC, evil, "[1,2]", evil)])
     meas(data, MAC)
     other = "00:1a:2b:00:00:02"
     data.add_batch(T0, leases=[(other, None, None, None)])
-    data.add_batch(T0 + DWELL, leases=[(other, None, None, None)])
+    data.add_batch(T0 + DWELL + SK, leases=[(other, None, None, None)])
     meas(data, other)
     run(data, T0 + DWELL + 1)
     assert len(incidents(data)) == 2  # the hostname is no signal in either direction
