@@ -50,9 +50,13 @@ def _audit_request_id(supplied: str | None, detail: dict) -> str:
 
 
 def is_guarded_write(method: str, path: str) -> bool:
-    """Writes whose 403 must precede any body error: incident decisions and evidence exports."""
+    """Writes whose 403 must precede any body error: incident decisions, evidence exports and
+    essential-device marks."""
     export = path.startswith("/devices/") and path.endswith(EXPORT_PATH_SUFFIX)
-    return method == "POST" and (path.startswith("/incidents/") or export)
+    essential = path.startswith("/devices/") and path.endswith("/essential")
+    return (method == "POST" and (path.startswith("/incidents/") or export)) or (
+        method in ("PUT", "DELETE") and essential
+    )
 
 
 def install(app: FastAPI, settings, clock, deps: tuple[Any, ...], errors_for) -> None:

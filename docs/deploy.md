@@ -245,9 +245,25 @@ Put the data directory on an encrypted filesystem (PRP section 9).
    (`restart: on-failure`) until the schema matches. On a fresh stack the pipeline therefore
    restarts a few times until `provision-collector.sh` has created `inventory.db`; that is expected.
 5. `overrides.db` is migrated by the api at startup (it creates and migrates the file).
-6. Roll back by restoring the previous image tag. A schema that moved forward cannot be moved back:
-   keep a copy of the data volume before an upgrade that bumps a schema version
-   (`podman volume export`, *unverified*).
+   **The essential-devices release moves `overrides.db` from user_version 9 to 10** (one new table,
+   `essential_devices`, additive and forward-only). The api applies it at startup even when nothing is
+   marked essential and the feature has no effect yet. Order matters:
+   1. Take the pre-deploy `vigie-backup backup` and `verify` it **with the old image**:
+      `vigie-backup` requires an exact `user_version` match, so after the migration a scheduled
+      backup job still on the old image fails, and so does `verify` of a v10 copy with the old image.
+   2. **Any** new-image `vigie-api` command that opens `overrides.db` through `open_overrides`
+      (`tokens`, `evidence`, `dataset`, and the API itself) runs the migration. Never run one against
+      the live volume before the API is upgraded: the old API then refuses v10 and crash-loops.
+      (`vigie-api essential` is the exception: it never creates or migrates, and refuses a
+      database older than the build with "run the API image once to migrate".)
+   3. Rollback is the old image **plus** a restore of the v9 backup. Restoring only the image leaves
+      a v10 database that the old API refuses (`overrides schema v10 is newer than this build`).
+   4. Ingest never opens `overrides.db`. An old pipeline image keeps working: it opens it
+      read-only and ignores the new table.
+6. Roll back by restoring the previous image tag **and** the pre-upgrade backup of the data. A schema
+   that moved forward cannot be moved back, and an older api refuses a newer `overrides.db` (see 5.3):
+   keep a verified backup or a copy of the data volume before any upgrade that bumps a schema
+   version (`podman volume export`, *unverified*).
 
 ## Rotating the server certificates (SPKI pin)
 

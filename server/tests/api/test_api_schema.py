@@ -101,12 +101,12 @@ def test_inventory_missing_is_not_created(tmp_path: Path) -> None:
     assert not (tmp_path / "inventory.db").exists()
 
 
-def test_overrides_schema_is_at_version_9(tmp_path: Path) -> None:
+def test_overrides_schema_is_at_version_10(tmp_path: Path) -> None:
     from vigie_api.schema import OVERRIDES_MIGRATIONS
 
     conn = open_overrides(tmp_path / "o.db")
-    assert len(OVERRIDES_MIGRATIONS) == 9
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert len(OVERRIDES_MIGRATIONS) == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 SHA = "a" * 64
@@ -230,7 +230,7 @@ def test_migration_9_upgrades_a_v8_db_with_staged_accepted_and_rejected_rows(
     raw.execute("INSERT INTO dataset_entries_staging VALUES ('rej','k','{}')")
     raw.close()
     conn = open_overrides(tmp_path / "o.db")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
     rows = {r["id"]: r for r in conn.execute("SELECT * FROM dataset_imports")}
     assert (rows["old"]["status"], rows["old"]["rejected_by"]) == ("accepted", None)
     assert (rows["stg"]["status"], rows["stg"]["content_sha256"]) == ("staged", None)

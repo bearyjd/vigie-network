@@ -1219,3 +1219,13 @@ Full CI and independent review remain release evidence recorded in the PR, not a
 The [field report](monitoring-field-status-2026-10-25.md) separates completed installation and logfs
 capacity, parsed-DNS, scoped persistence and bounded-outage recovery proof, deployed processing-age API and controlled repair/reconciled helper recovery from pending natural rotation, reboot behavior and
 long-duration learning. D1–D6 owner decisions remain unchanged.
+
+## Essential devices: rule for the future absence detector
+
+`overrides.db` records which devices the owner marked essential (`essential_devices`, see
+`docs/api.md`); nothing reads the table yet. A mark is stored under the id the owner marked, and that
+device can later be merged into another. **The absence detector must resolve each marked id to its
+current canonical device on every run** (follow the identity links, as the effective view does), and
+count any member MAC seen as "seen". It must not treat a marked alias as a separate device, and must
+not require the stored id to stay canonical. Unmarking a merged alias is allowed so the owner can
+always free the slot.

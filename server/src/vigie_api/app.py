@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vigie_api import (
     effective,
+    essential_routes,
     evidence_routes,
     feeds,
     identity_writes,
@@ -26,7 +27,7 @@ from vigie_api import (
 )
 from vigie_api.bodylimit import BodyLimitMiddleware
 from vigie_api.config import Settings
-from vigie_api.errors import ApiError, envelope, error_envelope
+from vigie_api.errors import ETAG_HEADER, ApiError, envelope, error_envelope
 from vigie_api.models import (
     ActivityResponse,
     CoverageResponse,
@@ -81,14 +82,6 @@ ERROR_TEXT = {
     428: "If-Match header missing",
     429: "Rate limited; see Retry-After",
     503: "inventory_unavailable: inventory.db does not exist yet",
-}
-ETAG_HEADER = {
-    "headers": {
-        "ETag": {
-            "description": "Override version of the device; send it back as If-Match.",
-            "schema": {"type": "string"},
-        }
-    }
 }
 
 
@@ -822,4 +815,5 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         )
 
     evidence_routes.install(app, settings, clock, (get_inv, get_ov, writer), _errors)
+    essential_routes.install(app, clock, (get_inv, get_ov, authenticate, writer), _errors)
     return app
