@@ -23,7 +23,7 @@ from vigie_api.schema import open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_pipeline.baselines import BaselineConfig
 from vigie_pipeline.baselines_tod import TodConfig
-from vigie_pipeline.monitoring_engine import analyze_monitoring, samples_for
+from vigie_pipeline.monitoring_engine import ENGINE_DETECTORS, analyze_monitoring, samples_for
 from vigie_pipeline.monitoring_identity import lineage
 from vigie_pipeline.monitoring_strategy import strategy_for
 from vigie_pipeline.replay.errors import ReplayInputError
@@ -32,7 +32,7 @@ from vigie_pipeline.schema import open_pipeline_inventory
 
 MAX_TICKS = 2160
 TICK_OFFSET_S = 1  # a pass runs just after the hour boundary, like a real scheduler
-DETECTORS = ("large_upload", "upload_deviation")
+DETECTORS = ENGINE_DETECTORS
 ABSTAINED, FIRED, QUIET = "abstained", "fired", "quiet"
 
 

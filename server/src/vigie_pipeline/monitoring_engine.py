@@ -21,6 +21,7 @@ AGGREGATE_DAYS = 90
 DETAIL_DAYS = 7
 # The only detectors this engine's incident lifecycle may resolve or supersede.
 ENGINE_DETECTORS = ("large_upload", "upload_deviation")
+_ENGINE_IN = ",".join("?" * len(ENGINE_DETECTORS))
 
 
 def revision(inv):
@@ -155,8 +156,8 @@ def analyze_entity(inv, ov, collector, device, policy, now):
             return
         if changed:
             inv.execute(
-                "UPDATE monitoring_incidents SET state='superseded' WHERE collector_id"
-                "=? AND device_id=? AND state='open' AND detector IN (?,?)",
+                "UPDATE monitoring_incidents SET state='superseded' WHERE collector_id"  # noqa: S608
+                "=? AND device_id=? AND state='open' AND detector IN (" + _ENGINE_IN + ")",
                 (collector, identity.device_id, *ENGINE_DETECTORS),
             )
         if reference is not None and (old is None or changed or old["baseline_id"] is None):
@@ -269,8 +270,10 @@ def analyze_entity(inv, ov, collector, device, policy, now):
         if current is not None and current.eligible:
             firing = {f["detector"] for f in found}
             for active in inv.execute(
-                "SELECT id,detector,last_hour FROM monitoring_incidents WHERE collecto"
-                "r_id=? AND device_id=? AND lineage=? AND state='open' AND detector IN (?,?)",
+                "SELECT id,detector,last_hour FROM monitoring_incidents WHERE collecto"  # noqa: S608
+                "r_id=? AND device_id=? AND lineage=? AND state='open' AND detector IN ("
+                + _ENGINE_IN
+                + ")",
                 (collector, identity.device_id, identity.key, *ENGINE_DETECTORS),
             ).fetchall():
                 if active["detector"] not in firing and active["last_hour"] < current_hour:
