@@ -165,8 +165,26 @@ def test_database_or_temp_directory_oserrors_are_a_fixed_error(files, capsys, mo
 
 def test_tod_strategy_option_runs(files, capsys):
     args = ["--strategy", "tod", "--min-samples-per-cohort", "2", "--min-days-per-cohort", "2"]
-    code, out, _ = run_cli(files, capsys, args)
-    assert code == 0 and json.loads(out)["policy"]["algorithm"] == "tod-median-v1"
+    assert main(["--series", str(files[0]), "--labels", str(files[1]), *args]) == 0
+    assert json.loads(capsys.readouterr().out)["policy"]["algorithm"] == "tod-median-v1"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--strategy", "tod", "--minimum-hours", "3"],
+        ["--strategy", "tod", "--minimum-days", "3"],
+        ["--min-samples-per-cohort", "3"],
+        ["--strategy", "pooled", "--min-days-per-cohort", "3"],
+    ],
+)
+def test_options_for_the_other_strategy_are_rejected_not_ignored(args, files, capsys):
+    with pytest.raises(SystemExit) as exit_:
+        main(["--series", str(files[0]), "--labels", str(files[1]), *args])
+    assert exit_.value.code == 2
+    cap = capsys.readouterr()
+    assert cap.err.strip() == "replay: invalid command-line arguments" and cap.out == ""
+    assert "3" not in cap.err
 
 
 def test_module_entrypoint_runs_in_a_subprocess_without_side_effects(files, tmp_path):

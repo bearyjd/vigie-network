@@ -1045,10 +1045,21 @@ detector output and no schema, so it does not restart the pilot clock.
   fixed line and exit 2 without echoing the value. `within_budget` is `false` when the
   known false episodes already exceed the budget, `unknown` while unlabelled episodes exist
   otherwise, and `true` only when every episode is labelled. The top-level `budget` block sums false
-  episodes across both detectors against the same budget.
+  episodes across both detectors against the same budget. `within_budget` gates the MEAN false
+  episodes per network day, not a per-day cap; a network day is any UTC day with an evidence hour
+  (a one-hour day counts whole, per-device rates use hours/24) and `max_false_episodes_in_a_day`
+  is the informational worst day. The combined verdict is false if any detector or the summed rate
+  is false, unknown if any is unknown, else true, so it is never better than a detector's own; its
+  rate figure is informational and can dilute across days only one detector judged. An `ignore`
+  hour inside a run of anomalous hours splits it into two events. `abstained.ignored` makes
+  `evidence_hours + abstained.total - abstained.ignored` equal `universe_hours`.
 - **Abstentions are separate.** A detector abstains, with a reason, on hours it cannot judge:
   `no_sample`, `unqualified`, `clock_gap`, `learning`, `in_training`, `previous_unavailable`,
-  `cohort_abstain` (tod). Abstained hours are counted by reason and never as misses or negatives.
+  `cohort_abstain` (tod; the engine only freezes a tod baseline once every cohort is mature, so this
+  is a defensive check that no scenario reaches), `rebuilding_quality` (the engine discarded a
+  baseline because a training hour later became unqualified; replay ingests each hour once, so it
+  is defensive too) and `before_training_since` (the hour precedes the profile's training start; the
+  engine feeds neither detector such hours). Abstained hours are counted by reason and never as misses or negatives.
   `large_upload` judges any qualified hour, even while the profile is learning;
   `upload_deviation` needs a frozen baseline and a qualified previous hour.
 - **`unknown`, never zero.** A ratio with no evidence behind it (no alert, no labelled positive, no

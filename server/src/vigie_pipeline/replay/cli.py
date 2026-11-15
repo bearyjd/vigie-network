@@ -96,7 +96,14 @@ def run(args: argparse.Namespace) -> dict:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    foreign = {
+        "pooled": (args.min_samples_per_cohort, args.min_days_per_cohort),
+        "tod": (args.minimum_hours, args.minimum_days),
+    }[args.strategy]
+    if any(v is not None for v in foreign):  # an option for the other strategy would be ignored
+        parser.error("option does not apply to the chosen strategy")
     try:
         report = run(args)
         print(json.dumps(report, sort_keys=True, indent=2))  # noqa: T201 - CLI output

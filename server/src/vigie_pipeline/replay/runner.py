@@ -126,40 +126,53 @@ def _judge(inv, ov, policy, name, ids, now: int, hour: int) -> tuple[Outcome, ..
     collector, device, _mac = ids
     identity = lineage(inv, ov, device)
     by_hour = {s.hour: s for s in samples_for(inv, collector, identity, now)}
-    current, previous = by_hour.get(hour), by_hour.get(hour - 3600)
     fired = _fired(inv, collector, identity.device_id, hour)
     profile = inv.execute(
-        "SELECT state,baseline_id FROM monitoring_profiles WHERE collector_id=? AND device_id=?",
+        "SELECT state,baseline_id,training_since FROM monitoring_profiles "
+        "WHERE collector_id=? AND device_id=?",
         (collector, identity.device_id),
     ).fetchone()
-    reason = _deviation_abstention(inv, policy, current, previous, profile)
+    # the engine only scores samples from the profile's training_since on (earlier ones are not
+    # fed to its detectors at all), so an earlier hour is unavailable to the harness as well
+    since = profile["training_since"] if profile is not None else None
+    current, previous = (
+        None if since is not None and h < since else by_hour.get(h) for h in (hour, hour - 3600)
+    )
+    early = by_hour.get(hour) is not None and current is None
+    reason = _deviation_abstention(inv, policy, current, previous, profile, early)
     out = []
     for detector in DETECTORS:
-        why = _large_abstention(current) if detector == DETECTORS[0] else reason
+        why = _large_abstention(current, early) if detector == DETECTORS[0] else reason
         out.append(_outcome(name, hour, detector, why, fired))
     return tuple(out)
 
 
 def _outcome(device, hour, detector, why, fired) -> Outcome:
     if why is not None:
+        if detector in fired:  # never drop an alert the engine raised
+            raise ReplayInputError("replay: harness and engine disagree")
         return Outcome(device, hour, detector, ABSTAINED, why)
     if detector in fired:
         return Outcome(device, hour, detector, FIRED, None, fired[detector])
     return Outcome(device, hour, detector, QUIET)
 
 
-def _large_abstention(current):
+def _large_abstention(current, early):
+    if early:
+        return "before_training_since"
     if current is None:
         return "no_sample"
     return None if current.eligible else "unqualified"
 
 
-def _deviation_abstention(inv, policy, current, previous, profile):
-    if current is None:
-        return "no_sample"
+def _deviation_abstention(inv, policy, current, previous, profile, early):
+    if early or current is None:
+        return _large_abstention(current, early)
     if not current.eligible:
         return "unqualified"
-    if profile is None or profile["state"] != "mature" or not profile["baseline_id"]:
+    if profile is None or profile["state"] == "rebuilding_quality":
+        return "rebuilding_quality" if profile is not None else "learning"
+    if profile["state"] != "mature" or not profile["baseline_id"]:
         return "learning"
     row = inv.execute(
         "SELECT * FROM monitoring_baselines WHERE id=?", (profile["baseline_id"],)
@@ -172,8 +185,8 @@ def _deviation_abstention(inv, policy, current, previous, profile):
         return "in_training"
     if previous is None or not previous.eligible or previous.hour <= reference["trained_until"]:
         return "previous_unavailable"
-    if strategy.threshold(current, reference) is None:
-        return "cohort_abstain"
+    if any(strategy.threshold(s, reference) is None for s in (current, previous)):
+        return "cohort_abstain"  # the engine abstains when either hour's cohort is unscorable
     return None
 
 

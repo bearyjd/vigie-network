@@ -313,3 +313,70 @@ def test_detector_scoped_ignore_only_affects_its_own_detector():
     back = Label(ignored.device, ignored.hour, "normal", "", "large_upload")
     again = build_report(rows, labels + [ignored, back], "a", "v")
     assert again["detectors"]["large_upload"]["false_alerts_per_network_day"] == 1.0
+
+
+def _learning_days_repro():
+    "16 days of large_upload evidence; upload_deviation judges only the last 2, with 6 false."
+    base = (H0 // 86400 + 1) * 86400
+    rows, labels = [], []
+    for day in range(16):
+        hour = base + day * 86400
+        rows.append(Outcome("a", hour, "large_upload", "quiet"))
+        if day < 14:
+            rows.append(Outcome("a", hour, DET, "abstained", "learning"))
+            continue
+        for k in range(3):
+            h = hour + (k + 1) * 7200
+            rows.append(Outcome("a", h, DET, "fired", None, f"e{day}{k}"))
+            labels.append(Label("a", h, "normal"))
+    return rows, labels
+
+
+def _one_sample():
+    rows = [Outcome("a", H0, DET, "fired", None, "e")]
+    return rows, [Label("a", H0, "normal")]
+
+
+def _good_and_bad():
+    rows = [Outcome("a", H0 + i * 3600, DET, "quiet") for i in range(48)]
+    return rows, [Label("a", H0 + 3600, "normal")]
+
+
+def test_combined_verdict_is_never_better_than_any_detector():
+    for build in (_learning_days_repro, _one_sample, _good_and_bad):
+        rows, labels = build()
+        rep = build_report(rows, labels, "a", "v")
+        rank = {True: 0, UNKNOWN: 1, False: 2}
+        worst = max(rank[d["within_budget"]] for d in rep["detectors"].values())
+        assert rank[rep["budget"]["within_budget"]] >= worst, build.__name__
+    rep = build_report(*_learning_days_repro(), "a", "v")
+    assert rep["detectors"][DET]["false_alerts_per_network_day"] == 3.0
+    assert rep["detectors"][DET]["within_budget"] is False
+    assert rep["budget"]["false_alerts_per_network_day"] == 0.375  # diluted, informational
+    assert rep["budget"]["within_budget"] is False  # ...but the verdict is not
+    one = build_report(*_one_sample(), "a", "v")["budget"]
+    # large_upload has no evidence at all (unknown), so the combined verdict cannot be true
+    assert one["within_budget"] == UNKNOWN and one["false_alerts_per_network_day"] == 1.0
+    unknown = build_report([Outcome("a", H0, DET, "fired", None, "e")], [], "a", "v")
+    assert unknown["budget"]["within_budget"] == UNKNOWN
+
+
+def test_max_false_episodes_in_a_day_is_reported_per_detector_and_combined():
+    rep = build_report(*_learning_days_repro(), "a", "v")
+    assert rep["detectors"][DET]["max_false_episodes_in_a_day"] == 3
+    assert rep["detectors"]["large_upload"]["max_false_episodes_in_a_day"] == 0
+    assert rep["budget"]["max_false_episodes_in_a_day"] == 3
+    assert "_false_days" not in rep["detectors"][DET]
+    assert build_report([], [], "a", "v")["budget"]["max_false_episodes_in_a_day"] == 0
+
+
+def test_evidence_and_abstained_reconcile_with_the_universe():
+    rows = [out(0, "quiet"), out(1, "abstained", "learning"), out(2, "abstained", "no_sample")]
+    rows += [out(3, "fired", episode="e"), out(4, "quiet")]
+    r = det(rows, [lab(1, "ignore"), lab(4, "ignore")])
+    assert r["abstained"]["ignored"] == 1 and r["ignored_labels"] == 2
+    c = r["coverage"]
+    assert (
+        c["evidence_hours"] + r["abstained"]["total"] - r["abstained"]["ignored"]
+        == c["universe_hours"]
+    )

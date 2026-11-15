@@ -147,21 +147,23 @@ def test_tod_strategy_abstains_while_a_cohort_cannot_mature_then_evaluates():
     assert {o.status for o in rows if o.detector == "large_upload"} == {"quiet"}
 
 
-def test_harness_matches_the_live_engine_incident_for_incident(tmp_path):
-    "Replay's fired outcomes equal what a hand-driven analyze_monitoring writes to the database."
+TOD = TodConfig(min_samples_per_cohort=2, min_days_per_cohort=2, bucket_hours=24)
+
+
+def _live(tmp_path, series, policy):
+    """Drive analyze_monitoring by hand, one pass per sample hour, and record per hour what the
+    engine itself did: which detectors have an open incident ending that hour, and the facts
+    its deviation detector needed (profile state, frozen baseline, scorable samples)."""
     from vigie_api.schema import open_overrides
-    from vigie_pipeline.monitoring_engine import analyze_monitoring
+    from vigie_pipeline.baselines_tod import findings_tod
+    from vigie_pipeline.monitoring_engine import analyze_monitoring, samples_for
+    from vigie_pipeline.monitoring_identity import lineage
+    from vigie_pipeline.monitoring_strategy import strategy_for
     from vigie_pipeline.schema import open_pipeline_inventory
 
-    series = scenario()["dev-backup"]
-    spans: dict = {}
-    for o in replay((series,), POLICY):
-        if o.status == "fired":
-            lo, hi = spans.get((o.detector, o.episode), (o.hour, o.hour))
-            spans[(o.detector, o.episode)] = (min(lo, o.hour), max(hi, o.hour))
-    replayed = sorted((d, lo, hi) for (d, _e), (lo, hi) in spans.items())
     inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     ov = open_overrides(tmp_path / "overrides.db")
+    seen: dict = {}
     try:
         inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c1','k1')")
         inv.execute("INSERT INTO devices(id,first_seen,last_seen) VALUES ('d1','x','x')")
@@ -181,21 +183,62 @@ def test_harness_matches_the_live_engine_incident_for_incident(tmp_path):
                 (row.hour, row.qualified_seconds, row.qualified_seconds),
             )
             inv.execute("INSERT OR REPLACE INTO monitoring_dirty VALUES ('c1',?,0)", (mac,))
-            analyze_monitoring(inv, ov, POLICY, row.hour + 3601)
-        live = [
-            (r["detector"], r["episode_start"], r["last_hour"])
-            for r in inv.execute(
-                "SELECT detector,episode_start,last_hour FROM monitoring_incidents"
-                " ORDER BY detector,episode_start"
-            )
-        ]
+            now = row.hour + 3601
+            analyze_monitoring(inv, ov, policy, now)
+            fired = {
+                r["detector"]
+                for r in inv.execute(
+                    "SELECT detector FROM monitoring_incidents WHERE last_hour=?", (row.hour,)
+                )
+            }
+            profile = inv.execute("SELECT state,baseline_id FROM monitoring_profiles").fetchone()
+            reason = "not_mature"
+            if profile["state"] == "mature":
+                base = inv.execute(
+                    "SELECT * FROM monitoring_baselines WHERE id=?", (profile["baseline_id"],)
+                ).fetchone()
+                strategy = strategy_for(policy)
+                ref = strategy.hydrate(dict(base))
+                by = {s.hour: s for s in samples_for(inv, "c1", lineage(inv, ov, "d1"), now)}
+                cur, prev = by.get(row.hour), by.get(row.hour - 3600)
+                ok = cur.eligible and prev is not None and prev.eligible
+                ok = ok and prev.hour > ref["trained_until"]
+                if ok and isinstance(policy, TodConfig):
+                    ok = findings_tod(cur, prev, ref["tod"], policy).abstain_reason is None
+                reason = None if ok else "engine_abstains"
+            seen[row.hour] = (fired, reason)
     finally:
         inv.close()
         ov.close()
-    # an incident may open on the pair's first hour; both end on the same last firing hour
-    assert replayed and len(replayed) == len(live)
-    for (det, lo, hi), (ldet, start, last) in zip(replayed, live, strict=True):
-        assert det == ldet and start <= lo and hi == last
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("name", "policy"),
+    [
+        ("dev-backup", POLICY),
+        ("dev-restart", POLICY),
+        ("dev-gap", POLICY),
+        ("dev-big", POLICY),
+        ("2001:db8::1", POLICY),
+        ("dev-backup", TOD),
+        ("dev-gap", TOD),
+    ],
+)
+def test_harness_matches_the_live_engine_hour_by_hour(tmp_path, name, policy):
+    "Every sampled hour: same fired detectors, and 'not abstained' only where the engine scores."
+    series = scenario()[name]
+    live = _live(tmp_path, series, policy)
+    rows = [o for o in replay((series,), policy) if o.hour in live]
+    assert rows
+    for o in rows:
+        fired, engine_reason = live[o.hour]
+        assert (o.status == "fired") == (o.detector in fired), (o.hour, o.detector)
+        if o.detector == "upload_deviation" and o.status != "abstained":
+            assert engine_reason is None, o.hour  # the harness never scores what the engine won't
+        if o.detector == "upload_deviation" and engine_reason is None:
+            assert o.status != "abstained", o.hour  # ...nor abstains where the engine scores
+    assert any(o.status == "fired" for o in rows) == any(f for f, _ in live.values())
 
 
 def test_open_failure_closes_the_inventory_connection(tmp_path, monkeypatch):
@@ -235,3 +278,27 @@ def test_clock_validation():
 
 def test_large_bytes_constant_sanity():
     assert GIB == 1024 * MIB and BASE < POLICY.minimum_bytes
+
+
+def test_engine_alerts_are_never_dropped_when_the_harness_would_abstain():
+    from vigie_pipeline.replay.runner import _outcome
+
+    with pytest.raises(ReplayInputError, match="disagree"):
+        _outcome("d", 0, "large_upload", "unqualified", {"large_upload": "inc"})
+    assert _outcome("d", 0, "upload_deviation", "learning", {"large_upload": "i"}).status == (
+        "abstained"
+    )
+
+
+def test_abstention_rules_for_training_start_rebuilding_and_unscorable_cohorts():
+    from types import SimpleNamespace as NS
+
+    from vigie_pipeline.replay.runner import _deviation_abstention, _large_abstention
+
+    ok = NS(eligible=True, hour=7200)
+    assert _large_abstention(None, True) == "before_training_since"
+    assert _large_abstention(ok, False) is None
+    assert _deviation_abstention(None, POLICY, None, None, None, True) == "before_training_since"
+    rebuilding = {"state": "rebuilding_quality", "baseline_id": None}
+    assert _deviation_abstention(None, POLICY, ok, ok, rebuilding, False) == "rebuilding_quality"
+    assert _deviation_abstention(None, POLICY, ok, ok, None, False) == "learning"
