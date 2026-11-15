@@ -1009,6 +1009,71 @@ connection error); 5 TLS verification failed (including not yet valid or expired
 would retry); 6 DNS failure. Record the codes for a wrong id, a disabled automation and so on in
 the PRP-004 H0 table.
 
+## Replay and evaluation
+
+`python -m vigie_pipeline.replay --series SERIES.json --labels LABELS.json [--strategy pooled|tod]
+[--large-upload-bytes N]` is an offline, chronological replay of owner-labelled hours through the real `analyze_monitoring`,
+one pass per hour from an injected clock. It prints one JSON report on stdout. It never opens the
+live data directory, configuration or the network: the engine runs against a throwaway database in
+a private temp directory that is removed afterwards, the inputs are opened read-only, and an error
+prints one fixed message (no paths, no input values) and exits 2, including unexpected internal
+errors (no traceback). Only a SIGKILL or power loss mid-run can leave the `vigie-replay-*` temp
+directory behind; it holds synthetic rows only and is safe to delete by hand. `--large-upload-bytes`
+overrides the fixed ceiling for the run (the policy `config_version` then differs). It changes no policy, no
+detector output and no schema, so it does not restart the pilot clock.
+
+- **Series file** (a copy exported by the owner, or a synthetic fixture):
+  `{"version":1,"devices":[{"device":"dev-1","samples":[{"hour":H,"bytes_up":N,
+  "qualified_seconds":0-3600,"degraded":false}]}]}`. `hour` is the UTC hour start in epoch seconds.
+  Device ids are placeholders such as `dev-1` or `2001:db8::1`. An hour with no row is absent, never
+  zero. At most 20 devices, 2160 samples per device, 4 MiB per file.
+- **Label file**: `{"version":1,"labels":[{"device":"dev-1","hour":H,"verdict":"normal"|"anomalous"|
+  "ignore","note":"at most 200 printable characters","detector":"large_upload"|"upload_deviation"}]}`.
+  `detector` is optional: a scoped label counts only for that detector and overrides an unscoped
+  label for it; without it the label applies to both. Unknown fields, duplicates, non-integer or
+  off-boundary hours and over-size files are rejected. `ignore` is tallied and left out of every
+  denominator (coverage, per-day rates and the budget included).
+- **Determinism.** Devices, samples and labels are sorted before use, so input order cannot change
+  the report.
+- **Per detector** (`large_upload`, `upload_deviation`) the report gives TP, FP, FN, TN on labelled
+  hours where the detector evaluated; precision = TP/(TP+FP); `recall` = TP/(TP+FN) over evaluated
+  hours and `recall_all_labelled` which also counts labelled-anomalous hours the detector abstained
+  on as misses; `event_recall` (and `event_recall_all_labelled`): an event is a run of consecutive
+  anomalous hours of one device, detected when the detector fired on any hour of it; coverage (hours
+  with qualified evidence over all hours); false alert episodes per device-day and per network-day
+  against the budget of 1 unwanted notification per network per day. An episode is one engine
+  incident; it is false when its labelled hours are all `normal`; an episode whose labelled hours are
+  all `ignore` is `ignored_episodes`, neither false nor unlabelled. Bad command-line values print one
+  fixed line and exit 2 without echoing the value. `within_budget` is `false` when the
+  known false episodes already exceed the budget, `unknown` while unlabelled episodes exist
+  otherwise, and `true` only when every episode is labelled. The top-level `budget` block sums false
+  episodes across both detectors against the same budget. `within_budget` gates the MEAN false
+  episodes per network day, not a per-day cap; a network day is any UTC day with an evidence hour
+  (a one-hour day counts whole, per-device rates use hours/24) and `max_false_episodes_in_a_day`
+  is the informational worst day. The combined verdict is false if any detector or the summed rate
+  is false, unknown if any is unknown, else true, so it is never better than a detector's own; its
+  rate figure is informational and can dilute across days only one detector judged. An `ignore`
+  hour inside a run of anomalous hours splits it into two events. `abstained.ignored` makes
+  `evidence_hours + abstained.total - abstained.ignored` equal `universe_hours`.
+- **Abstentions are separate.** A detector abstains, with a reason, on hours it cannot judge:
+  `no_sample`, `unqualified`, `clock_gap`, `learning`, `in_training`, `previous_unavailable`,
+  `cohort_abstain` (tod; the engine only freezes a tod baseline once every cohort is mature, so this
+  is a defensive check that no scenario reaches), `rebuilding_quality` (the engine discarded a
+  baseline because a training hour later became unqualified; replay ingests each hour once, so it
+  is defensive too) and `before_training_since` (the hour precedes the profile's training start; the
+  engine feeds neither detector such hours). Abstained hours are counted by reason and never as misses or negatives.
+  `large_upload` judges any qualified hour, even while the profile is learning;
+  `upload_deviation` needs a frozen baseline and a qualified previous hour.
+- **`unknown`, never zero.** A ratio with no evidence behind it (no alert, no labelled positive, no
+  qualified hour) is the string `"unknown"`.
+- **No single accuracy score.** The report is per detector and deliberately has none.
+
+Limits: coverage is per synthetic collector (one per device), so a shared-collector coverage
+outage is not modelled; hours without a tick of the injected clock are `clock_gap`; false-alert
+episodes are a lower bound while unlabelled episodes exist; no output is meaningful before the
+baseline matures (14 distinct dates for `pooled-median-v1`), so run it on the owner's labels at day
+14 or later.
+
 ## Probes (built, off by default, not deployed)
 
 Bounded DNS and TCP reachability probes run in a separate host unit, never in the pipeline (which

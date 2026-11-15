@@ -1,0 +1,382 @@
+"""Metric arithmetic of the replay report, on hand-built outcomes with hand-computed answers."""
+
+import json
+
+from vigie_pipeline.replay.labels import Label
+from vigie_pipeline.replay.report import BUDGET_PER_NETWORK_DAY, UNKNOWN, build_report
+from vigie_pipeline.replay.runner import Outcome
+
+DET = "upload_deviation"
+H0 = 3600 * 400_000  # a UTC day boundary is not required for these tests
+
+
+def out(i, status, reason=None, episode=None, device="d", detector=DET):
+    return Outcome(device, H0 + i * 3600, detector, status, reason, episode)
+
+
+def lab(i, verdict, device="d"):
+    return Label(device, H0 + i * 3600, verdict)
+
+
+def det(outcomes, labels, name=DET):
+    return build_report(outcomes, labels, "algo", "v1")["detectors"][name]
+
+
+def test_confusion_counts_and_denominators():
+    outcomes = [
+        out(0, "fired", episode="e1"),  # anomalous: TP
+        out(1, "fired", episode="e2"),  # anomalous: TP
+        out(2, "quiet"),  # anomalous: FN
+        out(3, "fired", episode="e3"),  # normal: FP
+        out(4, "quiet"),  # normal: TN
+        out(5, "quiet"),  # normal: TN
+        out(6, "quiet"),  # normal: TN
+    ]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(2, "anomalous")]
+    labels += [lab(3, "normal"), lab(4, "normal"), lab(5, "normal"), lab(6, "normal")]
+    r = det(outcomes, labels)
+    assert r["verdicts"] == {"tp": 2, "fp": 1, "fn": 1, "tn": 3}
+    assert r["precision"] == round(2 / 3, 6)  # tp / (tp + fp), not / labelled
+    assert r["recall"] == round(2 / 3, 6)  # tp / (tp + fn), not / hours
+
+
+def test_precision_and_recall_differ_when_denominators_differ():
+    outcomes = [out(0, "fired", episode="a"), out(1, "quiet"), out(2, "quiet"), out(3, "quiet")]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(2, "anomalous"), lab(3, "anomalous")]
+    r = det(outcomes, labels)
+    assert (r["precision"], r["recall"]) == (1.0, 0.25)
+
+
+def test_abstentions_are_separate_and_never_false_negatives_or_negatives():
+    outcomes = [
+        out(0, "abstained", "learning"),
+        out(1, "abstained", "learning"),
+        out(2, "abstained", "no_sample"),
+        out(3, "abstained", "clock_gap"),
+        out(4, "fired", episode="e"),
+    ]
+    labels = [lab(0, "anomalous"), lab(1, "normal"), lab(2, "anomalous"), lab(4, "anomalous")]
+    r = det(outcomes, labels)
+    assert r["verdicts"] == {"tp": 1, "fp": 0, "fn": 0, "tn": 0}
+    assert r["recall"] == 1.0  # evaluated hours only: the abstained anomalous hours are not misses
+    assert r["recall_all_labelled"] == round(1 / 3, 6)  # ...but they are, counted the other way
+    ab = r["abstained"]
+    assert ab["total"] == 4
+    assert ab["by_reason"] == {"clock_gap": 1, "learning": 2, "no_sample": 1}
+    assert ab["labelled_anomalous"] == 2 and ab["labelled_normal"] == 1
+
+
+def test_unknown_never_zero_without_evidence():
+    outcomes = [out(0, "abstained", "learning"), out(1, "abstained", "no_sample")]
+    r = det(outcomes, [lab(0, "anomalous")])
+    assert r["precision"] == UNKNOWN and r["recall"] == UNKNOWN
+    assert r["coverage"]["fraction"] == 0.0 and r["coverage"]["evidence_hours"] == 0
+    assert r["false_alerts_per_device_day"] == UNKNOWN
+    assert r["false_alerts_per_network_day"] == UNKNOWN
+    assert r["within_budget"] == UNKNOWN
+    empty = det([], [])
+    assert empty["coverage"]["fraction"] == UNKNOWN
+    assert empty["precision"] == UNKNOWN
+
+
+def test_recall_unknown_without_positive_labels_precision_unknown_without_alerts():
+    r = det([out(0, "quiet"), out(1, "fired", episode="e")], [lab(0, "normal")])
+    assert r["recall"] == UNKNOWN  # no anomalous label with a verdict
+    assert r["precision"] == UNKNOWN  # the only alert is on an unlabelled hour
+    r = det([out(0, "quiet")], [lab(0, "anomalous")])
+    assert r["precision"] == UNKNOWN and r["recall"] == 0.0  # FN present: recall is a real 0
+
+
+def test_ignore_is_tallied_but_excluded_everywhere():
+    outcomes = [out(0, "fired", episode="e"), out(1, "quiet")]
+    r = det(outcomes, [lab(0, "ignore"), lab(1, "ignore")])
+    assert r["verdicts"] == {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    assert r["ignored_labels"] == 2
+    assert r["alerts"]["ignored_episodes"] == 1 and r["alerts"]["false_episodes"] == 0
+    assert r["alerts"]["unlabelled_episodes"] == 0
+
+
+def test_unlabelled_alert_hours_are_counted_apart():
+    r = det([out(0, "fired", episode="e"), out(1, "quiet")], [lab(1, "normal")])
+    assert r["unlabelled_alert_hours"] == 1
+    assert r["verdicts"]["fp"] == 0
+
+
+def test_coverage_counts_hours_with_a_verdict():
+    outcomes = [out(0, "quiet"), out(1, "fired", episode="e"), out(2, "abstained", "learning")]
+    outcomes += [out(3, "abstained", "no_sample")]
+    c = det(outcomes, [lab(0, "normal"), lab(2, "normal")])["coverage"]
+    assert (c["evidence_hours"], c["universe_hours"], c["fraction"]) == (2, 4, 0.5)
+    assert (c["labelled_hours"], c["labelled_with_verdict"]) == (2, 1)
+
+
+def test_episodes_classified_by_their_labelled_hours():
+    outcomes = [
+        out(0, "fired", episode="true"),
+        out(1, "fired", episode="true"),  # one episode over two hours
+        out(2, "fired", episode="false"),
+        out(3, "fired", episode="mixed"),
+        out(4, "fired", episode="mixed"),
+        out(5, "fired", episode="unl"),
+    ]
+    labels = [lab(0, "anomalous"), lab(1, "normal"), lab(2, "normal")]
+    labels += [lab(3, "normal"), lab(4, "anomalous")]
+    a = det(outcomes, labels)["alerts"]
+    assert a == {
+        "episodes": 4,
+        "true_episodes": 2,
+        "false_episodes": 1,
+        "ignored_episodes": 0,
+        "unlabelled_episodes": 1,
+    }
+
+
+def test_false_alert_rate_per_device_day_and_network_day_against_budget():
+    # 2 devices x 24 hours of evidence on the same UTC day: 2 device-days, 1 network-day
+    day = (H0 // 86400 + 1) * 86400
+    outcomes = []
+    for dev in ("a", "b"):
+        for i in range(24):
+            outcomes.append(Outcome(dev, day + i * 3600, DET, "quiet"))
+    outcomes[0] = Outcome("a", day, DET, "fired", None, "fa")
+    outcomes[24] = Outcome("b", day, DET, "fired", None, "fb")
+    labels = [Label("a", day, "normal"), Label("b", day, "normal")]
+    r = det(outcomes, labels)
+    assert r["alerts"]["false_episodes"] == 2
+    assert r["false_alerts_per_device_day"] == 1.0  # 2 / (48 / 24)
+    assert r["false_alerts_per_network_day"] == 2.0  # 2 / 1 day
+    assert r["budget_per_network_day"] == BUDGET_PER_NETWORK_DAY == 1
+    assert r["within_budget"] is False
+    labels = [Label("a", day, "normal"), Label("b", day, "anomalous")]
+    r = det(outcomes, labels)  # one false episode, none unlabelled: exactly on budget
+    assert r["false_alerts_per_network_day"] == 1.0 and r["within_budget"] is True
+    r = det(outcomes, labels[:1])  # b's alert is unlabelled: the bound holds but is not proof
+    assert r["alerts"]["unlabelled_episodes"] == 1 and r["within_budget"] == UNKNOWN
+    r = det(outcomes, [])  # nothing labelled: no false episode known, so nothing is proven
+    assert r["alerts"]["false_episodes"] == 0 and r["within_budget"] == UNKNOWN
+
+
+def test_budget_combines_detectors_and_is_unknown_with_unlabelled_episodes():
+    day = (H0 // 86400 + 1) * 86400
+    rows = [
+        Outcome("a", day + i * 3600, d, "quiet") for i in range(24) for d in (DET, "large_upload")
+    ]
+    rows[0] = Outcome("a", day, DET, "fired", None, "e1")
+    rows[1] = Outcome("a", day, "large_upload", "fired", None, "e2")
+    both = [Label("a", day, "normal")]
+    rep = build_report(rows, both, "a", "v")
+    # each detector alone is exactly on budget (1 false episode / 1 day) ...
+    assert all(d["within_budget"] is True for d in rep["detectors"].values())
+    # ... but the network receives both notifications
+    assert rep["budget"]["false_episodes"] == 2
+    assert rep["budget"]["false_alerts_per_network_day"] == 2.0
+    assert rep["budget"]["within_budget"] is False
+    one = build_report(rows[:1] + rows[2:], both, "a", "v")
+    assert one["budget"]["within_budget"] is True
+    unl = build_report(rows[:1] + rows[2:], [], "a", "v")
+    assert unl["budget"]["within_budget"] == UNKNOWN
+    assert build_report([], [], "a", "v")["budget"]["within_budget"] == UNKNOWN
+
+
+def test_event_level_recall_counts_runs_of_anomalous_hours():
+    outcomes = [
+        out(0, "quiet"),  # event 1: two hours, caught on the second
+        out(1, "fired", episode="e"),
+        out(5, "quiet"),  # event 2: missed
+        out(8, "abstained", "learning"),  # event 3: never evaluated
+    ]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(5, "anomalous"), lab(8, "anomalous")]
+    r = det(outcomes, labels)
+    assert r["recall"] == round(1 / 3, 6)  # hour level: 1 of 3 evaluated hours
+    assert (r["anomalous_events"], r["evaluated_events"], r["detected_events"]) == (3, 2, 1)
+    assert r["event_recall"] == 0.5 and r["event_recall_all_labelled"] == round(1 / 3, 6)
+    assert det([out(0, "quiet")], [lab(0, "normal")])["event_recall"] == UNKNOWN
+    # a gap between labelled hours splits events, another device does too
+    split = det(
+        [out(0, "fired", episode="e"), out(2, "quiet"), out(0, "quiet", device="x")],
+        [lab(0, "anomalous"), lab(2, "anomalous"), lab(1, "anomalous", "x")],
+    )
+    assert split["anomalous_events"] == 3
+
+
+def test_detector_scoped_labels_apply_to_one_detector_and_override_unscoped():
+    outcomes = [
+        out(0, "fired", episode="a", detector="large_upload"),
+        out(0, "fired", episode="b"),
+        out(1, "quiet", detector="large_upload"),
+        out(1, "quiet"),
+    ]
+    labels = [
+        Label("d", H0, "anomalous", "", "upload_deviation"),
+        Label("d", H0 + 3600, "normal"),
+        Label("d", H0 + 3600, "anomalous", "", "large_upload"),  # overrides for one detector
+    ]
+    rep = build_report(outcomes, labels, "a", "v")["detectors"]
+    assert rep["upload_deviation"]["verdicts"] == {"tp": 1, "fp": 0, "fn": 0, "tn": 1}
+    assert rep["large_upload"]["verdicts"] == {"tp": 0, "fp": 0, "fn": 1, "tn": 0}
+    assert rep["large_upload"]["unlabelled_alert_hours"] == 1  # the deviation label is not its
+
+
+def test_detectors_are_reported_independently_and_report_is_json_safe():
+    outcomes = [
+        out(0, "fired", episode="e", detector="large_upload"),
+        out(0, "abstained", "learning"),
+    ]
+    rep = build_report(outcomes, [lab(0, "anomalous")], "algo", "v1")
+    assert rep["detectors"]["large_upload"]["verdicts"]["tp"] == 1
+    assert rep["detectors"][DET]["verdicts"]["tp"] == 0
+    assert rep["detectors"][DET]["abstained"]["total"] == 1
+    assert rep["policy"] == {"algorithm": "algo", "config_version": "v1"}
+    assert json.loads(json.dumps(rep, sort_keys=True)) == rep
+
+
+def test_labels_for_unknown_devices_are_counted_not_dropped():
+    rep = build_report([out(0, "quiet")], [lab(0, "normal"), lab(0, "normal", "zz")], "a", "v")
+    assert rep["labels"] == {
+        "total": 2,
+        "normal": 2,
+        "anomalous": 0,
+        "ignore": 0,
+        "unknown_device": 1,
+    }
+
+
+def test_report_independent_of_outcome_and_label_order():
+    outcomes = [out(i, "fired" if i % 3 == 0 else "quiet", episode=f"e{i}") for i in range(9)]
+    labels = [lab(i, "anomalous" if i % 2 else "normal") for i in range(9)]
+    one = build_report(outcomes, labels, "a", "v")
+    two = build_report(outcomes[::-1], labels[::-1], "a", "v")
+    assert json.dumps(one, sort_keys=True) == json.dumps(two, sort_keys=True)
+
+
+def test_episode_with_only_ignored_hours_is_ignored_not_unlabelled():
+    outcomes = [out(0, "fired", episode="i"), out(1, "fired", episode="i"), out(2, "quiet")]
+    outcomes += [out(i, "quiet") for i in range(3, 24)]
+    r = det(outcomes, [lab(0, "ignore"), lab(1, "ignore")])
+    assert r["alerts"]["ignored_episodes"] == 1 and r["alerts"]["unlabelled_episodes"] == 0
+    assert r["alerts"]["episodes"] == 1 and r["within_budget"] is True
+    bare = det(outcomes, [])  # no label at all: still waiting for the owner
+    assert bare["alerts"]["ignored_episodes"] == 0 and bare["alerts"]["unlabelled_episodes"] == 1
+    assert bare["within_budget"] == UNKNOWN
+
+
+def test_events_only_for_devices_with_rows_so_both_recalls_agree():
+    outcomes = [out(0, "quiet"), out(1, "quiet")]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(0, "anomalous", device="ghost")]
+    r = det(outcomes, labels)
+    assert r["anomalous_events"] == 1  # the ghost device is only tallied as unknown_device
+    assert r["event_recall_all_labelled"] == 0.0 == r["recall_all_labelled"]
+    rep = build_report(outcomes, labels, "a", "v")
+    assert rep["labels"]["unknown_device"] == 1
+
+
+def _two_false_day_one_then_ignored_day_two(detector=DET):
+    d1 = (H0 // 86400 + 1) * 86400
+    d2 = d1 + 86400
+    rows = [Outcome("a", d1 + i * 3600, detector, "quiet") for i in range(24)]
+    rows[0] = Outcome("a", d1, detector, "fired", None, "e1")
+    rows[1] = Outcome("a", d1 + 3600, detector, "fired", None, "e2")
+    rows.append(Outcome("a", d2, detector, "quiet"))  # one qualified hour on day two
+    labels = [Label("a", d1, "normal"), Label("a", d1 + 3600, "normal")]
+    return rows, labels, Label("a", d2, "ignore", "", None)
+
+
+def test_ignored_hours_do_not_widen_the_budget_denominators():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two()
+    r = det(rows, labels + [ignored])
+    assert r["false_alerts_per_network_day"] == 2.0  # one network day, not two
+    assert r["within_budget"] is False
+    assert r["coverage"]["evidence_hours"] == 24 and r["coverage"]["universe_hours"] == 24
+    assert r["ignored_labels"] == 1
+    # the same data without the ignore label has two evidence days
+    assert det(rows, labels)["false_alerts_per_network_day"] == 1.0
+
+
+def test_combined_budget_excludes_ignored_hours_too():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two()
+    rep = build_report(rows, labels + [ignored], "a", "v")
+    assert rep["budget"]["false_alerts_per_network_day"] == 2.0
+    assert rep["budget"]["within_budget"] is False
+
+
+def test_detector_scoped_ignore_only_affects_its_own_detector():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two("large_upload")
+    rows += [Outcome("a", r.hour, DET, "quiet") for r in rows]  # the other detector, same hours
+    scoped = Label(ignored.device, ignored.hour, "ignore", "", "large_upload")
+    rep = build_report(rows, labels + [scoped], "a", "v")
+    assert rep["detectors"]["large_upload"]["false_alerts_per_network_day"] == 2.0
+    other = rep["detectors"][DET]  # not ignored here: both days count, and no false episode
+    assert other["coverage"]["evidence_hours"] == 25
+    # combined: day two still has the other detector's evidence, so two network days
+    assert rep["budget"]["false_alerts_per_network_day"] == 1.0
+    # a scoped normal label overrides an unscoped ignore, so the hour counts again
+    back = Label(ignored.device, ignored.hour, "normal", "", "large_upload")
+    again = build_report(rows, labels + [ignored, back], "a", "v")
+    assert again["detectors"]["large_upload"]["false_alerts_per_network_day"] == 1.0
+
+
+def _learning_days_repro():
+    "16 days of large_upload evidence; upload_deviation judges only the last 2, with 6 false."
+    base = (H0 // 86400 + 1) * 86400
+    rows, labels = [], []
+    for day in range(16):
+        hour = base + day * 86400
+        rows.append(Outcome("a", hour, "large_upload", "quiet"))
+        if day < 14:
+            rows.append(Outcome("a", hour, DET, "abstained", "learning"))
+            continue
+        for k in range(3):
+            h = hour + (k + 1) * 7200
+            rows.append(Outcome("a", h, DET, "fired", None, f"e{day}{k}"))
+            labels.append(Label("a", h, "normal"))
+    return rows, labels
+
+
+def _one_sample():
+    rows = [Outcome("a", H0, DET, "fired", None, "e")]
+    return rows, [Label("a", H0, "normal")]
+
+
+def _good_and_bad():
+    rows = [Outcome("a", H0 + i * 3600, DET, "quiet") for i in range(48)]
+    return rows, [Label("a", H0 + 3600, "normal")]
+
+
+def test_combined_verdict_is_never_better_than_any_detector():
+    for build in (_learning_days_repro, _one_sample, _good_and_bad):
+        rows, labels = build()
+        rep = build_report(rows, labels, "a", "v")
+        rank = {True: 0, UNKNOWN: 1, False: 2}
+        worst = max(rank[d["within_budget"]] for d in rep["detectors"].values())
+        assert rank[rep["budget"]["within_budget"]] >= worst, build.__name__
+    rep = build_report(*_learning_days_repro(), "a", "v")
+    assert rep["detectors"][DET]["false_alerts_per_network_day"] == 3.0
+    assert rep["detectors"][DET]["within_budget"] is False
+    assert rep["budget"]["false_alerts_per_network_day"] == 0.375  # diluted, informational
+    assert rep["budget"]["within_budget"] is False  # ...but the verdict is not
+    one = build_report(*_one_sample(), "a", "v")["budget"]
+    # large_upload has no evidence at all (unknown), so the combined verdict cannot be true
+    assert one["within_budget"] == UNKNOWN and one["false_alerts_per_network_day"] == 1.0
+    unknown = build_report([Outcome("a", H0, DET, "fired", None, "e")], [], "a", "v")
+    assert unknown["budget"]["within_budget"] == UNKNOWN
+
+
+def test_max_false_episodes_in_a_day_is_reported_per_detector_and_combined():
+    rep = build_report(*_learning_days_repro(), "a", "v")
+    assert rep["detectors"][DET]["max_false_episodes_in_a_day"] == 3
+    assert rep["detectors"]["large_upload"]["max_false_episodes_in_a_day"] == 0
+    assert rep["budget"]["max_false_episodes_in_a_day"] == 3
+    assert "_false_days" not in rep["detectors"][DET]
+    assert build_report([], [], "a", "v")["budget"]["max_false_episodes_in_a_day"] == 0
+
+
+def test_evidence_and_abstained_reconcile_with_the_universe():
+    rows = [out(0, "quiet"), out(1, "abstained", "learning"), out(2, "abstained", "no_sample")]
+    rows += [out(3, "fired", episode="e"), out(4, "quiet")]
+    r = det(rows, [lab(1, "ignore"), lab(4, "ignore")])
+    assert r["abstained"]["ignored"] == 1 and r["ignored_labels"] == 2
+    c = r["coverage"]
+    assert (
+        c["evidence_hours"] + r["abstained"]["total"] - r["abstained"]["ignored"]
+        == c["universe_hours"]
+    )
