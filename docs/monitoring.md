@@ -1030,7 +1030,7 @@ detector output and no schema, so it does not restart the pilot clock.
   `detector` is optional: a scoped label counts only for that detector and overrides an unscoped
   label for it; without it the label applies to both. Unknown fields, duplicates, non-integer or
   off-boundary hours and over-size files are rejected. `ignore` is tallied and left out of every
-  denominator.
+  denominator (coverage, per-day rates and the budget included).
 - **Determinism.** Devices, samples and labels are sorted before use, so input order cannot change
   the report.
 - **Per detector** (`large_upload`, `upload_deviation`) the report gives TP, FP, FN, TN on labelled

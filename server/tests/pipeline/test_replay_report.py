@@ -268,3 +268,48 @@ def test_events_only_for_devices_with_rows_so_both_recalls_agree():
     assert r["event_recall_all_labelled"] == 0.0 == r["recall_all_labelled"]
     rep = build_report(outcomes, labels, "a", "v")
     assert rep["labels"]["unknown_device"] == 1
+
+
+def _two_false_day_one_then_ignored_day_two(detector=DET):
+    d1 = (H0 // 86400 + 1) * 86400
+    d2 = d1 + 86400
+    rows = [Outcome("a", d1 + i * 3600, detector, "quiet") for i in range(24)]
+    rows[0] = Outcome("a", d1, detector, "fired", None, "e1")
+    rows[1] = Outcome("a", d1 + 3600, detector, "fired", None, "e2")
+    rows.append(Outcome("a", d2, detector, "quiet"))  # one qualified hour on day two
+    labels = [Label("a", d1, "normal"), Label("a", d1 + 3600, "normal")]
+    return rows, labels, Label("a", d2, "ignore", "", None)
+
+
+def test_ignored_hours_do_not_widen_the_budget_denominators():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two()
+    r = det(rows, labels + [ignored])
+    assert r["false_alerts_per_network_day"] == 2.0  # one network day, not two
+    assert r["within_budget"] is False
+    assert r["coverage"]["evidence_hours"] == 24 and r["coverage"]["universe_hours"] == 24
+    assert r["ignored_labels"] == 1
+    # the same data without the ignore label has two evidence days
+    assert det(rows, labels)["false_alerts_per_network_day"] == 1.0
+
+
+def test_combined_budget_excludes_ignored_hours_too():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two()
+    rep = build_report(rows, labels + [ignored], "a", "v")
+    assert rep["budget"]["false_alerts_per_network_day"] == 2.0
+    assert rep["budget"]["within_budget"] is False
+
+
+def test_detector_scoped_ignore_only_affects_its_own_detector():
+    rows, labels, ignored = _two_false_day_one_then_ignored_day_two("large_upload")
+    rows += [Outcome("a", r.hour, DET, "quiet") for r in rows]  # the other detector, same hours
+    scoped = Label(ignored.device, ignored.hour, "ignore", "", "large_upload")
+    rep = build_report(rows, labels + [scoped], "a", "v")
+    assert rep["detectors"]["large_upload"]["false_alerts_per_network_day"] == 2.0
+    other = rep["detectors"][DET]  # not ignored here: both days count, and no false episode
+    assert other["coverage"]["evidence_hours"] == 25
+    # combined: day two still has the other detector's evidence, so two network days
+    assert rep["budget"]["false_alerts_per_network_day"] == 1.0
+    # a scoped normal label overrides an unscoped ignore, so the hour counts again
+    back = Label(ignored.device, ignored.hour, "normal", "", "large_upload")
+    again = build_report(rows, labels + [ignored, back], "a", "v")
+    assert again["detectors"]["large_upload"]["false_alerts_per_network_day"] == 1.0

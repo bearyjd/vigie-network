@@ -94,6 +94,13 @@ def _episodes(fired: list[Outcome], labelled: dict) -> dict:
     }
 
 
+def _evidence(rows, labelled: dict) -> list[Outcome]:
+    "Hours the detector judged, minus owner-ignored hours: `ignore` leaves every denominator."
+    return [
+        o for o in rows if o.status != ABSTAINED and labelled.get((o.device, o.hour)) != "ignore"
+    ]
+
+
 def _detector(rows: list[Outcome], labelled: dict) -> dict:
     "labelled: (device, hour) -> verdict as seen by this detector."
     verdicts = Counter()
@@ -119,9 +126,10 @@ def _detector(rows: list[Outcome], labelled: dict) -> dict:
             ] += 1
         elif o.status == FIRED and label is None:
             unlabelled_alert_hours += 1
-    evidence = [o for o in rows if o.status != ABSTAINED]
-    fired_rows = [o for o in evidence if o.status == FIRED]
+    evidence = _evidence(rows, labelled)
+    fired_rows = [o for o in rows if o.status == FIRED]  # ignored hours still shape an episode
     alerts = _episodes(fired_rows, labelled)
+    universe = len(rows) - ignored
     return {
         "verdicts": {k: verdicts[k] for k in ("tp", "fp", "fn", "tn")},
         "precision": _ratio(verdicts["tp"], verdicts["tp"] + verdicts["fp"]),
@@ -140,8 +148,8 @@ def _detector(rows: list[Outcome], labelled: dict) -> dict:
         "unlabelled_alert_hours": unlabelled_alert_hours,
         "coverage": {
             "evidence_hours": len(evidence),
-            "universe_hours": len(rows),
-            "fraction": _ratio(len(evidence), len(rows)),
+            "universe_hours": universe,
+            "fraction": _ratio(len(evidence), universe),
             "labelled_hours": labelled_hours,
             "labelled_with_verdict": with_verdict,
         },
@@ -172,9 +180,13 @@ def _budget(evidence: list[Outcome], false_episodes: int, unlabelled: int) -> di
     }
 
 
-def _combined(detectors: dict, outcomes) -> dict:
+def _combined(detectors: dict, outcomes, labelled_by: dict) -> dict:
     "One notification budget for the whole network: false episodes of every detector add up."
-    evidence = [o for o in outcomes if o.status != ABSTAINED]
+    evidence = [
+        o
+        for name in labelled_by
+        for o in _evidence([x for x in outcomes if x.detector == name], labelled_by[name])
+    ]
     false = sum(d["alerts"]["false_episodes"] for d in detectors.values())
     unlabelled = sum(d["alerts"]["unlabelled_episodes"] for d in detectors.values())
     days = len({o.hour // 86400 for o in evidence})
@@ -198,8 +210,9 @@ def build_report(
     devices = {o.device for o in outcomes}
     kinds = Counter(x.verdict for x in labels)
     names = sorted({o.detector for o in outcomes} | set(DETECTORS))
+    labelled_by = {name: _labelled(labels, name) for name in names}
     detectors = {
-        name: _detector([o for o in outcomes if o.detector == name], _labelled(labels, name))
+        name: _detector([o for o in outcomes if o.detector == name], labelled_by[name])
         for name in names
     }
     return {
@@ -212,5 +225,5 @@ def build_report(
             "unknown_device": sum(1 for x in labels if x.device not in devices),
         },
         "detectors": detectors,
-        "budget": _combined(detectors, outcomes),
+        "budget": _combined(detectors, outcomes, labelled_by),
     }
