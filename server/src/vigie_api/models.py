@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from vigie_api.essential import MAX_S, MIN_S
 from vigie_api.textsafe import has_forbidden
 
 DeviceType = Literal["phone", "tv", "iot", "camera", "laptop", "console", "unknown"]
@@ -195,9 +196,9 @@ class EssentialPut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     absent_after_s: StrictInt = Field(
-        ge=3600,
-        le=604800,
-        description="Seconds of qualified Vigie coverage without seeing the device (1 h to 7 d).",
+        ge=MIN_S,
+        le=MAX_S,
+        description=f"Seconds of qualified coverage without seeing it ({MIN_S} to {MAX_S}).",
     )
 
 

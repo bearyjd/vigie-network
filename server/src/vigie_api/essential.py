@@ -13,6 +13,8 @@ from typing import Any
 from vigie_api.errors import ApiError
 from vigie_api.writes import check_target, etag
 
+MIN_S = 3600  # the schema CHECK in vigie_api.schema repeats these two literals (tested)
+MAX_S = 604800
 MAX_ESSENTIAL = 32
 
 
@@ -53,7 +55,11 @@ def set_essential(
     """Mark (int) or unmark (None) a device iff the essential version still matches."""
     ov.execute("BEGIN IMMEDIATE")  # the cap check and the write share one write lock
     try:
-        check_target(inv, ov, device_id)
+        if absent_after_s is None:  # clearing must work for a since-merged alias: exists only
+            if inv.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone() is None:
+                raise ApiError(404, "not_found", "device not found")
+        else:
+            check_target(inv, ov, device_id, action="mark")
         row = ov.execute(
             "SELECT absent_after_s, version FROM essential_devices WHERE device_id=?", (device_id,)
         ).fetchone()

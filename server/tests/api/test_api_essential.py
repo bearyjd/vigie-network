@@ -300,3 +300,111 @@ def test_empty_list_when_nothing_marked(env: Env) -> None:
 def test_nothing_ships_pre_marked(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "overrides.db")
     assert conn.execute("SELECT COUNT(*) FROM essential_devices").fetchone()[0] == 0
+
+
+def test_mark_survives_merge_and_the_alias_can_still_be_cleared(env: Env) -> None:
+    env.device("a")
+    env.device("c")
+    put(env, "a", {"absent_after_s": DAY})
+    env.link("a", "c")
+    assert [i["device_id"] for i in env.get("/essential-devices").json()["data"]] == ["a"]
+    r = delete(env, "a", '"1"')
+    assert r.status_code == 200 and r.json()["data"]["absent_after_s"] is None
+    assert env.get("/essential-devices").json()["data"] == []
+    assert len(audits(env, "device.essential.clear")) == 1
+
+
+def test_clearing_a_merged_alias_frees_its_cap_slot(env: Env) -> None:
+    for i in range(33):
+        env.device(f"d{i}")
+    for i in range(32):
+        put(env, f"d{i}", {"absent_after_s": DAY})
+    env.link("d0", "d1")
+    assert put(env, "d32", {"absent_after_s": DAY}).status_code == 409
+    assert delete(env, "d0", '"1"').status_code == 200
+    assert put(env, "d32", {"absent_after_s": DAY}).status_code == 200
+
+
+def test_marking_an_alias_is_still_409_with_a_route_specific_message(env: Env) -> None:
+    env.device("canon")
+    env.device("alias")
+    env.link("alias", "canon")
+    r = put(env, "alias", {"absent_after_s": DAY})
+    assert r.status_code == 409 and "patch" not in r.json()["error"]["message"]
+    assert "canon" in r.json()["error"]["message"]
+
+
+def test_clearing_unknown_device_is_404(env: Env) -> None:
+    assert delete(env, "ghost", "0").status_code == 404
+
+
+@pytest.mark.parametrize("scope", ["read-only", "service", "integration"])
+@pytest.mark.parametrize("body", [{"absent_after_s": "x"}, b"{", b"", {}])
+def test_non_writer_with_bad_body_is_403_not_422(env: Env, scope: str, body) -> None:
+    env.device("d1")
+    _, token = tokens.create_token(env.ov, "other", scope=scope)
+    assert put(env, "d1", body, token=token).status_code == 403
+
+
+@pytest.mark.parametrize("bad", ["has space", "x" * 129, "a/b", "<script>", ""])
+def test_bad_request_id_is_422(env: Env, bad: str) -> None:
+    env.device("d1")
+    headers = {**env.auth, "If-Match": "0", "X-Request-Id": bad}
+    r = env.client.put("/devices/d1/essential", json={"absent_after_s": DAY}, headers=headers)
+    assert r.status_code == 422 and row(env, "d1") is None
+    assert env.client.delete("/devices/d1/essential", headers=headers).status_code == 422
+
+
+def test_good_request_id_lands_in_the_audit_row(env: Env) -> None:
+    env.device("d1")
+    headers = {**env.auth, "If-Match": "0", "X-Request-Id": "req-1.a:b"}
+    env.client.put("/devices/d1/essential", json={"absent_after_s": DAY}, headers=headers)
+    (entry,) = audits(env, "device.essential.set")
+    assert json.loads(entry["detail"])["request_id"] == "req-1.a:b"
+
+
+def test_list_returns_exactly_the_32_marked(env: Env) -> None:
+    for i in range(32):
+        env.device(f"d{i:02d}")
+        put(env, f"d{i:02d}", {"absent_after_s": DAY})
+    listing = env.get("/essential-devices").json()["data"]
+    assert len(listing) == 32 and listing[0]["device_id"] == "d00"
+
+
+def test_constants_match_the_schema_check_and_the_model(env: Env) -> None:
+    from vigie_api import essential, models
+
+    sql = env.ov.execute("SELECT sql FROM sqlite_master WHERE name='essential_devices'")
+    assert f"BETWEEN {essential.MIN_S} AND {essential.MAX_S}" in sql.fetchone()[0]
+    assert (essential.MIN_S, essential.MAX_S, essential.MAX_ESSENTIAL) == (3600, 604800, 32)
+    props = models.EssentialPut.model_json_schema()["properties"]["absent_after_s"]
+    assert (props["minimum"], props["maximum"]) == (essential.MIN_S, essential.MAX_S)
+
+
+def test_write_waits_for_the_overrides_write_lock(env: Env) -> None:
+    """Deterministic serialisation: with the write lock held elsewhere the request cannot
+    check the cap or write until the lock is released."""
+    env.device("d1")
+    blocker = open_overrides(env.root / "overrides.db")
+    blocker.execute("BEGIN IMMEDIATE")
+    done = threading.Event()
+    result: list[int] = []
+
+    def request() -> None:
+        with TestClient(create_app(env.settings, clock=lambda: NOW)) as client:
+            r = client.put(
+                "/devices/d1/essential",
+                json={"absent_after_s": DAY},
+                headers={**env.auth, "If-Match": "0"},
+            )
+            result.append(r.status_code)
+            done.set()
+
+    thread = threading.Thread(target=request)
+    thread.start()
+    assert not done.wait(0.5), "the write must wait for the lock"
+    assert row(env, "d1") is None
+    blocker.execute("ROLLBACK")
+    thread.join(10)
+    assert result == [200] and row(env, "d1")["absent_after_s"] == DAY
+    blocker.close()

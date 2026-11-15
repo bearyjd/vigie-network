@@ -367,6 +367,9 @@ OVERRIDES_MIGRATIONS: Sequence[Sequence[str | Callable[[sqlite3.Connection], Non
         """CREATE TRIGGER no_essential_delete BEFORE DELETE ON essential_devices
           BEGIN SELECT RAISE(ABORT, 'essential marks are cleared by nulling, never deleted');
           END""",
+        """CREATE TRIGGER essential_version_monotonic BEFORE UPDATE ON essential_devices
+          WHEN NEW.version <= OLD.version
+          BEGIN SELECT RAISE(ABORT, 'version must increase'); END""",
     ),
 )
 

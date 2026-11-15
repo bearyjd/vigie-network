@@ -247,9 +247,19 @@ Put the data directory on an encrypted filesystem (PRP section 9).
 5. `overrides.db` is migrated by the api at startup (it creates and migrates the file).
    **The essential-devices release moves `overrides.db` from user_version 9 to 10** (one new table,
    `essential_devices`, additive and forward-only). The api applies it at startup even when nothing is
-   marked essential and the feature has no effect yet, so **take a `vigie-backup backup` first**
-   (see the backup section above). An older api image refuses the newer `overrides.db` (`overrides
-   schema v10 is newer than this build`); restore the backup to go back.
+   marked essential and the feature has no effect yet. Order matters:
+   1. Take the pre-deploy `vigie-backup backup` and `verify` it **with the old image**:
+      `vigie-backup` requires an exact `user_version` match, so after the migration a scheduled
+      backup job still on the old image fails, and so does `verify` of a v10 copy with the old image.
+   2. **Any** new-image `vigie-api` command that opens `overrides.db` through `open_overrides`
+      (`tokens`, `evidence`, `dataset`, and the API itself) runs the migration. Never run one against
+      the live volume before the API is upgraded: the old API then refuses v10 and crash-loops.
+      (`vigie-api essential` is the exception: it never creates or migrates, and refuses a
+      database older than the build with "run the API image once to migrate".)
+   3. Rollback is the old image **plus** a restore of the v9 backup. Restoring only the image leaves
+      a v10 database that the old API refuses (`overrides schema v10 is newer than this build`).
+   4. Ingest never opens `overrides.db`. An old pipeline image keeps working: it opens it
+      read-only and ignores the new table.
 6. Roll back by restoring the previous image tag. A schema that moved forward cannot be moved back:
    keep a copy of the data volume before an upgrade that bumps a schema version
    (`podman volume export`, *unverified*).

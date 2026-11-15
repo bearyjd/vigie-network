@@ -95,6 +95,16 @@ def test_table_checks_reject_out_of_range_and_wrong_types(tmp_path: Path, value)
         conn.execute("INSERT INTO essential_devices VALUES ('d',?,'t','x',1)", (value,))
 
 
+def test_version_must_increase_on_update(tmp_path: Path) -> None:
+    conn = open_overrides(tmp_path / "o.db")
+    conn.execute("INSERT INTO essential_devices VALUES ('d',3600,'t','x',2)")
+    for lower in (2, 1):
+        with pytest.raises(sqlite3.DatabaseError, match="version must increase"):
+            conn.execute("UPDATE essential_devices SET version=? WHERE device_id='d'", (lower,))
+    conn.execute("UPDATE essential_devices SET version=3, absent_after_s=NULL WHERE device_id='d'")
+    assert conn.execute("SELECT version FROM essential_devices").fetchone()[0] == 3
+
+
 def test_null_row_cannot_be_deleted_and_version_must_be_positive(tmp_path: Path) -> None:
     conn = open_overrides(tmp_path / "o.db")
     conn.execute("INSERT INTO essential_devices VALUES ('d',NULL,'t','x',1)")

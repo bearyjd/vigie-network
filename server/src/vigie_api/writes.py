@@ -50,12 +50,14 @@ def _validate(conn: sqlite3.Connection, changes: dict[str, Any]) -> None:
         raise ApiError(422, "unknown_group", "group does not exist")
 
 
-def check_target(inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str) -> None:
+def check_target(
+    inv: sqlite3.Connection, ov: sqlite3.Connection, device_id: str, action: str = "patch"
+) -> None:
     if not rows(inv, "SELECT 1 FROM devices WHERE id=?", (device_id,)):
         raise ApiError(404, "not_found", "device not found")
     into = link_map(ov).get(device_id)
     if into is not None:
-        raise ApiError(409, "device_merged", f"device was merged into {into}; patch that device")
+        raise ApiError(409, "device_merged", f"device was merged into {into}; {action} that device")
 
 
 def patch_override(

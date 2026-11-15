@@ -421,6 +421,14 @@ Example: `PUT /devices/<device-id>/essential` with `If-Match: "0"` and `{"absent
 
 CLI (same rules, audited as `cli:local`): `python -m vigie_api essential list`,
 `essential set <device-id> <seconds>`, `essential clear <device-id>`.
+The CLI never creates or migrates `overrides.db`: a mistyped `--data-dir` creates nothing, a
+missing, locked or newer database is a one-line error, and a database older than the build is
+refused ("run the API image once to migrate it"). See the upgrade order in `docs/deploy.md`.
+
+Unmarking works for a device that was merged after it was marked (it only needs to exist), which
+frees its slot of the 32. Marking requires the canonical device. The essential ETag is its own
+counter (`essential_devices.version`); it is not interchangeable with the `device_overrides` ETag of
+`GET`/`PATCH /devices/{device_id}`.
 
 Stored in `overrides.db` (migration to user_version 10). **Take a `vigie-backup` before deploying:**
 the migration applies even with nothing marked, and an older api image refuses the newer database.

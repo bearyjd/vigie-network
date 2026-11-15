@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+ETAG_HEADER = {
+    "headers": {
+        "ETag": {
+            "description": "Override version of the device; send it back as If-Match.",
+            "schema": {"type": "string"},
+        }
+    }
+}
+
 
 class ApiError(Exception):
     def __init__(

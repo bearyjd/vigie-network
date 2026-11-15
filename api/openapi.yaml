@@ -1326,7 +1326,7 @@
         "additionalProperties": false,
         "properties": {
           "absent_after_s": {
-            "description": "Seconds of qualified Vigie coverage without seeing the device (1 h to 7 d).",
+            "description": "Seconds of qualified coverage without seeing it (3600 to 604800).",
             "maximum": 604800.0,
             "minimum": 3600.0,
             "title": "Absent After S",
@@ -4217,7 +4217,7 @@
     },
     "/devices/{device_id}/essential": {
       "delete": {
-        "description": "Sets the mark to null (the row is kept so the version never resets).",
+        "description": "Sets the mark to null (the row is kept so the version never resets). Works for a device that was merged after it was marked.",
         "operationId": "delete_essential_devices__device_id__essential_delete",
         "parameters": [
           {
@@ -4249,6 +4249,25 @@
           },
           {
             "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9_.:-]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Request-Id"
+            }
+          },
+          {
+            "in": "header",
             "name": "authorization",
             "required": false,
             "schema": {
@@ -4276,7 +4295,7 @@
             "description": "Successful Response",
             "headers": {
               "ETag": {
-                "description": "Override version of the device; send it back as If-Match.",
+                "description": "Essential version of the device; send it back as If-Match.",
                 "schema": {
                   "type": "string"
                 }
@@ -4347,11 +4366,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Validation error"
           },
           "428": {
             "content": {
@@ -4438,7 +4457,7 @@
             "description": "Successful Response",
             "headers": {
               "ETag": {
-                "description": "Override version of the device; send it back as If-Match.",
+                "description": "Essential version of the device; send it back as If-Match.",
                 "schema": {
                   "type": "string"
                 }
@@ -4507,7 +4526,7 @@
         ]
       },
       "put": {
-        "description": "Records the owner's opt-in only; nothing is monitored yet. `absent_after_s` has no default: 3600 to 604800. At most 32 devices; a merged alias is refused (mark the canonical device). If-Match is the current essential version (0 if never marked).",
+        "description": "Records the owner's opt-in only; nothing is monitored yet. `absent_after_s` has no default: 3600 to 604800. At most 32 devices; a merged alias is refused (mark the canonical device). If-Match is the current essential version (0 if never marked); it is its own counter, not the device override ETag.",
         "operationId": "put_essential_devices__device_id__essential_put",
         "parameters": [
           {
@@ -4535,6 +4554,25 @@
                 }
               ],
               "title": "If-Match"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9_.:-]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Request-Id"
             }
           },
           {
@@ -4576,7 +4614,7 @@
             "description": "Successful Response",
             "headers": {
               "ETag": {
-                "description": "Override version of the device; send it back as If-Match.",
+                "description": "Essential version of the device; send it back as If-Match.",
                 "schema": {
                   "type": "string"
                 }

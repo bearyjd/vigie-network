@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from pathlib import Path
 
 import pytest
 from api_helpers import Env, env  # noqa: F401
 
-from vigie_api import cli
+from vigie_api import cli, essential_cli
+from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 
 
 def run(env: Env, *argv: str) -> int:
@@ -37,3 +40,72 @@ def test_unknown_device_and_unmark_unmarked_fail(env: Env, capsys) -> None:
     assert run(env, "set", "nope", "3600") == 1
     assert run(env, "clear", "d1") == 1
     assert "not_essential" in capsys.readouterr().err
+
+
+def test_clear_works_after_the_device_was_merged(env: Env) -> None:
+    env.device("a")
+    env.device("c")
+    assert run(env, "set", "a", "3600") == 0
+    env.link("a", "c")
+    assert run(env, "clear", "a") == 0
+    assert env.ov.execute("SELECT absent_after_s FROM essential_devices").fetchone()[0] is None
+
+
+def test_mistyped_data_dir_creates_nothing(tmp_path: Path, capsys) -> None:
+    typo = tmp_path / "typo"
+    assert cli.main(["essential", "--data-dir", str(typo), "list"]) == 1
+    assert not typo.exists()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert cli.main(["essential", "--data-dir", str(empty), "list"]) == 1
+    assert list(empty.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and err.count("\n") == 2
+
+
+def test_refuses_to_migrate_an_older_database(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "overrides.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    for statement in OVERRIDES_MIGRATIONS[0]:
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version=1")
+    conn.close()
+    for argv in (["list"], ["clear", "d"]):
+        assert cli.main(["essential", "--data-dir", str(tmp_path), *argv]) == 1
+    assert "run the API image once to migrate" in capsys.readouterr().err
+    check = sqlite3.connect(path)
+    assert check.execute("PRAGMA user_version").fetchone()[0] == 1
+    names = check.execute("SELECT name FROM sqlite_master WHERE name='essential_devices'")
+    assert names.fetchone() is None
+
+
+def test_newer_schema_is_a_clean_error(tmp_path: Path, capsys) -> None:
+    open_overrides(tmp_path / "overrides.db").close()
+    raw = sqlite3.connect(tmp_path / "overrides.db")
+    raw.execute(f"PRAGMA user_version={len(OVERRIDES_MIGRATIONS) + 1}")
+    raw.close()
+    assert cli.main(["essential", "--data-dir", str(tmp_path), "list"]) == 1
+    err = capsys.readouterr().err
+    assert "newer than this build" in err and "Traceback" not in err
+
+
+def test_locked_database_is_a_clean_error(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    env.device("d1")
+    monkeypatch.setattr(essential_cli, "BUSY_TIMEOUT_S", 0.1)
+    blocker = open_overrides(env.root / "overrides.db")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        assert run(env, "set", "d1", "3600") == 1
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    err = capsys.readouterr().err
+    assert "locked" in err and "Traceback" not in err
+
+
+def test_unreadable_location_is_a_clean_error(tmp_path: Path, capsys) -> None:
+    (tmp_path / "overrides.db").mkdir()  # a directory where the file should be
+    assert cli.main(["essential", "--data-dir", str(tmp_path), "list"]) == 1
+    assert "Traceback" not in capsys.readouterr().err
