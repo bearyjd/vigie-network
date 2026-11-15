@@ -154,7 +154,12 @@ def test_harness_matches_the_live_engine_incident_for_incident(tmp_path):
     from vigie_pipeline.schema import open_pipeline_inventory
 
     series = scenario()["dev-backup"]
-    replayed = {(o.hour, o.detector) for o in replay((series,), POLICY) if o.status == "fired"}
+    spans: dict = {}
+    for o in replay((series,), POLICY):
+        if o.status == "fired":
+            lo, hi = spans.get((o.detector, o.episode), (o.hour, o.hour))
+            spans[(o.detector, o.episode)] = (min(lo, o.hour), max(hi, o.hour))
+    replayed = sorted((d, lo, hi) for (d, _e), (lo, hi) in spans.items())
     inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
     ov = open_overrides(tmp_path / "overrides.db")
     try:
@@ -177,14 +182,43 @@ def test_harness_matches_the_live_engine_incident_for_incident(tmp_path):
             )
             inv.execute("INSERT OR REPLACE INTO monitoring_dirty VALUES ('c1',?,0)", (mac,))
             analyze_monitoring(inv, ov, POLICY, row.hour + 3601)
-        live = {
-            (r["last_hour"], r["detector"])
-            for r in inv.execute("SELECT detector,last_hour FROM monitoring_incidents")
-        }
+        live = [
+            (r["detector"], r["episode_start"], r["last_hour"])
+            for r in inv.execute(
+                "SELECT detector,episode_start,last_hour FROM monitoring_incidents"
+                " ORDER BY detector,episode_start"
+            )
+        ]
     finally:
         inv.close()
         ov.close()
-    assert replayed and replayed == live
+    # an incident may open on the pair's first hour; both end on the same last firing hour
+    assert replayed and len(replayed) == len(live)
+    for (det, lo, hi), (ldet, start, last) in zip(replayed, live, strict=True):
+        assert det == ldet and start <= lo and hi == last
+
+
+def test_open_failure_closes_the_inventory_connection(tmp_path, monkeypatch):
+    import sqlite3
+
+    from vigie_pipeline.replay import runner
+
+    opened = []
+    real = runner.open_pipeline_inventory
+
+    def tracking(*a, **k):
+        opened.append(real(*a, **k))
+        return opened[-1]
+
+    def broken(_path):
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(runner, "open_pipeline_inventory", tracking)
+    monkeypatch.setattr(runner, "open_overrides", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        runner._open(tmp_path)
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")  # closed
 
 
 def test_clock_validation():

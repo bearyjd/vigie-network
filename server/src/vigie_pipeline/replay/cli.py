@@ -26,8 +26,16 @@ from vigie_pipeline.replay.runner import replay
 from vigie_pipeline.replay.series import load_series
 
 
+class _FixedMessageParser(argparse.ArgumentParser):
+    "argparse echoes offending values (possibly paths); print one fixed line instead."
+
+    def error(self, message: str):
+        print("replay: invalid command-line arguments", file=sys.stderr)  # noqa: T201 - CLI output
+        raise SystemExit(2)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _FixedMessageParser(
         prog="python -m vigie_pipeline.replay",
         description="Offline chronological replay of owner-labelled hours; prints a JSON report.",
     )
@@ -91,11 +99,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         report = run(args)
+        print(json.dumps(report, sort_keys=True, indent=2))  # noqa: T201 - CLI output
+    except BrokenPipeError:  # the reader went away: nothing useful to say
+        return 2
     except ReplayInputError as exc:
         print(str(exc), file=sys.stderr)  # noqa: T201 - CLI output
         return 2
     except Exception:  # no traceback: it would print paths and input values
         print("replay: unexpected internal error", file=sys.stderr)  # noqa: T201 - CLI output
         return 2
-    print(json.dumps(report, sort_keys=True, indent=2))  # noqa: T201 - CLI output
     return 0

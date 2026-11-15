@@ -1040,7 +1040,9 @@ detector output and no schema, so it does not restart the pilot clock.
   anomalous hours of one device, detected when the detector fired on any hour of it; coverage (hours
   with qualified evidence over all hours); false alert episodes per device-day and per network-day
   against the budget of 1 unwanted notification per network per day. An episode is one engine
-  incident; it is false when its labelled hours are all `normal`. `within_budget` is `false` when the
+  incident; it is false when its labelled hours are all `normal`; an episode whose labelled hours are
+  all `ignore` is `ignored_episodes`, neither false nor unlabelled. Bad command-line values print one
+  fixed line and exit 2 without echoing the value. `within_budget` is `false` when the
   known false episodes already exceed the budget, `unknown` while unlabelled episodes exist
   otherwise, and `true` only when every episode is labelled. The top-level `budget` block sums false
   episodes across both detectors against the same budget.

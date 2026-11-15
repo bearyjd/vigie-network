@@ -67,9 +67,17 @@ def _ticks(clock: Iterable[int]) -> tuple[int, ...]:
 
 def _open(root: Path):
     inv = open_pipeline_inventory(root / "inventory.db", migrate=True)
-    ov = open_overrides(root / "overrides.db")
-    for conn in (inv, ov):  # throwaway files: durability is pointless, fsync dominates the time
-        conn.execute("PRAGMA synchronous=OFF")
+    try:
+        ov = open_overrides(root / "overrides.db")
+        try:
+            for conn in (inv, ov):  # throwaway files: durability is pointless, fsync dominates
+                conn.execute("PRAGMA synchronous=OFF")
+        except BaseException:
+            ov.close()
+            raise
+    except BaseException:
+        inv.close()
+        raise
     return inv, ov
 
 

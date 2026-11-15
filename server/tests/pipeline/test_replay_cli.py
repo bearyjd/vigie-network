@@ -49,7 +49,7 @@ def test_report_separates_abstentions_and_reports_each_detector(files, capsys):
     assert up["event_recall"] == 1.0 and up["event_recall_all_labelled"] == round(2 / 3, 6)
     assert up["ignored_labels"] == 1 and big["ignored_labels"] == 1  # the restart hour
     assert up["alerts"]["unlabelled_episodes"] == 0 and up["within_budget"] is True
-    assert rep["budget"]["false_episodes"] >= 1
+    assert rep["budget"]["false_episodes"] == 1 + big["alerts"]["false_episodes"]
     # sleeping, gap and restart labels abstain; they are not in any verdict count
     assert up["abstained"]["by_reason"]["no_sample"] >= 2
     assert up["abstained"]["labelled_normal"] >= 2
@@ -195,3 +195,33 @@ def test_module_entrypoint_runs_in_a_subprocess_without_side_effects(files, tmp_
     assert proc.returncode == 0, proc.stderr[-300:]
     assert json.loads(proc.stdout)["detectors"]
     assert not (tmp_path / "nope").exists() and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--minimum-hours", "/private/x/labels.json"],
+        ["--minimum-hours=/private/x/labels.json"],
+        ["--strategy", "/private/x/labels.json"],
+        ["--no-such-flag", "/private/x/labels.json"],
+        ["/private/x/labels.json"],
+    ],
+)
+def test_argument_errors_are_a_fixed_message_without_the_value(args, files, capsys):
+    argv = ["--series", str(files[0]), "--labels", str(files[1]), *args]
+    with pytest.raises(SystemExit) as exit_:
+        main(argv)
+    assert exit_.value.code == 2
+    err = capsys.readouterr().err
+    assert err.strip() == "replay: invalid command-line arguments"
+    assert "/private" not in err and "labels.json" not in err
+
+
+def test_broken_pipe_on_stdout_is_quiet(files, capsys, monkeypatch):
+    def broken(*_a, **_k):
+        raise BrokenPipeError
+
+    monkeypatch.setattr("builtins.print", broken)
+    assert main(["--series", str(files[0]), "--labels", str(files[1]), *SMALL]) == 2
+    monkeypatch.undo()
+    assert capsys.readouterr().err == ""

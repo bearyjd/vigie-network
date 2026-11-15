@@ -92,7 +92,8 @@ def test_ignore_is_tallied_but_excluded_everywhere():
     r = det(outcomes, [lab(0, "ignore"), lab(1, "ignore")])
     assert r["verdicts"] == {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     assert r["ignored_labels"] == 2
-    assert r["alerts"]["unlabelled_episodes"] == 1 and r["alerts"]["false_episodes"] == 0
+    assert r["alerts"]["ignored_episodes"] == 1 and r["alerts"]["false_episodes"] == 0
+    assert r["alerts"]["unlabelled_episodes"] == 0
 
 
 def test_unlabelled_alert_hours_are_counted_apart():
@@ -121,7 +122,13 @@ def test_episodes_classified_by_their_labelled_hours():
     labels = [lab(0, "anomalous"), lab(1, "normal"), lab(2, "normal")]
     labels += [lab(3, "normal"), lab(4, "anomalous")]
     a = det(outcomes, labels)["alerts"]
-    assert a == {"episodes": 4, "true_episodes": 2, "false_episodes": 1, "unlabelled_episodes": 1}
+    assert a == {
+        "episodes": 4,
+        "true_episodes": 2,
+        "false_episodes": 1,
+        "ignored_episodes": 0,
+        "unlabelled_episodes": 1,
+    }
 
 
 def test_false_alert_rate_per_device_day_and_network_day_against_budget():
@@ -240,3 +247,24 @@ def test_report_independent_of_outcome_and_label_order():
     one = build_report(outcomes, labels, "a", "v")
     two = build_report(outcomes[::-1], labels[::-1], "a", "v")
     assert json.dumps(one, sort_keys=True) == json.dumps(two, sort_keys=True)
+
+
+def test_episode_with_only_ignored_hours_is_ignored_not_unlabelled():
+    outcomes = [out(0, "fired", episode="i"), out(1, "fired", episode="i"), out(2, "quiet")]
+    outcomes += [out(i, "quiet") for i in range(3, 24)]
+    r = det(outcomes, [lab(0, "ignore"), lab(1, "ignore")])
+    assert r["alerts"]["ignored_episodes"] == 1 and r["alerts"]["unlabelled_episodes"] == 0
+    assert r["alerts"]["episodes"] == 1 and r["within_budget"] is True
+    bare = det(outcomes, [])  # no label at all: still waiting for the owner
+    assert bare["alerts"]["ignored_episodes"] == 0 and bare["alerts"]["unlabelled_episodes"] == 1
+    assert bare["within_budget"] == UNKNOWN
+
+
+def test_events_only_for_devices_with_rows_so_both_recalls_agree():
+    outcomes = [out(0, "quiet"), out(1, "quiet")]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(0, "anomalous", device="ghost")]
+    r = det(outcomes, labels)
+    assert r["anomalous_events"] == 1  # the ghost device is only tallied as unknown_device
+    assert r["event_recall_all_labelled"] == 0.0 == r["recall_all_labelled"]
+    rep = build_report(outcomes, labels, "a", "v")
+    assert rep["labels"]["unknown_device"] == 1

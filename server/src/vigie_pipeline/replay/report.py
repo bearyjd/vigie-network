@@ -1,5 +1,7 @@
 """Per-detector evaluation report. Counts are integers; a ratio with no evidence is "unknown",
-never zero. Abstentions are reported apart from verdicts and are never misses or negatives.
+never zero. `labels.normal/anomalous/ignore` count label records, so a detector-scoped label and an
+unscoped one for the same hour count twice. Abstentions are reported apart from verdicts and are
+never misses or negatives.
 
 Hour level: a verdict is an hour where the detector actually evaluated (fired or quiet). TP/FP/FN/TN
 use only owner labels normal and anomalous on such hours. precision = TP/(TP+FP). Recall is
@@ -14,7 +16,8 @@ least one evaluated hour, `event_recall_all_labelled` by every event.
 
 Alert level (the notification budget): an episode is one engine incident (consecutive firing hours).
 It is true if any of its hours is labelled anomalous, else false if any is labelled normal, else
-unlabelled. False episodes are therefore a lower bound while unlabelled episodes exist, so
+unlabelled; an episode whose labelled hours are all `ignore` is `ignored_episodes` (not
+unlabelled). False episodes are therefore a lower bound while unlabelled episodes exist, so
 `within_budget` is `false` only when that lower bound already exceeds the budget, `unknown` while
 unlabelled episodes exist and the bound does not, and `true` only with every episode labelled. The
 top-level `budget` sums false episodes across detectors (each is a separate notification source).
@@ -48,7 +51,8 @@ def _labelled(labels, detector: str) -> dict:
 def _events(rows: list[Outcome], labelled: dict) -> dict:
     "Runs of consecutive anomalous hours per device; detected when the detector fired in the run."
     status = {(o.device, o.hour): o.status for o in rows}
-    hours = sorted(k for k, v in labelled.items() if v == "anomalous")
+    known = {o.device for o in rows}  # labels for other devices are only tallied as unknown_device
+    hours = sorted(k for k, v in labelled.items() if v == "anomalous" and k[0] in known)
     runs: list[list] = []
     for device, hour in hours:
         if runs and runs[-1][0] == device and runs[-1][-1] == hour - 3600:
@@ -73,17 +77,20 @@ def _episodes(fired: list[Outcome], labelled: dict) -> dict:
     marks: dict = {}
     for o in fired:
         verdict = labelled.get((o.device, o.hour))
-        if verdict in ("normal", "anomalous"):
-            marks.setdefault((o.device, o.episode), set()).add(verdict)
-        else:
-            marks.setdefault((o.device, o.episode), set())
-    true = sum(1 for v in marks.values() if "anomalous" in v)
-    false = sum(1 for v in marks.values() if v == {"normal"})
+        marks.setdefault((o.device, o.episode), set())
+        if verdict in ("normal", "anomalous", "ignore"):
+            marks[(o.device, o.episode)].add(verdict)
+    judged = {k: v - {"ignore"} for k, v in marks.items()}
+    true = sum(1 for v in judged.values() if "anomalous" in v)
+    false = sum(1 for v in judged.values() if v == {"normal"})
+    # all labelled hours are `ignore`: neither true nor false, and not waiting for a label either
+    ignored = sum(1 for k, v in judged.items() if not v and marks[k])
     return {
         "episodes": len(marks),
         "true_episodes": true,
         "false_episodes": false,
-        "unlabelled_episodes": len(marks) - true - false,
+        "ignored_episodes": ignored,
+        "unlabelled_episodes": len(marks) - true - false - ignored,
     }
 
 
