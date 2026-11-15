@@ -52,6 +52,7 @@ def _config(args: argparse.Namespace) -> PipelineConfig:
         transient_min_dwell_s=_pick(args.min_dwell_s, base.transient_min_dwell_s),
         promotion_cap_per_hour=_pick(args.promotion_cap, base.promotion_cap_per_hour),
         migrate=args.migrate,
+        pass_interval_s=args.loop or base.pass_interval_s,
     )
 
 

@@ -193,6 +193,8 @@ class DeliverySettings:
 PROBE_STALE_DEFAULT_S = 300
 NEW_DEVICE_MAX_PER_DAY_DEFAULT = 3
 NEW_DEVICE_MAX_PER_DAY_LIMIT = 20
+PASS_INTERVAL_DEFAULT_S = 30  # the pipeline loop (VIGIE_PIPELINE_INTERVAL_S)
+NEW_DEVICE_MAX_PASS_INTERVAL_S = 1800  # longest pass interval F5 supports (its gap is 4x this)
 
 
 @dataclass(frozen=True)
@@ -249,12 +251,20 @@ class PipelineConfig:
     # dataclass, so the monitoring policy versions are unchanged.
     new_device_notice: bool = False
     new_device_max_per_day: int = NEW_DEVICE_MAX_PER_DAY_DEFAULT
+    pass_interval_s: int = PASS_INTERVAL_DEFAULT_S  # set from --loop; F5 derives its resume gap
 
     def __post_init__(self) -> None:
         if type(self.new_device_max_per_day) is not int or not (
             1 <= self.new_device_max_per_day <= NEW_DEVICE_MAX_PER_DAY_LIMIT
         ):
             raise ValueError("VIGIE_NEW_DEVICE_MAX_PER_DAY must be an integer in 1..20")
+        if type(self.pass_interval_s) is not int or self.pass_interval_s < 1:
+            raise ValueError("pass_interval_s must be a positive integer")
+        if self.new_device_notice and self.pass_interval_s > NEW_DEVICE_MAX_PASS_INTERVAL_S:
+            raise ValueError(
+                "VIGIE_NEW_DEVICE_NOTICE needs a pipeline pass interval of at most "
+                f"{NEW_DEVICE_MAX_PASS_INTERVAL_S} seconds"
+            )
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
             raise ValueError("monitoring_large_upload_bytes outside supported bounds")
         if self.monitoring_baseline not in MONITORING_BASELINES:

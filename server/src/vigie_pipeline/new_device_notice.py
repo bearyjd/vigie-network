@@ -22,13 +22,25 @@ stays excluded. Processing order, not receipt time, is the definition: a device 
 processed after the floor was set counts as new even if the batch was received earlier (a lagging
 pipeline).
 
-The floor moves forward to the newest event when the sweep did not run for more than RESUME_GAP_S
-(the flag was switched off and on again, the pipeline or its overrides store was down, or the clock
-stepped forward by more than that) or its stored state is unreadable. It is NOT watertight for short
-gaps: a toggle or outage shorter than RESUME_GAP_S keeps the old floor, so devices that arrived and
-dwelled in that window are noticed. When the clock steps BACK (last run in the future) the pass
-opens nothing, changes no floor and re-bases `f5_last_run` to now. `f5_enabled_since` (epoch of the
-last floor move) is informational.
+The floor moves forward to the newest event when the sweep did not run for more than the gap
+(max(RESUME_GAP_S, 4 x the configured pass interval): the flag was switched off and on again, the
+pipeline or its overrides store was down, or the clock stepped forward by more than that) or its
+stored state is unreadable or above the issued sequence. It is NOT watertight for short gaps: a
+toggle or outage shorter than the gap keeps the old floor, so devices that arrived and dwelled in
+that window are noticed. The last-run stamp is written in its own small transaction before the
+work, so passes that fail (a contained exception streak) still count as runs. When the clock steps
+BACK (last run in the future) the pass opens nothing, changes no floor and re-bases `f5_last_run`.
+`f5_enabled_since` (epoch of the last floor move) is informational.
+
+Scan cursor: `f5_scan_cursor` is the highest creation-event seq up to which every device is
+DECIDED (noticed, skipped, or first MAC randomized, i.e. never eligible). It only advances over a
+contiguous run of decided devices (at most SCAN_ADVANCE events per pass) and stops at the first
+undecided one (not yet dwelled, unmeasured, backed off, held), so no undecided device is skipped.
+The candidate query starts above max(floor, cursor); a floor move resets it to the floor.
+
+Probe rotation: when every device of a run's slice fails its lineage, a store problem is told apart
+from per-device failures by probing REFERENCE_PROBES other devices, starting after the persisted
+`f5_probe_cursor` and wrapping, so a healthy device is found within ceil(devices / probes) passes.
 
 Hold age: a device that is eligible but not noticed (daily cap) is dropped once it has been held
 HOLD_MAX_AGE_S. The age starts at the first pass where the device was among the first FETCH_MAX
@@ -48,8 +60,10 @@ incident id is random (sha256 of 16 random bytes): never derived from the MAC or
 The incident row is bytes-centric: observed/threshold are 0 and the evidence carries the data. It
 holds no MAC, hostname, vendor or IP. The upload engine never touches it. Closing: a decision of
 `acknowledged` or `expected` in overrides.db resolves it here (the API never writes inventory.db).
-Nothing else closes it; no recover is ever sent (delivery_types.OPEN_ONLY_DETECTORS). Per-pass cost
-is O(candidates) (at most FETCH_MAX rows) in two small write transactions (open, close).
+Nothing else closes it; no recover is ever sent (delivery_types.OPEN_ONLY_DETECTORS). Per-pass
+cost: O(events above the scan cursor), plus at most FETCH_MAX candidates, SCAN_ADVANCE decided
+rows examined and SWEEP_MAX lineage lookups, in three small write transactions (floor, open,
+close).
 """
 
 from __future__ import annotations
@@ -72,15 +86,18 @@ SWEEP_MAX = 20  # devices handled per run
 FETCH_MAX = 200  # candidates read and hold-stamped per run
 CLOSE_MAX = 200  # open incidents examined per run for an owner decision (cursor-rotated)
 PROMOTE_MIN_HOURS = 2  # keep equal to processor.PROMOTE_MIN_HOURS (asserted by a test)
-RESUME_GAP_S = 900  # the pipeline loops every 30 s: no sweep for 15 min = re-enabled or outage
+RESUME_GAP_S = 900  # least gap: max(this, 4 x the pass interval) without a run = re-enable/outage
 HOLD_MAX_AGE_S = 72 * 3600  # a candidate held this long by the cap is dropped
 RETRY_BASE_S = 3600  # first lineage backoff; doubles per failure up to RETRY_MAX_S
 RETRY_MAX_S = 86400
 REFERENCE_PROBES = 8  # devices tried to tell a store problem from a per-device lineage failure
+SCAN_ADVANCE = 2000  # events examined per pass when advancing the scan cursor
 SINCE_KEY = "f5_enabled_since"  # informational: epoch of the last floor move
 FLOOR_KEY = "f5_floor"
 LAST_RUN_KEY = "f5_last_run"
 CLOSE_CURSOR_KEY = "f5_close_cursor"
+SCAN_KEY = "f5_scan_cursor"  # every device with a creation event up to here is decided
+PROBE_KEY = "f5_probe_cursor"  # last reference device probed (a device id)
 NOTICED = "f5_noticed:"  # + device id; value = UTC ISO timestamp of the notice
 SKIPPED = "f5_skipped:"  # + device id; value = "<ISO> <reason>"; permanent
 RETRY = "f5_retry:"  # + device id; value = "<failures>|<retry after, epoch>"
@@ -150,11 +167,29 @@ def _issued_events(inv: sqlite3.Connection) -> int:
     return 0 if row is None else int(row[0])
 
 
-def _floor(inv: sqlite3.Connection, now: float) -> int | None:
+def _gap(config: PipelineConfig) -> int:
+    """No sweep run for this long = the flag was off, the pipeline was down, or the clock jumped:
+    the floor moves. Derived from the configured pass interval, never below RESUME_GAP_S."""
+    return max(RESUME_GAP_S, 4 * config.pass_interval_s)
+
+
+def _created_between(inv: sqlite3.Connection, low: int, high: int) -> int:
+    """Devices created in (low, high]: an upper bound of what a floor move drops (to 1000)."""
+    return inv.execute(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM events WHERE kind='new_device' AND seq>? AND seq<=?"
+        " LIMIT 1000)",
+        (low, high),
+    ).fetchone()[0]
+
+
+def _floor(inv: sqlite3.Connection, now: float, gap: int) -> int | None:
     """The floor to use this pass, or None when the pass must not open anything (clock stepped
     back). Set at the first run; moved to the newest event when the sweep did not run for more than
-    RESUME_GAP_S or its stored state is unreadable; never moved by a backward clock step."""
+    `gap`, or its stored state is unreadable or above the issued sequence; never moved by a
+    backward clock step. Runs in its own small transaction, so a pass that fails later still
+    counts as a run."""
     floor, last = _meta_int(inv, FLOOR_KEY), _meta_int(inv, LAST_RUN_KEY)
+    issued = _issued_events(inv)
     reason = None
     if floor is None or last is None:
         reason = "first_run" if _meta(inv, LAST_RUN_KEY) is None else "invalid_state"
@@ -162,14 +197,24 @@ def _floor(inv: sqlite3.Connection, now: float) -> int | None:
         _put(inv, LAST_RUN_KEY, str(int(now)))
         log(logger, logging.WARNING, "new_device_watermark_moved", reason="clock_stepped_back")
         return None
-    elif now - last > RESUME_GAP_S:
+    elif floor > issued:
+        reason = "invalid_state"
+    elif now - last > gap:
         reason = "resumed"
     if reason:
-        floor = _issued_events(inv)
+        pending = _created_between(inv, floor or 0, issued) if reason != "first_run" else 0
+        floor = issued
         _put(inv, FLOOR_KEY, str(floor))
         _put(inv, SINCE_KEY, str(int(now)))
+        _put(inv, SCAN_KEY, str(floor))
         if reason != "first_run":
-            log(logger, logging.WARNING, "new_device_watermark_moved", reason=reason)
+            log(
+                logger,
+                logging.WARNING,
+                "new_device_watermark_moved",
+                reason=reason,
+                pending=pending,
+            )
     _put(inv, LAST_RUN_KEY, str(int(now)))
     return floor
 
@@ -270,6 +315,26 @@ def _lineage_failed(inv: sqlite3.Connection, device_id: str, now: float) -> None
     _put(inv, RETRY + device_id, f"{count}|{int(now) + delay}")
 
 
+def _probe_ids(inv: sqlite3.Connection, failed: list[str]) -> list[str]:
+    """Up to REFERENCE_PROBES devices after the persisted probe cursor (wrapping around), so
+    successive passes walk through every device instead of re-probing the same lowest ids."""
+    marks = ",".join("?" * len(failed))
+    base = f"SELECT id FROM devices WHERE id NOT IN ({marks})"  # noqa: S608
+    cursor = _meta(inv, PROBE_KEY) or ""
+    ids = [
+        r[0]
+        for r in inv.execute(
+            base + " AND id>? ORDER BY id LIMIT ?", (*failed, cursor, REFERENCE_PROBES)
+        )
+    ]
+    if len(ids) < REFERENCE_PROBES:
+        more = inv.execute(
+            base + " AND id<=? ORDER BY id LIMIT ?", (*failed, cursor, REFERENCE_PROBES - len(ids))
+        )
+        ids += [r[0] for r in more]
+    return ids
+
+
 def _systemic(
     inv: sqlite3.Connection,
     ov: sqlite3.Connection | None,
@@ -277,16 +342,16 @@ def _systemic(
     resolved_here: bool,
 ) -> bool:
     """A failure is the store's, not the device's, when some other device resolved in this run or
-    on a probe of up to REFERENCE_PROBES devices; with none that resolves (or none to compare)
-    nobody is blamed and nobody is backed off."""
+    on a probe of REFERENCE_PROBES devices; the probe window rotates a persisted cursor through all
+    devices, so a healthy device is found within ceil(devices / REFERENCE_PROBES) passes and the
+    failing batch is then backed off. With none that resolves (or none to compare) nobody is
+    blamed and nobody is backed off."""
     if resolved_here:
         return False
-    marks = ",".join("?" * len(failed))
-    others = inv.execute(
-        f"SELECT id FROM devices WHERE id NOT IN ({marks}) ORDER BY id LIMIT ?",  # noqa: S608
-        (*failed, REFERENCE_PROBES),
-    ).fetchall()
-    for (device_id,) in others:
+    ids = _probe_ids(inv, failed)
+    if ids:
+        _put(inv, PROBE_KEY, ids[-1])
+    for device_id in ids:
         try:
             lineage(inv, ov, device_id)
         except LineageUnavailable:
@@ -372,45 +437,83 @@ def _report(
         log(logger, logging.INFO, "new_device_unmeasured", devices=counts["unmeasured"])
 
 
+def _handle(
+    inv: sqlite3.Connection,
+    ov: sqlite3.Connection | None,
+    rows: list[sqlite3.Row],
+    floor: int,
+    now: float,
+    room: int,
+) -> tuple[int, dict[str, int]]:
+    """Classify the first SWEEP_MAX candidates: open, hold, drop, skip or back off."""
+    counts = {"dropped": 0, "held": 0, "failed": 0, "unmeasured": 0}
+    failed: list[str] = []
+    opened = 0
+    for row in rows[:SWEEP_MAX]:
+        verdict, identity = _classify(inv, ov, row, floor, now)
+        if verdict == "failed":
+            failed.append(row["id"])
+        elif verdict in ("merged", "stale"):
+            _skip(inv, row["id"], now, verdict)
+            counts["dropped"] += verdict == "stale"
+        elif room <= 0:
+            counts["held"] += 1
+        else:
+            _open_incident(inv, row, identity, now)
+            room, opened = room - 1, opened + 1
+    if failed and not _systemic(inv, ov, failed, len(failed) < len(rows[:SWEEP_MAX])):
+        for device_id in failed:
+            _lineage_failed(inv, device_id, now)
+    if room <= 0:
+        counts["held"] += max(0, len(rows) - SWEEP_MAX)
+    counts["failed"] = len(failed)
+    return opened, counts
+
+
+def _advance_cursor(inv: sqlite3.Connection, start: int) -> None:
+    """Move the scan cursor past the contiguous run of DECIDED devices after `start`: noticed,
+    skipped, or whose first MAC is randomized (never eligible). It stops at the first undecided
+    device (not yet dwelled, unmeasured, backed off, held), so nothing undecided is ever skipped;
+    at most SCAN_ADVANCE events are examined per pass."""
+    rows = inv.execute(
+        "SELECT e.seq, EXISTS (SELECT 1 FROM pipeline_meta p"
+        " WHERE p.key IN (? || e.device_id, ? || e.device_id))"
+        " OR COALESCE((SELECT o.is_randomized FROM observations o WHERE o.device_id=e.device_id"
+        " ORDER BY o.first_seen, o.mac LIMIT 1), 0)=1"
+        " FROM events e WHERE e.kind='new_device' AND e.seq>? ORDER BY e.seq LIMIT ?",
+        (NOTICED, SKIPPED, start, SCAN_ADVANCE),
+    ).fetchall()
+    cursor = start
+    for seq, decided in rows:
+        if not decided:
+            break
+        cursor = seq
+    if cursor != start:
+        _put(inv, SCAN_KEY, str(cursor))
+
+
 def _open_new_incidents(
     inv: sqlite3.Connection, ov: sqlite3.Connection | None, config: PipelineConfig, now: float
 ) -> int:
+    with immediate(inv):  # its own small transaction: a failing pass below still counts as a run
+        floor = _floor(inv, now, _gap(config))
+    if floor is None:
+        return 0
     with immediate(inv):
-        floor = _floor(inv, now)
-        if floor is None:
-            return 0
+        scan = max(floor, _meta_int(inv, SCAN_KEY) or 0)  # devices at or below it are decided
         used = inv.execute(
             "SELECT COUNT(*) FROM pipeline_meta WHERE key>=? AND key<? AND substr(value,1,10)=?",
             (NOTICED, _upper(NOTICED), iso_utc(now)[:10]),
         ).fetchone()[0]
-        room = max(0, config.new_device_max_per_day - used)
-        rows = inv.execute(FRESH_SQL, _params(floor, config, now, FETCH_MAX)).fetchall()
+        rows = inv.execute(FRESH_SQL, _params(scan, config, now, FETCH_MAX)).fetchall()
         _stamp(inv, rows, now)
-        counts = {"dropped": 0, "held": 0, "failed": 0, "unmeasured": 0}
-        failed: list[str] = []
-        opened = 0
-        for row in rows[:SWEEP_MAX]:
-            verdict, identity = _classify(inv, ov, row, floor, now)
-            if verdict == "failed":
-                failed.append(row["id"])
-            elif verdict in ("merged", "stale"):
-                _skip(inv, row["id"], now, verdict)
-                counts["dropped"] += verdict == "stale"
-            elif room <= 0:
-                counts["held"] += 1
-            else:
-                _open_incident(inv, row, identity, now)
-                room, opened = room - 1, opened + 1
-        if failed and not _systemic(inv, ov, failed, len(failed) < len(rows[:SWEEP_MAX])):
-            for device_id in failed:
-                _lineage_failed(inv, device_id, now)
-        if room <= 0:
-            counts["held"] += max(0, len(rows) - SWEEP_MAX)
-        counts["failed"] = len(failed)
+        room = max(0, config.new_device_max_per_day - used)
+        opened, counts = _handle(inv, ov, rows, floor, now, room)
         counts["unmeasured"] = inv.execute(
-            UNMEASURED_SQL, _params(floor, config, now, SWEEP_MAX)
+            UNMEASURED_SQL, _params(scan, config, now, SWEEP_MAX)
         ).fetchone()[0]
         _report(inv, config, now, counts)
+        _advance_cursor(inv, scan)
     return opened
 
 

@@ -124,6 +124,7 @@ def test_the_first_ever_run_sets_both_keys(data):
         "f5_enabled_since": str(T0 - 60),
         "f5_last_run": str(T0 - 60),
         "f5_floor": "0",
+        "f5_scan_cursor": "0",
     }
 
 
