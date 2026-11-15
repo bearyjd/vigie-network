@@ -381,7 +381,7 @@ detector is added back before the rows are forgotten and the incident resolved m
 recover is sent only when no recover row existed: a recover row that was pending when the detector
 was removed expired and is never revived (only a withdrawn recover row is).
 
-**Open-only detectors.** `new_device` (the F5 new-device notice, not yet produced by any code) is
+**Open-only detectors.** `new_device` (the F5 new-device notice, see "New-device notice (F5)") is
 open-only: when allowlisted its incident gets one `open` delivery whose text is "New device on your
 network: " plus the alias or label (never a MAC, hostname, vendor or IP), and NEVER a `recover`,
 whether the incident later resolves or is superseded; a sent open stays sent. The upload detectors
@@ -397,8 +397,8 @@ If delivery is disabled or the decision store is unavailable, only the planner f
 so a closed non-upload incident whose rows were never forgotten is kept until they are; that set is
 static (nothing new is added while delivery is off).
 An open `new_device` incident, and its sent `open` delivery row (rows of an open incident are never
-forgotten), therefore stay indefinitely: the per-day cap of the sweep that creates them (a later
-slice) is the only bound on their number.
+forgotten), therefore stay until the owner reviews them (the F5 sweep resolves a reviewed one, see
+"New-device notice (F5)"); the per-day cap of that sweep bounds how many can appear.
 
 The pilot report counts `new_device` incidents under their own key in `incidents.per_detector` only:
 they are excluded from `incidents.total`, `incidents.per_day`, the delivery counts, the
@@ -1226,6 +1226,62 @@ Config fields (all values are placeholders): `enabled`, `state_file` (absolute p
 probe volume), optional `state_world_readable` (mode 0644 so the pipeline's uid can read it; the
 document holds ids, error classes and counters only) and `targets`, each with `id`, `kind`,
 `resolver` plus `qname` (DNS) or `address` plus `port` (TCP), and an optional `timeout_s` up to 2.
+
+## New-device notice (F5)
+
+**OFF by default and not deployed** (pilot freeze: deploy only after the day-14 pilot evaluation,
+about 2026-11-28). `VIGIE_NEW_DEVICE_NOTICE=1` (only 1/true/yes enable, garbage is a startup error)
+turns on a bounded sweep, run after the transient sweep in every pipeline pass, that opens ONE
+incident of detector `new_device` for a genuinely new, durable device. With the flag off nothing is
+read, written or swept and the database is byte-identical to a build without F5. The flag and the cap
+live in `PipelineConfig`, never in a policy dataclass: the monitoring policy versions are unchanged.
+
+**Eligibility** (all must hold). (1) The device's first MAC is not randomized; a randomized MAC never
+notifies, even after promotion. (2) It persisted like a promotion candidate: at least 2 distinct
+server hours and `VIGIE_TRANSIENT_MIN_DWELL_S` (default 2 h) between the MAC's first server receipt
+(`mac_first_received`) and its last receipt-clamped activity; collector-supplied stamps cannot fake
+this. (3) It first arrived after `f5_enabled_since`, a `pipeline_meta` watermark set once at the first
+enabled run: existing devices never notify, and a flag that was off for a while never back-fills.
+(4) It is not stitched into an older device and has not absorbed one (every MAC of its lineage
+arrived after the watermark). (5) A collector has measured it (the incident is collector-scoped).
+Hostnames, DHCP options and mDNS names are never signals and never appear in any text. A cloned
+known MAC is not new, so no notice is sent for it: a known gap F5 does not cover.
+
+**Cap and bounds.** At most `VIGIE_NEW_DEVICE_MAX_PER_DAY` (default 3, integer 1..20, anything else
+fails at startup without echoing the value) incidents per UTC day, in (first_seen, id) order, and at
+most 20 devices handled per run. When devices are held back by the cap, ONE `new_device_capped`
+event per UTC day records the count (counted only up to 21) and no MAC; held devices are noticed on
+later days, 3 a day. Compose forwards both variables with `${VAR-default}` (`0` and `3`): only an
+unset variable gets the default, an explicitly empty `VIGIE_NEW_DEVICE_MAX_PER_DAY` is a startup
+error.
+
+**The incident.** Detector `new_device`, `observed_bytes=0`, `threshold_bytes=0`, evidence exactly
+`{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}`; no MAC, hostname,
+vendor or IP in the row. Its id is random (sha256 of 16 random bytes), never derived from the MAC
+or the device, so the notification link is unlinkable to either. The upload engine never touches it.
+
+**Once per device life.** `pipeline_meta` key `f5_noticed:<device id>` is written in the same
+transaction as the incident (`f5_skipped:<device id>` marks a merged device that is never new). A
+re-run, a closed incident, a retired then revived device or a lineage change never produces a second
+incident for the same device. The existing `new_device` event cannot serve: it exists for every
+device.
+
+**Review and close.** An incident stays open until the owner reviews it. A decision of
+`acknowledged` or `expected` (the existing decision path) makes the sweep resolve the incident on a
+later pass (it examines the 200 most recent decisions per run); `snoozed` and a cleared decision keep
+it open. The API never writes inventory.db, which is why the sweep does the close. A resolved
+`new_device` incident sends NO recover (open-only) and becomes prunable under the retention rule
+above. Nothing else closes it; no auto-resolve.
+
+**Delivery needs three things.** `VIGIE_DELIVERY_ENABLED=1`, `new_device` in
+`VIGIE_DELIVERY_DETECTORS` AND the flag. Backlog bound: an open-only incident that has no delivery
+row yet is announced only while it is younger than the delivery TTL (`VIGIE_DELIVERY_TTL_S`, 24 h).
+Adding `new_device` to the allowlist later therefore never replays old unreviewed incidents; at most
+the incidents of the last day (cap, so at most 20, default 3) are announced.
+
+**Known follow-up.** The pre-existing `new_device` event written when a device is first created
+(every new MAC, randomized included) embeds the raw MAC in its summary. F5 does not change it; the
+incident, evidence, delivery text and `new_device_capped` event never contain it.
 
 ## Retention and verification limits
 

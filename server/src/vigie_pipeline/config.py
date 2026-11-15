@@ -181,6 +181,8 @@ class DeliverySettings:
 
 
 PROBE_STALE_DEFAULT_S = 300
+NEW_DEVICE_MAX_PER_DAY_DEFAULT = 3
+NEW_DEVICE_MAX_PER_DAY_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -233,8 +235,16 @@ class PipelineConfig:
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
     delivery: DeliverySettings = DeliverySettings()
     probes: ProbeSettings = ProbeSettings()
+    # F5 new-device notice (docs/monitoring.md). DEFAULT OFF; deliberately NOT in any policy
+    # dataclass, so the monitoring policy versions are unchanged.
+    new_device_notice: bool = False
+    new_device_max_per_day: int = NEW_DEVICE_MAX_PER_DAY_DEFAULT
 
     def __post_init__(self) -> None:
+        if type(self.new_device_max_per_day) is not int or not (
+            1 <= self.new_device_max_per_day <= NEW_DEVICE_MAX_PER_DAY_LIMIT
+        ):
+            raise ValueError("VIGIE_NEW_DEVICE_MAX_PER_DAY must be an integer in 1..20")
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
             raise ValueError("monitoring_large_upload_bytes outside supported bounds")
         if self.monitoring_baseline not in MONITORING_BASELINES:
@@ -285,4 +295,8 @@ class PipelineConfig:
             activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
             delivery=DeliverySettings.from_env(source),
             probes=ProbeSettings.from_env(source),
+            new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
+            new_device_max_per_day=_env_int(
+                source, "VIGIE_NEW_DEVICE_MAX_PER_DAY", NEW_DEVICE_MAX_PER_DAY_DEFAULT
+            ),
         )
