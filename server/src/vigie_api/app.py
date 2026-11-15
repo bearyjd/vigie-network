@@ -63,6 +63,7 @@ from vigie_pipeline.config import PipelineConfig
 
 DeviceId = Annotated[str, Path(min_length=1, max_length=64)]
 Limit = Annotated[int, Query(ge=1, le=500)]
+EventOrder = Literal["asc", "desc"]
 VERSION = "0.1.0"
 LOG = logging.getLogger("vigie_api")
 ERROR_TEXT = {
@@ -536,7 +537,9 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
             "Paged by insertion order, so an event that arrives late with an older `ts` is never "
             "skipped. Items within a page are sorted by `ts` for display only. `since` is the "
             "opaque `page.next_cursor` of a previous response: the resume point, i.e. the last "
-            "row included per source. An empty page returns the `since` you sent."
+            "row included per source. An empty page returns the `since` you sent. "
+            "`device_id` keeps only events whose `device_id` equals it (exact match). "
+            "`order=desc` pages newest first; its cursors are only valid with `order=desc`."
         ),
         response_model=EventsResponse,
         responses=_errors(400, 401, 422, 429, 503),
@@ -548,10 +551,19 @@ def create_app(settings: Settings, clock: Callable[[], float] = time.time) -> Fa
         since: Annotated[str | None, Query(max_length=256)] = None,
         kind: Annotated[str | None, Query(max_length=64)] = None,
         severity: Annotated[str | None, Query(max_length=32)] = None,
+        device_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        order: EventOrder = "asc",
         limit: Limit = 100,
     ) -> dict[str, Any]:
         items, nxt = feeds.list_events(
-            inv, ov, since=since, kind=kind, severity=severity, limit=limit
+            inv,
+            ov,
+            since=since,
+            kind=kind,
+            severity=severity,
+            limit=limit,
+            device_id=device_id,
+            newest_first=order == "desc",
         )
         return envelope(items, page={"next_cursor": nxt})
 
