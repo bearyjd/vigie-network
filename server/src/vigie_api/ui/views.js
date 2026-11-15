@@ -217,7 +217,7 @@ export function incidentView(d, onActivity) {
 /* Events: every API string is shown through text(); severity reaches `class` only via this allowlist. */
 export const EVENT_PAGE = 25; export const EVENT_TIMELINE = 10; export const EVENT_MAX_PAGES = 40;
 const SEVERITY_TONE = {info: '', warn: 'warn', warning: 'warn', error: 'bad', critical: 'bad'};
-const clip = (value, size = 500) => { const s = text(value); return s.length > size ? `${s.slice(0, size)}…` : s; };
+const clip = (value, size = 500) => { const s = text(value); const points = Array.from(s); return points.length > size ? `${points.slice(0, size).join('')}…` : s; };
 function checkEvents(data, limit) { if (!Array.isArray(data) || data.length > limit || data.some(e => !e || typeof e !== 'object' || typeof e.id !== 'string')) throw new Error('Malformed events response'); }
 const eventDevice = e => typeof e.device_id === 'string' && e.device_id ? node('code', {class: 'mono'}, clip(e.device_id, 64)) : node('span', {class: 'muted'}, 'No device');
 const eventSeverity = e => badge(e.severity, typeof e.severity === 'string' && Object.hasOwn(SEVERITY_TONE, e.severity) ? SEVERITY_TONE[e.severity] : '');
@@ -235,8 +235,11 @@ export function eventFilterForm(filter, onApply) {
 }
 /* Per-device timeline on the identity page. `events` is the API data, or null when the fetch failed. */
 export function timelineSection(events, deviceId, onAll) {
-  const body = events === null ? node('p', {class: 'small muted'}, 'Timeline unavailable. The identity details above are unaffected.')
-    : (checkEvents(events, EVENT_TIMELINE), !events.length ? node('p', {class: 'small muted'}, 'No events recorded for this identity.')
-      : node('ol', {class: 'plain-list'}, events.map(e => node('li', {}, `${utc(e.ts)} · ${clip(e.kind, 64)} · `, eventSeverity(e), ` · ${clip(e.summary, 200)}`))));
+  const unavailable = () => node('p', {class: 'small muted'}, 'Timeline unavailable. The identity details above are unaffected.');
+  let body;
+  try {
+    if (events === null) body = unavailable();
+    else { checkEvents(events, EVENT_TIMELINE); body = !events.length ? node('p', {class: 'small muted'}, 'No events recorded for this identity.') : node('ol', {class: 'plain-list'}, events.map(e => node('li', {}, `${utc(e.ts)} · ${clip(e.kind, 64)} · `, eventSeverity(e), ` · ${clip(e.summary, 200)}`))); }
+  } catch { body = unavailable(); }
   return node('section', {class: 'timeline', 'aria-label': 'Device timeline'}, node('h3', {}, 'Recent events'), body, node('button', {type: 'button', 'data-focus-key': `events:all:${deviceId}`, onclick: () => onAll(deviceId)}, 'View all events'));
 }

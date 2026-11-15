@@ -63,7 +63,7 @@ function chrome() {
   byId('connection-state').textContent = state.connected ? 'Connected · read-only view' : 'Disconnected';
   document.querySelectorAll('nav button[data-view]').forEach(button => { button.disabled = !state.connected; if (button.dataset.view === state.view && state.connected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
   byId('view-title').textContent = titles[state.view]; setBanner();
-  byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : state.view === 'events' ? 'Events span all sources, newest first · UTC · read-only' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
+  byId('scope-label').textContent = state.view === 'inventory' ? 'Inventory spans all stored sources. Active canonical identities are shown; this page is not a physical-device count.' : state.view === 'events' ? 'Events span all sources, newest first within a page · UTC · read-only' : `Collector: ${state.collector} · ${state.view === 'incidents' ? 'Retained incident evidence' : `Last ${state.hours} hours · UTC`}`;
   byId('refresh').setAttribute('aria-disabled', String(state.loading || Date.now() < client.retryAt));
   byId('content').setAttribute('aria-busy', String(state.loading));
   const retryButton = byId('notice').querySelector('button'); if (retryButton) retryButton.disabled = Date.now() < client.retryAt;
@@ -135,7 +135,7 @@ async function load(clear = false, focus = null, automatic = false) {
       const rows = eventsView(list.data);  // validates the page before anything is shown
       const more = list.data.length === EVENT_PAGE && state.page + 1 < EVENT_MAX_PAGES ? list.page?.next_cursor || null : null;  // next_cursor is also sent on the last page
       next = more;
-      content = node('section', {}, heading('Recent events', 'Newest first · text only · events without a device show as "No device"'), eventFilterForm(state.eventFilter, filterEvents), rows, pager(state.page, list.data.length, next, page), node('p', {class: 'table-note'}, `Showing at most ${EVENT_PAGE * EVENT_MAX_PAGES} recent events; narrow with a device or kind filter.`));
+      content = node('section', {}, heading('Recent events', 'Newest first within a page, by arrival · text only · events without a device show as "No device"'), eventFilterForm(state.eventFilter, filterEvents), rows, pager(state.page, list.data.length, next, page), node('p', {class: 'table-note'}, `Showing at most ${EVENT_PAGE * EVENT_MAX_PAGES} recent events; narrow with a device or kind filter.`));
     }
     if (state.view === 'incidents') {
       const [list, detail] = await Promise.all([client.incidents(state.collector, cursor), state.selectedIncident ? client.incident(state.selectedIncident, state.collector) : Promise.resolve(null)]);

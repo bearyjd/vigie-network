@@ -131,15 +131,15 @@ Technique credit: Vedetta `net-gauge.js` (MIT, Sived80/vedetta), rewritten witho
 
 ## Events view and device timeline
 
-The Events view lists recent events newest first, 25 per page, with a hard cap of 40 pages (the
+The Events view lists recent events newest first within each page (across pages the order follows arrival, not timestamp), 25 per page, with a hard cap of 40 pages (the
 footer says so; narrow with the device or kind filter to go further back). Filters are a device ID and
 an event kind, each at most 64 characters, held in memory only: not in the URL, the hash or any
 storage, and sent only as URL-encoded query parameters. Applying or clearing a filter restarts at the
 first page. Next is offered only on a full page, because the API also returns a cursor on the last page.
 Events with no device (rule, incident and export actions) show `No device`. The identity page gains a
 "Recent events" timeline (latest 10 for that identity) with a "View all events" button; if the
-timeline request fails the identity details still render, except that a 401 disconnects as everywhere
-else.
+timeline request fails or returns malformed data the identity details still render, except that a 401
+disconnects as everywhere else. The device filter is an unindexed scan, which is fine at household scale.
 
 Everything the API sends (summary, kind, severity, device ID, time) is rendered as text through the
 same helpers as the other views: no `innerHTML`, severity maps to a style only through an allowlist,

@@ -156,8 +156,10 @@ try {
   assert.equal(seen[2].url.searchParams.get('limit'), '25'); assert.equal(seen[2].url.searchParams.get('order'), 'desc', 'page size and order are not caller-chosen');
   assert.equal(seen[3].url.searchParams.get('limit'), '10'); assert.equal(seen[3].url.searchParams.get('device_id'), 'dev-1'); assert.equal(seen[3].url.searchParams.get('order'), 'desc');
   const before = seen.length;
-  for (const bad of [() => c.events({kind: 'k'.repeat(65)}), () => c.events({deviceId: 'd'.repeat(65)}), () => c.events({deviceId: '..'}), () => c.events({deviceId: 'a/b'}), () => c.events({deviceId: 'a\nb'}), () => c.events({}, 'c'.repeat(257)), () => c.deviceTimeline(''), () => c.deviceTimeline('a\\b')]) assert.throws(bad, error => error instanceof ApiError && error.code === 'invalid_input');
+  for (const bad of [() => c.events({kind: 'k'.repeat(65)}), () => c.events({deviceId: 'd'.repeat(65)}), () => c.events({}, 'c'.repeat(257)), () => c.deviceTimeline(''), () => c.deviceTimeline(7)]) assert.throws(bad, error => error instanceof ApiError && error.code === 'invalid_input');
   assert.equal(seen.length, before, 'refused filters send nothing');
+  // The server accepts these device_id values (it only bounds length), so the client sends them as query data instead of rejecting them.
+  const sent = seen.length; for (const odd of ['..', 'a/b', 'a\\b', 'a\nb', '.']) { await c.events({deviceId: odd}); await c.deviceTimeline(odd); assert.equal(seen.at(-1).url.searchParams.get('device_id'), odd); assert.equal(seen.at(-2).url.searchParams.get('device_id'), odd); } assert.equal(seen.length, sent + 10);
   const out = new ApiClient(); await assert.rejects(out.events(), error => error.status === 401);
   const source = (await import('node:fs')).readFileSync(new URL('../../server/src/vigie_api/ui/client.js', import.meta.url), 'utf8');
   assert.ok(!/\b(POST|PUT|PATCH|DELETE)\b/.test(source), 'no write verb appears in the client');

@@ -12,6 +12,10 @@ def ids(r) -> list[str]:
     return [e["id"] for e in r.json()["data"]]
 
 
+def ids_of(body: dict) -> list[str]:
+    return [e["id"] for e in body["data"]]
+
+
 def audit(env: Env, row_id: str, action: str, target: str | None, when: float = 0) -> None:
     env.ov.execute(
         "INSERT INTO audit_log (id, ts, principal, action, target) VALUES (?,?,?,?,?)",
@@ -177,3 +181,58 @@ def test_desc_bad_cursor_is_400(env: Env, bad: str) -> None:
 
 def test_unknown_order_is_422(env: Env) -> None:
     assert env.get("/events", order="sideways").status_code == 422
+
+
+def test_desc_device_filter_pages_across_both_sources_without_gaps_or_repeats(env: Env) -> None:
+    env.device("d1")
+    env.device("d2")
+    want = []
+    for i in range(4):
+        want.append(env.event("d1", -400 + 2 * i, "anomaly"))
+        env.event("d2", -399 + 2 * i, "anomaly")
+        audit(env, f"au{i}", "device.patch", "d1", when=-399 + 2 * i)
+        audit(env, f"ax{i}", "device.patch", "d2", when=-398 + 2 * i)
+        want.append(f"au{i}")
+    seen, cursor = [], None
+    for _ in range(10):
+        params = {
+            "order": "desc",
+            "device_id": "d1",
+            "limit": 3,
+            **({"since": cursor} if cursor else {}),
+        }
+        body = env.get("/events", **params).json()
+        if not body["data"]:
+            break
+        assert {e["device_id"] for e in body["data"]} == {"d1"}
+        seen += [e["id"] for e in body["data"]]
+        cursor = body["page"]["next_cursor"]
+    assert len(seen) == len(want) == len(set(seen)) and set(seen) == set(want)
+
+
+def test_desc_pages_on_when_one_source_runs_out_but_its_key_stays_in_the_cursor(env: Env) -> None:
+    env.device("d1")
+    audit(env, "au1", "device.patch", "d1", when=-900)
+    made = [env.event("d1", -500 + i, "anomaly") for i in range(4)]
+    first = env.get("/events", order="desc", limit=1).json()
+    assert ids_of(first) == [made[3]]
+    cursor = first["page"]["next_cursor"]
+    got = []
+    for _ in range(6):
+        body = env.get("/events", order="desc", limit=2, since=cursor).json()
+        if not body["data"]:
+            break
+        got += [e["id"] for e in body["data"]]
+        cursor = body["page"]["next_cursor"]
+    assert got == [*reversed(made[:3]), "au1"]
+    final = decode_cursor(cursor)
+    assert '"audit"' in final and '"inv"' in final
+
+
+def test_desc_cursor_with_only_dir_is_no_cursor(env: Env) -> None:
+    env.device("d1")
+    a = env.event("d1", -300, "anomaly")
+    b = env.event("d1", -100, "anomaly")
+    bare = encode_cursor('{"dir":"desc"}')
+    r = env.get("/events", order="desc", since=bare)
+    assert r.status_code == 200 and ids(r) == ids(env.get("/events", order="desc")) == [b, a]

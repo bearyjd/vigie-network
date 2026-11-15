@@ -623,6 +623,10 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   const section = content.querySelectorAll('section').find(n => n.getAttribute('aria-label') === 'Device timeline'); assert.ok(section, 'the identity page has a labelled timeline');
   assert.ok(section.textContent.includes(hostile[0])); assert.equal(section.querySelectorAll('img').length, 0); assert.equal(section.querySelectorAll('li').length, 2); assert.ok(content.textContent.includes('Synthetic device'));
   sets.reply = () => json([]); await openDevice(); assert.ok(content.textContent.includes('No events recorded for this identity'));
+  // A malformed timeline payload degrades only the timeline, never the identity page.
+  for (const bad of [{}, 'text', [null], [{id: 7}], Array.from({length: 11}, (_, n) => ev(n))]) { sets.reply = () => json(bad); await openDevice(); assert.ok(content.textContent.includes('Timeline unavailable'), 'malformed timeline degrades'); assert.ok(content.textContent.includes('Synthetic device'), 'identity page survives'); assert.equal(notice.hidden, true); }
+  // clip never splits a surrogate pair.
+  sets.reply = () => json([ev(1, {device_id: 'dev-1', summary: '\u{1F600}'.repeat(300)})]); await openDevice(); assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(content.textContent), 'no lone surrogate in clipped text');
   for (const status of [503, 403, 404]) { sets.reply = () => json(null, null, status); await openDevice(); assert.ok(content.textContent.includes('Timeline unavailable'), `timeline degrades on ${status}`); assert.ok(content.textContent.includes('Synthetic device'), 'the identity page still renders'); assert.equal(notice.hidden, true, 'a timeline failure raises no page-level error'); }
   sets.reply = () => json([]); await openDevice();
   buttons('View all events')[0].fire('click'); await flush();
