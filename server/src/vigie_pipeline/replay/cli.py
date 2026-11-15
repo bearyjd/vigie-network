@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", choices=("pooled", "tod"), default="pooled")
     parser.add_argument("--minimum-hours", type=int, help="pooled cold-start floor (default 20)")
     parser.add_argument("--minimum-days", type=int, help="pooled distinct-day floor (default 14)")
+    parser.add_argument("--large-upload-bytes", type=int, help="fixed large-upload ceiling (1 GiB)")
     parser.add_argument("--min-samples-per-cohort", type=int, help="tod floor (default 20)")
     parser.add_argument("--min-days-per-cohort", type=int, help="tod day floor (default 7)")
     return parser
@@ -60,10 +61,15 @@ def read_input(path: Path) -> bytes:
 
 def _policy(args: argparse.Namespace):
     pick = {
-        "pooled": {"minimum_hours": args.minimum_hours, "minimum_days": args.minimum_days},
+        "pooled": {
+            "minimum_hours": args.minimum_hours,
+            "minimum_days": args.minimum_days,
+            "large_upload_bytes": args.large_upload_bytes,
+        },
         "tod": {
             "min_samples_per_cohort": args.min_samples_per_cohort,
             "min_days_per_cohort": args.min_days_per_cohort,
+            "large_upload_bytes": args.large_upload_bytes,
         },
     }[args.strategy]
     given = {k: v for k, v in pick.items() if v is not None}
@@ -87,6 +93,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = run(args)
     except ReplayInputError as exc:
         print(str(exc), file=sys.stderr)  # noqa: T201 - CLI output
+        return 2
+    except Exception:  # no traceback: it would print paths and input values
+        print("replay: unexpected internal error", file=sys.stderr)  # noqa: T201 - CLI output
         return 2
     print(json.dumps(report, sort_keys=True, indent=2))  # noqa: T201 - CLI output
     return 0

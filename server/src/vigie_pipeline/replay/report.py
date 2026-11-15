@@ -2,12 +2,22 @@
 never zero. Abstentions are reported apart from verdicts and are never misses or negatives.
 
 Hour level: a verdict is an hour where the detector actually evaluated (fired or quiet). TP/FP/FN/TN
-use only owner labels normal and anomalous on such hours. precision = TP/(TP+FP), recall =
-TP/(TP+FN). `ignore` labels are tallied and excluded from every denominator.
+use only owner labels normal and anomalous on such hours. precision = TP/(TP+FP). Recall is
+reported both ways: `recall` = TP/(TP+FN) over evaluated hours only, and `recall_all_labelled` =
+TP/(TP+FN+abstained anomalous hours), which counts a hour the detector could not judge as a miss.
+`ignore` labels are tallied and excluded from every denominator. A label may be scoped to one
+detector; it then overrides an unscoped label for that detector.
+
+Event level: an anomalous event is a run of consecutive anomalous-labelled hours of one device. It
+is detected when the detector fired on any hour of it; `event_recall` divides by events with at
+least one evaluated hour, `event_recall_all_labelled` by every event.
 
 Alert level (the notification budget): an episode is one engine incident (consecutive firing hours).
 It is true if any of its hours is labelled anomalous, else false if any is labelled normal, else
-unlabelled. False episodes are therefore a lower bound while unlabelled episodes exist.
+unlabelled. False episodes are therefore a lower bound while unlabelled episodes exist, so
+`within_budget` is `false` only when that lower bound already exceeds the budget, `unknown` while
+unlabelled episodes exist and the bound does not, and `true` only with every episode labelled. The
+top-level `budget` sums false episodes across detectors (each is a separate notification source).
 """
 
 from __future__ import annotations
@@ -24,6 +34,39 @@ PLACES = 6
 
 def _ratio(numerator: int, denominator: int):
     return UNKNOWN if denominator == 0 else round(numerator / denominator, PLACES)
+
+
+def _labelled(labels, detector: str) -> dict:
+    "(device, hour) -> verdict for one detector: a scoped label beats an unscoped one."
+    found: dict = {}
+    for x in sorted(labels, key=lambda x: x.detector is not None):
+        if x.detector in (None, detector):
+            found[(x.device, x.hour)] = x.verdict
+    return found
+
+
+def _events(rows: list[Outcome], labelled: dict) -> dict:
+    "Runs of consecutive anomalous hours per device; detected when the detector fired in the run."
+    status = {(o.device, o.hour): o.status for o in rows}
+    hours = sorted(k for k, v in labelled.items() if v == "anomalous")
+    runs: list[list] = []
+    for device, hour in hours:
+        if runs and runs[-1][0] == device and runs[-1][-1] == hour - 3600:
+            runs[-1].append(hour)
+        else:
+            runs.append([device, hour])
+    evaluated = detected = 0
+    for run in runs:
+        states = [status.get((run[0], h)) for h in run[1:]]
+        evaluated += any(x in (FIRED, "quiet") for x in states)
+        detected += FIRED in states
+    return {
+        "anomalous_events": len(runs),
+        "evaluated_events": evaluated,
+        "detected_events": detected,
+        "event_recall": _ratio(detected, evaluated),
+        "event_recall_all_labelled": _ratio(detected, len(runs)),
+    }
 
 
 def _episodes(fired: list[Outcome], labelled: dict) -> dict:
@@ -45,6 +88,7 @@ def _episodes(fired: list[Outcome], labelled: dict) -> dict:
 
 
 def _detector(rows: list[Outcome], labelled: dict) -> dict:
+    "labelled: (device, hour) -> verdict as seen by this detector."
     verdicts = Counter()
     abstained = Counter()
     ab_labels = Counter()
@@ -75,6 +119,10 @@ def _detector(rows: list[Outcome], labelled: dict) -> dict:
         "verdicts": {k: verdicts[k] for k in ("tp", "fp", "fn", "tn")},
         "precision": _ratio(verdicts["tp"], verdicts["tp"] + verdicts["fp"]),
         "recall": _ratio(verdicts["tp"], verdicts["tp"] + verdicts["fn"]),
+        "recall_all_labelled": _ratio(
+            verdicts["tp"], verdicts["tp"] + verdicts["fn"] + ab_labels["anomalous"]
+        ),
+        **_events(rows, labelled),
         "abstained": {
             "total": sum(abstained.values()),
             "by_reason": dict(sorted(abstained.items())),
@@ -91,11 +139,19 @@ def _detector(rows: list[Outcome], labelled: dict) -> dict:
             "labelled_with_verdict": with_verdict,
         },
         "alerts": alerts,
-        **_budget(evidence, alerts["false_episodes"]),
+        **_budget(evidence, alerts["false_episodes"], alerts["unlabelled_episodes"]),
     }
 
 
-def _budget(evidence: list[Outcome], false_episodes: int) -> dict:
+def _within(rate, unlabelled: int):
+    if rate == UNKNOWN:
+        return UNKNOWN
+    if rate > BUDGET_PER_NETWORK_DAY:
+        return False  # a lower bound already over budget
+    return UNKNOWN if unlabelled else True
+
+
+def _budget(evidence: list[Outcome], false_episodes: int, unlabelled: int) -> dict:
     device_days = len(evidence) / 24
     network_days = len({o.hour // 86400 for o in evidence})
     per_network = UNKNOWN if not evidence else round(false_episodes / network_days, PLACES)
@@ -105,7 +161,23 @@ def _budget(evidence: list[Outcome], false_episodes: int) -> dict:
         else round(false_episodes / device_days, PLACES),
         "false_alerts_per_network_day": per_network,
         "budget_per_network_day": BUDGET_PER_NETWORK_DAY,
-        "within_budget": UNKNOWN if not evidence else per_network <= BUDGET_PER_NETWORK_DAY,
+        "within_budget": _within(per_network, unlabelled),
+    }
+
+
+def _combined(detectors: dict, outcomes) -> dict:
+    "One notification budget for the whole network: false episodes of every detector add up."
+    evidence = [o for o in outcomes if o.status != ABSTAINED]
+    false = sum(d["alerts"]["false_episodes"] for d in detectors.values())
+    unlabelled = sum(d["alerts"]["unlabelled_episodes"] for d in detectors.values())
+    days = len({o.hour // 86400 for o in evidence})
+    rate = UNKNOWN if not evidence else round(false / days, PLACES)
+    return {
+        "false_episodes": false,
+        "unlabelled_episodes": unlabelled,
+        "false_alerts_per_network_day": rate,
+        "budget_per_network_day": BUDGET_PER_NETWORK_DAY,
+        "within_budget": _within(rate, unlabelled),
     }
 
 
@@ -116,10 +188,13 @@ def build_report(
     config_version: str,
 ) -> dict:
     "Deterministic, JSON-safe report; independent of the order of outcomes and labels."
-    labelled = {(x.device, x.hour): x.verdict for x in labels}
     devices = {o.device for o in outcomes}
     kinds = Counter(x.verdict for x in labels)
     names = sorted({o.detector for o in outcomes} | set(DETECTORS))
+    detectors = {
+        name: _detector([o for o in outcomes if o.detector == name], _labelled(labels, name))
+        for name in names
+    }
     return {
         "policy": {"algorithm": algorithm, "config_version": config_version},
         "labels": {
@@ -129,7 +204,6 @@ def build_report(
             "ignore": kinds["ignore"],
             "unknown_device": sum(1 for x in labels if x.device not in devices),
         },
-        "detectors": {
-            name: _detector([o for o in outcomes if o.detector == name], labelled) for name in names
-        },
+        "detectors": detectors,
+        "budget": _combined(detectors, outcomes),
     }

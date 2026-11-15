@@ -58,13 +58,16 @@ def scenario():
         ),
         # five consecutive missing hours
         "dev-gap": DeviceSeries("dev-gap", steady(skip={(4, h) for h in range(3, 8)})),
-        "2001:db8::1": DeviceSeries("2001:db8::1", steady()),
+        # IPv6 device: a two-hour spike the owner calls anomalous, scored by the deviation detector
+        "2001:db8::1": DeviceSeries(
+            "2001:db8::1", steady(override={(5, 14): 300 * MIB, (5, 15): 300 * MIB})
+        ),
     }
 
 
 def labels():
-    def lab(dev, day, hour, verdict, note=""):
-        return Label(dev, hr(day, hour), verdict, note)
+    def lab(dev, day, hour, verdict, note="", detector=None):
+        return Label(dev, hr(day, hour), verdict, note, detector)
 
     return (
         lab("dev-backup", 5, 2, "anomalous", "backup first hour"),
@@ -78,6 +81,8 @@ def labels():
         lab("dev-restart", 4, 6, "ignore", "restart"),
         lab("dev-gap", 4, 5, "normal"),  # in the gap: abstains
         lab("2001:db8::1", 5, 12, "normal"),
+        lab("2001:db8::1", 5, 14, "anomalous", "ipv6 spike", "upload_deviation"),
+        lab("2001:db8::1", 5, 15, "anomalous", "ipv6 spike", "upload_deviation"),
     )
 
 
@@ -109,7 +114,13 @@ def labels_json(items):
         {
             "version": 1,
             "labels": [
-                {"device": x.device, "hour": x.hour, "verdict": x.verdict, "note": x.note}
+                {
+                    "device": x.device,
+                    "hour": x.hour,
+                    "verdict": x.verdict,
+                    "note": x.note,
+                    **({"detector": x.detector} if x.detector else {}),
+                }
                 for x in items
             ],
         }

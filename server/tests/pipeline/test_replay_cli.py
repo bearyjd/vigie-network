@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from replay_fixtures import labels, labels_json, scenario, series_json
 
-from tests.pipeline.replay_fixtures import labels, labels_json, scenario, series_json
 from vigie_pipeline.replay.cli import main
+from vigie_pipeline.replay.errors import ReplayInputError
 
 pytestmark = pytest.mark.timeout(120)
 SMALL = ["--minimum-hours", "6", "--minimum-days", "3"]
@@ -37,9 +38,18 @@ def test_report_separates_abstentions_and_reports_each_detector(files, capsys):
     rep = json.loads(out)
     assert rep["policy"]["algorithm"] == "pooled-median-v1"
     up, big = rep["detectors"]["upload_deviation"], rep["detectors"]["large_upload"]
-    # backup: first hour is a miss (needs a pair), second is caught; update: a false alert
-    assert up["verdicts"]["tp"] == 1 and up["verdicts"]["fn"] == 1 and up["verdicts"]["fp"] == 1
-    assert up["alerts"]["true_episodes"] == 1 and up["alerts"]["false_episodes"] == 1
+    # backup and the IPv6 spike: first hour a miss (needs a pair), second caught; update: false
+    assert up["verdicts"]["tp"] == 2 and up["verdicts"]["fn"] == 2 and up["verdicts"]["fp"] == 1
+    assert up["alerts"]["true_episodes"] == 2 and up["alerts"]["false_episodes"] == 1
+    # recall both ways: dev-big's hour is anomalous but abstained (learning) for this detector
+    assert up["recall"] == 0.5 and up["abstained"]["labelled_anomalous"] == 1
+    assert up["recall_all_labelled"] == round(2 / 5, 6)
+    # event level: backup and IPv6 caught on their second hour, dev-big never evaluated
+    assert (up["anomalous_events"], up["evaluated_events"], up["detected_events"]) == (3, 2, 2)
+    assert up["event_recall"] == 1.0 and up["event_recall_all_labelled"] == round(2 / 3, 6)
+    assert up["ignored_labels"] == 1 and big["ignored_labels"] == 1  # the restart hour
+    assert up["alerts"]["unlabelled_episodes"] == 0 and up["within_budget"] is True
+    assert rep["budget"]["false_episodes"] >= 1
     # sleeping, gap and restart labels abstain; they are not in any verdict count
     assert up["abstained"]["by_reason"]["no_sample"] >= 2
     assert up["abstained"]["labelled_normal"] >= 2
@@ -48,6 +58,7 @@ def test_report_separates_abstentions_and_reports_each_detector(files, capsys):
     )
     assert big["abstained"]["by_reason"]["unqualified"] >= 1
     assert rep["labels"]["ignore"] == 1 and rep["labels"]["unknown_device"] == 0
+    assert rep["labels"]["anomalous"] == 5
     assert up["precision"] != "unknown" and up["coverage"]["evidence_hours"] > 0
     assert str(files[0].parent) not in out
 
@@ -104,6 +115,52 @@ def test_symlink_and_oversize_inputs_are_refused(tmp_path, capsys, files):
     big.write_bytes(b" " * ((4 << 20) + 5))
     assert main(["--series", str(big), "--labels", str(files[1])]) == 2
     assert capsys.readouterr().err.strip() == "series: input too large or unreadable"
+
+
+def test_large_upload_bytes_flag_moves_the_fixed_ceiling(files, capsys):
+    _, out, _ = run_cli(files, capsys)
+    base = json.loads(out)
+    _, out, _ = run_cli(files, capsys, ["--large-upload-bytes", str(100 * 1024 * 1024)])
+    low = json.loads(out)
+    assert low["policy"]["config_version"] != base["policy"]["config_version"]
+    # 200 MiB update hours and 300 MiB backup hours are now over the ceiling
+    assert low["detectors"]["large_upload"]["verdicts"]["fp"] > 0
+    assert base["detectors"]["large_upload"]["verdicts"]["fp"] == 0
+    assert (
+        main(["--series", str(files[0]), "--labels", str(files[1]), "--large-upload-bytes=0"]) == 2
+    )
+    assert "outside supported bounds" in capsys.readouterr().err
+
+
+def test_fifo_and_directory_inputs_are_refused_without_blocking(tmp_path, capsys, files):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)  # no writer: a blocking open() would hang here
+    for bad in (fifo, tmp_path):
+        assert main(["--series", str(bad), "--labels", str(files[1])]) == 2
+        assert capsys.readouterr().err.strip() == "replay: cannot read an input file"
+    from vigie_pipeline.replay.cli import read_input
+
+    with pytest.raises(ReplayInputError):
+        read_input(Path("/dev/null"))  # a character device is not a regular file
+
+
+def test_unexpected_errors_print_one_fixed_line_not_a_traceback(files, capsys, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("/secret/path value=42")
+
+    monkeypatch.setattr("vigie_pipeline.replay.cli.replay", boom)
+    assert main(["--series", str(files[0]), "--labels", str(files[1]), *SMALL]) == 2
+    cap = capsys.readouterr()
+    assert cap.err.strip() == "replay: unexpected internal error" and cap.out == ""
+
+
+def test_database_or_temp_directory_oserrors_are_a_fixed_error(files, capsys, monkeypatch):
+    def no_space(_root):
+        raise OSError(28, "No space left on device: /secret/path")
+
+    monkeypatch.setattr("vigie_pipeline.replay.runner._open", no_space)
+    assert main(["--series", str(files[0]), "--labels", str(files[1]), *SMALL]) == 2
+    assert capsys.readouterr().err.strip() == "replay: engine database error"
 
 
 def test_tod_strategy_option_runs(files, capsys):

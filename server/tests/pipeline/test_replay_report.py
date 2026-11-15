@@ -58,7 +58,8 @@ def test_abstentions_are_separate_and_never_false_negatives_or_negatives():
     labels = [lab(0, "anomalous"), lab(1, "normal"), lab(2, "anomalous"), lab(4, "anomalous")]
     r = det(outcomes, labels)
     assert r["verdicts"] == {"tp": 1, "fp": 0, "fn": 0, "tn": 0}
-    assert r["recall"] == 1.0  # the abstained anomalous hours are not misses
+    assert r["recall"] == 1.0  # evaluated hours only: the abstained anomalous hours are not misses
+    assert r["recall_all_labelled"] == round(1 / 3, 6)  # ...but they are, counted the other way
     ab = r["abstained"]
     assert ab["total"] == 4
     assert ab["by_reason"] == {"clock_gap": 1, "learning": 2, "no_sample": 1}
@@ -139,8 +140,74 @@ def test_false_alert_rate_per_device_day_and_network_day_against_budget():
     assert r["false_alerts_per_network_day"] == 2.0  # 2 / 1 day
     assert r["budget_per_network_day"] == BUDGET_PER_NETWORK_DAY == 1
     assert r["within_budget"] is False
-    r = det(outcomes, labels[:1])  # one false episode: exactly on budget
+    labels = [Label("a", day, "normal"), Label("b", day, "anomalous")]
+    r = det(outcomes, labels)  # one false episode, none unlabelled: exactly on budget
     assert r["false_alerts_per_network_day"] == 1.0 and r["within_budget"] is True
+    r = det(outcomes, labels[:1])  # b's alert is unlabelled: the bound holds but is not proof
+    assert r["alerts"]["unlabelled_episodes"] == 1 and r["within_budget"] == UNKNOWN
+    r = det(outcomes, [])  # nothing labelled: no false episode known, so nothing is proven
+    assert r["alerts"]["false_episodes"] == 0 and r["within_budget"] == UNKNOWN
+
+
+def test_budget_combines_detectors_and_is_unknown_with_unlabelled_episodes():
+    day = (H0 // 86400 + 1) * 86400
+    rows = [
+        Outcome("a", day + i * 3600, d, "quiet") for i in range(24) for d in (DET, "large_upload")
+    ]
+    rows[0] = Outcome("a", day, DET, "fired", None, "e1")
+    rows[1] = Outcome("a", day, "large_upload", "fired", None, "e2")
+    both = [Label("a", day, "normal")]
+    rep = build_report(rows, both, "a", "v")
+    # each detector alone is exactly on budget (1 false episode / 1 day) ...
+    assert all(d["within_budget"] is True for d in rep["detectors"].values())
+    # ... but the network receives both notifications
+    assert rep["budget"]["false_episodes"] == 2
+    assert rep["budget"]["false_alerts_per_network_day"] == 2.0
+    assert rep["budget"]["within_budget"] is False
+    one = build_report(rows[:1] + rows[2:], both, "a", "v")
+    assert one["budget"]["within_budget"] is True
+    unl = build_report(rows[:1] + rows[2:], [], "a", "v")
+    assert unl["budget"]["within_budget"] == UNKNOWN
+    assert build_report([], [], "a", "v")["budget"]["within_budget"] == UNKNOWN
+
+
+def test_event_level_recall_counts_runs_of_anomalous_hours():
+    outcomes = [
+        out(0, "quiet"),  # event 1: two hours, caught on the second
+        out(1, "fired", episode="e"),
+        out(5, "quiet"),  # event 2: missed
+        out(8, "abstained", "learning"),  # event 3: never evaluated
+    ]
+    labels = [lab(0, "anomalous"), lab(1, "anomalous"), lab(5, "anomalous"), lab(8, "anomalous")]
+    r = det(outcomes, labels)
+    assert r["recall"] == round(1 / 3, 6)  # hour level: 1 of 3 evaluated hours
+    assert (r["anomalous_events"], r["evaluated_events"], r["detected_events"]) == (3, 2, 1)
+    assert r["event_recall"] == 0.5 and r["event_recall_all_labelled"] == round(1 / 3, 6)
+    assert det([out(0, "quiet")], [lab(0, "normal")])["event_recall"] == UNKNOWN
+    # a gap between labelled hours splits events, another device does too
+    split = det(
+        [out(0, "fired", episode="e"), out(2, "quiet"), out(0, "quiet", device="x")],
+        [lab(0, "anomalous"), lab(2, "anomalous"), lab(1, "anomalous", "x")],
+    )
+    assert split["anomalous_events"] == 3
+
+
+def test_detector_scoped_labels_apply_to_one_detector_and_override_unscoped():
+    outcomes = [
+        out(0, "fired", episode="a", detector="large_upload"),
+        out(0, "fired", episode="b"),
+        out(1, "quiet", detector="large_upload"),
+        out(1, "quiet"),
+    ]
+    labels = [
+        Label("d", H0, "anomalous", "", "upload_deviation"),
+        Label("d", H0 + 3600, "normal"),
+        Label("d", H0 + 3600, "anomalous", "", "large_upload"),  # overrides for one detector
+    ]
+    rep = build_report(outcomes, labels, "a", "v")["detectors"]
+    assert rep["upload_deviation"]["verdicts"] == {"tp": 1, "fp": 0, "fn": 0, "tn": 1}
+    assert rep["large_upload"]["verdicts"] == {"tp": 0, "fp": 0, "fn": 1, "tn": 0}
+    assert rep["large_upload"]["unlabelled_alert_hours"] == 1  # the deviation label is not its
 
 
 def test_detectors_are_reported_independently_and_report_is_json_safe():

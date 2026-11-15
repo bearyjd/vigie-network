@@ -1009,12 +1009,15 @@ the PRP-004 H0 table.
 
 ## Replay and evaluation
 
-`python -m vigie_pipeline.replay --series SERIES.json --labels LABELS.json [--strategy pooled|tod]`
-is an offline, chronological replay of owner-labelled hours through the real `analyze_monitoring`,
+`python -m vigie_pipeline.replay --series SERIES.json --labels LABELS.json [--strategy pooled|tod]
+[--large-upload-bytes N]` is an offline, chronological replay of owner-labelled hours through the real `analyze_monitoring`,
 one pass per hour from an injected clock. It prints one JSON report on stdout. It never opens the
 live data directory, configuration or the network: the engine runs against a throwaway database in
 a private temp directory that is removed afterwards, the inputs are opened read-only, and an error
-prints one fixed message (no paths, no input values) and exits 2. It changes no policy, no
+prints one fixed message (no paths, no input values) and exits 2, including unexpected internal
+errors (no traceback). Only a SIGKILL or power loss mid-run can leave the `vigie-replay-*` temp
+directory behind; it holds synthetic rows only and is safe to delete by hand. `--large-upload-bytes`
+overrides the fixed ceiling for the run (the policy `config_version` then differs). It changes no policy, no
 detector output and no schema, so it does not restart the pilot clock.
 
 - **Series file** (a copy exported by the owner, or a synthetic fixture):
@@ -1023,16 +1026,24 @@ detector output and no schema, so it does not restart the pilot clock.
   Device ids are placeholders such as `dev-1` or `2001:db8::1`. An hour with no row is absent, never
   zero. At most 20 devices, 2160 samples per device, 4 MiB per file.
 - **Label file**: `{"version":1,"labels":[{"device":"dev-1","hour":H,"verdict":"normal"|"anomalous"|
-  "ignore","note":"at most 200 printable characters"}]}`. Unknown fields, duplicates, non-integer or
+  "ignore","note":"at most 200 printable characters","detector":"large_upload"|"upload_deviation"}]}`.
+  `detector` is optional: a scoped label counts only for that detector and overrides an unscoped
+  label for it; without it the label applies to both. Unknown fields, duplicates, non-integer or
   off-boundary hours and over-size files are rejected. `ignore` is tallied and left out of every
   denominator.
 - **Determinism.** Devices, samples and labels are sorted before use, so input order cannot change
   the report.
 - **Per detector** (`large_upload`, `upload_deviation`) the report gives TP, FP, FN, TN on labelled
-  hours where the detector evaluated; precision = TP/(TP+FP); recall = TP/(TP+FN); coverage (hours
+  hours where the detector evaluated; precision = TP/(TP+FP); `recall` = TP/(TP+FN) over evaluated
+  hours and `recall_all_labelled` which also counts labelled-anomalous hours the detector abstained
+  on as misses; `event_recall` (and `event_recall_all_labelled`): an event is a run of consecutive
+  anomalous hours of one device, detected when the detector fired on any hour of it; coverage (hours
   with qualified evidence over all hours); false alert episodes per device-day and per network-day
   against the budget of 1 unwanted notification per network per day. An episode is one engine
-  incident; it is false when its labelled hours are all `normal`.
+  incident; it is false when its labelled hours are all `normal`. `within_budget` is `false` when the
+  known false episodes already exceed the budget, `unknown` while unlabelled episodes exist
+  otherwise, and `true` only when every episode is labelled. The top-level `budget` block sums false
+  episodes across both detectors against the same budget.
 - **Abstentions are separate.** A detector abstains, with a reason, on hours it cannot judge:
   `no_sample`, `unqualified`, `clock_gap`, `learning`, `in_training`, `previous_unavailable`,
   `cohort_abstain` (tod). Abstained hours are counted by reason and never as misses or negatives.

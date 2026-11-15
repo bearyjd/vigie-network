@@ -63,6 +63,10 @@ def test_labels_roundtrip_and_sorted_independent_of_input_order():
         labels_doc(lab(device="a" * 65)),
         labels_doc(lab(note="x" * (MAX_NOTE + 1))),
         labels_doc(lab(note="line\nbreak")),
+        labels_doc(lab(note="carriage\rreturn")),
+        labels_doc(lab(note="sep\u2028arator")),
+        labels_doc(lab(detector="nonsense")),
+        labels_doc(lab(detector=5)),
         labels_doc(lab(note=5)),
         labels_doc(lab(extra_key=1)),
         labels_doc(lab(), lab()),  # duplicate (device, hour)
@@ -74,6 +78,14 @@ def test_labels_reject_bad_input_with_fixed_message(bad):
         load_labels(bad)
     assert str(err.value).startswith("labels: ")
     assert "/home" not in str(err.value) and "has space" not in str(err.value)
+
+
+def test_labels_detector_scope_roundtrip_and_duplicates():
+    both = lab(detector="upload_deviation"), lab(), lab(detector="large_upload")
+    got = load_labels(labels_doc(*both))
+    assert [x.detector for x in got] == [None, "large_upload", "upload_deviation"]
+    with pytest.raises(ReplayInputError):
+        load_labels(labels_doc(lab(detector="large_upload"), lab(detector="large_upload")))
 
 
 def test_labels_size_and_count_caps():

@@ -2,7 +2,8 @@
 coverage-qualification output. The constants were computed on main at ba2f3e0, before this change;
 a diff here means a policy or lineage change that restarts every profile in `learning`."""
 
-from tests.pipeline.test_monitoring_engine import MAC, hour, seeded
+from test_monitoring_engine import MAC, hour, seeded
+
 from vigie_pipeline.baselines import BaselineConfig
 from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.monitoring_engine import samples_for

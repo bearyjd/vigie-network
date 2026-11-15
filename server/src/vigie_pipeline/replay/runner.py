@@ -1,6 +1,9 @@
 """Chronological replay of a fixture through the real `analyze_monitoring`, one injected-clock pass
 per hour, against a throwaway database that is created in a private temp directory and removed.
 
+A SIGKILL (or power loss) while a replay runs leaves its `vigie-replay-*` directory in the temp
+directory; it holds only synthetic fixture rows and is safe to delete by hand.
+
 Nothing here opens or imports configuration, the live data directory or the network. Each device
 gets its own synthetic collector so that coverage (which is per collector and hour in the engine)
 is per device in the fixture. Data is ingested chronologically: before the pass at `now`, every
@@ -202,17 +205,17 @@ def replay(
         clock = hourly_clock(min(hours), max(hours)) if hours else ()
     ticks = _ticks(clock)
     universe = _universe(devices, ticks, extra_hours)
-    done: dict = {}
-    with tempfile.TemporaryDirectory(prefix="vigie-replay-") as tmp:
-        inv, ov = _open(Path(tmp))
-        try:
-            ids = _seed(inv, devices, hours[0] if hours else 0)
-            done = _run(inv, ov, policy, devices, ids, ticks)
-        except sqlite3.Error as exc:
-            raise ReplayInputError("replay: engine database error") from exc
-        finally:
-            inv.close()
-            ov.close()
+    try:
+        with tempfile.TemporaryDirectory(prefix="vigie-replay-") as tmp:
+            inv, ov = _open(Path(tmp))
+            try:
+                ids = _seed(inv, devices, hours[0] if hours else 0)
+                done = _run(inv, ov, policy, devices, ids, ticks)
+            finally:
+                inv.close()
+                ov.close()
+    except (sqlite3.Error, OSError) as exc:  # temp dir, database open and engine alike
+        raise ReplayInputError("replay: engine database error") from exc
     return _assemble(devices, universe, done)
 
 

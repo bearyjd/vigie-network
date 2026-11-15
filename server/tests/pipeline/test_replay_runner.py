@@ -3,8 +3,7 @@
 import random
 
 import pytest
-
-from tests.pipeline.replay_fixtures import (
+from replay_fixtures import (
     BASE,
     DAYS,
     GIB,
@@ -15,6 +14,7 @@ from tests.pipeline.replay_fixtures import (
     scenario,
     steady,
 )
+
 from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.replay.errors import ReplayInputError
 from vigie_pipeline.replay.runner import MAX_TICKS, hourly_clock, replay
@@ -54,8 +54,8 @@ def test_large_upload_fires_during_learning_while_deviation_abstains(outcomes):
 
 def test_training_hour_then_evaluated(outcomes):
     steady_dev = [
-        o for o in outcomes if o.device == "2001:db8::1" and o.detector == "upload_deviation"
-    ]
+        o for o in outcomes if o.device == "dev-update" and o.detector == "upload_deviation"
+    ][: 5 * 24 + 4]  # before the update hours
     reasons = [o.reason for o in steady_dev if o.status == "abstained"]
     assert set(reasons) == {"learning", "in_training", "previous_unavailable"}
     assert reasons.count("in_training") == 1
@@ -63,6 +63,7 @@ def test_training_hour_then_evaluated(outcomes):
     assert reasons[reasons.index("in_training") + 1] == "previous_unavailable"
     assert reasons.count("previous_unavailable") == 1
     assert steady_dev[-1].status == "quiet"
+    assert {o.status for o in steady_dev} == {"abstained", "quiet"}
 
 
 def test_sleeping_gap_restart_and_missing_hours_abstain_with_reasons(outcomes):
@@ -77,10 +78,22 @@ def test_sleeping_gap_restart_and_missing_hours_abstain_with_reasons(outcomes):
     assert pick(outcomes, "dev-gap", 4, 8, "large_upload").status == "quiet"
     after_restart = pick(outcomes, "dev-restart", 4, 7, "upload_deviation")
     assert after_restart.reason == "previous_unavailable"
+    assert pick(outcomes, "dev-restart", 4, 7, "large_upload").status == "quiet"
+    # the zero-counter restart hour never produces an alert and the device recovers afterwards
+    restart_rows = [o for o in outcomes if o.device == "dev-restart"]
+    assert not [o for o in restart_rows if o.status == "fired"]
+    assert pick(outcomes, "dev-restart", 4, 9, "upload_deviation").status == "quiet"
 
 
-def test_ipv6_device_replays_like_any_other(outcomes):
-    assert pick(outcomes, "2001:db8::1", 5, 12, "large_upload").status == "quiet"
+def test_ipv6_device_replays_like_any_other_and_its_spike_is_caught(outcomes):
+    v6 = "2001:db8::1"
+    assert pick(outcomes, v6, 5, 12, "large_upload").status == "quiet"
+    assert pick(outcomes, v6, 5, 12, "upload_deviation").status == "quiet"
+    assert pick(outcomes, v6, 5, 14, "upload_deviation").status == "quiet"  # needs a pair
+    assert pick(outcomes, v6, 5, 15, "upload_deviation").status == "fired"
+    assert pick(outcomes, v6, 5, 16, "upload_deviation").status == "quiet"
+    # the fixed ceiling is far above the spike
+    assert pick(outcomes, v6, 5, 15, "large_upload").status == "quiet"
 
 
 def test_clock_gap_hour_is_never_evaluated_but_later_hours_still_are():
@@ -115,12 +128,63 @@ def test_runner_never_touches_the_given_series_or_live_paths(tmp_path, monkeypat
     assert list(tmp_path.iterdir()) == []  # the throwaway directory is removed
 
 
-def test_tod_strategy_replays_and_reports_cohort_abstention():
-    cfg = TodConfig(min_samples_per_cohort=2, min_days_per_cohort=2, bucket_hours=24)
-    rows = replay((DeviceSeries("d", steady()),), cfg)
-    kinds = {(o.detector, o.status, o.reason) for o in rows}
-    assert ("upload_deviation", "abstained", "learning") in kinds
-    assert ("large_upload", "quiet", None) in kinds
+def test_tod_strategy_abstains_while_a_cohort_cannot_mature_then_evaluates():
+    seven = DeviceSeries("d", steady())
+    # the weekend cohort can only ever hold 2 distinct days, so 3 is never reached: no verdicts
+    never = TodConfig(min_samples_per_cohort=2, min_days_per_cohort=3, bucket_hours=24)
+    rows = [o for o in replay((seven,), never) if o.detector == "upload_deviation"]
+    assert {(o.status, o.reason) for o in rows} == {("abstained", "learning")}
+    ok = TodConfig(min_samples_per_cohort=2, min_days_per_cohort=2, bucket_hours=24)
+    rows = replay((seven,), ok)
+    dev = [o for o in rows if o.detector == "upload_deviation"]
+    assert [o.reason for o in dev if o.status == "abstained"].count("learning") == 6 * 24
+    assert {o.reason for o in dev if o.status == "abstained"} == {
+        "learning",
+        "in_training",
+        "previous_unavailable",
+    }
+    assert dev[-1].status == "quiet"
+    assert {o.status for o in rows if o.detector == "large_upload"} == {"quiet"}
+
+
+def test_harness_matches_the_live_engine_incident_for_incident(tmp_path):
+    "Replay's fired outcomes equal what a hand-driven analyze_monitoring writes to the database."
+    from vigie_api.schema import open_overrides
+    from vigie_pipeline.monitoring_engine import analyze_monitoring
+    from vigie_pipeline.schema import open_pipeline_inventory
+
+    series = scenario()["dev-backup"]
+    replayed = {(o.hour, o.detector) for o in replay((series,), POLICY) if o.status == "fired"}
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    ov = open_overrides(tmp_path / "overrides.db")
+    try:
+        inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c1','k1')")
+        inv.execute("INSERT INTO devices(id,first_seen,last_seen) VALUES ('d1','x','x')")
+        mac = "aa:bb:cc:00:00:01"
+        inv.execute(
+            "INSERT INTO observations(mac,device_id,is_randomized,link_source,first_seen,"
+            "last_seen) VALUES (?, 'd1', 0, 'self', 'x', 'x')",
+            (mac,),
+        )
+        for row in series.samples:
+            inv.execute(
+                "INSERT INTO measurements_hourly VALUES ('c1',?,?,?,0,1,0)",
+                (mac, row.hour, row.bytes_up),
+            )
+            inv.execute(
+                "INSERT OR REPLACE INTO coverage_hourly VALUES ('c1',?,?,?,'[]')",
+                (row.hour, row.qualified_seconds, row.qualified_seconds),
+            )
+            inv.execute("INSERT OR REPLACE INTO monitoring_dirty VALUES ('c1',?,0)", (mac,))
+            analyze_monitoring(inv, ov, POLICY, row.hour + 3601)
+        live = {
+            (r["last_hour"], r["detector"])
+            for r in inv.execute("SELECT detector,last_hour FROM monitoring_incidents")
+        }
+    finally:
+        inv.close()
+        ov.close()
+    assert replayed and replayed == live
 
 
 def test_clock_validation():
