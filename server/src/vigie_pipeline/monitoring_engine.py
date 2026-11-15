@@ -383,6 +383,7 @@ def prune_monitoring(inv, now):
         inv.execute(
             "DELETE FROM monitoring_incidents WHERE seq IN "
             "(SELECT seq FROM monitoring_incidents WHERE last_hour<? "
+            "AND NOT (state='open' AND detector NOT IN ('large_upload','upload_deviation')) "
             "ORDER BY last_hour LIMIT 1000)",
             (cutoff,),
         )

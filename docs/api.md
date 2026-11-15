@@ -215,6 +215,12 @@ covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers
 A snooze on an incident that later resolves stays as history with `attention` false. `GET /incidents`
 also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
 
+`detector` is `large_upload`, `upload_deviation` or (additive, F5) `new_device`. A `new_device` incident
+has `observed_bytes` and `threshold_bytes` of 0 and its `evidence` is exactly
+`{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}` (`dwell_hours` null if the
+stored value is implausible): never a MAC, hostname, vendor or IP; any other stored key is dropped. The
+same shape appears in the evidence pack. Upload evidence is unchanged.
+
 The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
 `bucket_hours` (one of 1, 2, 3, 4, 6, 8, 12, 24), `cohort_is_weekend` (boolean), `cohort_bucket` (integer 0 to 23,
 the bucket index `utc_hour // bucket_hours`, covering UTC hours `[b*bucket_hours, (b+1)*bucket_hours)`; dropped when it

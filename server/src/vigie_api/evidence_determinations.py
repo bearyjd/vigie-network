@@ -24,7 +24,7 @@ from vigie_api.evidence_types import (
     sensitive,
     when,
 )
-from vigie_api.models import TOD_BUCKET_HOURS, tod_cohort_bucket_valid
+from vigie_api.models import TOD_BUCKET_HOURS, new_device_evidence, tod_cohort_bucket_valid
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -32,7 +32,7 @@ REASON_CODES = (
     "two_qualified_upload_hours",
     "two_qualified_upload_hours_in_cohort",
 )
-DETECTORS = ("large_upload", "upload_deviation")
+DETECTORS = ("large_upload", "upload_deviation", "new_device")
 INCIDENT_STATES = ("open", "resolved", "superseded")
 REVIEW_STATUSES = ("acknowledged", "snoozed", "expected")
 _INT = "int"
@@ -120,7 +120,11 @@ def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
         "baseline_id": sensitive("baseline_id", row["baseline_id"]),
-        "evidence": allowlisted_evidence(row["evidence"]),
+        "evidence": (
+            new_device_evidence(row["evidence"])
+            if row["detector"] == "new_device"
+            else allowlisted_evidence(row["evidence"])
+        ),
         "review": _review(row["review"]),
         "decision_version": row["decision_version"],
         "attention": bool(row["attention"]),

@@ -131,6 +131,17 @@ def test_counts_per_detector_and_day(seeded, capsys, monkeypatch):
     assert sum(sum(d.values()) for d in r["incidents"]["per_day"].values()) == 3
 
 
+def test_new_device_incidents_are_counted_under_their_own_detector(seeded, capsys, monkeypatch):
+    incident(seeded, "nd1", device="d1", detector="new_device", episode=HOUR0 - 3600)
+    set_detected(seeded, "nd1", -3600)
+    r = report(seeded, capsys, monkeypatch)
+    assert r["incidents"]["per_detector"] == {
+        "large_upload": 2,
+        "new_device": 1,
+        "pooled_upload": 1,
+    }
+
+
 def test_decision_ratios(seeded, capsys, monkeypatch):
     d = report(seeded, capsys, monkeypatch)["decisions"]
     assert d["counts"] == {"acknowledged": 1, "expected": 2, "snoozed": 0}

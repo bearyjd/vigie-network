@@ -331,6 +331,9 @@ assert.deepEqual(views.inboxRows(mixed, 'quiet', NOW).map(r => r.d.id), ['a', 'e
 const none = render([]); assert.match(text(none), /No incidents recorded for this scope/); assert.match(text(none), /absence of incidents is not proof of health/i);
 assert.equal(none.querySelectorAll('span').filter(s => /good/.test(s.getAttribute('class') || '')).length, 0, 'an empty inbox shows no success badge');
 assert.match(text(render(mixed.slice(0, 1), opts('attention'))), /No incidents match this filter/);
+// F5: a new_device incident renders its own label and no misleading upload byte counts.
+const fresh = render([inc('n1', {detector: 'new_device', observed_bytes: 0, threshold_bytes: 0})]);
+assert.match(text(fresh), /New device/); assert.doesNotMatch(text(fresh), /0 B/, 'no upload byte counts for a new device');
 // XSS: hostile strings are inert text; only the expected tags exist
 const hostile = render([inc('<img src=x onerror=alert(1)>', {detector: '</script><script>alert(1)</script>', device_id: '<img onerror=alert(2)>', review: {status: '<b onmouseover=x>'}})]);
 const tags = new Set(); (function walk(el) { tags.add(el.tag); el.children.forEach(c => c instanceof FakeElement && walk(c)); })(hostile);

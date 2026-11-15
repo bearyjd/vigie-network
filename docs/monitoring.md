@@ -381,6 +381,16 @@ detector is added back before the rows are forgotten and the incident resolved m
 recover is sent only when no recover row existed: a recover row that was pending when the detector
 was removed expired and is never revived (only a withdrawn recover row is).
 
+**Open-only detectors.** `new_device` (the F5 new-device notice, not yet produced by any code) is
+open-only: when allowlisted its incident gets one `open` delivery whose text is "New device on your
+network: " plus the alias or label (never a MAC, hostname, vendor or IP), and NEVER a `recover`,
+whether the incident later resolves or is superseded; a sent open stays sent. The upload detectors
+are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
+
+**Retention of incidents.** Incidents older than 90 days (by `last_hour`) are pruned, except an
+`open` incident of a non-upload detector (e.g. `new_device`), which is kept for as long as it is
+`open` (an acknowledgement does not close it). Upload incidents are pruned exactly as before.
+
 **FilePublisher format.** The only publisher today appends one JSON object per line to
 `VIGIE_DELIVERY_FILE`: `{"delivery_id","kind","title","body","link"}`, ASCII-only. The file is
 created 0600 with `O_APPEND|O_NOFOLLOW`, only a regular file is accepted (a symlink, FIFO or
