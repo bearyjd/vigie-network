@@ -148,6 +148,16 @@ def test_new_device_is_reported_separately_and_leaves_upload_numbers_alone(
     assert after["deliveries"]["status"] != "unknown"
 
 
+def test_only_new_device_rows_with_an_engine_gap_stay_unknown(env, capsys, monkeypatch):  # noqa: F811
+    seed_collector(env)  # no coverage evidence in the window: the upload engine cannot have run
+    empty = report(env, capsys, monkeypatch)["incidents"]
+    assert empty["status"] == "unknown"
+    incident(env, "nd1", device="d1", detector="new_device", episode=HOUR0 - 3600)
+    set_detected(env, "nd1", -3600)
+    got = report(env, capsys, monkeypatch)["incidents"]
+    assert got == empty  # an unavailable upload count is never a measured zero
+
+
 def test_an_expected_new_device_with_a_sent_open_is_not_an_unwanted_notification(
     seeded, capsys, monkeypatch
 ):

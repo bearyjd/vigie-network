@@ -196,8 +196,8 @@ def incidents_section(inv: sqlite3.Connection | None, lo: int, hi: int, gap: str
         f"WHERE {_INCIDENT_WINDOW} GROUP BY detector,day ORDER BY day,detector LIMIT ?",
         (*_incident_args(lo, hi), ROW_LIMIT + 1),
     ).fetchall()
-    if not rows and gap:
-        return _unknown(f"no incidents: {gap}")
+    if gap and all(r["detector"] in OPEN_ONLY_DETECTORS for r in rows[:ROW_LIMIT]):
+        return _unknown(f"no incidents: {gap}")  # no UPLOAD rows: the zero would not be real
     per_detector: dict[str, int] = defaultdict(int)
     per_day: dict[str, dict[str, int]] = defaultdict(dict)
     for row in rows[:ROW_LIMIT]:
