@@ -39,5 +39,10 @@ def test_coverage_bytes_are_unchanged_by_probe_rows(env: Env, tmp_path):
     assert env.inv.execute("SELECT COUNT(*) FROM events WHERE kind='probe_outage'").fetchone()[0]
     assert env.inv.execute("SELECT 1 FROM pipeline_meta WHERE key='probe_status'").fetchone()
     assert coverage_bytes(env) == before
-    assert env.get("/probes").status_code == 200  # reading the probe view leaves /coverage alone
+    probes = env.get("/probes")
+    assert probes.status_code == 200, probes.text
+    view = probes.json()["data"]
+    assert view["enabled"] is True and view["stale"] is False and view["written_at"] == int(NOW)
+    assert [(t["id"], t["state"]) for t in view["targets"]] == [("router-dns", "outage")]
+    # reading the probe view leaves /coverage alone
     assert hashlib.sha256(coverage_bytes(env)).hexdigest() == GOLDEN_SHA256

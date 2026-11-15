@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 from api_helpers import NOW, Env, env, ts  # noqa: F401
 
 from vigie_api import tokens
+from vigie_pipeline.config import ProbeSettings
+from vigie_pipeline.probes import fold_probes
+
+_RUNNER = Path(__file__).parents[3] / "deploy" / "persistent" / "probe_runner.py"
+_spec = importlib.util.spec_from_file_location("probe_runner_for_api_tests", _RUNNER)
+pr = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = pr
+_spec.loader.exec_module(pr)
 
 
 def target(ident: str = "dns-local", kind: str | None = "dns_local", **over: Any) -> dict[str, Any]:
@@ -22,7 +33,7 @@ def target(ident: str = "dns-local", kind: str | None = "dns_local", **over: Any
 def store(env: Env, *targets: dict[str, Any], **over: Any) -> None:
     status = {
         "v": 1, "folded_at": int(NOW), "stale": False, "reason": None,
-        "written_at": int(NOW - 30), "valid_until": int(NOW + 270), "targets": list(targets),
+        "written_at": NOW - 30.0, "valid_until": int(NOW + 270), "targets": list(targets),
     }  # fmt: skip
     put(env, json.dumps({**status, **over}))
 
@@ -191,3 +202,66 @@ def test_read_only(env: Env) -> None:
     env.get("/probes")
     after = env.inv.execute("SELECT value FROM pipeline_meta WHERE key='probe_status'").fetchone()
     assert before[0] == after[0]
+
+
+def test_a_real_runner_state_folded_by_the_pipeline_reads_as_fresh_normal(
+    env: Env, tmp_path
+) -> None:
+    """The runner's own serializer writes written_at as a float; the pipeline keeps it a float."""
+    fresh_collector(env)
+    written = NOW - 20.0
+    ts_ = pr.TargetState(
+        id="router-dns", kind="dns_local", state="ok", consecutive_ok=3, last_ok_at=written,
+        last_latency_ms=4, last_attempt=written, episodes_day=ts()[:10],
+    )  # fmt: skip
+    path = tmp_path / "probe-state.json"
+    path.write_bytes(pr.serialize_state(pr.State(written_at=written, targets=(ts_,))))
+    assert isinstance(json.loads(path.read_text())["written_at"], float)
+    fold_probes(env.inv, ProbeSettings(file=path), lambda: NOW)
+    stored = json.loads(
+        env.inv.execute("SELECT value FROM pipeline_meta WHERE key='probe_status'").fetchone()[0]
+    )
+    assert isinstance(stored["written_at"], float)
+    d = data(env)
+    assert d["stale"] is False and d["written_at"] == int(written) and d["verdict"] == "normal"
+
+
+def test_returned_ids_are_unique(env: Env) -> None:
+    fresh_collector(env)
+    store(env, target("a"), target("a", state="outage"), target("b"), target("a"))
+    ids = [t["id"] for t in data(env)["targets"]]
+    assert ids == ["a", "b"]
+
+
+def test_status_over_64_kib_reads_stale(env: Env) -> None:
+    store(env, target(), ring=["x" * 1000] * 70)
+    assert (
+        len(
+            env.inv.execute("SELECT value FROM pipeline_meta WHERE key='probe_status'").fetchone()[
+                0
+            ]
+        )
+        > 64 * 1024
+    )
+    d = data(env)
+    assert d["enabled"] is True and d["stale"] is True and d["targets"] == []
+    assert d["verdict"] == "unknown"
+
+
+def test_the_pipelines_own_stale_flag_is_honoured(env: Env) -> None:
+    fresh_collector(env)
+    store(env, target(), stale=True, reason="stale")  # timestamps themselves are valid
+    d = data(env)
+    assert d["stale"] is True and d["verdict"] == "unknown" and d["targets"] == []
+
+
+def test_an_outage_wins_over_an_unknown_sibling_dns_local(env: Env) -> None:
+    fresh_collector(env)
+    store(env, target("a", state="unknown"), target("b", state="outage"))
+    assert data(env)["verdict"] == "router_resolver_down"
+
+
+def test_a_storage_error_is_the_uniform_500_like_other_routes(env: Env) -> None:
+    env.inv.execute("DROP TABLE pipeline_meta")
+    r = env.get("/probes")
+    assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"

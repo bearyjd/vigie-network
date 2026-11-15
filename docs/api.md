@@ -365,8 +365,7 @@ rate limit (429 with `Retry-After`). It reads one `pipeline_meta` row and writes
   `malformed`, `bad_id`, `rcode`, `no_answer`, `timeout`, `oserror`, `refused`, `unreachable`,
   `other`, or null. `last_latency_ms` is 0 to 5000.
 - `verdict` is `normal`, `upstream_unreachable`, `router_resolver_down`, `vigie_blind` or `unknown`
-  (table in [monitoring](monitoring.md)). Collector freshness is the newest `observation` batch
-  received within 900 s, across all collectors.
+  (table in [monitoring](monitoring.md)). Collector freshness is a chosen value, not from the spec: "fresh" means the newest `observation` batch across ANY collector was received within 900 s. With several collectors one blind collector would be masked by the others (only one collector exists today).
 - The stored status is hostile data: a target with an invalid or duplicate id is dropped, at most
   10 are returned, and any other invalid value is replaced by null or `unknown`. No stored string
   is echoed unless it matched a fixed set or the id pattern `[a-z0-9_-]{1,32}`.

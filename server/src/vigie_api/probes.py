@@ -58,12 +58,9 @@ def _load(inv: sqlite3.Connection) -> Any:
 
 
 def _collector_fresh(inv: sqlite3.Connection, now: float) -> bool:
-    try:
-        row = inv.execute(
-            "SELECT MAX(received_at) FROM batches WHERE observation_kind='observation'"
-        ).fetchone()
-    except sqlite3.Error:
-        return False
+    row = inv.execute(
+        "SELECT MAX(received_at) FROM batches WHERE observation_kind='observation'"
+    ).fetchone()
     return row is not None and row[0] is not None and row[0] >= iso_utc(now - COLLECTOR_FRESH_S)
 
 
@@ -90,7 +87,9 @@ def probes_view(inv: sqlite3.Connection, now: float) -> dict[str, Any]:
             "enabled": False, "written_at": None, "stale": False, "targets": [],
             "verdict": "unknown",
         }  # fmt: skip
-    written_at = probe_number(doc.get("written_at"), integer=True)
+    # the pipeline stores written_at as a float (the runner's own); a whole-second int is served
+    written_at = probe_number(doc.get("written_at"))
+    written_at = None if written_at is None else int(written_at)
     valid_until = probe_number(doc.get("valid_until"))
     stale = (
         doc.get("stale") is not False

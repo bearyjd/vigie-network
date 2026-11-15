@@ -1149,19 +1149,23 @@ all of the user's volumes, so that rests on the runner's code and config, not on
   outbox, coverage or any detector, so they cannot change alert volume or the policy version.
   `/coverage` response bytes are unchanged by probes (pinned by a golden hash in the tests).
 - **`GET /probes` and the verdict.** `/probes` ([api](api.md#probes)) folds the stored status with
-  collector freshness (newest `observation` batch within 900 s). Evaluated top to bottom:
+  collector freshness. Collector freshness is a chosen value, not from the spec: "fresh" means the newest `observation` batch across ANY collector was received within 900 s. With several collectors one blind collector would be masked by the others (only one collector exists today). Rows are evaluated top to bottom, the first match wins:
 
   | collector fresh | dns_local | dns_upstream | Verdict |
   |---|---|---|---|
-  | any | probe data stale or expired, or no `dns_local` target, or its state unknown | any | `unknown`: probe unit not running, status unknown |
-  | any | outage | any | `router_resolver_down`: router resolver down (or router down) |
-  | no | ok | any | `vigie_blind`: collector or ingest path blind, network up |
-  | yes | ok | outage | `upstream_unreachable`: internet or upstream DNS broken; LAN and Vigie fine |
-  | yes | ok | ok, unknown or absent | `normal` |
+  | any | probe data stale or expired, or no `dns_local` target | any | `unknown`: probe unit not running, status unknown |
+  | any | any `dns_local` in outage | any | `router_resolver_down`: router resolver down (or router down) |
+  | any | a `dns_local` state unknown, none in outage | any | `unknown` |
+  | no | all ok | any | `vigie_blind`: collector or ingest path blind, network up |
+  | yes | all ok | outage | `upstream_unreachable`: internet or upstream DNS broken; LAN and Vigie fine |
+  | yes | all ok | ok, unknown or absent | `normal` |
 
+  With several `dns_local` targets an outage in one wins over an unknown state in another, so the
+  verdict is `router_resolver_down`.
   A `dns_upstream` target in state `unknown` does not change the verdict. The status stores each
   target's `kind` (optional in the state file: a file or status written before the runner recorded
   it reads as kind `unknown` and gives verdict `unknown`).
+- **Upgrade order.** Upgrade the PIPELINE before the runner. The runner now records each target's `kind` in the state file; a pipeline from before this change rejects that key, so a new runner with an old pipeline shows probe data as stale. An old runner reading a state file a new runner wrote starts fresh (the file no longer parses for it) and loses its hysteresis state.
 - **Self-contamination.** The server's own probe queries pass through the household resolver and
   can be attributed to the server host as DNS volume (about 1 to 2 per minute); keep the rate
   fixed and account for it before any DNS-volume detector.
