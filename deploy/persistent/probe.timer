@@ -1,0 +1,13 @@
+# TEMPLATE, not installed or enabled by anything in this repository.
+[Unit]
+Description=Run the Vigie probe every minute
+
+[Timer]
+OnActiveSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Persistent=no
+Unit=probe.service
+
+[Install]
+WantedBy=timers.target

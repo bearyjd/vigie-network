@@ -153,6 +153,39 @@ class DeliverySettings:
         )
 
 
+PROBE_STALE_DEFAULT_S = 300
+
+
+@dataclass(frozen=True)
+class ProbeSettings:
+    """Server-side probe status (docs/monitoring.md). DEFAULT OFF; `file` is the read-only handoff
+    written by the separate probe unit. Deliberately NOT part of BaselineConfig/TodConfig or the
+    monitoring policy version."""
+
+    file: Path | None = None
+    stale_s: int = PROBE_STALE_DEFAULT_S
+
+    def __post_init__(self) -> None:
+        if self.file is None:
+            return  # off: a probe-only value must never stop the main services
+        if type(self.stale_s) is not int or not 180 <= self.stale_s <= 86400:
+            raise ValueError("VIGIE_PROBE_STALE_S must be an integer in 180..86400")
+
+    @property
+    def enabled(self) -> bool:
+        return self.file is not None
+
+    @classmethod
+    def from_env(cls, source: dict[str, str]) -> ProbeSettings:
+        file = _opt_path(source.get("VIGIE_PROBE_FILE"))
+        if file is None:
+            return cls()  # disabled: VIGIE_PROBE_STALE_S is not read
+        return cls(
+            file=file,
+            stale_s=_env_int(source, "VIGIE_PROBE_STALE_S", PROBE_STALE_DEFAULT_S),
+        )
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     data_dir: Path
@@ -172,6 +205,7 @@ class PipelineConfig:
     activity_retention_s: int = ACTIVITY_RETENTION_DEFAULT_S
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
     delivery: DeliverySettings = DeliverySettings()
+    probes: ProbeSettings = ProbeSettings()
 
     def __post_init__(self) -> None:
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
@@ -223,4 +257,5 @@ class PipelineConfig:
             overlap_grace_s=int(source.get("VIGIE_OVERLAP_GRACE_S", OVERLAP_GRACE_DEFAULT_S)),
             activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
             delivery=DeliverySettings.from_env(source),
+            probes=ProbeSettings.from_env(source),
         )
