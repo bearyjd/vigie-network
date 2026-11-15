@@ -154,7 +154,7 @@ def test_cursors_do_not_cross_orders(env: Env) -> None:
     env.event("d1", -5, "anomaly")
     asc = env.get("/events").json()["page"]["next_cursor"]
     desc = env.get("/events", order="desc").json()["page"]["next_cursor"]
-    assert decode_cursor(desc) == '{"dir":"desc","inv":1}'
+    assert decode_cursor(desc) == '{"audit":1,"dir":"desc","inv":1}'
     for params in (
         {"order": "desc", "since": asc},
         {"since": desc},
@@ -236,3 +236,25 @@ def test_desc_cursor_with_only_dir_is_no_cursor(env: Env) -> None:
     bare = encode_cursor('{"dir":"desc"}')
     r = env.get("/events", order="desc", since=bare)
     assert r.status_code == 200 and ids(r) == ids(env.get("/events", order="desc")) == [b, a]
+
+
+def test_desc_inventory_only_first_page_still_bounds_audit(env: Env) -> None:
+    env.device("d1")
+    audit(env, "au-old", "device.patch", "d1", when=-900)
+    newest = env.event("d1", -100, "anomaly")
+    first = env.get("/events", order="desc", limit=1).json()
+    assert ids_of(first) == [newest]
+    audit(env, "au-new", "device.patch", "d1", when=-5)  # arrives after page 1
+    rest = env.get("/events", order="desc", since=first["page"]["next_cursor"]).json()
+    assert ids_of(rest) == ["au-old"]
+
+
+def test_desc_audit_only_first_page_still_bounds_inventory(env: Env) -> None:
+    env.device("d1")
+    old = env.event("d1", -900, "anomaly")
+    audit(env, "au-newest", "device.patch", "d1", when=-100)
+    first = env.get("/events", order="desc", limit=1).json()
+    assert ids_of(first) == ["au-newest"]
+    env.event("d1", -5, "anomaly")  # arrives after page 1
+    rest = env.get("/events", order="desc", since=first["page"]["next_cursor"]).json()
+    assert ids_of(rest) == [old]

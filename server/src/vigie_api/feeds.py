@@ -25,8 +25,9 @@ def _decode_event_cursor(cursor: str | None, newest_first: bool = False) -> dict
     """Opaque `{"inv": <events.rowid>, "audit": <audit_log.rowid>}`; anything else is a 400.
 
     Ascending cursors are the resume points (rowid > value, absent = 0). Newest-first cursors
-    carry `"dir": "desc"` and are the lowest rowid served per source (rowid < value, absent =
-    unbounded), so a cursor can never be replayed in the other order.
+    carry `"dir": "desc"` and are, per source, an exclusive upper bound (rowid < value): the
+    first page pins both sources at their current max+1, later pages lower it to the lowest rowid
+    served, so rows inserted mid-traversal never appear. A bare `{"dir": "desc"}` is no cursor. Cursors never replay in the other order.
     """
     if not cursor:
         return {} if newest_first else dict.fromkeys(_CURSOR_KEYS, 0)
@@ -134,6 +135,10 @@ def _audit_event(r: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _next_rowid(conn: sqlite3.Connection, table: str) -> int:
+    return conn.execute(f"SELECT COALESCE(MAX(rowid), 0) + 1 FROM {table}").fetchone()[0]  # noqa: S608 - fixed table names
+
+
 def list_events(
     inv: sqlite3.Connection,
     ov: sqlite3.Connection,
@@ -154,6 +159,13 @@ def list_events(
     same streams from the highest rowid down; its cursor is the lowest rowid served per source.
     """
     cursor = _decode_event_cursor(since, newest_first)
+    if (
+        newest_first and not cursor
+    ):  # first page: pin every source's upper bound, even an unused one
+        cursor = {
+            "inv": _next_rowid(inv, "events"),
+            "audit": _next_rowid(ov, "audit_log"),
+        }
     streams = [
         _inventory_events(inv, cursor.get("inv"), kind, severity, limit, device_id, newest_first),
         _audit_events(ov, cursor.get("audit"), kind, severity, limit, device_id, newest_first),
