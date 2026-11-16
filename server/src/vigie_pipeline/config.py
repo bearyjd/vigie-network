@@ -79,6 +79,16 @@ def _env_int(source: dict[str, str], name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer") from None
 
 
+def _env_cap(source: dict[str, str]) -> int:
+    """Plain ASCII digits only (no sign, space or underscore); the range is checked later."""
+    raw = source.get("VIGIE_NEW_DEVICE_MAX_PER_DAY")
+    if raw is None:
+        return NEW_DEVICE_MAX_PER_DAY_DEFAULT
+    if not (raw.isascii() and raw.isdigit()):
+        raise ValueError("VIGIE_NEW_DEVICE_MAX_PER_DAY must be an integer in 1..20")
+    return int(raw)
+
+
 def _env_flag(source: dict[str, str], name: str) -> bool:
     """Only 1/true/yes enable; 0/false/no/off/empty disable; anything else is a startup error."""
     value = source.get(name, "").strip().lower()
@@ -86,7 +96,7 @@ def _env_flag(source: dict[str, str], name: str) -> bool:
         return True
     if value in ("", "0", "false", "no", "off"):
         return False
-    raise ValueError(f"{name} must be one of 1/true/yes or 0/false/no/off, not {value!r}")
+    raise ValueError(f"{name} must be one of 1/true/yes or 0/false/no/off")
 
 
 DETECTOR_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -181,6 +191,10 @@ class DeliverySettings:
 
 
 PROBE_STALE_DEFAULT_S = 300
+NEW_DEVICE_MAX_PER_DAY_DEFAULT = 3
+NEW_DEVICE_MAX_PER_DAY_LIMIT = 20
+PASS_INTERVAL_DEFAULT_S = 30  # the pipeline loop (VIGIE_PIPELINE_INTERVAL_S)
+NEW_DEVICE_MAX_PASS_INTERVAL_S = 1800  # longest pass interval F5 supports (its gap is 4x this)
 
 
 @dataclass(frozen=True)
@@ -233,8 +247,24 @@ class PipelineConfig:
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
     delivery: DeliverySettings = DeliverySettings()
     probes: ProbeSettings = ProbeSettings()
+    # F5 new-device notice (docs/monitoring.md). DEFAULT OFF; deliberately NOT in any policy
+    # dataclass, so the monitoring policy versions are unchanged.
+    new_device_notice: bool = False
+    new_device_max_per_day: int = NEW_DEVICE_MAX_PER_DAY_DEFAULT
+    pass_interval_s: int = PASS_INTERVAL_DEFAULT_S  # set from --loop; F5 derives its resume gap
 
     def __post_init__(self) -> None:
+        if type(self.new_device_max_per_day) is not int or not (
+            1 <= self.new_device_max_per_day <= NEW_DEVICE_MAX_PER_DAY_LIMIT
+        ):
+            raise ValueError("VIGIE_NEW_DEVICE_MAX_PER_DAY must be an integer in 1..20")
+        if type(self.pass_interval_s) is not int or self.pass_interval_s < 1:
+            raise ValueError("pass_interval_s must be a positive integer")
+        if self.new_device_notice and self.pass_interval_s > NEW_DEVICE_MAX_PASS_INTERVAL_S:
+            raise ValueError(
+                "VIGIE_NEW_DEVICE_NOTICE needs a pipeline pass interval of at most "
+                f"{NEW_DEVICE_MAX_PASS_INTERVAL_S} seconds"
+            )
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
             raise ValueError("monitoring_large_upload_bytes outside supported bounds")
         if self.monitoring_baseline not in MONITORING_BASELINES:
@@ -285,4 +315,6 @@ class PipelineConfig:
             activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
             delivery=DeliverySettings.from_env(source),
             probes=ProbeSettings.from_env(source),
+            new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
+            new_device_max_per_day=_env_cap(source),
         )

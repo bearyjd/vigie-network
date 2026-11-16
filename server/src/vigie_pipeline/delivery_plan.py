@@ -351,6 +351,12 @@ def _eligible(incident: IncidentView, config: DeliveryConfig) -> bool:
     return since is None or not _num(incident.detected_at) or incident.detected_at >= since
 
 
+def _fresh(incident: IncidentView, now: float, config: DeliveryConfig) -> bool:
+    """An open-only incident with no rows yet is announced only while it is younger than the
+    pending TTL: adding its detector to the allowlist later never replays an old backlog."""
+    return not _num(incident.detected_at) or now - incident.detected_at < config.pending_ttl_seconds
+
+
 def plan(
     incidents: Iterable[IncidentView],
     reviews: Mapping[str, ReviewView],
@@ -374,7 +380,10 @@ def plan(
             grouped.setdefault(d.incident_id, {})[d.kind] = d
     by_incident: dict[str, IncidentView] = {}
     for incident in incidents:  # the watermark only hides incidents that have no rows yet
-        if incident.id in grouped or _eligible(incident, config):
+        if incident.id in grouped or (
+            _eligible(incident, config)
+            and (incident.id not in open_only or _fresh(incident, now, config))
+        ):
             by_incident.setdefault(incident.id, incident)
     actions: list[Action] = []
     for iid in sorted(by_incident.keys() | grouped.keys()):

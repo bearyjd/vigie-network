@@ -26,6 +26,7 @@ from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
+from vigie_pipeline.new_device_notice import sweep_new_devices
 from vigie_pipeline.overrides import canonical_device, open_overrides_ro
 from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.schema import open_pipeline_inventory
@@ -73,6 +74,8 @@ def run_once(
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
+        if config.new_device_notice and usable:  # F5, default off: nothing else touches it
+            sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
         if usable:
             analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
