@@ -104,8 +104,14 @@ def incident_link(incident_id: object) -> str:
 
 # Per-detector text; any detector not listed here uses the upload text above. A new device has no
 # recover text: it is open-only (see delivery_types.OPEN_ONLY_DETECTORS).
-DETECTOR_TITLES = {("new_device", "open"): "New device on your network: {label}"}
-DETECTOR_BODIES = {("new_device", "open"): "New device on your network: {label}. Review it: {link}"}
+DETECTOR_TITLES = {
+    ("new_device", "open"): "New device on your network: {label}",
+    ("essential_absence", "open"): "{label} has not been seen",
+}
+DETECTOR_BODIES = {
+    ("new_device", "open"): "New device on your network: {label}. Review it: {link}",
+    ("essential_absence", "open"): "{label} has not been seen for a while. Review it: {link}",
+}
 
 
 def build_message(

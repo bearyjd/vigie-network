@@ -385,7 +385,8 @@ was removed expired and is never revived (only a withdrawn recover row is).
 open-only: when allowlisted its incident gets one `open` delivery whose text is "New device on your
 network: " plus the alias or label (never a MAC, hostname, vendor or IP), and NEVER a `recover`,
 whether the incident later resolves or is superseded; a sent open stays sent. The upload detectors
-are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`.
+are unchanged. The set lives in `delivery_types.OPEN_ONLY_DETECTORS`. `essential_absence` (F6, see
+"Essential-device absence (F6)") is open-only the same way, with its own text.
 
 **Retention of incidents.** Incidents older than 90 days (by `last_hour`) are pruned, except an
 `open` incident of a non-upload detector (e.g. `new_device`), which is kept for as long as it is
@@ -1392,12 +1393,77 @@ The [field report](monitoring-field-status-2026-10-25.md) separates completed in
 capacity, parsed-DNS, scoped persistence and bounded-outage recovery proof, deployed processing-age API and controlled repair/reconciled helper recovery from pending natural rotation, reboot behavior and
 long-duration learning. D1–D6 owner decisions remain unchanged.
 
-## Essential devices: rule for the future absence detector
+## Essential-device absence (F6)
+
+**OFF by default and not deployed** (pilot freeze: deploy only after the day-14 pilot evaluation,
+about 2026-11-28). `VIGIE_ESSENTIAL_ABSENCE=1` (only 1/true/yes enable; garbage is a startup error
+that does not echo the value) lets the pipeline open ONE incident of detector `essential_absence`
+when a device the OWNER marked essential has not been seen for the owner's own number of hours
+while Vigie could see the network. With the flag off nothing is read, written or swept and the
+database is byte-identical to a build without F6-b. The flag lives in `PipelineConfig`, never in a
+policy dataclass: the monitoring policy versions are unchanged. There is no migration.
+
+**Owner opt-in.** Nothing fires until the owner marks at least one device essential (F6-a:
+`PUT /devices/{id}/essential`, the `vigie-api essential` CLI; at most 32 devices;
+`absent_after_s` 3600 to 604800, no default). With the flag on and nothing marked the sweep
+reads the marks and the open `essential_absence` incidents and writes nothing. Docs suggest 24 h or
+more for battery devices: a sleeping device that renews DHCP is not absent.
+
+**Rule.** Each pass (after the batches are processed; skipped when a shard could not be read) every
+marked device is resolved to its CURRENT canonical device (a mark on a since-merged alias is judged on
+the canonical device; if the alias and the canonical device are both marked the smaller threshold
+wins; one incident per lineage). Its anchor is the newest `last_seen` of any member MAC or member
+device row. The collector is the one that most recently measured any member MAC (never measured:
+abstain, with an event). Q is the number of ELIGIBLE `coverage_hourly` hours of that collector
+strictly after the anchor's hour and before the current hour (qualified for at least 3420 s and no
+reasons, the same notion as the upload engine). The incident opens iff `Q * 3600 >= absent_after_s`.
+An hour the collector was blind (no row, short, degraded) is not counted: **a collector outage,
+a pipeline gap or a clock step pauses the clock and can never fire it**. Anchor and coverage are
+stamped by the same collector clock, so a constant offset cancels; an anchor more than 300 s ahead
+of the server clock cannot be judged and is reported by an `essential_unjudged` event (once per
+device and day), never silently.
+
+**Episode and re-arm.** The anchor's hour is the incident's `episode_start`. An absence is announced
+once per lineage and anchor, in any incident state: re-running, review, unmark then re-mark, or a
+merge never announce it twice. The device being seen again moves the anchor past the episode, which
+resolves the incident; a later absence has a new anchor and may notify again. No recover is ever sent.
+
+**Close rules** (one transaction, close before open; the sweep never writes overrides.db):
+the device was seen again (anchor hour later than `episode_start`; a late row inside the same hour
+is not a return), the owner marked it `acknowledged` or `expected`, the mark was cleared, or the
+incident's device is no longer canonical (merged). A marks table that cannot be read (missing,
+locked, newer schema) closes nothing: that is not an unmark. Likewise, while any mark cannot be
+resolved to a device (no known MAC, unusable identity graph) or a row is out of range, nothing is
+closed as "unmarked" (it might be the alias of the open incident's device); an `essential_unjudged`
+event (or, for an out-of-range row, a log line) says so, and the reviewed and merged rules still
+apply.
+
+**Bounds.** At most 32 marks read; at most 8 incidents opened per UTC day (`MAX_PER_DAY`); a held
+device stays eligible and one `essential_capped` event per day says so; at most 65 open incidents
+examined per pass; no `pipeline_meta` key at all (the sweep is stateless). An error anywhere is logged
+by class name only and contained: it never fails the pass. The incident id is random (never derived
+from the device); the evidence is exactly `{"reason_code":"essential_absent","absent_for_hours":Q,
+"threshold_hours":N}`; no MAC, hostname, vendor or IP.
+
+**Delivery.** Open-only (`delivery_types.OPEN_ONLY_DETECTORS`): the text is the alias or label plus
+"has not been seen", never a MAC, hostname, vendor or IP, and there is no "is back" message (the
+owner decided open-only; the design's recover text is not built). It is NOT delivered unless
+`essential_absence` is in `VIGIE_DELIVERY_DETECTORS` AND `VIGIE_DELIVERY_ENABLED=1`; with either
+missing it shows only in the API/GUI inbox. Adding it to the allowlist enqueues only incidents
+detected after the delivery watermark. Closed incidents are pruned after 90 days once no delivery row
+refers to them; open ones are kept. Pilot-report counts list it apart from the upload numbers.
+
+**Known gaps.** Whoever can forge traffic from the marked device's MAC keeps it "seen" and masks its
+absence (like the cloned-MAC gap of F5). A forged last-seen stamp far in the future suppresses it
+(reported by the event above). A device marked while it is already absent notifies after N eligible
+hours, not N hours from the mark. A very old absence whose incident was pruned (90 days) may notify
+once more. A device with no measurement row ever (DHCP-only) abstains.
+
+### Rule recorded by F6-a (now implemented)
 
 `overrides.db` records which devices the owner marked essential (`essential_devices`, see
-`docs/api.md`); nothing reads the table yet. A mark is stored under the id the owner marked, and that
-device can later be merged into another. **The absence detector must resolve each marked id to its
-current canonical device on every run** (follow the identity links, as the effective view does), and
-count any member MAC seen as "seen". It must not treat a marked alias as a separate device, and must
-not require the stored id to stay canonical. Unmarking a merged alias is allowed so the owner can
-always free the slot.
+`docs/api.md`). A mark is stored under the id the owner marked, and that device can later be merged
+into another; the sweep above resolves each marked id to its current canonical device on every run
+(following the identity links, as the effective view does), counts any member MAC seen as "seen",
+and does not require the stored id to stay canonical. Unmarking a merged alias is allowed so the
+owner can always free the slot.
