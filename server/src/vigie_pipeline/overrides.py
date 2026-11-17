@@ -45,6 +45,37 @@ def link_revocations_supported(conn: sqlite3.Connection) -> bool:
     return "revoked_at" in columns
 
 
+def _live_filter(conn: sqlite3.Connection) -> str:
+    return " AND revoked_at IS NULL" if link_revocations_supported(conn) else ""
+
+
+def links_select_sql(conn: sqlite3.Connection) -> str:
+    """SQL listing every live (from_device, into_device) link."""
+    where = " WHERE revoked_at IS NULL" if link_revocations_supported(conn) else ""
+    return f"SELECT from_device, into_device FROM identity_links{where}"  # noqa: S608
+
+
+def link_target(conn: sqlite3.Connection, device_id: str) -> str | None:
+    """The device a live link merges device_id into, or None."""
+    row = conn.execute(
+        f"SELECT into_device FROM identity_links WHERE from_device=?{_live_filter(conn)}",  # noqa: S608
+        (device_id,),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def link_sources(conn: sqlite3.Connection, device_id: str, limit: int = 257) -> list[str]:
+    """Devices a live link merges into device_id (at most limit)."""
+    return [
+        row[0]
+        for row in conn.execute(
+            f"SELECT from_device FROM identity_links WHERE into_device=?{_live_filter(conn)}"  # noqa: S608
+            " LIMIT ?",
+            (device_id, limit),
+        )
+    ]
+
+
 def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
     """Follow identity_links (from_device -> into_device) to the canonical device.
     Links are flattened on merge, but a bounded walk also tolerates chains and cycles."""
@@ -52,14 +83,9 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
         return device_id
     seen = {device_id}
     current = device_id
-    query = (
-        "SELECT into_device FROM identity_links WHERE from_device=? AND revoked_at IS NULL"
-        if link_revocations_supported(conn)
-        else "SELECT into_device FROM identity_links WHERE from_device=?"
-    )
     for _ in range(MAX_LINK_DEPTH):
         try:
-            row = conn.execute(query, (current,)).fetchone()
+            target = link_target(conn, current)
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc):  # api has not created the schema yet
                 return device_id
@@ -67,8 +93,8 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
                 logger.error("overrides_unreadable error=%s: ignoring identity links", exc)
                 return device_id
             raise
-        if row is None or row["into_device"] in seen:
+        if target is None or target in seen:
             return current
-        current = row["into_device"]
+        current = target
         seen.add(current)
     return current
