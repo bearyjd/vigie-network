@@ -54,6 +54,29 @@ def test_retired_transient_mac_rows_are_kept_within_90_days(data):
     assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
 
 
+def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
+    mac = "aa:bb:cc:00:00:01"
+    data.add_batch(T0, neigh=[mac, NIC])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # transient retired
+    transient = data.q("SELECT device_id FROM observations WHERE mac=?", mac)[0][0]
+    active = data.q("SELECT device_id FROM observations WHERE mac=?", NIC)[0][0]
+    ov = sqlite3.connect(data.make_overrides())
+    ov.execute("INSERT INTO identity_links VALUES (?,?,'m','t','u')", (transient, active))
+    ov.commit()
+    ov.close()
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+
+
+def test_pruning_is_skipped_when_overrides_is_unreadable(data):
+    mac = "aa:bb:cc:00:00:01"
+    data.add_batch(T0, neigh=[mac])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    (data.root / "overrides.db").write_bytes(b"not a database" * 100)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+
+
 def test_active_device_mac_rows_are_never_pruned(data):
     data.add_batch(T0, neigh=[NIC])  # globally administered: active, not transient
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
