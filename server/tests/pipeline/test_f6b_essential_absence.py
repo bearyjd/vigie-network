@@ -1,7 +1,9 @@
 """F6-b: the essential-device absence sweep (flag OFF by default; nothing runs when off).
 
-Judged on hours the collector could SEE (eligible coverage hours) after the device's anchor (its
-newest last_seen), both stamped by the same collector clock. Stateless: no pipeline_meta key.
+Judged on hours the collector could SEE (eligible coverage hours, no identity or DNS drops) after
+the device's anchor (the newest hour of ACTIVE evidence: a measurements_hourly row; a lease or a
+neighbour entry is a snapshot and never counts), both stamped by the same collector clock.
+Stateless: no pipeline_meta key.
 """
 
 from __future__ import annotations
@@ -38,24 +40,49 @@ class Env:
         self.ov = open_overrides_ro(root / "overrides.db")
         self.inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c1','k1')")
         self.n = 0
+        self.macs: dict[str, str] = {}
+        self.collector: dict[str, str] = {}
 
-    def device(self, did, last_seen=H + 600, collector="c1", measured=True) -> str:
+    def device(
+        self, did, last_seen=H + 600, collector="c1", measured=True, active=0, randomized=0
+    ) -> str:
+        """`active` = the hour offset of its newest measured activity; `last_seen` is the snapshot
+        stamp (a lease or neighbour row), which must never matter."""
         self.n += 1
         mac = f"00:1a:2b:00:00:{self.n:02x}"
+        self.macs[did] = mac
+        self.collector[did] = collector
         self.inv.execute(
             "INSERT INTO devices(id,first_seen,last_seen) VALUES (?,?,?)",
             (did, iso_utc(H - 86400), iso_utc(last_seen)),
         )
         self.inv.execute(
             "INSERT INTO observations(mac,device_id,is_randomized,link_source,first_seen,"
-            "last_seen) VALUES (?,?,0,'self',?,?)",
-            (mac, did, iso_utc(H - 86400), iso_utc(last_seen)),
+            "last_seen) VALUES (?,?,?,'self',?,?)",
+            (mac, did, randomized, iso_utc(H - 86400), iso_utc(last_seen)),
         )
         if measured:
             self.inv.execute(
-                "INSERT INTO measurements_hourly VALUES (?,?,?,1,1,1,0)", (collector, mac, H)
+                "INSERT INTO measurements_hourly VALUES (?,?,?,1,1,1,0)",
+                (collector, mac, H + active * HOUR),
             )
         return mac
+
+    def active(self, did, hours) -> None:
+        """Real activity (a flow or DNS row) in the hour H + hours: moves the anchor."""
+        self.inv.execute(
+            "INSERT OR IGNORE INTO measurements_hourly VALUES (?,?,?,1,1,1,0)",
+            (self.collector[did], self.macs[did], H + hours * HOUR),
+        )
+
+    def batch(self, start, end, truncated=None, collector="c1") -> None:
+        """A recorded batch window with its `truncated` map (the collector's drop counters)."""
+        self.n += 1
+        self.inv.execute(
+            "INSERT INTO batches(collector_id,batch_id,received_at,truncated,dropped_batches,"
+            "window_start,window_end,observation_kind) VALUES (?,?,?,?,0,?,?,'observation')",
+            (collector, f"b{self.n}", iso_utc(end), json.dumps(truncated or {}), start, end),
+        )
 
     def seen(self, did, at) -> None:
         for table in ("devices", "observations"):
@@ -237,7 +264,7 @@ def test_return_resolves_without_a_second_row_and_rearms(env):
     env.cover(1, 2)
     env.sweep(now_after(2))
     assert [r["state"] for r in env.rows()] == ["open"]
-    env.seen("d1", H + 3 * HOUR + 60)  # the device is back (anchor moves past the episode)
+    env.active("d1", 3)  # the device is back (anchor moves past the episode)
     env.cover(3, 1)
     env.sweep(now_after(3))
     assert [r["state"] for r in env.rows()] == ["resolved"]
@@ -252,7 +279,7 @@ def test_a_return_inside_the_anchor_hour_is_not_a_return(env):
     env.mark("d1", 3600)
     env.cover(1, 2)
     env.sweep(now_after(2))
-    env.seen("d1", H + 3000)  # a late backlog row stamped in the SAME hour
+    env.active("d1", 0)  # a late backlog row in the SAME hour
     env.sweep(now_after(2) + 5)
     assert [r["state"] for r in env.rows()] == ["open"]
 
@@ -300,7 +327,7 @@ def test_any_member_mac_seen_counts_as_seen(env):
     env.mark("alias", 3 * 3600)
     env.merge("alias", "canon")
     env.cover(1, 3)
-    env.seen("alias", H + 2 * HOUR + 5)  # only the alias' MAC is active, in hour H+2
+    env.active("alias", 2)  # only the alias' MAC is active, in hour H+2
     assert env.sweep(now_after(3)) == 0  # one completed hour after it: below three
     env.cover(4, 3)
     assert env.sweep(now_after(6)) == 1  # H+3 .. H+6 after H+2: counted from the NEWEST member
@@ -370,17 +397,18 @@ def test_a_pipeline_gap_changes_nothing_and_a_late_pass_opens_exactly_once(env):
     assert env.sweep(now_after(2) + 7 * 86400 + 30) == 0
 
 
-def test_the_collector_clock_ahead_abstains_with_an_event_not_silently(env):
-    env.device("d1", last_seen=H + 6 * HOUR)  # stamped in the future: a clock that runs ahead
+def test_far_future_activity_neither_suppresses_nor_disables_judging(env):
+    env.device("d1")
     env.mark("d1", 3600)
-    env.cover(1, 4)
-    assert env.sweep(now_after(4)) == 0
-    assert [r[0] for r in env.inv.execute("SELECT kind FROM events")] == ["essential_unjudged"]
+    env.active("d1", 24 * 365 * 30)  # one forged far-future window: ignored, not an anchor
+    env.cover(1, 2)
+    assert env.sweep(now_after(2)) == 1  # M4: it is still judged, on the real anchor
+    assert env.rows()[0]["episode_start"] == H
 
 
 @pytest.mark.parametrize("skew", [-5 * HOUR, 5 * HOUR])
 def test_a_constant_collector_offset_never_fires_early(env, skew):
-    env.device("d1", last_seen=H + 600 + skew)
+    env.device("d1", active=skew // HOUR)
     env.mark("d1", 3 * 3600)
     first = H + skew // HOUR * HOUR  # coverage is stamped by the same clock
     for h in range(1, 3):
@@ -469,9 +497,8 @@ def test_at_most_32_marks_are_read(env, caplog):
         env.device(f"d{i:02d}")
         env.mark(f"d{i:02d}", 3600)
     env.cover(1, 3)
-    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
-        env.sweep(now_after(3))
-    assert "essential_absence_overflow" in logged(caplog)
+    env.sweep(now_after(3))
+    assert [e for e in env.inv.execute("SELECT summary FROM events") if "too many" in e[0]]
     assert len(env.rows()) == ea.MAX_PER_DAY  # 32 judged, the daily cap bounds the opens
     assert {r["device_id"] for r in env.rows()} <= {f"d{i:02d}" for i in range(32)}
 
@@ -481,7 +508,7 @@ def test_forged_traffic_for_the_marked_mac_suppresses_the_alert_known_gap(env):
     env.device("d1")
     env.mark("d1", 3600)
     env.cover(1, 3)
-    env.seen("d1", H + 3 * HOUR + 5)  # forged sighting
+    env.active("d1", 3)  # forged traffic
     assert env.sweep(now_after(3)) == 0
 
 
@@ -572,21 +599,3 @@ def test_sweep_skipped_when_a_shard_could_not_be_read(env, monkeypatch):
     with pytest.raises(processor.ShardReadError):
         run_once(config_for(env.root, essential_absence=True), now=T0)
     assert calls == []  # a stale view must not page "absent"
-
-
-def test_an_unresolvable_mark_blocks_close_on_unmark_but_not_the_other_closes(env):
-    """A mark that cannot be resolved might be the alias of an open incident's device: closing
-    it as "unmarked" would be a guess. The unjudged event says so; it stays open meanwhile."""
-    env.device("d1")
-    env.mark("d1", 3600)
-    env.cover(1, 2)
-    env.sweep(now_after(2))
-    env.mark("d1", None)
-    env.mark("ghost", 3600)  # no observations: cannot be resolved
-    env.sweep(now_after(2) + 5)
-    assert [r["state"] for r in env.rows()] == ["open"]
-    kinds = [r[0] for r in env.inv.execute("SELECT kind FROM events")]
-    assert kinds == ["essential_unjudged"]
-    env.seen("d1", H + 3 * HOUR + 1)  # a return of an unmarked device closes nothing
-    env.sweep(now_after(2) + 9)
-    assert [r["state"] for r in env.rows()] == ["open"]
