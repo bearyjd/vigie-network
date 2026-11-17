@@ -337,6 +337,12 @@ assert.match(text(fresh), /New device/); assert.doesNotMatch(text(fresh), /0 B/,
 const panel = text(views.incidentView({...inc('n1', {detector: 'new_device', observed_bytes: 0, threshold_bytes: 0}), evidence: {reason_code: 'new_device_first_seen', randomized: false, dwell_hours: 3}}, () => {}));
 assert.match(panel, /New device/); assert.match(panel, /Hours present when noticed/); assert.match(panel, /new_device_first_seen/);
 assert.doesNotMatch(panel, /Observed upload|Threshold|No mature baseline/, 'a new device panel carries no upload facts');
+// F6-b: an essential_absence incident has its own label, no byte counts and its own facts.
+const absent = render([inc('e1', {detector: 'essential_absence', observed_bytes: 0, threshold_bytes: 0})]);
+assert.match(text(absent), /Essential device not seen/); assert.doesNotMatch(text(absent), /0 B/, 'no upload byte counts for an absence');
+const absentPanel = text(views.incidentView({...inc('e1', {detector: 'essential_absence', observed_bytes: 0, threshold_bytes: 0}), evidence: {reason_code: 'essential_absent', absent_for_hours: 30, threshold_hours: 24}}, () => {}));
+assert.match(absentPanel, /Essential device not seen/); assert.match(absentPanel, /Hours not seen/); assert.match(absentPanel, /essential_absent/); assert.match(absentPanel, /30/);
+assert.doesNotMatch(absentPanel, /Observed upload|No mature baseline|Hours present when noticed/, 'an absence panel carries no upload or new-device facts');
 // XSS: hostile strings are inert text; only the expected tags exist
 const hostile = render([inc('<img src=x onerror=alert(1)>', {detector: '</script><script>alert(1)</script>', device_id: '<img onerror=alert(2)>', review: {status: '<b onmouseover=x>'}})]);
 const tags = new Set(); (function walk(el) { tags.add(el.tag); el.children.forEach(c => c instanceof FakeElement && walk(c)); })(hostile);

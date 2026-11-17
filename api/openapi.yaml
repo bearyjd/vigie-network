@@ -1251,6 +1251,47 @@
         "title": "ErrorEnvelope",
         "type": "object"
       },
+      "EssentialAbsenceEvidence": {
+        "description": "Evidence of an `essential_absence` incident: no MAC, hostname, vendor or IP, ever.",
+        "properties": {
+          "absent_for_hours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Eligible (collector-visible) hours the device was not seen; null if the stored value is not a plausible count.",
+            "title": "Absent For Hours"
+          },
+          "reason_code": {
+            "const": "essential_absent",
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "threshold_hours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner's threshold in whole hours (rounded up); null if implausible.",
+            "title": "Threshold Hours"
+          }
+        },
+        "required": [
+          "reason_code",
+          "absent_for_hours",
+          "threshold_hours"
+        ],
+        "title": "EssentialAbsenceEvidence",
+        "type": "object"
+      },
       "EssentialListItem": {
         "properties": {
           "absent_after_s": {
@@ -2092,7 +2133,8 @@
             "enum": [
               "large_upload",
               "upload_deviation",
-              "new_device"
+              "new_device",
+              "essential_absence"
             ],
             "title": "Detector",
             "type": "string"
@@ -2112,6 +2154,9 @@
               },
               {
                 "$ref": "#/components/schemas/NewDeviceEvidence"
+              },
+              {
+                "$ref": "#/components/schemas/EssentialAbsenceEvidence"
               }
             ],
             "title": "Evidence"

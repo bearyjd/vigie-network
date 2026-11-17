@@ -558,13 +558,43 @@ def new_device_evidence(raw: Any) -> dict[str, Any]:
     }
 
 
+ESSENTIAL_MAX_HOURS = 10**6
+
+
+class EssentialAbsenceEvidence(BaseModel):
+    "Evidence of an `essential_absence` incident: no MAC, hostname, vendor or IP, ever."
+
+    reason_code: Literal["essential_absent"]
+    absent_for_hours: int | None = Field(
+        description="Eligible (collector-visible) hours the device was not seen; null if the "
+        "stored value is not a plausible count."
+    )
+    threshold_hours: int | None = Field(
+        description="The owner's threshold in whole hours (rounded up); null if implausible."
+    )
+
+
+def _hours(value: Any) -> int | None:
+    return value if type(value) is int and 0 < value < ESSENTIAL_MAX_HOURS else None
+
+
+def essential_absence_evidence(raw: Any) -> dict[str, Any]:
+    """The only shape an `essential_absence` incident may expose; extras and bad values drop."""
+    get = raw.get if isinstance(raw, dict) else (lambda _k: None)
+    return {
+        "reason_code": "essential_absent",
+        "absent_for_hours": _hours(get("absent_for_hours")),
+        "threshold_hours": _hours(get("threshold_hours")),
+    }
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
     device_id: str
     lineage: str
     current_lineage: bool
-    detector: Literal["large_upload", "upload_deviation", "new_device"]
+    detector: Literal["large_upload", "upload_deviation", "new_device", "essential_absence"]
     state: Literal["open", "resolved", "superseded"]
     episode_start: int
     last_hour: int
@@ -572,7 +602,7 @@ class IncidentOut(BaseModel):
     observed_bytes: int
     threshold_bytes: int
     baseline_id: str | None
-    evidence: IncidentEvidence | NewDeviceEvidence
+    evidence: IncidentEvidence | NewDeviceEvidence | EssentialAbsenceEvidence
     review: IncidentReview | None = Field(
         description="Current human decision, or null. A separate axis from `state`: `expected` "
         "is a per-incident label, not a suppression."

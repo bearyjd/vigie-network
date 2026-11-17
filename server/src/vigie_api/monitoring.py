@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
-from vigie_api.models import new_device_evidence
+from vigie_api.models import essential_absence_evidence, new_device_evidence
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -340,14 +340,17 @@ def baseline_view(inv, collector, device, key):
     }
 
 
+_SANITISED = {"new_device": new_device_evidence, "essential_absence": essential_absence_evidence}
+
+
 def _evidence(detector, stored):
-    if detector != "new_device":
+    if detector not in _SANITISED:
         return json.loads(stored)
     try:
         parsed = json.loads(stored)
-    except (ValueError, RecursionError):  # malformed stored text: serve the null-dwell shape
+    except (ValueError, RecursionError):  # malformed stored text: serve the null-count shape
         parsed = None
-    return new_device_evidence(parsed)
+    return _SANITISED[detector](parsed)
 
 
 def incident_row(inv, ov, row, review, now):

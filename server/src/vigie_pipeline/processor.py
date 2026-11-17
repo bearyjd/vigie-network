@@ -22,6 +22,7 @@ from vigie_pipeline.characterization_store import (
 )
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.delivery_wiring import run_delivery_stage
+from vigie_pipeline.essential_absence import sweep_essential_absence
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
@@ -76,6 +77,9 @@ def run_once(
         promoted, retired = sweep_transients(inv, clock, config)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
+        # F6-b, default off. Not after a failed shard read: a stale view must not page "absent"
+        if config.essential_absence and usable and not failures:
+            sweep_essential_absence(inv, overrides, clock)
         purge_activity(inv, clock, config.activity_retention_s)
         if usable:
             analyze_monitoring(inv, overrides, monitoring_policy(config), clock)

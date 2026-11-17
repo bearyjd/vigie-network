@@ -252,6 +252,8 @@ class PipelineConfig:
     new_device_notice: bool = False
     new_device_max_per_day: int = NEW_DEVICE_MAX_PER_DAY_DEFAULT
     pass_interval_s: int = PASS_INTERVAL_DEFAULT_S  # set from --loop; F5 derives its resume gap
+    # F6-b essential-device absence (docs/monitoring.md). DEFAULT OFF; in no policy dataclass.
+    essential_absence: bool = False
 
     def __post_init__(self) -> None:
         if type(self.new_device_max_per_day) is not int or not (
@@ -317,4 +319,5 @@ class PipelineConfig:
             probes=ProbeSettings.from_env(source),
             new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
             new_device_max_per_day=_env_cap(source),
+            essential_absence=_env_flag(source, "VIGIE_ESSENTIAL_ABSENCE"),
         )
