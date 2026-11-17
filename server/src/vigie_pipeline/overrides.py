@@ -45,6 +45,27 @@ def link_revocations_supported(conn: sqlite3.Connection) -> bool:
     return "revoked_at" in columns
 
 
+def read_decisions(conn: sqlite3.Connection) -> list[tuple[str, str, float | None]]:
+    """(incident_id, status, snooze_until) for every owner decision. Sole reader of the
+    API-owned incident_decisions table; sqlite3.Error propagates to the caller."""
+    rows = conn.execute("SELECT incident_id,status,snooze_until FROM incident_decisions")
+    return [(r[0], r[1], r[2]) for r in rows.fetchall()]
+
+
+def decided_incident_ids(
+    conn: sqlite3.Connection, incident_ids: list[str], statuses: tuple[str, ...]
+) -> list[str]:
+    """Ids among incident_ids whose decision status is in statuses (sqlite3.Error propagates)."""
+    status_marks = ",".join("?" * len(statuses))
+    id_marks = ",".join("?" * len(incident_ids))
+    rows = conn.execute(
+        f"SELECT incident_id FROM incident_decisions WHERE status IN ({status_marks})"  # noqa: S608
+        f" AND incident_id IN ({id_marks})",
+        (*statuses, *incident_ids),
+    )
+    return [r[0] for r in rows]
+
+
 def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
     """Follow identity_links (from_device -> into_device) to the canonical device.
     Links are flattened on merge, but a bounded walk also tolerates chains and cycles."""

@@ -78,6 +78,7 @@ from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.config import ACTIVITY_SKEW_S, PipelineConfig
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
+from vigie_pipeline.overrides import decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
@@ -534,17 +535,8 @@ def _close_reviewed(inv: sqlite3.Connection, ov: sqlite3.Connection | None) -> i
         if not batch:
             return 0
         ids = [r[1] for r in batch]
-        marks = ",".join("?" * len(ids))
-        quiet = ",".join("?" * len(QUIET))
         try:
-            reviewed = [
-                r[0]
-                for r in ov.execute(
-                    f"SELECT incident_id FROM incident_decisions WHERE status IN ({quiet})"  # noqa: S608
-                    f" AND incident_id IN ({marks})",
-                    (*QUIET, *ids),
-                )
-            ]
+            reviewed = decided_incident_ids(ov, ids, QUIET)
         except sqlite3.Error as exc:
             log(logger, logging.ERROR, "new_device_close_failed", error=type(exc).__name__)
             return 0
