@@ -19,7 +19,9 @@ see `docs/monitoring.md`).
   in >= 2 distinct server hours (`batches.received_at`) and its first-to-last-seen dwell is >= the
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
-  window; a retired device seen again returns to transient (`device_reappeared`).
+  window; a retired device seen again returns to transient (`device_reappeared`). Self-linked MAC
+  rows of retired devices unseen for 90 days are pruned (`observations`; cumulative count in
+  `pipeline_meta.retired_mac_rows_pruned`); the device row stays.
 - `dhcp_fingerprint` / `vendor_class` are first-wins. A differing value for the same MAC is not
   stored; the device is set to `identity_state='conflict'` and one `identity_conflict` event per
   (device, field) per day is emitted (short hashes only). Hostnames may change freely.
@@ -90,9 +92,6 @@ IMMEDIATE` APPLY that re-reads `overrides.db` and re-validates every decision be
   `stitching_skipped`. Hostnames, fingerprints and MACs appear only as short hashes.
 
 ## Known gaps
-- 90-day pruning/aggregation of retired transient MAC rows (PRP section 8 housekeeping) is NOT
-  implemented; see the strict-xfail test `test_retired_transient_mac_rows_are_pruned_after_90_days`.
-  `observations` and `transient_*` rows grow until it lands.
 - Ingest owns `devices`/`observations`/`collectors`/`batches`; the pipeline verifies their schema
   version and refuses to run (or to downgrade) unless `--migrate` is given.
 - Identity stitching does not yet include behavioural demotion (needs the features stage) and

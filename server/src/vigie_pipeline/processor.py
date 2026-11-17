@@ -20,7 +20,7 @@ from vigie_pipeline.characterization_store import (
     refresh_characterization,
     save_services,
 )
-from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.config import PRUNE_BATCH_ROWS, RETIRED_MAC_RETENTION_S, PipelineConfig
 from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
@@ -74,6 +74,7 @@ def run_once(
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
+        prune_retired_macs(inv, clock)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -409,6 +410,26 @@ def sweep_transients(
                 " (SELECT id FROM devices WHERE status<>'transient')"
             )
     return promoted, retired
+
+
+def prune_retired_macs(inv: sqlite3.Connection, now: float) -> int:
+    """Drop self-linked MAC rows of retired devices unseen for 90 days (PRP section 8). One
+    bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
+    are never deleted; a pruned MAC that returns starts over as a new transient."""
+    with immediate(inv):
+        pruned = inv.execute(
+            "DELETE FROM observations WHERE mac IN (SELECT o.mac FROM observations o"
+            " JOIN devices d ON d.id=o.device_id WHERE d.status='retired'"
+            " AND o.link_source='self' AND o.last_seen<? ORDER BY o.last_seen LIMIT ?)",
+            (iso_utc(now - RETIRED_MAC_RETENTION_S), PRUNE_BATCH_ROWS),
+        ).rowcount
+        if pruned:
+            inv.execute(
+                "INSERT INTO pipeline_meta (key, value) VALUES ('retired_mac_rows_pruned', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
+                (str(pruned), pruned),
+            )
+    return pruned
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:
