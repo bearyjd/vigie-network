@@ -12,6 +12,7 @@ from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_api.models import new_device_evidence
+from vigie_pipeline.detectors import NEW_DEVICE
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -341,7 +342,7 @@ def baseline_view(inv, collector, device, key):
 
 
 def _evidence(detector, stored):
-    if detector != "new_device":
+    if detector != NEW_DEVICE:
         return json.loads(stored)
     try:
         parsed = json.loads(stored)
