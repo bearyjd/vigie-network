@@ -76,13 +76,14 @@ import uuid
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.config import ACTIVITY_SKEW_S, PipelineConfig
+from vigie_pipeline.detectors import NEW_DEVICE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
 from vigie_pipeline.overrides import decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
-DETECTOR = "new_device"
+DETECTOR = NEW_DEVICE
 SWEEP_MAX = 20  # devices handled per run
 FETCH_MAX = 200  # candidates read and hold-stamped per run
 CLOSE_MAX = 200  # open incidents examined per run for an owner decision (cursor-rotated)
