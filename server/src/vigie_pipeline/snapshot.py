@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from functools import cached_property
 
 from vigie_pipeline.logs import log
-from vigie_pipeline.overrides import link_revocations_supported
+from vigie_pipeline.overrides import links_select_sql
 
 logger = logging.getLogger("vigie_pipeline")
 OPT55_RE = re.compile(r"[0-9]+(,[0-9]+)*")
@@ -235,16 +235,11 @@ def _read(conn: sqlite3.Connection, now: float) -> Snapshot:
         if identity_version is None
         else None
     )
-    links_query = (
-        "SELECT from_device, into_device FROM identity_links WHERE revoked_at IS NULL"
-        if link_revocations_supported(conn)
-        else "SELECT from_device, into_device FROM identity_links"
-    )
     links = {
         _str(r["from_device"], "identity_links.from_device"): _str(
             r["into_device"], "identity_links.into_device"
         )
-        for r in _rows(conn, links_query)
+        for r in _rows(conn, links_select_sql(conn))
     }
     rules, malformed, bad_devices, unknown = [], 0, set(), False
     for row in _rows(
