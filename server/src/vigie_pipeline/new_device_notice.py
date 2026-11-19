@@ -79,7 +79,7 @@ from vigie_pipeline.config import ACTIVITY_SKEW_S, PipelineConfig
 from vigie_pipeline.detectors import NEW_DEVICE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
-from vigie_pipeline.overrides import decided_incident_ids
+from vigie_pipeline.overrides import QUIET_STATUSES, decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
@@ -105,7 +105,6 @@ SKIPPED = "f5_skipped:"  # + device id; value = "<ISO> <reason>"; permanent
 RETRY = "f5_retry:"  # + device id; value = "<failures>|<retry after, epoch>"
 ELIGIBLE = "f5_eligible:"  # + device id; value = epoch of the first pass it was a candidate
 DROPPED = "f5_dropped:"  # + UTC day; value = stale drops that day (older days are cleaned)
-QUIET = ("acknowledged", "expected")  # incident_decisions.status values that close the incident
 
 _SELECT = (
     "SELECT d.id AS id, o.mac AS mac, mf.received AS received,"  # noqa: S608
@@ -537,7 +536,7 @@ def _close_reviewed(inv: sqlite3.Connection, ov: sqlite3.Connection | None) -> i
             return 0
         ids = [r[1] for r in batch]
         try:
-            reviewed = decided_incident_ids(ov, ids, QUIET)
+            reviewed = decided_incident_ids(ov, ids, QUIET_STATUSES)
         except sqlite3.Error as exc:
             log(logger, logging.ERROR, "new_device_close_failed", error=type(exc).__name__)
             return 0

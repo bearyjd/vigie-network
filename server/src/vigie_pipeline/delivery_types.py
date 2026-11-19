@@ -16,7 +16,6 @@ DEFAULT_DETECTORS = ENGINE
 OPEN_ONLY_DETECTORS = OPEN_ONLY  # announced once on open; never a "back to normal" send
 STATES = frozenset({"pending", "sending", "sent", "failed", "suppressed", "expired", "withdrawn"})
 TERMINAL = frozenset({"sent", "failed", "suppressed", "expired", "withdrawn"})
-QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 CLOSED_STATES = frozenset({"resolved", "superseded"})
 UNRECOGNISED = "unrecognised_state"
 

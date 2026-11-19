@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
 MAX_LINK_DEPTH = 32
+# Review statuses that quiet an incident; a pinned mirror of vigie_api.incident_decisions.
+QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 logger = logging.getLogger("vigie_pipeline")
 
 
@@ -53,9 +56,10 @@ def read_decisions(conn: sqlite3.Connection) -> list[tuple[str, str, float | Non
 
 
 def decided_incident_ids(
-    conn: sqlite3.Connection, incident_ids: list[str], statuses: tuple[str, ...]
+    conn: sqlite3.Connection, incident_ids: list[str], statuses: Iterable[str]
 ) -> list[str]:
     """Ids among incident_ids whose decision status is in statuses (sqlite3.Error propagates)."""
+    statuses = tuple(statuses)
     status_marks = ",".join("?" * len(statuses))
     id_marks = ",".join("?" * len(incident_ids))
     rows = conn.execute(
