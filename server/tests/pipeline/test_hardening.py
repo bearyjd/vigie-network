@@ -62,6 +62,22 @@ def test_retired_row_with_rule_link_is_kept(data):
     assert len(data.q("SELECT * FROM observations")) == 1
 
 
+def test_retired_row_with_human_link_is_kept(data):
+    _retire(data)
+    data.make_overrides()
+    dev = data.q("SELECT id FROM devices")[0][0]
+    ov = sqlite3.connect(data.root / "overrides.db")
+    ov.execute(
+        "INSERT INTO identity_links (from_device, into_device, merge_id, created_at, created_by)"
+        " VALUES (?, 'known-device', 'm1', 't', 'op')",
+        (dev,),
+    )
+    ov.commit()
+    ov.close()
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * DAY)
+    assert len(data.q("SELECT * FROM observations")) == 1
+
+
 def test_non_retired_rows_are_never_pruned(data):
     _retire(data)
     data.q("UPDATE devices SET status='active'")

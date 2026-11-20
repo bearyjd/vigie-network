@@ -73,7 +73,9 @@ def run_once(
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
-        promoted, retired = sweep_transients(inv, clock, config)
+        promoted, retired = sweep_transients(
+            inv, clock, config, overrides if usable else None, prune=usable
+        )
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -389,7 +391,11 @@ def _record_hours(inv: sqlite3.Connection, device_id: str, received: str) -> Non
 
 
 def sweep_transients(
-    inv: sqlite3.Connection, now: float, config: PipelineConfig
+    inv: sqlite3.Connection,
+    now: float,
+    config: PipelineConfig,
+    overrides: sqlite3.Connection | None = None,
+    prune: bool = True,
 ) -> tuple[int, int]:
     """Promote transients seen in >=2 server-received hours with >= min dwell between first and
     last seen, at most `promotion_cap_per_hour` per server hour; retire the rest once the window
@@ -408,17 +414,39 @@ def sweep_transients(
                 f"DELETE FROM {table} WHERE device_id IN"  # noqa: S608
                 " (SELECT id FROM devices WHERE status<>'transient')"
             )
-        prune_retired_observations(inv, now, config)
+        if prune:  # unreadable overrides: human links unknown, never infer them absent
+            prune_retired_observations(inv, now, config, _human_linked(overrides))
     return promoted, retired
 
 
-def prune_retired_observations(inv: sqlite3.Connection, now: float, config: PipelineConfig) -> int:
+def _human_linked(overrides: sqlite3.Connection | None) -> set[str]:
+    """Device ids on either side of a human merge (overrides.db identity_links)."""
+    if overrides is None:
+        return set()
+    return {
+        r[0]
+        for r in overrides.execute(
+            "SELECT from_device FROM identity_links UNION SELECT into_device FROM identity_links"
+        )
+    }
+
+
+def prune_retired_observations(
+    inv: sqlite3.Connection,
+    now: float,
+    config: PipelineConfig,
+    protected: frozenset[str] | set[str] = frozenset(),
+) -> int:
     """Delete observations of retired devices last seen before the retention window, unless a rule
-    or human link is attached. Device rows are kept (no_device_delete); mac_activity has its own
+    link is attached or the device is in `protected` (human-merged). Device rows are kept (no_device_delete); mac_activity has its own
     purge. Caller holds the write transaction. Idempotent."""
+    inv.execute("CREATE TEMP TABLE IF NOT EXISTS _prune_protected (id TEXT PRIMARY KEY)")
+    inv.execute("DELETE FROM _prune_protected")
+    inv.executemany("INSERT OR IGNORE INTO _prune_protected VALUES (?)", [(d,) for d in protected])
     return inv.execute(
         "DELETE FROM observations WHERE link_source='self' AND link_rule_id IS NULL"
-        " AND last_seen < ? AND device_id IN (SELECT id FROM devices WHERE status='retired')",
+        " AND last_seen < ? AND device_id IN (SELECT id FROM devices WHERE status='retired')"
+        " AND device_id NOT IN (SELECT id FROM _prune_protected)",
         (iso_utc(now - config.retired_retention_s),),
     ).rowcount
 

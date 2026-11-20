@@ -91,7 +91,7 @@ IMMEDIATE` APPLY that re-reads `overrides.db` and re-validates every decision be
 
 ## Known gaps
 - Retired transient MAC rows are pruned from `observations` after `VIGIE_RETIRED_RETENTION_S`
-  (default 90 days since `last_seen`; rule/human-linked rows kept; `devices` rows are never
+  (default 90 days since `last_seen`; rule-linked and human-merged (identity_links) rows kept; pruning skipped if overrides.db unreadable; `devices` rows are never
   deleted). No aggregation of pruned rows is kept.
 - Ingest owns `devices`/`observations`/`collectors`/`batches`; the pipeline verifies their schema
   version and refuses to run (or to downgrade) unless `--migrate` is given.
