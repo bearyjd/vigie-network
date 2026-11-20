@@ -11,7 +11,7 @@ from pipeline_helpers import T0, Data, data  # noqa: F401
 
 from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_ingest.db import iso_utc
-from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import RETIRED_MAC_RETENTION_S, PipelineConfig
 from vigie_pipeline.processor import prune_retired_macs, run_once
 
@@ -65,7 +65,7 @@ def prune(data: Data, now: float = LATER) -> int:
 
 def counter(data: Data) -> str:
     sql_ = "SELECT value FROM pipeline_meta WHERE key=?"
-    return data.q(sql_, processor.PRUNED_COUNTER_KEY)[0][0]
+    return data.q(sql_, prune_module.PRUNED_COUNTER_KEY)[0][0]
 
 
 def rows(data: Data) -> int:
@@ -146,8 +146,8 @@ def test_an_exclusively_locked_overrides_db_prunes_nothing(data, monkeypatch):
     retire(data)
     path = migrated_overrides(data.root)
     sql(path, "PRAGMA journal_mode=DELETE")
-    real = processor.open_overrides_ro
-    monkeypatch.setattr(processor, "open_overrides_ro", lambda p: real(p, timeout=0.05))
+    real = prune_module.open_overrides_ro
+    monkeypatch.setattr(prune_module, "open_overrides_ro", lambda p: real(p, timeout=0.05))
     writer = sqlite3.connect(path, isolation_level=None)
     writer.execute("BEGIN EXCLUSIVE")
     try:
@@ -247,7 +247,7 @@ def test_a_recent_last_seen_keeps_a_row_whose_retirement_stamp_is_old(data):
 def test_the_running_total_adds_up_across_pruning_passes(data, monkeypatch):
     retire(data, count=3)
     migrated_overrides(data.root)
-    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 2)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 2)
     assert prune(data) == 2
     assert counter(data) == "2"
     assert prune(data) == 1
@@ -266,7 +266,7 @@ def test_the_retention_boundary_is_exclusive(data):
 def test_one_pass_prunes_at_most_the_batch_cap(data, monkeypatch):
     retire(data, count=2)
     migrated_overrides(data.root)
-    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 1)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 1)
     assert prune(data) == 1
     assert rows(data) == 1
     assert counter(data) == "1"

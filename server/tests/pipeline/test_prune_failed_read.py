@@ -12,6 +12,7 @@ from test_prune_guards import LATER, migrated_overrides, retire, rows
 
 from vigie_ingest.db import connect, shard_name, utc_day
 from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.sources import ShardReadError
 
@@ -65,7 +66,7 @@ def test_a_busy_database_during_the_prune_skips_it_and_delivery_still_runs(
     def busy(*args):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(processor, "_prune_candidates", busy)
+    monkeypatch.setattr(prune_module, "_prune_candidates", busy)
     monkeypatch.setattr(processor, "run_delivery_stage", lambda *a, **k: delivered.append(1))
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="vigie_pipeline"):

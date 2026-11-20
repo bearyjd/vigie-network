@@ -7,7 +7,7 @@ import pytest
 from pipeline_helpers import data  # noqa: F401
 from test_prune_guards import LATER, migrated_overrides, prune, retire, rows
 
-from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.processor import run_once
 
@@ -92,7 +92,7 @@ def test_a_candidate_that_stopped_being_prunable_before_the_lock_keeps_row_and_i
     ((mac, _),) = retire(data).items()
     seed_last_ip(data, mac)
     migrated_overrides(data.root)
-    select = processor._prune_candidates
+    select = prune_module._prune_candidates
 
     def select_then_change(*args):
         found = select(*args)
@@ -100,7 +100,7 @@ def test_a_candidate_that_stopped_being_prunable_before_the_lock_keeps_row_and_i
         data.inv.execute("UPDATE observations SET link_source='human'")  # after the select
         return found
 
-    monkeypatch.setattr(processor, "_prune_candidates", select_then_change)
+    monkeypatch.setattr(prune_module, "_prune_candidates", select_then_change)
     assert prune(data) == 0
     assert rows(data) == 1
     assert [r[0] for r in data.q("SELECT mac FROM mac_last_ip")] == [mac]

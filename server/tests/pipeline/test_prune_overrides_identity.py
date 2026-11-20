@@ -22,6 +22,7 @@ from test_prune_overrides_recheck import ESSENTIAL, commit_after_protected_read
 
 from vigie_api.schema import open_overrides
 from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.overrides import OverridesNotUsable, open_overrides_ro, protected_device_ids
 
@@ -69,14 +70,14 @@ def test_protected_device_ids_names_the_unusable_value_kind_not_its_content(data
 def test_an_overrides_db_removed_after_the_protected_read_defers(data, monkeypatch, caplog):
     retire(data)
     path = migrated_overrides(data.root)
-    real = processor.protected_device_ids
+    real = prune_module.protected_device_ids
 
     def read_then_remove(conn):
         protected = real(conn)
         path.unlink()
         return protected
 
-    monkeypatch.setattr(processor, "protected_device_ids", read_then_remove)
+    monkeypatch.setattr(prune_module, "protected_device_ids", read_then_remove)
     with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
         assert prune(data) == 0
     assert "prune_deferred" in caplog.text
@@ -88,14 +89,14 @@ def test_an_overrides_db_replaced_after_the_protected_read_defers(data, monkeypa
     path = migrated_overrides(data.root)
     spare = path.with_name("spare.db")
     open_overrides(spare).close()
-    real = processor.protected_device_ids
+    real = prune_module.protected_device_ids
 
     def read_then_replace(conn):
         protected = real(conn)
         os.replace(spare, path)  # a restored backup: a new inode under the same name
         return protected
 
-    monkeypatch.setattr(processor, "protected_device_ids", read_then_replace)
+    monkeypatch.setattr(prune_module, "protected_device_ids", read_then_replace)
     assert prune(data) == 0
     assert rows(data) == 1
 
@@ -105,13 +106,13 @@ def test_an_overrides_db_replaced_between_the_stat_and_the_open_defers(data, mon
     path = migrated_overrides(data.root)
     spare = path.with_name("spare.db")
     open_overrides(spare).close()
-    real = processor.open_overrides_ro
+    real = prune_module.open_overrides_ro
 
     def replace_then_open(target, *args, **kwargs):
         os.replace(spare, path)
         return real(target, *args, **kwargs)
 
-    monkeypatch.setattr(processor, "open_overrides_ro", replace_then_open)
+    monkeypatch.setattr(prune_module, "open_overrides_ro", replace_then_open)
     assert prune(data) == 0
     assert rows(data) == 1
 

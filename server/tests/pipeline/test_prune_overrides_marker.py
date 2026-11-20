@@ -19,7 +19,7 @@ from test_prune_guards import (
 )
 
 from vigie_api.schema import open_overrides
-from vigie_pipeline.processor import OVERRIDES_SEEN_KEY
+from vigie_pipeline.prune import OVERRIDES_SEEN_KEY
 
 
 @pytest.fixture(autouse=True)

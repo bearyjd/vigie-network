@@ -25,6 +25,7 @@ from test_prune_guards import (
 
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.processor import run_once, sweep_transients
 
@@ -139,7 +140,7 @@ def test_a_protected_oldest_device_cannot_starve_the_batch(data, monkeypatch):
     data.inv.execute(  # the protected device has the oldest retirement: first in line
         "UPDATE transient_state SET since=? WHERE device_id=?", (iso_utc(T0), macs[protected])
     )
-    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 1)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 1)
     assert prune(data, LATER) == 1
     assert [r[0] for r in data.q("SELECT mac FROM observations")] == [protected]
 
@@ -226,6 +227,6 @@ def test_the_oldest_retirement_goes_first_under_the_cap(data, monkeypatch):
     data.inv.execute(
         "UPDATE transient_state SET since=? WHERE device_id=?", (iso_utc(T0), macs[second])
     )
-    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 1)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 1)
     assert prune(data, LATER) == 1
     assert [r["mac"] for r in data.q("SELECT mac FROM observations")] == [first]

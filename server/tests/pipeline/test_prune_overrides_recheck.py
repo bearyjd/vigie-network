@@ -11,6 +11,7 @@ from pipeline_helpers import data  # noqa: F401
 from test_prune_guards import LATER, STAMP, migrated_overrides, prune, retire, rows
 
 from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 
 ESSENTIAL = (
     "INSERT INTO essential_devices (device_id, updated_at, updated_by, version)"
@@ -28,7 +29,7 @@ def _visible_pipeline_log(monkeypatch):
 
 def commit_after_protected_read(monkeypatch, path, statement, device_id):
     """Seam: a second connection commits right after the protected set was read."""
-    real = processor.protected_device_ids
+    real = prune_module.protected_device_ids
 
     def read_then_race(conn):
         protected = real(conn)
@@ -38,7 +39,7 @@ def commit_after_protected_read(monkeypatch, path, statement, device_id):
         writer.close()
         return protected
 
-    monkeypatch.setattr(processor, "protected_device_ids", read_then_race)
+    monkeypatch.setattr(prune_module, "protected_device_ids", read_then_race)
 
 
 @pytest.mark.parametrize("statement", [ESSENTIAL, NAME], ids=["essential_mark", "device_name"])
@@ -51,7 +52,7 @@ def test_a_decision_committed_mid_prune_defers_it(data, monkeypatch, caplog, sta
     assert rows(data) == 1
     assert "prune_deferred" in caplog.text
     assert not any(mac in caplog.text for mac in macs)
-    assert data.q("SELECT 1 FROM pipeline_meta WHERE key=?", processor.PRUNED_COUNTER_KEY) == []
+    assert data.q("SELECT 1 FROM pipeline_meta WHERE key=?", prune_module.PRUNED_COUNTER_KEY) == []
 
 
 def test_the_next_pass_sees_the_decision_and_still_protects_the_row(data, monkeypatch):
@@ -73,7 +74,7 @@ def test_an_untouched_overrides_db_still_prunes(data):
 def test_a_re_check_that_cannot_read_overrides_defers_the_prune(data, monkeypatch):
     retire(data)
     migrated_overrides(data.root)
-    real = processor.overrides_data_version
+    real = prune_module.overrides_data_version
     calls = []
 
     def second_read_fails(conn):
@@ -82,7 +83,44 @@ def test_a_re_check_that_cannot_read_overrides_defers_the_prune(data, monkeypatc
             raise sqlite3.OperationalError("database is locked")
         return real(conn)
 
-    monkeypatch.setattr(processor, "overrides_data_version", second_read_fails)
+    monkeypatch.setattr(prune_module, "overrides_data_version", second_read_fails)
     assert prune(data, LATER) == 0
     assert len(calls) == 2
     assert rows(data) == 1
+
+
+def test_the_names_the_race_tests_patch_are_the_ones_the_prune_calls(data, monkeypatch):
+    """A patch that lands on a module the prune does not read from would silently do nothing, and
+    every injected-race test above would pass for nothing."""
+    retire(data)
+    migrated_overrides(data.root)
+    called = []
+    for name in ("open_overrides_ro", "overrides_data_version", "protected_device_ids"):
+        real = getattr(prune_module, name)
+
+        def spy(*args, _name=name, _real=real, **kwargs):
+            called.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(prune_module, name, spy)
+    select = prune_module._prune_candidates
+
+    def spy_select(*args):
+        called.append("_prune_candidates")
+        return select(*args)
+
+    monkeypatch.setattr(prune_module, "_prune_candidates", spy_select)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 0)  # the cap is read from this module
+    assert prune(data) == 0
+    assert set(called) == {
+        "open_overrides_ro",
+        "overrides_data_version",
+        "protected_device_ids",
+        "_prune_candidates",
+    }
+    assert rows(data) == 1  # the zero cap held: the patched constant is the one in effect
+
+
+def test_the_processor_no_longer_exposes_the_names_the_prune_reads_through():
+    for name in ("protected_device_ids", "overrides_data_version", "PRUNE_BATCH_ROWS"):
+        assert not hasattr(processor, name), name  # a stale patch on processor fails loudly

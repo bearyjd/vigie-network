@@ -14,7 +14,7 @@ from test_prune_guards import LATER, STAMP, migrated_overrides, prune, retire, r
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import prune_exclusions
 from vigie_pipeline.overrides import OverridesNotUsable, decided_suggestion_ids, open_overrides_ro
-from vigie_pipeline.processor import OVERRIDES_SEEN_KEY
+from vigie_pipeline.prune import OVERRIDES_SEEN_KEY
 
 DECIDE = (
     "INSERT INTO suggestion_decisions (suggestion_id, state, decided_by, decided_at)"
