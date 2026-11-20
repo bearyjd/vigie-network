@@ -49,7 +49,7 @@ def overrides_uri(path: Path) -> str:
     return f"file:{quote(str(path.resolve()))}?mode=ro"
 
 
-def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
+def open_overrides_ro(path: Path, timeout: float = 5.0) -> sqlite3.Connection | None:
     """Open overrides.db with mode=ro (URI) plus query_only.
 
     Returns None when there is nothing usable: the file does not exist yet, or it cannot be read
@@ -60,7 +60,7 @@ def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
     try:
-        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=5.0)
+        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # really readable?
@@ -182,4 +182,20 @@ def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     missing = [t for t in PROTECTED_TABLES if t not in tables]
     if missing:
         raise OverridesNotUsable(f"overrides.db lacks table(s): {', '.join(missing)}")
-    return {str(value) for sql in PROTECTED_READS for row in conn.execute(sql) for value in row}
+    values = [value for sql in PROTECTED_READS for row in conn.execute(sql) for value in row]
+    if not all(isinstance(value, str) and value for value in values):
+        # str(b"..") or str(7) would name an id that never matches a device: a protection that
+        # silently protects nothing. Say what kind of value, never its content.
+        raise OverridesNotUsable("overrides.db holds a device id that is not non-empty text")
+    return set(values)
+
+
+def overrides_identity(path: Path) -> tuple[int, int]:
+    """(st_dev, st_ino) of the file at `path`: a removed or replaced overrides.db (a restored
+    backup, a recreated file) is a different file than the one a connection reads."""
+    try:
+        info = path.stat()
+    except OSError as exc:
+        reason = type(exc).__name__
+        raise OverridesNotUsable(f"overrides.db cannot be inspected ({reason})") from exc
+    return (info.st_dev, info.st_ino)

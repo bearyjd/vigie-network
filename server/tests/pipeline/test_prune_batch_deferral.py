@@ -13,7 +13,6 @@ from test_prune_guards import FRONTIER, LATER, RETIRED_AT, migrated_overrides, r
 from vigie_ingest.db import connect, iso_utc, shard_name, utc_day
 from vigie_pipeline import processor
 from vigie_pipeline.config import PipelineConfig
-from vigie_pipeline.overrides import open_overrides_ro
 from vigie_pipeline.sources import ShardReadError
 
 
@@ -199,19 +198,15 @@ def test_a_purged_mark_row_defers_even_when_every_cursor_is_intact(data, monkeyp
 def test_the_batch_mark_is_a_required_argument(data):
     retire(data)
     migrated_overrides(data.root)
-    conn = open_overrides_ro(data.root / "overrides.db")
     with pytest.raises(TypeError):
-        processor.prune_retired_macs(data.inv, conn, LATER)  # type: ignore[call-arg]
-    conn.close()
+        processor.prune_retired_macs(data.inv, data.root / "overrides.db", LATER)  # type: ignore[call-arg]
     assert rows(data) == 1
 
 
 def test_a_none_mark_defers(data):
     retire(data)
     migrated_overrides(data.root)
-    conn = open_overrides_ro(data.root / "overrides.db")
-    assert processor.prune_retired_macs(data.inv, conn, LATER, None) == 0
-    conn.close()
+    assert processor.prune_retired_macs(data.inv, data.root / "overrides.db", LATER, None) == 0
     assert rows(data) == 1
 
 

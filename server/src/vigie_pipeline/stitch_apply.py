@@ -14,7 +14,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 
-from vigie_ingest.db import immediate
+from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.config import (
     CLEANUP_ROWS_SHARE,
     MAX_ATTACHES_PER_PASS,
@@ -366,11 +366,17 @@ class Applier:
             " WHERE id=?",
             (d.from_device, d.from_device, d.target),
         )
-        self.inv.execute(  # the orphaned self device is retired (never deleted)
+        retired = self.inv.execute(  # the orphaned self device is retired (never deleted)
             "UPDATE devices SET status='retired' WHERE id=? AND NOT EXISTS"
             " (SELECT 1 FROM observations WHERE device_id=?)",
             (d.from_device, d.from_device),
-        )
+        ).rowcount
+        if retired:  # the prune's clock starts when the status does, whatever stamp it carried
+            self.inv.execute(
+                "INSERT INTO transient_state (device_id, since) VALUES (?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET since=excluded.since",
+                (d.from_device, iso_utc(self.at)),
+            )
         # settled by the rule: its open suggestions are expired and its candidate rows dismissed
         # under the remaining row cap, the rest on later passes (Settle)
         self._cleanup(d.from_device)

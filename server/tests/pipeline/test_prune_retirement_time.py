@@ -95,6 +95,7 @@ def test_a_legacy_retired_device_without_a_stamp_is_not_prunable_until_90_days_a
     (device,) = retire(data).values()
     migrated_overrides(data.root)
     data.inv.execute("DELETE FROM transient_state")  # retired before the stamp existed
+    data.inv.execute("DELETE FROM stitch_state WHERE key=?", (processor.BACKFILL_KEY,))
     assert prune(data, LATER) == 0  # no stamp: not old
     sweep_transients(data.inv, LATER, CONFIG)
     assert stamp(data) == [(device, iso_utc(LATER))]
@@ -237,3 +238,40 @@ def test_a_collector_is_judged_by_its_newest_batch_not_an_older_one(data):
         "UPDATE batches SET window_end=? WHERE rowid=2", (RETIRED_AT + 3600,)
     )
     assert prune(data, LATER) == 1
+
+
+def test_the_prune_lock_of_a_real_pass_never_scans_observations_devices_or_batches(
+    data, monkeypatch
+):
+    retire(data, count=3)
+    migrated_overrides(data.root)
+    windows, current = [], None
+    real_open = processor.open_pipeline_inventory
+
+    def trace(statement):
+        nonlocal current
+        if statement.startswith("BEGIN"):
+            current = []
+        elif statement.startswith(("COMMIT", "ROLLBACK")):
+            windows.append(current)
+            current = None
+        elif current is not None:
+            current.append(statement)
+
+    def traced_open(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(processor, "open_pipeline_inventory", traced_open)
+    run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    (lock,) = [w for w in windows if any("DELETE FROM observations" in s for s in w)]
+    data.inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
+    scans = []
+    for statement in lock:
+        if re.match(r"\s*(SELECT|DELETE|UPDATE|INSERT)", statement):
+            plan = data.inv.execute("EXPLAIN QUERY PLAN " + statement).fetchall()
+            scans += [r[3] for r in plan if r[3].startswith("SCAN")]
+    # only the collector set (a handful of rows) may be walked
+    assert [s for s in scans if not s.startswith("SCAN c USING COVERING INDEX")] == []
+    assert rows(data) == 0

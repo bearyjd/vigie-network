@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
@@ -32,6 +33,7 @@ from vigie_pipeline.overrides import (
     canonical_device,
     open_overrides_ro,
     overrides_data_version,
+    overrides_identity,
     protected_device_ids,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
@@ -46,7 +48,7 @@ from vigie_pipeline.sources import (
     shards_missing,
 )
 from vigie_pipeline.stitch import StitchStats, stitch
-from vigie_pipeline.stitch_db import emit_once
+from vigie_pipeline.stitch_db import emit_once, state_get, state_set
 from vigie_pipeline.stitch_types import fold
 
 logger = logging.getLogger("vigie_pipeline")
@@ -88,9 +90,12 @@ def run_once(
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
-        promoted, retired = sweep_transients(inv, clock, config)
+        promoted, retired = sweep_transients(
+            inv, clock, config, retired_at=(live or (lambda: clock))()
+        )
         if usable:  # prune_retired_macs itself fails closed on a missing/unusable overrides.db
-            prune_retired_macs(inv, overrides, clock, None if failures or gaps else mark)
+            batch_mark = None if failures or gaps else mark
+            prune_retired_macs(inv, config.overrides_path, clock, batch_mark)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -429,16 +434,18 @@ def _record_hours(inv: sqlite3.Connection, device_id: str, received: str) -> Non
 
 
 def sweep_transients(
-    inv: sqlite3.Connection, now: float, config: PipelineConfig
+    inv: sqlite3.Connection, now: float, config: PipelineConfig, retired_at: float | None = None
 ) -> tuple[int, int]:
     """Promote transients seen in >=2 server-received hours with >= min dwell between first and
     last seen, at most `promotion_cap_per_hour` per server hour; retire the rest once the window
     has elapsed since they became transient. Devices are retired, never deleted. A hostname is
-    attacker-controlled and is never a promotion signal."""
+    attacker-controlled and is never a promotion signal. `retired_at` is the server moment the
+    retirement is stamped with (default `now`): a fresh clock read, not the pass start."""
     hour = iso_utc(now)[:13]
+    stamp = iso_utc(now if retired_at is None else retired_at)
     with immediate(inv):
         promoted = _promote(inv, hour, iso_utc(now), config)
-        retired = _retire_due(inv, now, config)
+        retired = _retire_due(inv, now, stamp, config)
         inv.execute(
             "DELETE FROM transient_hours WHERE device_id IN"
             " (SELECT id FROM devices WHERE status<>'transient')"
@@ -448,15 +455,29 @@ def sweep_transients(
             "DELETE FROM transient_state WHERE device_id IN"
             " (SELECT id FROM devices WHERE status='active')"
         )
-        inv.execute(  # retired before the stamp existed: the clock starts now
-            "INSERT OR IGNORE INTO transient_state (device_id, since)"
-            " SELECT id, ? FROM devices WHERE status='retired'",
-            (iso_utc(now),),
-        )
+        _backfill_stamps(inv, stamp)
     return promoted, retired
 
 
-def _retire_due(inv: sqlite3.Connection, now: float, config: PipelineConfig) -> int:
+BACKFILL_KEY = "retired_stamp_backfilled"
+
+
+def _backfill_stamps(inv: sqlite3.Connection, stamp: str) -> None:
+    """Once per database: devices retired before the stamp existed start their clock now. Every
+    retirement since stamps itself (`_retire_due`, stitch_apply), so the devices scan never
+    repeats; an unstamped retired device is simply not prunable. The marker is a `stitch_state` row,
+    not `pipeline_meta`: that table's contents are pinned byte for byte by the freeze tests."""
+    if state_get(inv, BACKFILL_KEY) is not None:
+        return
+    inv.execute(
+        "INSERT OR IGNORE INTO transient_state (device_id, since)"
+        " SELECT id, ? FROM devices WHERE status='retired'",
+        (stamp,),
+    )
+    state_set(inv, BACKFILL_KEY, stamp)
+
+
+def _retire_due(inv: sqlite3.Connection, now: float, stamp: str, config: PipelineConfig) -> int:
     """Retire the transients whose window elapsed and stamp them with the server moment of
     retirement: transient_state.since means "since the current status began" (the prune ages a
     retired device from it; a revival rewrites it)."""
@@ -471,7 +492,7 @@ def _retire_due(inv: sqlite3.Connection, now: float, config: PipelineConfig) -> 
     inv.executemany("UPDATE devices SET status='retired' WHERE id=?", due)
     inv.executemany(
         "UPDATE transient_state SET since=? WHERE device_id=?",
-        [(iso_utc(now), device_id) for (device_id,) in due],
+        [(stamp, device_id) for (device_id,) in due],
     )
     return len(due)
 
@@ -561,9 +582,45 @@ def _batches_settled(inv: sqlite3.Connection, mark: BatchMark | None) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _OverridesRead:
+    """A dedicated read-only connection to overrides.db and what it must still show at the end:
+    the file's identity from before the open and `PRAGMA data_version` from before the read."""
+
+    conn: sqlite3.Connection
+    path: Path
+    identity: tuple[int, int]
+    version: int
+
+    def moved(self) -> bool:
+        """True when overrides.db changed or was replaced since, or cannot say (fail closed)."""
+        try:
+            return (
+                overrides_identity(self.path) != self.identity
+                or overrides_data_version(self.conn) != self.version
+            )
+        except (sqlite3.Error, OverridesNotUsable):
+            return True
+
+
+def _open_overrides_read(path: Path) -> _OverridesRead:
+    """The identity is taken BEFORE the open: a file swapped in between is seen as moved. This
+    connection is opened here for the prune alone, so no cursor an earlier stage left open on the
+    pipeline's own connection can hold its `data_version` still."""
+    identity = overrides_identity(path)
+    conn = open_overrides_ro(path)
+    if conn is None:
+        raise OverridesNotUsable("overrides.db could not be opened")
+    try:
+        return _OverridesRead(conn, path, identity, overrides_data_version(conn))
+    except BaseException:
+        conn.close()
+        raise
+
+
 def prune_retired_macs(
     inv: sqlite3.Connection,
-    overrides: sqlite3.Connection | None,
+    overrides_path: Path,
     now: float,
     batch_mark: BatchMark | None,
 ) -> int:
@@ -574,28 +631,33 @@ def prune_retired_macs(
     Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
     that overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
     pruned: human decisions live there, not in `link_source`. Fails closed: with no
-    overrides.db, or one that is unreadable, locked, of another schema version or missing a
-    table, nothing is pruned; a busy inventory skips the pass. The protected set is re-validated
-    just before COMMIT (`PRAGMA data_version`): a human decision committed meanwhile defers the
-    whole pass, which rolls back. The two databases cannot share a transaction, so a commit
-    landing after that last check and before COMMIT (microseconds) is not seen, same as
-    stitch_apply's attach. `batch_mark` is the newest batch mark taken before the pass read its
-    batches, or None when a batch was unreadable or gutted: the pass is deferred unless no batch
-    can still carry a returning MAC."""
-    try:
-        before = overrides_data_version(overrides)
-        protected = protected_device_ids(overrides)
-    except (sqlite3.Error, OverridesNotUsable) as exc:
-        log(logger, logging.ERROR, "prune_skipped", error=str(exc))
+    overrides.db (a DEBUG line: normal before the API ran) nothing is pruned, and with one that
+    is unreadable, locked, of another schema version, missing a table or holding an id that is
+    not text, an ERROR line; a busy inventory skips the pass. The protected set is read on a
+    connection of its own and re-validated just before COMMIT (the file is the same one and
+    `PRAGMA data_version` is unchanged): a human decision committed meanwhile defers the whole
+    pass, which rolls back. The two databases cannot share a transaction, so a commit landing
+    after that last check and before COMMIT (microseconds) is not seen, same as stitch_apply's
+    attach. `batch_mark` is the newest batch mark taken before the pass read its batches, or None
+    when a batch was unreadable or gutted: the pass is deferred unless no batch can still carry a
+    returning MAC."""
+    if not overrides_path.exists():
+        log(logger, logging.DEBUG, "prune_skipped", reason="overrides_missing")
         return 0
+    read = None
     try:
-        pruned = _delete_retired_rows(inv, overrides, protected, (before, batch_mark), now)
+        read = _open_overrides_read(overrides_path)
+        protected = protected_device_ids(read.conn)
+        pruned = _delete_retired_rows(inv, read, protected, batch_mark, now)
     except _PruneDeferred as exc:
         log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
         return 0
-    except sqlite3.Error as exc:  # busy or locked: the rest of the pass must still run
+    except (sqlite3.Error, OverridesNotUsable) as exc:  # busy, locked, unusable: skip the pass
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
+    finally:
+        if read is not None:
+            read.conn.close()
     if pruned:
         log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
     return pruned
@@ -603,12 +665,11 @@ def prune_retired_macs(
 
 def _delete_retired_rows(
     inv: sqlite3.Connection,
-    overrides: sqlite3.Connection | None,
+    read: _OverridesRead,
     protected: set[str],
-    checks: tuple[int, BatchMark | None],
+    batch_mark: BatchMark | None,
     now: float,
 ) -> int:
-    before, batch_mark = checks
     cutoff = _prune_cutoff(inv, now)
     if cutoff is None:
         return 0  # no accepted activity: the server clock cannot be checked, prune nothing
@@ -623,7 +684,7 @@ def _delete_retired_rows(
                 " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
                 (PRUNED_COUNTER_KEY, str(pruned), pruned),
             )
-        if _overrides_moved(overrides, before):
+        if read.moved():
             raise _OverridesMoved  # immediate() rolls the DELETEs back
     return pruned
 
@@ -706,14 +767,6 @@ def _delete_candidates(inv: sqlite3.Connection, macs: list[str], cutoff: str) ->
             inv.execute("DELETE FROM mac_last_ip WHERE mac=?", (mac,))
         pruned += deleted
     return pruned
-
-
-def _overrides_moved(overrides: sqlite3.Connection | None, before: int) -> bool:
-    """True when overrides.db changed since `before`, or cannot say (fail closed)."""
-    try:
-        return overrides_data_version(overrides) != before
-    except (sqlite3.Error, OverridesNotUsable):
-        return True
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:

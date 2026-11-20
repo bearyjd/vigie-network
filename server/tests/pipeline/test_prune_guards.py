@@ -12,7 +12,6 @@ from pipeline_helpers import T0, Data, data  # noqa: F401
 from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_pipeline import processor
 from vigie_pipeline.config import RETIRED_MAC_RETENTION_S, PipelineConfig
-from vigie_pipeline.overrides import open_overrides_ro
 from vigie_pipeline.processor import prune_retired_macs, run_once
 
 RETENTION = RETIRED_MAC_RETENTION_S
@@ -65,12 +64,8 @@ def set_frontier(data: Data, end: int | None) -> None:
 
 
 def prune(data: Data, now: float = LATER) -> int:
-    conn = open_overrides_ro(data.root / "overrides.db")
-    try:
-        return prune_retired_macs(data.inv, conn, now, processor._batch_mark(data.inv))
-    finally:
-        if conn is not None:
-            conn.close()
+    path = data.root / "overrides.db"
+    return prune_retired_macs(data.inv, path, now, processor._batch_mark(data.inv))
 
 
 def counter(data: Data) -> str:
@@ -95,7 +90,7 @@ def test_a_usable_overrides_db_lets_old_retired_rows_go(data):
 
 def test_a_missing_overrides_db_prunes_nothing(data, caplog):
     macs = retire(data)
-    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+    with caplog.at_level(logging.DEBUG, logger="vigie_pipeline"):
         assert prune(data) == 0
     assert rows(data) == 1
     assert "prune_skipped" in caplog.text
@@ -152,21 +147,19 @@ def test_an_unreadable_table_is_skipped_not_raised(data, caplog):
     assert "prune_skipped" in caplog.text
 
 
-def test_an_exclusively_locked_overrides_db_prunes_nothing(data):
+def test_an_exclusively_locked_overrides_db_prunes_nothing(data, monkeypatch):
     retire(data)
     path = migrated_overrides(data.root)
     sql(path, "PRAGMA journal_mode=DELETE")
-    reader = open_overrides_ro(path)
-    assert reader is not None
-    reader.execute("PRAGMA busy_timeout=0")
+    real = processor.open_overrides_ro
+    monkeypatch.setattr(processor, "open_overrides_ro", lambda p: real(p, timeout=0.05))
     writer = sqlite3.connect(path, isolation_level=None)
     writer.execute("BEGIN EXCLUSIVE")
     try:
-        assert prune_retired_macs(data.inv, reader, LATER, processor._batch_mark(data.inv)) == 0
+        assert prune(data) == 0
     finally:
         writer.execute("ROLLBACK")
         writer.close()
-        reader.close()
     assert rows(data) == 1
 
 
