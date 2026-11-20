@@ -54,19 +54,17 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
 
 
 def set_frontier(data: Data, end: int | None) -> None:
-    """The newest `end` in mac_activity (None: no activity at all) and every collector's newest
-    batch window end: the prune's trusted clock, with all collectors agreeing on it."""
+    """The newest `end` in mac_activity (None: no activity at all): the prune's trusted clock."""
     data.inv.execute("DELETE FROM mac_activity")
     if end is not None:
         data.inv.execute(
             'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', (NIC, 0, end)
         )
-    data.inv.execute("UPDATE batches SET window_end=?", (end,))
 
 
 def prune(data: Data, now: float = LATER) -> int:
     path = data.root / "overrides.db"
-    return prune_retired_macs(data.inv, path, now, processor._batch_mark(data.inv))
+    return prune_retired_macs(data.inv, path, now)
 
 
 def counter(data: Data) -> str:

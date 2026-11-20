@@ -276,11 +276,11 @@ def test_a_suggestion_is_live_up_to_and_including_the_trusted_clock(data, ids):
     assert prune(data, LATER) == 1
 
 
-def test_a_suggestions_liveness_is_judged_on_the_corroborated_clock_not_the_servers(data):
+def test_a_suggestions_liveness_is_judged_on_the_trusted_clock_not_the_servers(data):
     macs = retire(data)
     ((mac, device),) = macs.items()
     migrated_overrides(data.root)
-    corroborated = RETIRED_AT + RETENTION + 100  # what every collector vouches for
+    corroborated = RETIRED_AT + RETENTION + 100  # what the activity frontier vouches for
     set_frontier(data, corroborated)
     expires = iso_utc(corroborated + 100)  # past for the (stepped) server, future for the truth
     _seed(data, _SUGGESTION.format(ids='["{dev}","z"]', expires=expires), mac, device)

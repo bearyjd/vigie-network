@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
-from vigie_ingest.db import SHARD_RE, shard_name, utc_day
+from vigie_ingest.db import SHARD_RE
 from vigie_pipeline.last_ip import address_candidate
 from vigie_pipeline.logs import log
 from vigie_pipeline.sanitize import clean_text
@@ -161,15 +161,6 @@ def _fold_shard(
                 logger, logging.ERROR, "shard_read_failed", shard=shard, table=table, error=str(exc)
             )
     return failed
-
-
-def shards_missing(data_dir: Path, earliest_ts: float) -> bool:
-    """True when no raw shard on disk reaches back to the day of `earliest_ts`: ingest retention
-    deletes shards oldest day first, so a batch from before the oldest shard was (or may have
-    been) emptied before the pass read it. A day with no rows never gets a shard, which only
-    matters for the oldest shard: a false answer there delays the prune one pass."""
-    paths = shard_paths(data_dir)
-    return not paths or paths[0].name > shard_name(utc_day(int(earliest_ts)))
 
 
 def read_batch(
