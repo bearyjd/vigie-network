@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 from pipeline_helpers import T0, Data, data  # noqa: F401
 
+from vigie_api.schema import open_overrides
 from vigie_ingest.db import INVENTORY_MIGRATIONS, connect, open_inventory
 from vigie_pipeline import cli
 from vigie_pipeline.config import PipelineConfig
@@ -33,17 +34,59 @@ def test_opt55_short_list_untouched():
     assert opt55_string("[1, 3, 6]") == "1,3,6"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="TODO(P2): 90-day pruning/aggregation of retired transient MAC rows (PRP section 8"
-    " housekeeping) is deliberately not implemented yet",
-)
 def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     mac = "aa:bb:cc:00:00:01"
     data.add_batch(T0, neigh=[mac])
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    open_overrides(data.root / "overrides.db").close()  # pruning needs a real, migrated file
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
+    # aggregated to a count; the device row is retired, never deleted
+    assert (
+        data.q("SELECT value FROM pipeline_meta WHERE key='retired_mac_rows_pruned'")[0][0] == "1"
+    )
+    assert [r["status"] for r in data.q("SELECT status FROM devices")] == ["retired"]
+
+
+def test_retired_transient_mac_rows_are_kept_within_90_days(data):
+    mac = "aa:bb:cc:00:00:01"
+    data.add_batch(T0, neigh=[mac])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 89 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+
+
+def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
+    mac = "aa:bb:cc:00:00:01"
+    data.add_batch(T0, neigh=[mac, NIC])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # transient retired
+    transient = data.q("SELECT device_id FROM observations WHERE mac=?", mac)[0][0]
+    active = data.q("SELECT device_id FROM observations WHERE mac=?", NIC)[0][0]
+    ov = open_overrides(data.root / "overrides.db")
+    ov.execute(
+        "INSERT INTO identity_links (from_device, into_device, merge_id, created_at, created_by)"
+        " VALUES (?,?,'m','t','u')",
+        (transient, active),
+    )
+    ov.commit()
+    ov.close()
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+
+
+def test_pruning_is_skipped_when_overrides_is_unreadable(data):
+    mac = "aa:bb:cc:00:00:01"
+    data.add_batch(T0, neigh=[mac])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    (data.root / "overrides.db").write_bytes(b"not a database" * 100)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+
+
+def test_active_device_mac_rows_are_never_pruned(data):
+    data.add_batch(T0, neigh=[NIC])  # globally administered: active, not transient
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    assert len(data.q("SELECT * FROM observations WHERE mac=?", NIC)) == 1
 
 
 # ---- F7: MAC handling ---------------------------------------------------------------------

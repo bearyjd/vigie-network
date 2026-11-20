@@ -30,6 +30,8 @@ OVERLAP_GRACE_DEFAULT_S = 600
 PEER_TAIL_MIN_GRACE_MULT = 2
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
+# MAC rows of retired transient devices are kept this long after last seen, then aggregated.
+RETIRED_MAC_RETENTION_S = 90 * 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 # Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
 # SERVER time it was first received (mac_first_received): older stamps are back-fill and count

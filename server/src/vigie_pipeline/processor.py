@@ -20,14 +20,19 @@ from vigie_pipeline.characterization_store import (
     refresh_characterization,
     save_services,
 )
-from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.config import PRUNE_BATCH_ROWS, RETIRED_MAC_RETENTION_S, PipelineConfig
 from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.new_device_notice import sweep_new_devices
-from vigie_pipeline.overrides import canonical_device, open_overrides_ro
+from vigie_pipeline.overrides import (
+    OverridesNotUsable,
+    canonical_device,
+    open_overrides_ro,
+    protected_device_ids,
+)
 from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -74,6 +79,8 @@ def run_once(
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
+        if usable:  # prune_retired_macs itself fails closed on a missing/unusable overrides.db
+            prune_retired_macs(inv, overrides, clock)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -409,6 +416,46 @@ def sweep_transients(
                 " (SELECT id FROM devices WHERE status<>'transient')"
             )
     return promoted, retired
+
+
+PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
+
+
+def prune_retired_macs(
+    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, now: float
+) -> int:
+    """Drop self-linked MAC rows of retired devices unseen for 90 days (PRP section 8). One
+    bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
+    are never deleted; a pruned MAC that returns starts over as a new transient. Devices that
+    overrides.db refers to (merge, rule, name, group, essential mark) are never pruned: human
+    decisions live there, not in `link_source`. Fails closed: with no overrides.db, or one that
+    is unreadable, locked, of another schema version or missing a table, nothing is pruned."""
+    try:
+        protected = protected_device_ids(overrides)
+    except (sqlite3.Error, OverridesNotUsable) as exc:
+        log(logger, logging.ERROR, "prune_skipped", error=str(exc))
+        return 0
+    with immediate(inv):
+        inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
+        inv.execute("DELETE FROM prune_protected")
+        inv.executemany(
+            "INSERT OR IGNORE INTO prune_protected (id) VALUES (?)", [(i,) for i in protected]
+        )
+        pruned = inv.execute(
+            "DELETE FROM observations WHERE mac IN (SELECT o.mac FROM observations o"
+            " JOIN devices d ON d.id=o.device_id WHERE d.status='retired'"
+            " AND o.link_source='self' AND o.last_seen<?"
+            " AND d.id NOT IN (SELECT id FROM prune_protected) ORDER BY o.last_seen LIMIT ?)",
+            (iso_utc(now - RETIRED_MAC_RETENTION_S), PRUNE_BATCH_ROWS),
+        ).rowcount
+        inv.execute("DROP TABLE prune_protected")
+        if pruned:
+            inv.execute(
+                "INSERT INTO pipeline_meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
+                (PRUNED_COUNTER_KEY, str(pruned), pruned),
+            )
+    return pruned
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:
