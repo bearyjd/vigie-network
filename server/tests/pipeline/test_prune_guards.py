@@ -17,7 +17,7 @@ from vigie_pipeline.processor import prune_retired_macs, run_once
 
 RETENTION = RETIRED_MAC_RETENTION_S
 RETIRED_AT = T0 + 86400  # the server time `retire` retires its devices
-FRONTIER = T0 + 400 * 86400  # newest accepted collector stamp `retire` leaves: ahead of every `now`
+FRONTIER = T0 + 400 * 86400  # `last_sent_ts` `retire` leaves every collector: ahead of every `now`
 LATER = RETIRED_AT + RETENTION + 86400  # a day past the retention, counted from the retirement
 NIC = "00:11:22:33:44:55"
 STAMP = "2026-01-01T00:00:00Z"
@@ -49,17 +49,13 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
     macs = [f"aa:bb:cc:00:00:{i:02x}" for i in range(1, count + 1)]
     data.add_batch(T0, neigh=macs)
     run_once(PipelineConfig(data_dir=data.root), now=RETIRED_AT)
-    set_frontier(data, FRONTIER)
+    set_clock(data, FRONTIER)
     return {r["mac"]: r["device_id"] for r in data.q("SELECT mac, device_id FROM observations")}
 
 
-def set_frontier(data: Data, end: int | None) -> None:
-    """The newest `end` in mac_activity (None: no activity at all): the prune's trusted clock."""
-    data.inv.execute("DELETE FROM mac_activity")
-    if end is not None:
-        data.inv.execute(
-            'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', (NIC, 0, end)
-        )
+def set_clock(data: Data, last_sent_ts: int | None) -> None:
+    """Every collector's `last_sent_ts` (None: none has ever sent): the prune's trusted clock."""
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (last_sent_ts or 0,))
 
 
 def prune(data: Data, now: float = LATER) -> int:
@@ -224,7 +220,7 @@ def test_only_retired_devices_are_pruned(data):
     data.add_batch(T0, neigh=[NIC, "02:00:5e:00:00:51"])
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 60)  # active + still-transient
     migrated_overrides(data.root)
-    set_frontier(data, FRONTIER)  # the clock is vouched for: only the status guard can hold
+    set_clock(data, FRONTIER)  # the clock is vouched for: only the status guard can hold
     active, transient = (
         data.q("SELECT id FROM devices WHERE status=? ORDER BY id", status)[0][0]
         for status in ("active", "transient")

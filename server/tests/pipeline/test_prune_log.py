@@ -10,7 +10,7 @@ from test_prune_guards import (  # noqa: F401
     migrated_overrides,
     prune,
     retire,
-    set_frontier,
+    set_clock,
 )
 
 
@@ -32,7 +32,7 @@ def test_the_log_line_carries_the_count_and_no_mac(data, caplog):
 def test_nothing_pruned_logs_no_line(data, caplog):
     retire(data)
     migrated_overrides(data.root)
-    set_frontier(data, None)  # no accepted activity: nothing may be pruned
+    set_clock(data, None)  # no accepted activity: nothing may be pruned
     with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
         assert prune(data) == 0
     assert pruned_lines(caplog) == []

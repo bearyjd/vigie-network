@@ -21,7 +21,13 @@ from vigie_pipeline.characterization_store import (
     refresh_characterization,
     save_services,
 )
-from vigie_pipeline.config import PRUNE_BATCH_ROWS, RETIRED_MAC_RETENTION_S, PipelineConfig
+from vigie_pipeline.config import (
+    PRUNE_BATCH_ROWS,
+    PRUNE_CLOCK_WARN_S,
+    RETIRED_BACKFILL_INTERVAL_S,
+    RETIRED_MAC_RETENTION_S,
+    PipelineConfig,
+)
 from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
@@ -38,6 +44,7 @@ from vigie_pipeline.overrides import (
 )
 from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.prune_exclusions import LIVE_SUGGESTION_PARAMS, PRUNE_EXCLUSIONS_SQL
+from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
@@ -419,9 +426,10 @@ def sweep_transients(
     last seen, at most `promotion_cap_per_hour` per server hour; retire the rest once the window
     has elapsed since they became transient. Devices are retired, never deleted. A hostname is
     attacker-controlled and is never a promotion signal. `retired_at` is the server moment the
-    retirement is stamped with (default `now`): a fresh clock read, not the pass start."""
+    retirement is stamped with (default `now`), never earlier than the newest batch receipt
+    (`retirement_stamp`): a fresh clock read, not the pass start."""
     hour = iso_utc(now)[:13]
-    stamp = iso_utc(now if retired_at is None else retired_at)
+    stamp = retirement_stamp(inv, now if retired_at is None else retired_at)
     with immediate(inv):
         promoted = _promote(inv, hour, iso_utc(now), config)
         retired = _retire_due(inv, now, stamp, config)
@@ -442,11 +450,15 @@ BACKFILL_KEY = "retired_stamp_backfilled"
 
 
 def _backfill_stamps(inv: sqlite3.Connection, stamp: str) -> None:
-    """Once per database: devices retired before the stamp existed start their clock now. Every
-    retirement since stamps itself (`_retire_due`, stitch_apply), so the devices scan never
-    repeats; an unstamped retired device is simply not prunable. The marker is a `stitch_state` row,
-    not `pipeline_meta`: that table's contents are pinned byte for byte by the freeze tests."""
-    if state_get(inv, BACKFILL_KEY) is not None:
+    """Retired devices without a stamp start their clock now, at most once per
+    RETIRED_BACKFILL_INTERVAL_S: every retirement of this build stamps itself (`_retire_due`,
+    stitch_apply), but one retired before the stamp existed, or by a build rolled back to, has
+    none and is not prunable until stamped. The scan of devices therefore repeats daily, not each
+    pass. The marker holds the stamp of the last scan; one from the future (the clock was set
+    back) counts as due. It is a `stitch_state` row, not `pipeline_meta`: that table's contents
+    are pinned byte for byte by the freeze tests."""
+    last = state_get(inv, BACKFILL_KEY)
+    if last is not None and last <= stamp < iso_utc(_epoch(last) + RETIRED_BACKFILL_INTERVAL_S):
         return
     inv.execute(
         "INSERT OR IGNORE INTO transient_state (device_id, since)"
@@ -533,10 +545,10 @@ def prune_retired_macs(
     now: float,
 ) -> int:
     """Drop self-linked MAC rows of retired devices 90 days after the server retired them
-    (transient_state.since; PRP section 8), on the older of the server clock and the newest accepted
-    collector activity (`_trusted_now`), so a stepped server clock prunes nothing. One bounded
-    batch per pass; the running total is the aggregate kept in `pipeline_meta` and each pass logs
-    only a count.
+    (transient_state.since; PRP section 8), on the older of the server clock and the oldest live
+    collector's `last_sent_ts` (`_trusted_now`), so a stepped server clock prunes nothing. One
+    bounded batch per pass; the running total is the aggregate kept in `pipeline_meta` and each
+    pass logs only a count.
     Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
     that overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
     pruned: human decisions live there, not in `link_source`. Fails closed: with no
@@ -555,6 +567,8 @@ def prune_retired_macs(
     try:
         read = _open_overrides_read(overrides_path)
         protected = protected_device_ids(read.conn)
+        if not _decisions_not_lost(inv, protected):
+            return 0
         pruned = _delete_retired_rows(inv, read, protected, now)
     except _PruneDeferred as exc:
         log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
@@ -570,6 +584,24 @@ def prune_retired_macs(
     return pruned
 
 
+OVERRIDES_SEEN_KEY = "prune_overrides_seen"
+
+
+def _decisions_not_lost(inv: sqlite3.Connection, protected: set[str]) -> bool:
+    """False when overrides.db once held a decision and now holds none: the file was probably lost
+    or recreated empty, and an empty protected set would then protect nothing. The marker is a
+    `stitch_state` row set by the first read that finds a decision; an install that never had one
+    (nothing to lose) prunes as usual."""
+    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
+    if protected and not seen:
+        with immediate(inv):
+            state_set(inv, OVERRIDES_SEEN_KEY, "1")
+    elif seen and not protected:
+        log(logger, logging.ERROR, "prune_skipped", reason="overrides_lost_decisions")
+        return False
+    return True
+
+
 def _delete_retired_rows(
     inv: sqlite3.Connection,
     read: _OverridesRead,
@@ -578,7 +610,7 @@ def _delete_retired_rows(
 ) -> int:
     trusted = _trusted_now(inv, now)
     if trusted is None:
-        return 0  # no accepted activity: the server clock cannot be checked, prune nothing
+        return 0  # no collector has ever sent: the server clock cannot be checked, prune nothing
     args = _prune_args(trusted)
     candidates = _prune_candidates(inv, protected, args)  # selected before the write lock
     with immediate(inv):
@@ -595,12 +627,22 @@ def _delete_retired_rows(
 
 
 def _trusted_now(inv: sqlite3.Connection, now: float) -> float | None:
-    """The instant the server can vouch for: the older of its own time and the newest accepted
-    collector activity (activity.py only accepts a stamp within a bounded distance of the server
-    receipt time, so after a forward step of the server clock the frontier stops). None (no
-    activity) prunes nothing."""
-    frontier = inv.execute('SELECT MAX("end") FROM mac_activity').fetchone()[0]
-    return None if frontier is None else min(now, frontier)
+    """The instant the server can vouch for: the older of its own time and the oldest
+    `collectors.last_sent_ts` among live collectors that ever sent. Ingest keeps that column as a
+    never-purged running maximum of accepted send times and accepts a send time only within its
+    skew window of the server clock, so a stepped server clock cannot drag it along for a collector
+    that kept true time, and purging batch rows cannot erase it. A silent collector holds the clock
+    back until it is revoked: fail safe, and named in a WARNING once it has been silent for
+    PRUNE_CLOCK_WARN_S. None (no collector with an accepted send) prunes nothing."""
+    row = inv.execute(
+        "SELECT id, last_sent_ts FROM collectors WHERE revoked=0 AND last_sent_ts>0"
+        " ORDER BY last_sent_ts LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    if row[1] < now - PRUNE_CLOCK_WARN_S:
+        log(logger, logging.WARNING, "prune_clock_held_back", collector=row[0], last_sent_ts=row[1])
+    return min(now, float(row[1]))
 
 
 def _prune_args(trusted: float) -> tuple[str, ...]:

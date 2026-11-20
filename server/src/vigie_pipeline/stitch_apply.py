@@ -14,7 +14,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 
-from vigie_ingest.db import immediate, iso_utc
+from vigie_ingest.db import immediate
 from vigie_pipeline.config import (
     CLEANUP_ROWS_SHARE,
     MAX_ATTACHES_PER_PASS,
@@ -23,6 +23,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
+from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.snapshot import OverridesUnreadable, Snapshot, read_identity_version
 from vigie_pipeline.stitch_db import (
     Attachment,
@@ -375,7 +376,7 @@ class Applier:
             self.inv.execute(
                 "INSERT INTO transient_state (device_id, since) VALUES (?,?)"
                 " ON CONFLICT(device_id) DO UPDATE SET since=excluded.since",
-                (d.from_device, iso_utc(self.at)),
+                (d.from_device, retirement_stamp(self.inv, self.at)),
             )
         # settled by the rule: its open suggestions are expired and its candidate rows dismissed
         # under the remaining row cap, the rest on later passes (Settle)

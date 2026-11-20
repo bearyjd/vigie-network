@@ -1,5 +1,6 @@
 """The retirement stamp is the prune's clock: written when a device is retired, by every path
-that retires one, and the one-off backfill for legacy rows never rescans devices again."""
+that retires one, never earlier than the newest batch receipt, and the backfill for retired
+devices without one rescans devices at most once a day."""
 
 from __future__ import annotations
 
@@ -9,11 +10,20 @@ from types import SimpleNamespace
 import pytest
 from pipeline_helpers import T0, data  # noqa: F401
 from stitch_helpers import appear, run, seeded
-from test_prune_guards import FRONTIER, LATER, RETIRED_AT, migrated_overrides, retire, rows
+from test_prune_guards import (
+    FRONTIER,
+    LATER,
+    RETENTION,
+    RETIRED_AT,
+    migrated_overrides,
+    prune,
+    retire,
+    rows,
+)
 
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import processor
-from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.config import RETIRED_BACKFILL_INTERVAL_S, PipelineConfig
 from vigie_pipeline.processor import BACKFILL_KEY, sweep_transients
 
 CONFIG = PipelineConfig(data_dir=None)  # type: ignore[arg-type]  # sweep reads only the windows
@@ -47,12 +57,12 @@ def test_a_second_sweep_does_not_backfill_again(data):
     assert stamps(data) == {}  # an unstamped retired device stays unprunable until restamped
 
 
-def test_the_sweep_never_scans_devices_for_a_backfill_after_the_first_pass(data):
+def test_the_sweep_does_not_scan_devices_for_a_backfill_within_the_interval(data):
     retire(data)
     seen = []
     data.inv.set_trace_callback(seen.append)
     try:
-        sweep_transients(data.inv, LATER, CONFIG)
+        sweep_transients(data.inv, RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S - 1, CONFIG)
     finally:
         data.inv.set_trace_callback(None)
     assert not [s for s in seen if "INSERT OR IGNORE INTO transient_state" in s]
@@ -95,3 +105,89 @@ def test_the_retirement_path_that_never_stamped_is_not_prunable(data):
     processor.run_once(PipelineConfig(data_dir=data.root), now=LATER)
     assert rows(data) == 1
     assert FRONTIER > LATER
+
+
+# ---- stamps erased by a rolled-back build are derived again --------------------------------
+
+
+def test_stamps_erased_by_a_rollback_are_derived_again_once_the_interval_passed(data):
+    (device,) = retire(data).values()
+    data.inv.execute("DELETE FROM transient_state")  # the previous build's sweep erased them
+    sweep_transients(data.inv, RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S - 1, CONFIG)
+    assert stamps(data) == {}  # bounded: not on every pass
+    due = RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S
+    sweep_transients(data.inv, due, CONFIG)
+    assert stamps(data) == {device: iso_utc(due)}
+
+
+def test_a_rederived_stamp_makes_the_device_prunable_90_days_later(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.inv.execute("DELETE FROM transient_state")
+    due = RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S
+    sweep_transients(data.inv, due, CONFIG)
+    assert prune(data, due + RETENTION) == 0
+    assert prune(data, due + RETENTION + 1) == 1
+
+
+def test_a_backfill_marker_from_the_future_counts_as_due(data):
+    (device,) = retire(data).values()
+    data.inv.execute("DELETE FROM transient_state")
+    data.inv.execute(  # the clock was set back since the last scan
+        "UPDATE stitch_state SET value=? WHERE key=?", (iso_utc(LATER + 86400), BACKFILL_KEY)
+    )
+    sweep_transients(data.inv, LATER, CONFIG)
+    assert stamps(data) == {device: iso_utc(LATER)}
+
+
+# ---- a clock set back cannot backdate a stamp ----------------------------------------------
+
+
+def make_transient(data):
+    data.add_batch(T0, neigh=["02:00:5e:00:00:41"])
+    processor.run_once(PipelineConfig(data_dir=data.root), now=RETIRED_AT - 3600)  # transient
+
+
+def test_a_retirement_is_not_backdated_before_the_newest_batch_receipt(data):
+    make_transient(data)
+    newest = RETIRED_AT + 5 * 86400
+    data.add_batch(newest, neigh=[])  # received on a clock that has since been set back
+    sweep_transients(data.inv, RETIRED_AT, CONFIG)
+    assert set(stamps(data).values()) == {iso_utc(newest)}
+
+
+def test_with_no_batch_recorded_the_stamp_is_the_clock(data):
+    make_transient(data)
+    data.inv.execute("DELETE FROM batches")
+    sweep_transients(data.inv, RETIRED_AT, CONFIG)
+    assert set(stamps(data).values()) == {iso_utc(RETIRED_AT)}
+
+
+def test_a_clock_ahead_of_every_batch_is_stamped_as_it_is(data):
+    make_transient(data)
+    sweep_transients(data.inv, RETIRED_AT + 9, CONFIG)
+    assert set(stamps(data).values()) == {iso_utc(RETIRED_AT + 9)}
+
+
+def test_the_backfill_stamp_is_clamped_too(data):
+    (device,) = retire(data).values()
+    data.inv.execute("DELETE FROM transient_state")
+    data.inv.execute("DELETE FROM stitch_state WHERE key=?", (BACKFILL_KEY,))
+    newest = LATER + 7 * 86400
+    data.add_batch(newest, neigh=[])
+    sweep_transients(data.inv, LATER, CONFIG)
+    assert stamps(data) == {device: iso_utc(newest)}
+
+
+def test_a_rule_retired_orphan_stamp_is_clamped_too(data):
+    ov, dev = seeded(data)
+    appear(data, 2, 400, 1100)
+    data.inv.execute(
+        "INSERT OR IGNORE INTO stitch_state (key, value) VALUES (?, '1')", (BACKFILL_KEY,)
+    )
+    newest = T0 + 30 * 86400
+    data.add_batch(newest, neigh=[])
+    run(data)
+    (orphan,) = [r[0] for r in data.q("SELECT id FROM devices WHERE status='retired'")]
+    assert stamps(data)[orphan] >= iso_utc(newest)
+    ov.close()

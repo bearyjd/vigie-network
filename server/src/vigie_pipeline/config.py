@@ -33,6 +33,11 @@ ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
 # MAC rows of retired transient devices are kept this long after the server retired them
 # (transient_state.since, server clock), then deleted; only a count is kept.
 RETIRED_MAC_RETENTION_S = 90 * 86400
+# a collector whose last_sent_ts holds the prune's clock back for longer than this is named in a
+# WARNING; the unstamped retired devices are looked for again this often (a rolled-back build
+# erases the stamps without a trace)
+PRUNE_CLOCK_WARN_S = 7 * 86400
+RETIRED_BACKFILL_INTERVAL_S = 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 # Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
 # SERVER time it was first received (mac_first_received): older stamps are back-fill and count

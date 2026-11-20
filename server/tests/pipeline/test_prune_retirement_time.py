@@ -19,7 +19,7 @@ from test_prune_guards import (
     prune,
     retire,
     rows,
-    set_frontier,
+    set_clock,
     sql,
 )
 
@@ -59,7 +59,7 @@ def test_an_ancient_collector_last_seen_with_a_fresh_retirement_is_not_pruned(da
 def test_a_server_clock_stepped_forward_with_an_old_frontier_prunes_nothing(data):
     retire(data)
     migrated_overrides(data.root)
-    set_frontier(data, RETIRED_AT + 3600)  # no stamp has been accepted since
+    set_clock(data, RETIRED_AT + 3600)  # no stamp has been accepted since
     assert prune(data, RETIRED_AT + 365 * 86400) == 0
     assert rows(data) == 1
 
@@ -67,7 +67,7 @@ def test_a_server_clock_stepped_forward_with_an_old_frontier_prunes_nothing(data
 def test_a_server_clock_stepped_back_trusts_the_server_clock(data):
     retire(data)
     migrated_overrides(data.root)
-    set_frontier(data, FRONTIER)  # the frontier is ahead of `now`
+    set_clock(data, FRONTIER)  # the frontier is ahead of `now`
     assert prune(data, RETIRED_AT + 30 * 86400) == 0
     assert rows(data) == 1
 
@@ -75,7 +75,7 @@ def test_a_server_clock_stepped_back_trusts_the_server_clock(data):
 def test_no_activity_at_all_prunes_nothing(data):
     retire(data)
     migrated_overrides(data.root)
-    set_frontier(data, None)
+    set_clock(data, None)
     assert prune(data, LATER) == 0
     assert rows(data) == 1
 
@@ -83,9 +83,9 @@ def test_no_activity_at_all_prunes_nothing(data):
 def test_the_boundary_is_exclusive_on_the_stamp_and_the_frontier_cutoff(data):
     retire(data)
     migrated_overrides(data.root)
-    set_frontier(data, RETIRED_AT + RETENTION)  # min(now, frontier) is the frontier
+    set_clock(data, RETIRED_AT + RETENTION)  # min(now, frontier) is the frontier
     assert prune(data, LATER) == 0  # frontier - 90d == the stamp: kept
-    set_frontier(data, RETIRED_AT + RETENTION + 1)
+    set_clock(data, RETIRED_AT + RETENTION + 1)
     assert prune(data, LATER) == 1  # one second further: pruned
 
 
@@ -126,7 +126,7 @@ def test_a_revived_then_retired_again_device_restarts_the_clock(data):
     again = revived + 86400
     run_once(PipelineConfig(data_dir=data.root), now=again)
     assert stamp(data) == [(device, iso_utc(again))]
-    set_frontier(data, FRONTIER)
+    set_clock(data, FRONTIER)
     assert prune(data, again + RETENTION) == 0  # the first retirement's clock would be long up
     assert prune(data, again + RETENTION + 1) == 1
 

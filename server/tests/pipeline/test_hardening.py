@@ -42,6 +42,7 @@ def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     # 90 days after the retirement (server time), with a fresh batch proving the clock moved
     late = T0 + 86400 + 90 * 86400 + 60
     data.add_batch(late, neigh=["aa:bb:cc:00:00:02"])
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (late,))  # what ingest records
     run_once(PipelineConfig(data_dir=data.root), now=late)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
     # aggregated to a count; the device row is retired, never deleted
@@ -56,7 +57,7 @@ def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
 
 LA_MAC = "02:00:5e:00:00:01"  # locally administered: randomized, so a transient device
 RETIRED = T0 + 86400  # the server time the transient below is retired at
-CLOCK_MOVED_BY = "02:00:5e:00:00:02"  # a fresh batch's MAC: it moves the activity frontier
+CLOCK_MOVED_BY = "02:00:5e:00:00:02"  # a fresh batch's MAC
 
 
 def retire_one(data):
@@ -68,6 +69,7 @@ def retire_one(data):
 def run_at(data, now):
     """A pass whose fresh batch moves the clock the prune trusts, so only the guards decide."""
     data.add_batch(now, neigh=[CLOCK_MOVED_BY])
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (now,))  # what ingest records
     run_once(PipelineConfig(data_dir=data.root), now=now)
 
 
