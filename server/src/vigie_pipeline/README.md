@@ -21,7 +21,11 @@ see `docs/monitoring.md`).
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
   window; a retired device seen again returns to transient (`device_reappeared`). Self-linked MAC
   rows of retired devices unseen for 90 days are pruned (`observations`; cumulative count in
-  `pipeline_meta.retired_mac_rows_pruned`); the device row stays.
+  `pipeline_meta.retired_mac_rows_pruned`); the device row stays. Pruning fails closed: it runs
+  only when `overrides.db` exists, opens read-only, is at exactly the schema version this build
+  supports, and has every table the protected-device query reads (devices named, grouped, marked
+  essential, targeted by a rule, or on either end of a live link are never pruned). Otherwise it
+  logs `prune_skipped` (error text only) and deletes nothing.
 - `dhcp_fingerprint` / `vendor_class` are first-wins. A differing value for the same MAC is not
   stored; the device is set to `identity_state='conflict'` and one `identity_conflict` event per
   (device, field) per day is emitted (short hashes only). Hostnames may change freely.

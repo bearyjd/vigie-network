@@ -27,7 +27,12 @@ from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.new_device_notice import sweep_new_devices
-from vigie_pipeline.overrides import canonical_device, link_revocations_supported, open_overrides_ro
+from vigie_pipeline.overrides import (
+    OverridesNotUsable,
+    canonical_device,
+    open_overrides_ro,
+    protected_device_ids,
+)
 from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -74,7 +79,7 @@ def run_once(
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
-        if usable:  # fail closed: without readable overrides, protected devices are unknown
+        if usable:  # prune_retired_macs itself fails closed on a missing/unusable overrides.db
             prune_retired_macs(inv, overrides, clock)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
@@ -413,28 +418,7 @@ def sweep_transients(
     return promoted, retired
 
 
-def _protected_device_ids(overrides: sqlite3.Connection | None) -> set[str]:
-    """Devices a human decision refers to: live identity links (either end), identity rules,
-    names/groups and essential marks. Absent tables hold nothing; any other read error raises."""
-    if overrides is None:
-        return set()
-    tables = {r[0] for r in overrides.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    live = " WHERE revoked_at IS NULL" if link_revocations_supported(overrides) else ""
-    queries = {
-        "identity_links": (
-            f"SELECT from_device FROM identity_links{live} UNION"  # noqa: S608
-            f" SELECT into_device FROM identity_links{live}"  # noqa: S608
-        ),
-        "identity_rules": "SELECT device_id FROM identity_rules",
-        "device_overrides": "SELECT device_id FROM device_overrides",
-        "essential_devices": "SELECT device_id FROM essential_devices",
-    }
-    return {
-        str(r[0])
-        for table, sql in queries.items()
-        if table in tables
-        for r in overrides.execute(sql)
-    }
+PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
 
 
 def prune_retired_macs(
@@ -444,10 +428,11 @@ def prune_retired_macs(
     bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
     are never deleted; a pruned MAC that returns starts over as a new transient. Devices that
     overrides.db refers to (merge, rule, name, group, essential mark) are never pruned: human
-    decisions live there, not in `link_source`. Callers skip this when overrides is unusable."""
+    decisions live there, not in `link_source`. Fails closed: with no overrides.db, or one that
+    is unreadable, locked, of another schema version or missing a table, nothing is pruned."""
     try:
-        protected = _protected_device_ids(overrides)
-    except sqlite3.Error as exc:
+        protected = protected_device_ids(overrides)
+    except (sqlite3.Error, OverridesNotUsable) as exc:
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
     with immediate(inv):
@@ -466,9 +451,9 @@ def prune_retired_macs(
         inv.execute("DROP TABLE prune_protected")
         if pruned:
             inv.execute(
-                "INSERT INTO pipeline_meta (key, value) VALUES ('retired_mac_rows_pruned', ?)"
+                "INSERT INTO pipeline_meta (key, value) VALUES (?, ?)"
                 " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
-                (str(pruned), pruned),
+                (PRUNED_COUNTER_KEY, str(pruned), pruned),
             )
     return pruned
 

@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 from pipeline_helpers import T0, Data, data  # noqa: F401
 
+from vigie_api.schema import open_overrides
 from vigie_ingest.db import INVENTORY_MIGRATIONS, connect, open_inventory
 from vigie_pipeline import cli
 from vigie_pipeline.config import PipelineConfig
@@ -37,6 +38,7 @@ def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     mac = "aa:bb:cc:00:00:01"
     data.add_batch(T0, neigh=[mac])
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    open_overrides(data.root / "overrides.db").close()  # pruning needs a real, migrated file
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
     # aggregated to a count; the device row is retired, never deleted
@@ -60,8 +62,12 @@ def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # transient retired
     transient = data.q("SELECT device_id FROM observations WHERE mac=?", mac)[0][0]
     active = data.q("SELECT device_id FROM observations WHERE mac=?", NIC)[0][0]
-    ov = sqlite3.connect(data.make_overrides())
-    ov.execute("INSERT INTO identity_links VALUES (?,?,'m','t','u')", (transient, active))
+    ov = open_overrides(data.root / "overrides.db")
+    ov.execute(
+        "INSERT INTO identity_links (from_device, into_device, merge_id, created_at, created_by)"
+        " VALUES (?,?,'m','t','u')",
+        (transient, active),
+    )
     ov.commit()
     ov.close()
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)

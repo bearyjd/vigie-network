@@ -8,10 +8,20 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
+from vigie_api.schema import OVERRIDES_MIGRATIONS
+
 MAX_LINK_DEPTH = 32
 # Review statuses that quiet an incident; a pinned mirror of vigie_api.incident_decisions.
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
+# The one overrides schema this build understands (same source of truth as backup verification).
+SUPPORTED_USER_VERSION = len(OVERRIDES_MIGRATIONS)
+# Tables the protected-device query reads; all must exist before anything is pruned on its word.
+PROTECTED_TABLES = ("device_overrides", "essential_devices", "identity_links", "identity_rules")
 logger = logging.getLogger("vigie_pipeline")
+
+
+class OverridesNotUsable(Exception):
+    """overrides.db cannot vouch for which devices a human decision refers to."""
 
 
 def overrides_uri(path: Path) -> str:
@@ -123,3 +133,30 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
         current = target
         seen.add(current)
     return current
+
+
+def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
+    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets
+    and both ends of every live identity link. FAILS CLOSED: raises OverridesNotUsable unless the
+    file is open, at exactly the supported schema version, and holds every table queried; an
+    empty set must mean "nothing is protected", never "could not tell"."""
+    if conn is None:
+        raise OverridesNotUsable("overrides.db is missing or could not be opened")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version != SUPPORTED_USER_VERSION:
+        raise OverridesNotUsable(
+            f"overrides.db schema v{version}, this build supports v{SUPPORTED_USER_VERSION}"
+        )
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    missing = [t for t in PROTECTED_TABLES if t not in tables]
+    if missing:
+        raise OverridesNotUsable(f"overrides.db lacks table(s): {', '.join(missing)}")
+    singles = (
+        "SELECT device_id FROM device_overrides",
+        "SELECT device_id FROM essential_devices",
+        "SELECT device_id FROM identity_rules",
+    )
+    protected = {str(r[0]) for sql in singles for r in conn.execute(sql)}
+    for from_device, into_device in conn.execute(links_select_sql(conn)):
+        protected.update((str(from_device), str(into_device)))
+    return protected
