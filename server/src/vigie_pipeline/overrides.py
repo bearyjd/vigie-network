@@ -155,6 +155,16 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
     return current
 
 
+def overrides_data_version(conn: sqlite3.Connection | None) -> int:
+    """SQLite's `PRAGMA data_version` of overrides.db: it changes when ANOTHER connection commits
+    anything (on this mode=ro connection it really moves, unlike with immutable=1). Not
+    identity_version, whose triggers miss names, essential marks, merges and incident decisions.
+    sqlite3.Error propagates; None raises OverridesNotUsable."""
+    if conn is None:
+        raise OverridesNotUsable("overrides.db is missing or could not be opened")
+    return int(conn.execute("PRAGMA data_version").fetchone()[0])
+
+
 def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     """Devices a human decision refers to: names/groups, essential marks, identity-rule targets,
     incident and candidate decisions, and both ends of every identity merge and link, undone

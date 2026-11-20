@@ -31,6 +31,7 @@ from vigie_pipeline.overrides import (
     OverridesNotUsable,
     canonical_device,
     open_overrides_ro,
+    overrides_data_version,
     protected_device_ids,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
@@ -422,20 +423,43 @@ def sweep_transients(
 PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
 
 
+class _OverridesMoved(Exception):
+    """overrides.db committed (or could not be asked) since the protected set was read."""
+
+
 def prune_retired_macs(
     inv: sqlite3.Connection, overrides: sqlite3.Connection | None, now: float
 ) -> int:
     """Drop self-linked MAC rows of retired devices unseen for 90 days (PRP section 8). One
     bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
     are never deleted; a pruned MAC that returns starts over as a new transient. Devices that
-    overrides.db refers to (merge, rule, name, group, essential mark) are never pruned: human
-    decisions live there, not in `link_source`. Fails closed: with no overrides.db, or one that
-    is unreadable, locked, of another schema version or missing a table, nothing is pruned."""
+    overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
+    pruned: human decisions live there, not in `link_source`. Fails closed: with no
+    overrides.db, or one that is unreadable, locked, of another schema version or missing a
+    table, nothing is pruned. The protected set is re-validated just before COMMIT
+    (`PRAGMA data_version`): a human decision committed meanwhile defers the whole pass, which
+    rolls back. The two databases cannot share a transaction, so a commit landing after that
+    last check and before COMMIT (microseconds) is not seen, same as stitch_apply's attach."""
     try:
+        before = overrides_data_version(overrides)
         protected = protected_device_ids(overrides)
     except (sqlite3.Error, OverridesNotUsable) as exc:
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
+    try:
+        return _delete_retired_rows(inv, overrides, protected, before, now)
+    except _OverridesMoved:
+        log(logger, logging.INFO, "prune_deferred", reason="overrides_changed")
+        return 0
+
+
+def _delete_retired_rows(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    protected: set[str],
+    before: int,
+    now: float,
+) -> int:
     with immediate(inv):
         inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
         inv.execute("DELETE FROM prune_protected")
@@ -457,7 +481,17 @@ def prune_retired_macs(
                 " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
                 (PRUNED_COUNTER_KEY, str(pruned), pruned),
             )
+        if _overrides_moved(overrides, before):
+            raise _OverridesMoved  # immediate() rolls the DELETEs back
     return pruned
+
+
+def _overrides_moved(overrides: sqlite3.Connection | None, before: int) -> bool:
+    """True when overrides.db changed since `before`, or cannot say (fail closed)."""
+    try:
+        return overrides_data_version(overrides) != before
+    except (sqlite3.Error, OverridesNotUsable):
+        return True
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:
