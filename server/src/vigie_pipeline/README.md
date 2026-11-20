@@ -90,9 +90,9 @@ IMMEDIATE` APPLY that re-reads `overrides.db` and re-validates every decision be
   `stitching_skipped`. Hostnames, fingerprints and MACs appear only as short hashes.
 
 ## Known gaps
-- 90-day pruning/aggregation of retired transient MAC rows (PRP section 8 housekeeping) is NOT
-  implemented; see the strict-xfail test `test_retired_transient_mac_rows_are_pruned_after_90_days`.
-  `observations` and `transient_*` rows grow until it lands.
+- Retired transient MAC rows are pruned from `observations` after `VIGIE_RETIRED_RETENTION_S`
+  (default 90 days since `last_seen`; rule/human-linked rows kept; `devices` rows are never
+  deleted). No aggregation of pruned rows is kept.
 - Ingest owns `devices`/`observations`/`collectors`/`batches`; the pipeline verifies their schema
   version and refuses to run (or to downgrade) unless `--migrate` is given.
 - Identity stitching does not yet include behavioural demotion (needs the features stage) and

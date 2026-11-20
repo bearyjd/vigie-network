@@ -33,17 +33,53 @@ def test_opt55_short_list_untouched():
     assert opt55_string("[1, 3, 6]") == "1,3,6"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="TODO(P2): 90-day pruning/aggregation of retired transient MAC rows (PRP section 8"
-    " housekeeping) is deliberately not implemented yet",
-)
+DAY = 86400
+
+
+def _retire(data, mac="aa:bb:cc:00:00:01"):
+    data.add_batch(T0, neigh=[mac])
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + DAY)  # retired
+
+
 def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     mac = "aa:bb:cc:00:00:01"
-    data.add_batch(T0, neigh=[mac])
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    _retire(data, mac)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * DAY)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
+    assert data.q("SELECT * FROM devices WHERE status='retired'") != []  # devices are kept
+
+
+def test_retired_row_inside_retention_is_kept(data):
+    _retire(data)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 89 * DAY)
+    assert len(data.q("SELECT * FROM observations")) == 1
+
+
+def test_retired_row_with_rule_link_is_kept(data):
+    _retire(data)
+    data.q("UPDATE observations SET link_source='rule', link_rule_id='r1'")
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * DAY)
+    assert len(data.q("SELECT * FROM observations")) == 1
+
+
+def test_non_retired_rows_are_never_pruned(data):
+    _retire(data)
+    data.q("UPDATE devices SET status='active'")
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * DAY)
+    assert len(data.q("SELECT * FROM observations")) == 1
+
+
+def test_retired_pruning_is_idempotent(data):
+    _retire(data)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * DAY)
+    run_once(PipelineConfig(data_dir=data.root), now=T0 + 92 * DAY)
+    assert data.q("SELECT * FROM observations") == []
+    assert len(data.q("SELECT * FROM devices")) == 1
+
+
+def test_retired_retention_is_configurable_from_env():
+    cfg = PipelineConfig.from_env({"VIGIE_RETIRED_RETENTION_S": "3600"})
+    assert cfg.retired_retention_s == 3600
 
 
 # ---- F7: MAC handling ---------------------------------------------------------------------

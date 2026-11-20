@@ -408,7 +408,19 @@ def sweep_transients(
                 f"DELETE FROM {table} WHERE device_id IN"  # noqa: S608
                 " (SELECT id FROM devices WHERE status<>'transient')"
             )
+        prune_retired_observations(inv, now, config)
     return promoted, retired
+
+
+def prune_retired_observations(inv: sqlite3.Connection, now: float, config: PipelineConfig) -> int:
+    """Delete observations of retired devices last seen before the retention window, unless a rule
+    or human link is attached. Device rows are kept (no_device_delete); mac_activity has its own
+    purge. Caller holds the write transaction. Idempotent."""
+    return inv.execute(
+        "DELETE FROM observations WHERE link_source='self' AND link_rule_id IS NULL"
+        " AND last_seen < ? AND device_id IN (SELECT id FROM devices WHERE status='retired')",
+        (iso_utc(now - config.retired_retention_s),),
+    ).rowcount
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:

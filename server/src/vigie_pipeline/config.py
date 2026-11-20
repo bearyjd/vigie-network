@@ -30,6 +30,7 @@ OVERLAP_GRACE_DEFAULT_S = 600
 PEER_TAIL_MIN_GRACE_MULT = 2
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
+RETIRED_RETENTION_DEFAULT_S = 90 * 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 # Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
 # SERVER time it was first received (mac_first_received): older stamps are back-fill and count
@@ -244,6 +245,7 @@ class PipelineConfig:
     overlap_grace_s: int = OVERLAP_GRACE_DEFAULT_S
     activity_gap_s: int = ACTIVITY_GAP_DEFAULT_S  # silence longer than this splits an interval
     activity_retention_s: int = ACTIVITY_RETENTION_DEFAULT_S
+    retired_retention_s: int = RETIRED_RETENTION_DEFAULT_S  # VIGIE_RETIRED_RETENTION_S
     suggestion_ttl_s: int = SUGGESTION_TTL_DEFAULT_S
     delivery: DeliverySettings = DeliverySettings()
     probes: ProbeSettings = ProbeSettings()
@@ -277,6 +279,8 @@ class PipelineConfig:
             raise ValueError("suggest_threshold must be in (0, 1]")
         if min(self.overlap_grace_s, self.activity_gap_s) < 0 or self.activity_retention_s < 1:
             raise ValueError("overlap_grace_s/activity_gap_s must be >= 0, retention positive")
+        if self.retired_retention_s < 1:
+            raise ValueError("retired_retention_s must be positive")
         if self.suggestion_ttl_s < 1:
             raise ValueError("suggestion_ttl_s must be positive")
 
@@ -313,6 +317,9 @@ class PipelineConfig:
             ),
             overlap_grace_s=int(source.get("VIGIE_OVERLAP_GRACE_S", OVERLAP_GRACE_DEFAULT_S)),
             activity_gap_s=int(source.get("VIGIE_ACTIVITY_GAP_S", ACTIVITY_GAP_DEFAULT_S)),
+            retired_retention_s=int(
+                source.get("VIGIE_RETIRED_RETENTION_S", RETIRED_RETENTION_DEFAULT_S)
+            ),
             delivery=DeliverySettings.from_env(source),
             probes=ProbeSettings.from_env(source),
             new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
