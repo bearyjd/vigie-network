@@ -275,3 +275,15 @@ def test_the_prune_lock_of_a_real_pass_never_scans_observations_devices_or_batch
     # only the collector set (a handful of rows) may be walked
     assert [s for s in scans if not s.startswith("SCAN c USING COVERING INDEX")] == []
     assert rows(data) == 0
+
+
+def test_the_oldest_retirement_goes_first_under_the_cap(data, monkeypatch):
+    macs = retire(data, count=2)
+    first, second = sorted(macs)  # mac order is the opposite of retirement order
+    migrated_overrides(data.root)
+    data.inv.execute(
+        "UPDATE transient_state SET since=? WHERE device_id=?", (iso_utc(T0), macs[second])
+    )
+    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 1)
+    assert prune(data, LATER) == 1
+    assert [r["mac"] for r in data.q("SELECT mac FROM observations")] == [first]

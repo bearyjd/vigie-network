@@ -10,6 +10,7 @@ import pytest
 from pipeline_helpers import T0, Data, data  # noqa: F401
 
 from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
+from vigie_ingest.db import iso_utc
 from vigie_pipeline import processor
 from vigie_pipeline.config import RETIRED_MAC_RETENTION_S, PipelineConfig
 from vigie_pipeline.processor import prune_retired_macs, run_once
@@ -222,12 +223,41 @@ def test_only_self_linked_rows_are_pruned(data):
 
 
 def test_only_retired_devices_are_pruned(data):
-    data.add_batch(T0, neigh=[NIC, "aa:bb:cc:00:00:01"])
+    data.add_batch(T0, neigh=[NIC, "02:00:5e:00:00:51"])
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 60)  # active + still-transient
     migrated_overrides(data.root)
+    set_frontier(data, FRONTIER)  # the clock is vouched for: only the status guard can hold
+    active, transient = (
+        data.q("SELECT id FROM devices WHERE status=? ORDER BY id", status)[0][0]
+        for status in ("active", "transient")
+    )
     assert {r["status"] for r in data.q("SELECT status FROM devices")} == {"active", "transient"}
+    data.inv.execute(  # both carry a stamp far older than the retention: only status protects
+        "INSERT OR REPLACE INTO transient_state (device_id, since) VALUES (?,?), (?,?)",
+        (active, "2000-01-01T00:00:00Z", transient, "2000-01-01T00:00:00Z"),
+    )
     assert prune(data) == 0
     assert rows(data) == 2
+
+
+def test_a_recent_last_seen_keeps_a_row_whose_retirement_stamp_is_old(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.inv.execute(  # retired long ago, yet the MAC itself was last seen 10 days before `now`
+        "UPDATE observations SET last_seen=?", (iso_utc(LATER - 10 * 86400),)
+    )
+    assert prune(data) == 0
+    assert rows(data) == 1
+
+
+def test_the_running_total_adds_up_across_pruning_passes(data, monkeypatch):
+    retire(data, count=3)
+    migrated_overrides(data.root)
+    monkeypatch.setattr(processor, "PRUNE_BATCH_ROWS", 2)
+    assert prune(data) == 2
+    assert counter(data) == "2"
+    assert prune(data) == 1
+    assert counter(data) == "3"
 
 
 def test_the_retention_boundary_is_exclusive(data):

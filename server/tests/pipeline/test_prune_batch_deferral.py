@@ -192,6 +192,26 @@ def test_a_purged_mark_row_defers_even_when_every_cursor_is_intact(data, monkeyp
     assert rows(data) == 2
 
 
+def test_a_batch_that_arrived_mid_pass_but_was_processed_still_allows_the_prune(data, monkeypatch):
+    ((mac, _),) = retire(data).items()
+    migrated_overrides(data.root)
+    data.inv.execute("UPDATE batches SET window_end=?", (FRONTIER,))
+    real = processor._pending
+    arrived = []
+
+    def pending_after_an_arrival(inv, collector):
+        if not arrived:  # lands above the mark, before this collector's batches are read
+            arrived.append(data.add_batch(LATER, neigh=[OTHER]))
+            inv.execute("UPDATE batches SET window_end=? WHERE batch_id=?", (FRONTIER, arrived[0]))
+        return real(inv, collector)
+
+    monkeypatch.setattr(processor, "_pending", pending_after_an_arrival)
+    assert run(data).batches == 1
+    assert arrived
+    assert [r["mac"] for r in data.q("SELECT mac FROM observations")] == [OTHER]
+    assert mac not in [r["mac"] for r in data.q("SELECT mac FROM observations")]
+
+
 # ---- batch_mark is required ----------------------------------------------------------------
 
 

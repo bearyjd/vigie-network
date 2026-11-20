@@ -54,19 +54,39 @@ def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     ]
 
 
+LA_MAC = "02:00:5e:00:00:01"  # locally administered: randomized, so a transient device
+RETIRED = T0 + 86400  # the server time the transient below is retired at
+CLOCK_MOVED_BY = "02:00:5e:00:00:02"  # a fresh batch's MAC: it moves the activity frontier
+
+
+def retire_one(data):
+    data.add_batch(T0, neigh=[LA_MAC])
+    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    assert data.q("SELECT status FROM devices")[0][0] == "retired"
+
+
+def run_at(data, now):
+    """A pass whose fresh batch moves the clock the prune trusts, so only the guards decide."""
+    data.add_batch(now, neigh=[CLOCK_MOVED_BY])
+    run_once(PipelineConfig(data_dir=data.root), now=now)
+
+
+def rows_of(data, mac):
+    return len(data.q("SELECT * FROM observations WHERE mac=?", mac))
+
+
 def test_retired_transient_mac_rows_are_kept_within_90_days(data):
-    mac = "aa:bb:cc:00:00:01"
-    data.add_batch(T0, neigh=[mac])
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 89 * 86400)
-    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+    retire_one(data)
+    open_overrides(data.root / "overrides.db").close()  # a migrated file: the prune can run
+    data.inv.execute("UPDATE observations SET last_seen='2000-01-01T00:00:00Z'")  # collector clock
+    run_at(data, RETIRED + 89 * 86400)
+    assert rows_of(data, LA_MAC) == 1  # the server-side retirement stamp alone holds it
 
 
 def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
-    mac = "aa:bb:cc:00:00:01"
-    data.add_batch(T0, neigh=[mac, NIC])
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # transient retired
-    transient = data.q("SELECT device_id FROM observations WHERE mac=?", mac)[0][0]
+    data.add_batch(T0, neigh=[LA_MAC, NIC])
+    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)  # transient retired
+    transient = data.q("SELECT device_id FROM observations WHERE mac=?", LA_MAC)[0][0]
     active = data.q("SELECT device_id FROM observations WHERE mac=?", NIC)[0][0]
     ov = open_overrides(data.root / "overrides.db")
     ov.execute(
@@ -76,23 +96,38 @@ def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
     )
     ov.commit()
     ov.close()
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
-    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+    run_at(data, RETIRED + 91 * 86400)  # past 90 days, the clock moved: the link alone protects
+    assert rows_of(data, LA_MAC) == 1
+
+
+def test_the_same_retired_transient_is_pruned_without_the_link(data):
+    data.add_batch(T0, neigh=[LA_MAC, NIC])
+    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    open_overrides(data.root / "overrides.db").close()
+    run_at(data, RETIRED + 91 * 86400)
+    assert rows_of(data, LA_MAC) == 0  # the link in the test above is what kept it
 
 
 def test_pruning_is_skipped_when_overrides_is_unreadable(data):
-    mac = "aa:bb:cc:00:00:01"
-    data.add_batch(T0, neigh=[mac])
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    retire_one(data)
     (data.root / "overrides.db").write_bytes(b"not a database" * 100)
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
-    assert len(data.q("SELECT * FROM observations WHERE mac=?", mac)) == 1
+    run_at(data, RETIRED + 91 * 86400)
+    assert rows_of(data, LA_MAC) == 1
 
 
 def test_active_device_mac_rows_are_never_pruned(data):
     data.add_batch(T0, neigh=[NIC])  # globally administered: active, not transient
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
-    assert len(data.q("SELECT * FROM observations WHERE mac=?", NIC)) == 1
+    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    open_overrides(data.root / "overrides.db").close()
+    run_at(data, RETIRED + 91 * 86400)
+    assert rows_of(data, NIC) == 1
+    assert (
+        data.q(
+            "SELECT status FROM devices WHERE id=(SELECT device_id FROM observations WHERE mac=?)",
+            NIC,
+        )[0][0]
+        == "active"
+    )
 
 
 # ---- F7: MAC handling ---------------------------------------------------------------------
