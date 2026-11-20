@@ -37,7 +37,7 @@ from vigie_pipeline.overrides import (
     protected_device_ids,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
-from vigie_pipeline.prune_exclusions import PRUNE_EXCLUSIONS_SQL
+from vigie_pipeline.prune_exclusions import LIVE_SUGGESTION_PARAMS, PRUNE_EXCLUSIONS_SQL
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import (
@@ -626,7 +626,7 @@ def prune_retired_macs(
 ) -> int:
     """Drop self-linked MAC rows of retired devices 90 days after the server retired them
     (transient_state.since; PRP section 8), on a clock every collector corroborates (see
-    `_prune_cutoff`), so a stepped server clock prunes nothing. One bounded batch per pass; the
+    `_trusted_now`), so a stepped server clock prunes nothing. One bounded batch per pass; the
     running total is the aggregate kept in `pipeline_meta` and each pass logs only a count.
     Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
     that overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
@@ -670,14 +670,15 @@ def _delete_retired_rows(
     batch_mark: BatchMark | None,
     now: float,
 ) -> int:
-    cutoff = _prune_cutoff(inv, now)
-    if cutoff is None:
+    trusted = _trusted_now(inv, now)
+    if trusted is None:
         return 0  # no accepted activity: the server clock cannot be checked, prune nothing
-    candidates = _prune_candidates(inv, protected, cutoff)  # selected before the write lock
+    args = _prune_args(trusted)
+    candidates = _prune_candidates(inv, protected, args)  # selected before the write lock
     with immediate(inv):
         if not _batches_settled(inv, batch_mark):
             raise _BatchesMoved
-        pruned = _delete_candidates(inv, candidates, cutoff)
+        pruned = _delete_candidates(inv, candidates, args)
         if pruned:
             inv.execute(
                 "INSERT INTO pipeline_meta (key, value) VALUES (?, ?)"
@@ -689,19 +690,27 @@ def _delete_retired_rows(
     return pruned
 
 
-def _prune_cutoff(inv: sqlite3.Connection, now: float) -> str | None:
-    """Retention boundary on the clock the server can vouch for: the oldest of its own time, the
-    newest accepted collector activity, and EVERY collector's own newest batch time. activity.py
-    only accepts a stamp within [received - ACTIVITY_MAX_REPORT_LAG_S, received + ACTIVITY_SKEW_S]
-    (hi_ok/lo_ok in _record_activity), so after a forward step of the server clock alone, or of a
-    collector alone, no stamp is accepted and the frontier stops: the cutoff stops with it. One
-    collector that follows the server's step must not corroborate it, so the newest batch of each
-    collector is consulted (`_collector_frontiers`). None (no activity, no batch) prunes nothing."""
+def _trusted_now(inv: sqlite3.Connection, now: float) -> float | None:
+    """The instant the server can vouch for: the oldest of its own time, the newest accepted
+    collector activity, and EVERY collector's own newest batch time. activity.py only accepts a
+    stamp within [received - ACTIVITY_MAX_REPORT_LAG_S, received + ACTIVITY_SKEW_S] (hi_ok/lo_ok
+    in _record_activity), so after a forward step of the server clock alone, or of a collector
+    alone, no stamp is accepted and the frontier stops: the clock stops with it. One collector
+    that follows the server's step must not corroborate it, so the newest batch of each collector
+    is consulted (`_collector_frontiers`). None (no activity, no batch) prunes nothing. The
+    retention boundary and the liveness of a suggestion are both read on this instant."""
     frontier = inv.execute('SELECT MAX("end") FROM mac_activity').fetchone()[0]
     collectors = _collector_frontiers(inv)
     if frontier is None or not collectors:
         return None
-    return iso_utc(min(now, frontier, *collectors) - RETIRED_MAC_RETENTION_S)
+    return min(now, frontier, *collectors)
+
+
+def _prune_args(trusted: float) -> tuple[str, ...]:
+    """Binds of the prunable predicate, in order: stamp cutoff, last_seen cutoff, then the instant
+    a suggestion must still be live at, once per direction."""
+    cutoff = iso_utc(trusted - RETIRED_MAC_RETENTION_S)
+    return (cutoff, cutoff, *(iso_utc(trusted),) * LIVE_SUGGESTION_PARAMS)
 
 
 def _collector_frontiers(inv: sqlite3.Connection) -> list[float]:
@@ -724,7 +733,7 @@ def _collector_frontiers(inv: sqlite3.Connection) -> list[float]:
 
 # The whole prunable predicate, selected before the lock and repeated by the DELETE inside it.
 # Aliases: o observations, d devices, t transient_state (the server-clock retirement stamp; a
-# retired device without one is not prunable). Placeholders: stamp cutoff, last_seen cutoff.
+# retired device without one is not prunable). Placeholders: see `_prune_args`.
 _PRUNABLE_SQL = (
     "FROM observations o JOIN devices d ON d.id=o.device_id"  # noqa: S608
     " JOIN transient_state t ON t.device_id=d.id"
@@ -733,7 +742,9 @@ _PRUNABLE_SQL = (
 )
 
 
-def _prune_candidates(inv: sqlite3.Connection, protected: set[str], cutoff: str) -> list[str]:
+def _prune_candidates(
+    inv: sqlite3.Connection, protected: set[str], args: tuple[str, ...]
+) -> list[str]:
     """Up to PRUNE_BATCH_ROWS MACs, oldest retirement first, with every protection already
     applied in SQL so a protected oldest batch cannot starve the LIMIT. The scan runs here, with
     no write lock held; the temp table lives in the temp database, not the main one."""
@@ -746,12 +757,12 @@ def _prune_candidates(inv: sqlite3.Connection, protected: set[str], cutoff: str)
         r[0]
         for r in inv.execute(
             f"SELECT o.mac {_PRUNABLE_SQL} ORDER BY t.since, o.mac LIMIT ?",  # noqa: S608
-            (cutoff, cutoff, PRUNE_BATCH_ROWS),
+            (*args, PRUNE_BATCH_ROWS),
         )
     ]
 
 
-def _delete_candidates(inv: sqlite3.Connection, macs: list[str], cutoff: str) -> int:
+def _delete_candidates(inv: sqlite3.Connection, macs: list[str], args: tuple[str, ...]) -> int:
     """Inside the lock: one DELETE per candidate that repeats the whole predicate as point
     lookups (a candidate revived, protected or stamped anew since the select is skipped). A
     pruned MAC's last-known IP goes with it: the MAC returning with traffic that carries no
@@ -761,7 +772,7 @@ def _delete_candidates(inv: sqlite3.Connection, macs: list[str], cutoff: str) ->
         deleted = inv.execute(
             "DELETE FROM observations WHERE mac=? AND mac IN"  # noqa: S608
             f" (SELECT o.mac {_PRUNABLE_SQL} AND o.mac=?)",
-            (mac, cutoff, cutoff, mac),
+            (mac, *args, mac),
         ).rowcount
         if deleted:
             inv.execute("DELETE FROM mac_last_ip WHERE mac=?", (mac,))

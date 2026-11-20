@@ -7,8 +7,20 @@ import logging
 
 import pytest
 from pipeline_helpers import data  # noqa: F401
-from test_prune_guards import LATER, STAMP, migrated_overrides, prune, retire, rows, sql
+from test_prune_guards import (
+    LATER,
+    RETENTION,
+    RETIRED_AT,
+    STAMP,
+    migrated_overrides,
+    prune,
+    retire,
+    rows,
+    set_frontier,
+    sql,
+)
 
+from vigie_ingest.db import iso_utc
 from vigie_pipeline.monitoring_identity import lineage
 from vigie_pipeline.overrides import open_overrides_ro
 
@@ -96,15 +108,26 @@ _CANDIDATE = (
 )
 _SUGGESTION = (
     "INSERT INTO suggestions (id, action, device_ids, payload, reason_code, basis, created_at,"
-    " expires_at) VALUES ('s1', 'merge_identity', '{ids}', '[]', 'rc', 'b', 'x', '1970-01-01')"
+    " expires_at) VALUES ('s1', 'merge_identity', '{ids}', '[]', 'rc', 'b', 'x', '{expires}')"
 )
+LIVE = "2999-01-01T00:00:00Z"
+EXPIRED = "1970-01-01T00:00:00Z"
+
+
+def _candidate(side: str, state: str) -> str:
+    pair = "'{dev}', 'z'" if side == "a" else "'z', '{dev}'"
+    stored = "gone" if state == "unknown_state" else state  # a state this build never writes
+    return f"{_CANDIDATE} VALUES ('c1', {pair}, 1, 'e', '{stored}', 'x')"
+
+
 INVENTORY_SOURCES = {
-    "candidate_a_open": f"{_CANDIDATE} VALUES ('c1', '{{dev}}', 'z', 1, 'e', 'open', 'x')",
-    "candidate_b_open": f"{_CANDIDATE} VALUES ('c1', 'z', '{{dev}}', 1, 'e', 'open', 'x')",
-    "candidate_a_dismissed": f"{_CANDIDATE} VALUES ('c1', '{{dev}}', 'z', 1, 'e', 'gone', 'x')",
-    "candidate_b_dismissed": f"{_CANDIDATE} VALUES ('c1', 'z', '{{dev}}', 1, 'e', 'gone', 'x')",
-    "suggestion_from": _SUGGESTION.format(ids='["{dev}","z"]', dev="{dev}"),
-    "suggestion_into": _SUGGESTION.format(ids='["z","{dev}"]', dev="{dev}"),
+    **{
+        f"candidate_{side}_{state}": _candidate(side, state)
+        for side in "ab"
+        for state in ("open", "suggested", "vetoed", "cleared", "unknown_state")
+    },
+    "suggestion_from": _SUGGESTION.format(ids='["{dev}","z"]', expires=LIVE),
+    "suggestion_into": _SUGGESTION.format(ids='["z","{dev}"]', expires=LIVE),
     "monitoring_profiles": _PROFILE,
     "monitoring_incidents": _INCIDENT,
     "monitoring_suspicious": (
@@ -166,14 +189,15 @@ def test_a_monitoring_incident_keeps_the_devices_lineage_key(data):
 
 def test_every_exclusion_is_a_seek_not_a_scan(data):
     """No exclusion table may be scanned: the prune runs inside the inventory write lock."""
-    from vigie_pipeline.prune_exclusions import PRUNE_EXCLUSIONS_SQL
+    from vigie_pipeline.prune_exclusions import LIVE_SUGGESTION_PARAMS, PRUNE_EXCLUSIONS_SQL
 
     retire(data)  # a pass creates the pipeline tables
     data.inv.execute("CREATE TEMP TABLE prune_protected (id TEXT PRIMARY KEY)")
     plan = data.inv.execute(
         "EXPLAIN QUERY PLAN SELECT o.mac FROM observations o JOIN devices d ON d.id=o.device_id"  # noqa: S608
         " WHERE d.status='retired' AND d.id NOT IN (SELECT id FROM prune_protected)"
-        + PRUNE_EXCLUSIONS_SQL
+        + PRUNE_EXCLUSIONS_SQL,
+        (STAMP,) * LIVE_SUGGESTION_PARAMS,
     ).fetchall()
     scans = {row[3].split()[1] for row in plan if row[3].startswith("SCAN")}
     assert scans <= {"o", "d", "c"}  # the outer walk and the tiny collectors set only
@@ -185,4 +209,80 @@ def test_a_missing_newly_protected_table_prunes_nothing(data, table):
     retire(data)
     sql(migrated_overrides(data.root), f"DROP TABLE {table}")
     assert prune(data) == 0
+    assert rows(data) == 1
+
+
+# ---- decided history stops pinning a retired device ---------------------------------------------
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_a_dismissed_candidate_with_no_overrides_protection_does_not_pin_the_device(data, side):
+    macs = retire(data, count=2)
+    pinned, free = sorted(macs)
+    migrated_overrides(data.root)
+    pair = ("{dev}", "z") if side == "a" else ("z", "{dev}")
+    _seed(
+        data,
+        f"{_CANDIDATE} VALUES ('c1', '{pair[0]}', '{pair[1]}', 1, 'e', 'dismissed', 'x')",
+        pinned,
+        macs[pinned],
+    )
+    assert prune(data) == 2
+    assert rows(data) == 0
+    assert {pinned, free} == set(macs)
+
+
+def test_a_dismissed_candidate_whose_owner_decision_is_in_overrides_still_keeps_the_row(data):
+    macs = retire(data)
+    ((mac, device),) = macs.items()
+    path = migrated_overrides(data.root)
+    sql(path, OVERRIDES_SOURCES["candidate_a"], device, STAMP)  # the owner's clear for the pair
+    _seed(
+        data,
+        f"{_CANDIDATE} VALUES ('c1', '{{dev}}', 'z', 1, 'e', 'dismissed', 'x')",
+        mac,
+        device,
+    )
+    assert prune(data) == 0
+    assert rows(data) == 1
+
+
+def test_an_expired_suggestion_does_not_pin_the_device(data):
+    macs = retire(data)
+    ((mac, device),) = macs.items()
+    migrated_overrides(data.root)
+    _seed(data, _SUGGESTION.format(ids='["{dev}","z"]', expires=EXPIRED), mac, device)
+    assert prune(data) == 1
+
+
+def test_an_expired_suggestion_whose_merge_was_applied_keeps_the_row_through_the_merge(data):
+    macs = retire(data)
+    ((mac, device),) = macs.items()
+    path = migrated_overrides(data.root)
+    sql(path, OVERRIDES_SOURCES["merge_from"], device, STAMP)  # the applied merge is protected
+    _seed(data, _SUGGESTION.format(ids='["{dev}","z"]', expires=EXPIRED), mac, device)
+    assert prune(data) == 0
+    assert rows(data) == 1
+
+
+@pytest.mark.parametrize("ids", ['["{dev}","z"]', '["z","{dev}"]'], ids=["from", "into"])
+def test_a_suggestion_is_live_up_to_and_including_the_trusted_clock(data, ids):
+    macs = retire(data)
+    ((mac, device),) = macs.items()
+    migrated_overrides(data.root)
+    _seed(data, _SUGGESTION.format(ids=ids, expires=iso_utc(LATER)), mac, device)
+    assert prune(data, LATER) == 0  # expires_at == now: still live
+    data.inv.execute("UPDATE suggestions SET expires_at=?", (iso_utc(LATER - 1),))
+    assert prune(data, LATER) == 1
+
+
+def test_a_suggestions_liveness_is_judged_on_the_corroborated_clock_not_the_servers(data):
+    macs = retire(data)
+    ((mac, device),) = macs.items()
+    migrated_overrides(data.root)
+    corroborated = RETIRED_AT + RETENTION + 100  # what every collector vouches for
+    set_frontier(data, corroborated)
+    expires = iso_utc(corroborated + 100)  # past for the (stepped) server, future for the truth
+    _seed(data, _SUGGESTION.format(ids='["{dev}","z"]', expires=expires), mac, device)
+    assert prune(data, LATER) == 0
     assert rows(data) == 1
