@@ -8,13 +8,14 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
-from vigie_api.schema import OVERRIDES_MIGRATIONS
-
 MAX_LINK_DEPTH = 32
 # Review statuses that quiet an incident; a pinned mirror of vigie_api.incident_decisions.
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
-# The one overrides schema this build understands (same source of truth as backup verification).
-SUPPORTED_USER_VERSION = len(OVERRIDES_MIGRATIONS)
+# The one overrides schema this build understands. A LITERAL on purpose: derived from the
+# migration list it would follow every new migration silently, and a new table or column that names
+# a device would be pruned from under. Bump only after reviewing PROTECTED_READS (and the
+# classification test in tests/pipeline/test_prune_protected_set.py) against the new schema.
+SUPPORTED_USER_VERSION = 10
 # Tables the protected-device query reads; all must exist before anything is pruned on its word.
 PROTECTED_TABLES = (
     "candidate_decisions",
@@ -26,8 +27,11 @@ PROTECTED_TABLES = (
     "incident_decisions",
 )
 # Every column below names a device a human decision refers to. Unfiltered on purpose: expired or
-# revoked rules, cleared marks and decisions, undone merges and revoked links still protect
-# (over-protecting fails safe). Kept in this module with the other identity_links SQL.
+# revoked rules, cleared marks, undone merges and revoked links still protect (over-protecting
+# fails safe). A cleared incident decision (status NULL) protects only while its row exists: the
+# API deletes incident_decisions rows together with their incident (120 days old, incident
+# already pruned; vigie_api.incident_decisions), so that protection ends with the incident.
+# Kept in this module with the other identity_links SQL.
 PROTECTED_READS = (
     "SELECT device_id FROM device_overrides",
     "SELECT device_id FROM essential_devices",

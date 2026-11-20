@@ -513,9 +513,10 @@ class _OverridesMoved(_PruneDeferred):
 
 
 class _BatchesMoved(_PruneDeferred):
-    """A batch arrived or was purged since the pass read its batches, or one was unreadable."""
+    """No proof that every batch was processed: one arrived, was purged, was unreadable or
+    gutted, or a cursor no longer names a real row."""
 
-    reason = "batches_changed"
+    reason = "batches_unsettled"
 
 
 # (batches.rowid, collector_id, batch_id) of the newest recorded batch; _NO_BATCHES when none.

@@ -211,10 +211,19 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   startup and hourly.
 - `batches` rows (dedupe records) are purged after 7 days; not configurable.
 - `VIGIE_MAX_SPOOL_AGE_S` - how old a collector window may be (default 24 h).
-- `mac_last_ip` (last observed address per MAC) is never pruned. It holds at most one row per MAC
-  in observations, and devices are retired, not deleted, so it is bounded by the MACs ever seen.
-  It is visible to every API token scope that can read `/devices` (no per-field gating); no IP
-  addresses were exposed by the API before it was added.
+- Retired transient devices: 90 days after the pipeline retired a device (server clock, counted on
+  a time every collector agrees with), its self-linked MAC rows in `inventory.db` are deleted, at
+  most 1000 per pass, oldest first, together with the MAC's `mac_last_ip` row; the device row itself
+  stays. Devices that `overrides.db` refers to (names, groups, merges, rules, essential marks,
+  decisions) and devices still named by an open candidate, a live suggestion or monitoring state
+  are never pruned. Nothing is pruned while `overrides.db` is missing or unusable, or while a
+  batch could still carry the MAC (the pass retries); a collector that stops reporting delays
+  pruning for up to 7 days. Not configurable. See `server/src/vigie_pipeline/README.md`.
+- `mac_last_ip` (last observed address per MAC) is deleted with its MAC row by the retired-device
+  prune above and is otherwise never pruned: it holds at most one row per MAC in observations, and
+  devices are retired, not deleted, so it is bounded by the MACs ever seen. It is visible to every
+  API token scope that can read `/devices` (no per-field gating); no IP addresses were exposed by
+  the API before it was added.
 - `incident_decisions` (human incident reviews, `overrides.db`) keeps the current decision only;
   history is in `audit_log`. Each incident write deletes up to 100 rows whose `decided_at` is older
   than 120 days and whose incident the pipeline has already pruned (incidents live 90 days).
