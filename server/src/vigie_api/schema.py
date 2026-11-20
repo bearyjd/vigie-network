@@ -20,6 +20,33 @@ BUSY_TIMEOUT_MS = 5000
 LOG = logging.getLogger("vigie_api")
 
 
+# Columns whose change invalidates identity_version. vigie_pipeline.snapshot must read nothing
+# else from these tables (pinned by test_identity_version).
+IDENTITY_WATCHED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "identity_rules": (
+        "id",
+        "device_id",
+        "signature",
+        "created_by",
+        "expires_at",
+        "revoked_at",
+    ),
+    "identity_links": ("from_device", "into_device", "revoked_at"),
+    "suggestion_decisions": ("suggestion_id", "state"),
+    "candidate_decisions": (
+        "id",
+        "candidate_id",
+        "device_a",
+        "device_b",
+        "action",
+        "decided_by",
+        "decided_at",
+    ),
+    "device_overrides": ("device_id", "group_id"),
+    "groups": ("id", "auto_inherit"),
+}
+
+
 def _identity_triggers() -> tuple[str, ...]:
     """Keep invalidation in the writing transaction, including UPSERT and direct SQL paths.
 
@@ -27,30 +54,7 @@ def _identity_triggers() -> tuple[str, ...]:
     do not authorize attaches: only group membership and auto_inherit invalidate those tables.
     """
     statements = []
-    columns = {
-        "identity_rules": (
-            "id",
-            "device_id",
-            "signature",
-            "created_by",
-            "expires_at",
-            "revoked_at",
-        ),
-        "identity_links": ("from_device", "into_device", "revoked_at"),
-        "suggestion_decisions": ("suggestion_id", "state"),
-        "candidate_decisions": (
-            "id",
-            "candidate_id",
-            "device_a",
-            "device_b",
-            "action",
-            "decided_by",
-            "decided_at",
-        ),
-        "device_overrides": ("device_id", "group_id"),
-        "groups": ("id", "auto_inherit"),
-    }
-    for table, watched in columns.items():
+    for table, watched in IDENTITY_WATCHED_COLUMNS.items():
         for event in ("INSERT", "UPDATE", "DELETE"):
             condition = ""
             if table == "device_overrides":

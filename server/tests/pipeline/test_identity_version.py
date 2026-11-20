@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from stitch_helpers import NOW_ABS, OLD, Overrides, inv  # noqa: F401
 
-from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
+from vigie_api.schema import IDENTITY_WATCHED_COLUMNS, OVERRIDES_MIGRATIONS, open_overrides
 from vigie_pipeline.overrides import open_overrides_ro
 from vigie_pipeline.snapshot import OverridesUnreadable, load_snapshot
 from vigie_pipeline.stitch_apply import apply_plan
@@ -164,6 +164,28 @@ def test_legacy_missing_table_uses_coarse_fallback(tmp_path):
     assert snap.identity_version is None and isinstance(snap.data_version, int)
     ov.conn.execute("INSERT INTO audit_log (id,ts,principal,action) VALUES ('a','t','u','test')")
     assert load_snapshot(ro, NOW_ABS).data_version != snap.data_version
+    ro.close()
+    ov.close()
+
+
+# Read by the snapshot but deliberately not an identity input (a label counter, see IRRELEVANT).
+SNAPSHOT_ONLY_COLUMNS = {("device_overrides", "version")}
+
+
+def test_every_snapshot_column_is_watched_by_the_triggers(tmp_path):
+    """A column added to a snapshot SELECT must also be added to IDENTITY_WATCHED_COLUMNS."""
+    ov, ro = world(tmp_path)
+    seen: list[str] = []
+    ro.set_trace_callback(seen.append)
+    load_snapshot(ro, NOW_ABS)
+    read = set()
+    for sql in seen:
+        match = re.match(r"SELECT (.+?) FROM (\w+)", " ".join(sql.split()))
+        if match and match.group(2) in IDENTITY_WATCHED_COLUMNS:
+            read |= {(match.group(2), col.strip()) for col in match.group(1).split(",")}
+    watched = {(t, c) for t, cols in IDENTITY_WATCHED_COLUMNS.items() for c in cols}
+    assert read, "no snapshot SELECT captured"
+    assert read - SNAPSHOT_ONLY_COLUMNS <= watched
     ro.close()
     ov.close()
 
