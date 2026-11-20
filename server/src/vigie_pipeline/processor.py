@@ -604,15 +604,20 @@ def _prune_candidates(inv: sqlite3.Connection, protected: set[str], cutoff: str)
 
 def _delete_candidates(inv: sqlite3.Connection, macs: list[str], cutoff: str) -> int:
     """Inside the lock: one DELETE per candidate that repeats the whole predicate as point
-    lookups (a candidate revived, protected or stamped anew since the select is skipped)."""
-    return sum(
-        inv.execute(
+    lookups (a candidate revived, protected or stamped anew since the select is skipped). A
+    pruned MAC's last-known IP goes with it: the MAC returning with traffic that carries no
+    address (DNS only) would otherwise show the old IP on its new device."""
+    pruned = 0
+    for mac in macs:
+        deleted = inv.execute(
             "DELETE FROM observations WHERE mac=? AND mac IN"  # noqa: S608
             f" (SELECT o.mac {_PRUNABLE_SQL} AND o.mac=?)",
             (mac, cutoff, cutoff, mac),
         ).rowcount
-        for mac in macs
-    )
+        if deleted:
+            inv.execute("DELETE FROM mac_last_ip WHERE mac=?", (mac,))
+        pruned += deleted
+    return pruned
 
 
 def _overrides_moved(overrides: sqlite3.Connection | None, before: int) -> bool:
