@@ -54,18 +54,20 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
 
 
 def set_frontier(data: Data, end: int | None) -> None:
-    """The newest `end` in mac_activity (None: no activity at all), the prune's trusted clock."""
+    """The newest `end` in mac_activity (None: no activity at all) and every collector's newest
+    batch window end: the prune's trusted clock, with all collectors agreeing on it."""
     data.inv.execute("DELETE FROM mac_activity")
     if end is not None:
         data.inv.execute(
             'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', (NIC, 0, end)
         )
+    data.inv.execute("UPDATE batches SET window_end=?", (end,))
 
 
 def prune(data: Data, now: float = LATER) -> int:
     conn = open_overrides_ro(data.root / "overrides.db")
     try:
-        return prune_retired_macs(data.inv, conn, now)
+        return prune_retired_macs(data.inv, conn, now, processor._batch_mark(data.inv))
     finally:
         if conn is not None:
             conn.close()
@@ -160,7 +162,7 @@ def test_an_exclusively_locked_overrides_db_prunes_nothing(data):
     writer = sqlite3.connect(path, isolation_level=None)
     writer.execute("BEGIN EXCLUSIVE")
     try:
-        assert prune_retired_macs(data.inv, reader, LATER) == 0
+        assert prune_retired_macs(data.inv, reader, LATER, processor._batch_mark(data.inv)) == 0
     finally:
         writer.execute("ROLLBACK")
         writer.close()

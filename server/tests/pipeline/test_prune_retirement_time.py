@@ -176,3 +176,64 @@ def test_no_statement_inside_the_write_lock_scans_inventory(data):
         scans += [r[3] for r in plan if r[3].startswith("SCAN")]
     # the exclusions probe the collector set (a handful of rows, never inventory-sized)
     assert [s for s in scans if not s.startswith("SCAN c USING COVERING INDEX")] == []
+
+
+# ---- the clock must be corroborated by EVERY collector, not by the one that agrees ----------
+
+
+def second_collector(data, window_end):
+    """A second collector whose newest batch ends at `window_end`."""
+    data.add_batch(T0, collector="rtr-2", neigh=["02:00:5e:00:00:31"])
+    data.inv.execute("UPDATE batches SET window_end=? WHERE collector_id='rtr-2'", (window_end,))
+
+
+def test_one_collector_sharing_a_forward_step_does_not_corroborate_a_wrong_clock(data):
+    retire(data)
+    migrated_overrides(data.root)
+    stepped = RETIRED_AT + 100 * 86400  # the server clock jumped; one collector followed it
+    set_frontier(data, stepped)
+    second_collector(data, RETIRED_AT + 3600)  # the other collector still tells the true time
+    assert prune(data, stepped) == 0
+    assert rows(data) == 1
+
+
+def test_every_collector_agreeing_on_the_later_time_lets_the_prune_through(data):
+    retire(data)
+    migrated_overrides(data.root)
+    set_frontier(data, FRONTIER)
+    second_collector(data, FRONTIER)
+    assert prune(data, LATER) == 1
+    assert rows(data) == 0
+
+
+def test_a_collector_with_no_recorded_batch_is_ignored(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.inv.execute("INSERT INTO collectors (id, key_id) VALUES ('idle', 'k9')")
+    assert prune(data, LATER) == 1
+
+
+def test_a_batch_without_a_window_end_counts_from_its_receipt(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.inv.execute("UPDATE batches SET window_end=NULL")  # legacy row: receipt time T0
+    assert prune(data, LATER) == 0
+    assert rows(data) == 1
+
+
+def test_no_recorded_batch_at_all_prunes_nothing(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.inv.execute("DELETE FROM batches")  # activity rows outlive their batches
+    assert prune(data, LATER) == 0
+    assert rows(data) == 1
+
+
+def test_a_collector_is_judged_by_its_newest_batch_not_an_older_one(data):
+    retire(data)
+    migrated_overrides(data.root)
+    data.add_batch(T0, received=T0 - 100, neigh=["02:00:5e:00:00:31"])
+    data.inv.execute(  # an older, lagging batch of the same collector
+        "UPDATE batches SET window_end=? WHERE rowid=2", (RETIRED_AT + 3600,)
+    )
+    assert prune(data, LATER) == 1

@@ -38,7 +38,13 @@ from vigie_pipeline.probes import fold_probes, retire_status
 from vigie_pipeline.prune_exclusions import PRUNE_EXCLUSIONS_SQL
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
-from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
+from vigie_pipeline.sources import (
+    MacActivity,
+    ShardReadError,
+    is_randomized,
+    read_batch,
+    shards_missing,
+)
 from vigie_pipeline.stitch import StitchStats, stitch
 from vigie_pipeline.stitch_db import emit_once
 from vigie_pipeline.stitch_types import fold
@@ -72,32 +78,23 @@ def run_once(
     inv = open_pipeline_inventory(config.inventory_path, config.migrate)
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
+    gaps: list[str] = []
     try:
         # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
         # no identity links for the batches, no stitching, cursor progress is kept
         usable = _overrides_readable(inv, overrides, config, clock)
         mark = _batch_mark(inv)
-        totals = _process_batches(inv, overrides if usable else None, config, failures)
+        totals = _process_batches(inv, overrides if usable else None, config, failures, gaps)
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
         if usable:  # prune_retired_macs itself fails closed on a missing/unusable overrides.db
-            prune_retired_macs(inv, overrides, clock, None if failures else mark)
+            prune_retired_macs(inv, overrides, clock, None if failures or gaps else mark)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
-        if usable:
-            analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
-            run_delivery_stage(
-                inv, overrides, config, live or (lambda: clock), should_stop=should_stop
-            )
-            refresh_characterization(inv, overrides, clock)
-        prune_monitoring(inv, clock)
-        if config.probes.enabled:  # needs no overrides; contains its own errors
-            fold_probes(inv, config.probes, live or (lambda: clock))
-        else:  # a status stored while it was on must not keep saying ok (a read when none exists)
-            retire_status(inv, live or (lambda: clock))
+        _monitor_deliver_probe(inv, overrides, config, usable, clock, live, should_stop)
     finally:
         inv.close()
         if overrides is not None:
@@ -113,6 +110,27 @@ def run_once(
     if failures:
         raise failures[0]
     return stats
+
+
+def _monitor_deliver_probe(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    usable: bool,
+    clock: float,
+    live: Callable[[], float] | None,
+    should_stop: Callable[[], bool],
+) -> None:
+    """The stages after the prune; they need a readable overrides.db except the probes."""
+    if usable:
+        analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
+        run_delivery_stage(inv, overrides, config, live or (lambda: clock), should_stop=should_stop)
+        refresh_characterization(inv, overrides, clock)
+    prune_monitoring(inv, clock)
+    if config.probes.enabled:  # needs no overrides; contains its own errors
+        fold_probes(inv, config.probes, live or (lambda: clock))
+    else:  # a status stored while it was on must not keep saying ok (a read when none exists)
+        retire_status(inv, live or (lambda: clock))
 
 
 def monitoring_policy(config: PipelineConfig) -> BaselineConfig | TodConfig:
@@ -175,6 +193,7 @@ def _process_batches(
     overrides: sqlite3.Connection | None,
     config: PipelineConfig,
     failures: list[ShardReadError],
+    gaps: list[str],
 ) -> dict[str, int]:
     totals = {"batches": 0, "macs": 0, "new_devices": 0, "skipped_macs": 0}
     collectors = [r[0] for r in inv.execute("SELECT DISTINCT collector_id FROM batches")]
@@ -188,6 +207,8 @@ def _process_batches(
                 # never advance past an unreadable batch: it and its successors stay pending
                 failures.append(exc)
                 break
+            if shards_missing(config.data_dir, _batch_start(inv, collector, batch_id, received)):
+                gaps.append(batch_id)  # read as empty because retention took its shards first
             with immediate(inv):
                 created = _apply_batch(inv, overrides, acts, received)
                 save_last_ips(inv, acts)
@@ -233,6 +254,15 @@ def _pending(inv: sqlite3.Connection, collector: str) -> list[tuple[int, str, st
             (collector, cursor),
         )
     ]
+
+
+def _batch_start(inv: sqlite3.Connection, collector: str, batch_id: str, received: str) -> float:
+    """Earliest time the batch's rows can carry: its window start, else its receipt."""
+    row = inv.execute(
+        "SELECT window_start FROM batches WHERE collector_id=? AND batch_id=?",
+        (collector, batch_id),
+    ).fetchone()
+    return _epoch(received) if row is None or row[0] is None else min(row[0], _epoch(received))
 
 
 def _advance_cursor(inv: sqlite3.Connection, collector: str, rowid: int, batch_id: str) -> None:
@@ -470,7 +500,6 @@ class _BatchesMoved(_PruneDeferred):
 # (batches.rowid, collector_id, batch_id) of the newest recorded batch; _NO_BATCHES when none.
 BatchMark = tuple[int, str, str]
 _NO_BATCHES: BatchMark = (0, "", "")
-_UNCHECKED: BatchMark = (-1, "", "")  # direct callers with no run_once context
 
 
 def _batch_mark(inv: sqlite3.Connection) -> BatchMark:
@@ -480,13 +509,41 @@ def _batch_mark(inv: sqlite3.Connection) -> BatchMark:
     return _NO_BATCHES if row is None else (row[0], row[1], row[2])
 
 
+# A cursor proves a batch processed only when it names a REAL row of its collector (the check
+# `_pending` makes): retention can empty `batches` while a cursor stays, and a returning batch
+# then reuses a rowid at or below that stale cursor. A collector without any batch row has no
+# arrival to vouch for, so its leftover cursor blocks nothing.
+def _cursor_row(cursor: str) -> str:
+    return (
+        "SELECT 1 FROM batches x WHERE x.collector_id="  # noqa: S608
+        f"{cursor}.collector_id AND x.rowid={cursor}.last_batch_rowid"
+        f" AND x.batch_id={cursor}.last_batch_id"
+    )
+
+
+_UNPROVEN_ARRIVAL_SQL = (
+    "SELECT 1 FROM batches b WHERE b.rowid>? AND NOT EXISTS ("
+    "SELECT 1 FROM pipeline_cursor c WHERE c.collector_id=b.collector_id"
+    " AND c.last_batch_rowid>=b.rowid) LIMIT 1"
+)
+# the collector set is a handful of rows; every other probe is a primary-key seek
+_STALE_CURSOR_SQL = (
+    "SELECT 1 FROM collectors c CROSS JOIN pipeline_cursor u ON u.collector_id=c.id"  # noqa: S608
+    " WHERE u.last_batch_rowid>0"
+    " AND EXISTS (SELECT 1 FROM batches b WHERE b.collector_id=c.id)"
+    f" AND NOT EXISTS ({_cursor_row('u')}) LIMIT 1"
+)
+
+
 def _batches_settled(inv: sqlite3.Connection, mark: BatchMark | None) -> bool:
     """True only when no batch can still carry a MAC this pass did not see. None (a batch was
-    unreadable, so a rowid at or below the mark is unprocessed) is never settled. The mark's own
-    row must still exist unchanged: a freed rowid is only reused after the newest row is purged,
-    so no rowid at or below the mark was reused. Every row above the mark is a batch that arrived
-    during this pass and must already be behind its collector's cursor; ingest commits batches in
-    this database, so under our write lock the answer is exact. Rowid range seeks only."""
+    unreadable or its shards were gone) is never settled. The mark's own row must still exist
+    unchanged: a freed rowid is only reused after the newest row is purged, so no rowid at or
+    below the mark was reused. Every row above the mark arrived during this pass and must be
+    behind its collector's cursor; and no collector that has batches may hold a cursor naming no
+    real row (rowid and batch id, as `_pending` checks), whichever collector's batch is the
+    mark. Ingest commits batches in this database, so under our write lock the answer is exact.
+    Rowid range seeks and primary-key probes only."""
     if mark is None:
         return False
     rowid, collector, batch_id = mark
@@ -498,33 +555,33 @@ def _batches_settled(inv: sqlite3.Connection, mark: BatchMark | None) -> bool:
         ).fetchone()
     ):
         return False
-    return not inv.execute(
-        "SELECT 1 FROM batches b LEFT JOIN pipeline_cursor c ON c.collector_id=b.collector_id"
-        " WHERE b.rowid>? AND b.rowid>COALESCE(c.last_batch_rowid,0) LIMIT 1",
-        (rowid,),
-    ).fetchone()
+    return not (
+        inv.execute(_UNPROVEN_ARRIVAL_SQL, (rowid,)).fetchone()
+        or inv.execute(_STALE_CURSOR_SQL).fetchone()
+    )
 
 
 def prune_retired_macs(
     inv: sqlite3.Connection,
     overrides: sqlite3.Connection | None,
     now: float,
-    batch_mark: BatchMark | None = _UNCHECKED,
+    batch_mark: BatchMark | None,
 ) -> int:
     """Drop self-linked MAC rows of retired devices 90 days after the server retired them
-    (transient_state.since; PRP section 8), on `min(now, newest mac_activity end)` so a stepped
-    server clock prunes nothing. One bounded batch per pass; the running total is the aggregate
-    kept in `pipeline_meta` and each pass logs only a count. Devices
-    are never deleted; a pruned MAC that returns starts over as a new transient. Devices that
-    overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
+    (transient_state.since; PRP section 8), on a clock every collector corroborates (see
+    `_prune_cutoff`), so a stepped server clock prunes nothing. One bounded batch per pass; the
+    running total is the aggregate kept in `pipeline_meta` and each pass logs only a count.
+    Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
+    that overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
     pruned: human decisions live there, not in `link_source`. Fails closed: with no
     overrides.db, or one that is unreadable, locked, of another schema version or missing a
-    table, nothing is pruned. The protected set is re-validated just before COMMIT
-    (`PRAGMA data_version`): a human decision committed meanwhile defers the whole pass, which
-    rolls back. The two databases cannot share a transaction, so a commit landing after that
-    last check and before COMMIT (microseconds) is not seen, same as stitch_apply's attach.
-    run_once also passes the newest batch mark taken before it read batches (None when a batch
-    was unreadable); the pass is deferred unless no batch can still carry a returning MAC."""
+    table, nothing is pruned; a busy inventory skips the pass. The protected set is re-validated
+    just before COMMIT (`PRAGMA data_version`): a human decision committed meanwhile defers the
+    whole pass, which rolls back. The two databases cannot share a transaction, so a commit
+    landing after that last check and before COMMIT (microseconds) is not seen, same as
+    stitch_apply's attach. `batch_mark` is the newest batch mark taken before the pass read its
+    batches, or None when a batch was unreadable or gutted: the pass is deferred unless no batch
+    can still carry a returning MAC."""
     try:
         before = overrides_data_version(overrides)
         protected = protected_device_ids(overrides)
@@ -535,6 +592,9 @@ def prune_retired_macs(
         pruned = _delete_retired_rows(inv, overrides, protected, (before, batch_mark), now)
     except _PruneDeferred as exc:
         log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
+        return 0
+    except sqlite3.Error as exc:  # busy or locked: the rest of the pass must still run
+        log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
     if pruned:
         log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
@@ -554,7 +614,7 @@ def _delete_retired_rows(
         return 0  # no accepted activity: the server clock cannot be checked, prune nothing
     candidates = _prune_candidates(inv, protected, cutoff)  # selected before the write lock
     with immediate(inv):
-        if batch_mark != _UNCHECKED and not _batches_settled(inv, batch_mark):
+        if not _batches_settled(inv, batch_mark):
             raise _BatchesMoved
         pruned = _delete_candidates(inv, candidates, cutoff)
         if pruned:
@@ -569,14 +629,36 @@ def _delete_retired_rows(
 
 
 def _prune_cutoff(inv: sqlite3.Connection, now: float) -> str | None:
-    """Retention boundary on the clock the server can vouch for: the older of its own time and
-    the newest accepted collector activity. activity.py only accepts a stamp within
-    [received - ACTIVITY_MAX_REPORT_LAG_S, received + ACTIVITY_SKEW_S] (hi_ok/lo_ok in
-    _record_activity), so after a forward step of the server clock alone, or of a collector
-    alone, no stamp is accepted and the frontier stops: the cutoff stops with it. One seek on
-    idx_mac_activity_end; None (no activity) prunes nothing."""
+    """Retention boundary on the clock the server can vouch for: the oldest of its own time, the
+    newest accepted collector activity, and EVERY collector's own newest batch time. activity.py
+    only accepts a stamp within [received - ACTIVITY_MAX_REPORT_LAG_S, received + ACTIVITY_SKEW_S]
+    (hi_ok/lo_ok in _record_activity), so after a forward step of the server clock alone, or of a
+    collector alone, no stamp is accepted and the frontier stops: the cutoff stops with it. One
+    collector that follows the server's step must not corroborate it, so the newest batch of each
+    collector is consulted (`_collector_frontiers`). None (no activity, no batch) prunes nothing."""
     frontier = inv.execute('SELECT MAX("end") FROM mac_activity').fetchone()[0]
-    return None if frontier is None else iso_utc(min(now, frontier) - RETIRED_MAC_RETENTION_S)
+    collectors = _collector_frontiers(inv)
+    if frontier is None or not collectors:
+        return None
+    return iso_utc(min(now, frontier, *collectors) - RETIRED_MAC_RETENTION_S)
+
+
+def _collector_frontiers(inv: sqlite3.Connection) -> list[float]:
+    """Per collector that still has a recorded batch: the window end of its newest batch (its own
+    clock; the receipt time for a legacy row without one). mac_activity is keyed by MAC, not by
+    collector, so the per-collector evidence lives here. A collector that went silent keeps
+    holding the minimum back until its last batch is purged (7 days): the prune waits, never
+    runs early. One index seek per collector (idx_batches_collector_received)."""
+    out: list[float] = []
+    for (collector,) in inv.execute("SELECT id FROM collectors").fetchall():
+        row = inv.execute(
+            "SELECT window_end, received_at FROM batches WHERE collector_id=?"
+            " ORDER BY received_at DESC, batch_id DESC LIMIT 1",
+            (collector,),
+        ).fetchone()
+        if row is not None:
+            out.append(_epoch(row[1]) if row[0] is None else float(row[0]))
+    return out
 
 
 # The whole prunable predicate, selected before the lock and repeated by the DELETE inside it.
