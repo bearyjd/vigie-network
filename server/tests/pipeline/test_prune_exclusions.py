@@ -124,7 +124,7 @@ INVENTORY_SOURCES = {
     **{
         f"candidate_{side}_{state}": _candidate(side, state)
         for side in "ab"
-        for state in ("open", "suggested", "vetoed", "cleared", "unknown_state")
+        for state in ("open", "suggested", "unknown_state")
     },
     "suggestion_from": _SUGGESTION.format(ids='["{dev}","z"]', expires=LIVE),
     "suggestion_into": _SUGGESTION.format(ids='["z","{dev}"]', expires=LIVE),
@@ -215,21 +215,39 @@ def test_a_missing_newly_protected_table_prunes_nothing(data, table):
 # ---- decided history stops pinning a retired device ---------------------------------------------
 
 
+@pytest.mark.parametrize("state", ["dismissed", "vetoed", "cleared"])
 @pytest.mark.parametrize("side", ["a", "b"])
-def test_a_dismissed_candidate_with_no_overrides_protection_does_not_pin_the_device(data, side):
+def test_a_settled_candidate_with_no_overrides_protection_does_not_pin_the_device(
+    data, side, state
+):
     macs = retire(data, count=2)
     pinned, free = sorted(macs)
     migrated_overrides(data.root)
     pair = ("{dev}", "z") if side == "a" else ("z", "{dev}")
     _seed(
         data,
-        f"{_CANDIDATE} VALUES ('c1', '{pair[0]}', '{pair[1]}', 1, 'e', 'dismissed', 'x')",
+        f"{_CANDIDATE} VALUES ('c1', '{pair[0]}', '{pair[1]}', 1, 'e', '{state}', 'x')",
         pinned,
         macs[pinned],
     )
     assert prune(data) == 2
     assert rows(data) == 0
     assert {pinned, free} == set(macs)
+
+
+@pytest.mark.parametrize("state", ["vetoed", "cleared"])
+def test_a_vetoed_or_cleared_candidate_whose_owner_decision_is_in_overrides_keeps_the_row(
+    data, state
+):
+    ((mac, device),) = retire(data).items()
+    sql(migrated_overrides(data.root), OVERRIDES_SOURCES["candidate_a"], device, STAMP)
+    _seed(
+        data,
+        f"{_CANDIDATE} VALUES ('c1', '{{dev}}', 'z', 1, 'e', '{state}', 'x')",
+        mac,
+        device,
+    )
+    assert prune(data) == 0
 
 
 def test_a_dismissed_candidate_whose_owner_decision_is_in_overrides_still_keeps_the_row(data):

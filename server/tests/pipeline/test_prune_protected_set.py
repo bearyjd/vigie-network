@@ -11,14 +11,27 @@ from pathlib import Path
 
 from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_pipeline import prune_exclusions
-from vigie_pipeline.overrides import PROTECTED_READS, SUPPORTED_USER_VERSION
+from vigie_pipeline.overrides import PROTECTED_READS, SUGGESTION_READS, SUPPORTED_USER_VERSION
 from vigie_pipeline.prune_exclusions import PRUNE_EXCLUSIONS_SQL
 from vigie_pipeline.schema import open_pipeline_inventory
 
-NAMES_A_DEVICE = re.compile(r"device|mac")  # device_id, from_device, device_a, device_ids, mac ...
+# A column that names a device or MAC directly (device_id, from_device, device_a, device_ids, mac)
+# or through another row: a suggestion, incident or candidate id, a rule target, a lineage key.
+NAMES_A_DEVICE = re.compile(r"device|mac|suggestion_id|incident_id|candidate_id|target|lineage")
 
 # overrides.db columns the prune does not read from PROTECTED_READS, and why that is safe.
 LEFT_ALONE_OVERRIDES = {
+    ("audit_log", "target"): "log text: what a decision touched, decides nothing by itself",
+    ("candidate_decisions", "candidate_id"): "the same row names both devices, both protected",
+    ("identity_merges", "suggestion_id"): (
+        "the same row names both devices, both protected; the suggestion is protected through"
+        " suggestion_decisions"
+    ),
+    ("incident_decisions", "incident_id"): "the same row names the device, protected",
+    ("incident_decisions", "lineage"): "the same row names the device, protected",
+    ("incident_decision_prune", "incident_id"): (
+        "tombstone of an incident the API already pruned, with its decision row"
+    ),
     ("monitoring_lineage_versions", "device_id"): (
         "a monotonic counter bumped by the identity_links triggers: every id in it is an end of an"
         " identity_links row, which PROTECTED_READS reads"
@@ -39,6 +52,14 @@ LEFT_ALONE_INVENTORY = {
     ("monitoring_quality_work", "after_mac"): "a paging cursor, not a reference to a device",
     ("transient_hours", "device_id"): "promotion bookkeeping, deleted once a device leaves it",
     ("transient_state", "device_id"): "the retirement stamp the prune ages devices from",
+    ("incident_deliveries", "incident_id"): (
+        "delivery state of an incident whose monitoring_incidents row excludes its device"
+    ),
+    ("monitoring_baselines", "lineage"): "same row as device_id, reached through the profile",
+    ("monitoring_incidents", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_profiles", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_suspicious", "lineage"): "same row as device_id, which is excluded",
+    ("rule_attachments", "target"): "same row as mac, which is excluded",
 }
 
 # inventory.db columns the prune itself reads or deletes with, by table.
@@ -46,9 +67,9 @@ PRUNE_OWN_INVENTORY = {
     ("observations", "mac"): "the rows the prune deletes",
     ("observations", "device_id"): "the device the prune is judged on",
     ("mac_last_ip", "mac"): "deleted together with the pruned MAC",
-    ("identity_candidates", "device_a"): "excluded unless dismissed",
-    ("identity_candidates", "device_b"): "excluded unless dismissed",
-    ("suggestions", "device_ids"): "excluded while unexpired",
+    ("identity_candidates", "device_a"): "excluded while open or suggested",
+    ("identity_candidates", "device_b"): "excluded while open or suggested",
+    ("suggestions", "device_ids"): "excluded while unexpired, and once decided (by id)",
     ("rule_attachments", "mac"): "excluded while the attachment exists",
 }
 
@@ -70,7 +91,7 @@ def device_columns(conn: sqlite3.Connection) -> set[tuple[str, str]]:
 
 def protected_reads() -> set[tuple[str, str]]:
     out = set()
-    for statement in PROTECTED_READS:
+    for statement in (*PROTECTED_READS, *SUGGESTION_READS):
         match = re.fullmatch(r"SELECT (.+) FROM (\w+)", statement)
         assert match, f"PROTECTED_READS entry is not a plain column read: {statement}"
         out |= {(match.group(2), column.strip()) for column in match.group(1).split(",")}
@@ -131,3 +152,24 @@ def test_the_classification_catches_a_new_device_column(tmp_path: Path):
     found = device_columns(conn)
     conn.close()
     assert ("new_feature", "pinned_device") in found - protected_reads() - set(LEFT_ALONE_OVERRIDES)
+
+
+def test_every_id_indirect_column_name_is_matched():
+    for name in ("suggestion_id", "incident_id", "candidate_id", "target", "lineage"):
+        assert NAMES_A_DEVICE.search(name), name
+
+
+def test_the_classification_catches_a_new_id_indirect_column(tmp_path: Path):
+    for conn, left in (
+        (open_overrides(tmp_path / "overrides.db"), set(LEFT_ALONE_OVERRIDES)),
+        (open_pipeline_inventory(tmp_path / "inventory.db", True), set(LEFT_ALONE_INVENTORY)),
+    ):
+        conn.execute(
+            "CREATE TABLE new_feature (suggestion_id TEXT, incident_id TEXT, candidate_id TEXT,"
+            " target TEXT, lineage TEXT)"
+        )
+        found = device_columns(conn)
+        conn.close()
+        classified = protected_reads() | left | exclusion_columns() | set(PRUNE_OWN_INVENTORY)
+        missing = {c for (t, c) in found - classified if t == "new_feature"}
+        assert missing == {"suggestion_id", "incident_id", "candidate_id", "target", "lineage"}

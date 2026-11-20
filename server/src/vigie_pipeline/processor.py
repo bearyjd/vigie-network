@@ -37,13 +37,18 @@ from vigie_pipeline.new_device_notice import sweep_new_devices
 from vigie_pipeline.overrides import (
     OverridesNotUsable,
     canonical_device,
+    decided_suggestion_ids,
     open_overrides_ro,
     overrides_data_version,
     overrides_identity,
     protected_device_ids,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
-from vigie_pipeline.prune_exclusions import LIVE_SUGGESTION_PARAMS, PRUNE_EXCLUSIONS_SQL
+from vigie_pipeline.prune_exclusions import (
+    LIVE_SUGGESTION_PARAMS,
+    PRUNE_EXCLUSIONS_SQL,
+    suggestion_devices,
+)
 from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -567,8 +572,10 @@ def prune_retired_macs(
     try:
         read = _open_overrides_read(overrides_path)
         protected = protected_device_ids(read.conn)
-        if not _decisions_not_lost(inv, protected):
+        decided = decided_suggestion_ids(read.conn)
+        if not _decisions_not_lost(inv, bool(protected or decided)):
             return 0
+        protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
         pruned = _delete_retired_rows(inv, read, protected, now)
     except _PruneDeferred as exc:
         log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
@@ -587,16 +594,17 @@ def prune_retired_macs(
 OVERRIDES_SEEN_KEY = "prune_overrides_seen"
 
 
-def _decisions_not_lost(inv: sqlite3.Connection, protected: set[str]) -> bool:
-    """False when overrides.db once held a decision and now holds none: the file was probably lost
+def _decisions_not_lost(inv: sqlite3.Connection, found: bool) -> bool:
+    """`found`: this read saw a decision in some protected source. False when overrides.db once
+    held a decision and now holds none: the file was probably lost
     or recreated empty, and an empty protected set would then protect nothing. The marker is a
     `stitch_state` row set by the first read that finds a decision; an install that never had one
     (nothing to lose) prunes as usual."""
     seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
-    if protected and not seen:
+    if found and not seen:
         with immediate(inv):
             state_set(inv, OVERRIDES_SEEN_KEY, "1")
-    elif seen and not protected:
+    elif seen and not found:
         log(logger, logging.ERROR, "prune_skipped", reason="overrides_lost_decisions")
         return False
     return True

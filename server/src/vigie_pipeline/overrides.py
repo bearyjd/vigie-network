@@ -25,13 +25,13 @@ PROTECTED_TABLES = (
     "identity_merges",
     "identity_rules",
     "incident_decisions",
+    "suggestion_decisions",
 )
 # Every column below names a device a human decision refers to. Unfiltered on purpose: expired or
 # revoked rules, cleared marks, undone merges and revoked links still protect (over-protecting
-# fails safe). A cleared incident decision (status NULL) protects only while its row exists: the
-# API deletes incident_decisions rows together with their incident (120 days old, incident
-# already pruned; vigie_api.incident_decisions), so that protection ends with the incident.
-# Kept in this module with the other identity_links SQL.
+# fails safe). Incident decisions, cleared ones (status NULL) included, protect while their row
+# exists; the API deletes the row together with its incident (vigie_api.incident_decisions), and
+# the protection ends with it. Kept in this module with the other identity_links SQL.
 PROTECTED_READS = (
     "SELECT device_id FROM device_overrides",
     "SELECT device_id FROM essential_devices",
@@ -41,6 +41,9 @@ PROTECTED_READS = (
     "SELECT device_a, device_b FROM candidate_decisions",
     "SELECT from_device, into_device FROM identity_links",
 )
+# The owner's decision on a suggestion (accepted or rejected) is keyed by suggestion id, not by
+# device: the devices it concerns are in the inventory's `suggestions` row (prune_exclusions).
+SUGGESTION_READS = ("SELECT suggestion_id FROM suggestion_decisions",)
 logger = logging.getLogger("vigie_pipeline")
 
 
@@ -169,12 +172,10 @@ def overrides_data_version(conn: sqlite3.Connection | None) -> int:
     return int(conn.execute("PRAGMA data_version").fetchone()[0])
 
 
-def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
-    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets,
-    incident and candidate decisions, and both ends of every identity merge and link, undone
-    or revoked ones included. FAILS CLOSED: raises OverridesNotUsable unless the
-    file is open, at exactly the supported schema version, and holds every table queried; an
-    empty set must mean "nothing is protected", never "could not tell"."""
+def _read_text_ids(conn: sqlite3.Connection | None, statements: Iterable[str]) -> set[str]:
+    """The non-empty text values of `statements`. FAILS CLOSED: raises OverridesNotUsable unless
+    the file is open, at exactly the supported schema version, and holds every table the prune
+    reads; an empty set must mean "nothing is protected", never "could not tell"."""
     if conn is None:
         raise OverridesNotUsable("overrides.db is missing or could not be opened")
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -186,12 +187,24 @@ def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     missing = [t for t in PROTECTED_TABLES if t not in tables]
     if missing:
         raise OverridesNotUsable(f"overrides.db lacks table(s): {', '.join(missing)}")
-    values = [value for sql in PROTECTED_READS for row in conn.execute(sql) for value in row]
+    values = [value for sql in statements for row in conn.execute(sql) for value in row]
     if not all(isinstance(value, str) and value for value in values):
-        # str(b"..") or str(7) would name an id that never matches a device: a protection that
+        # str(b"..") or str(7) would name an id that never matches a row: a protection that
         # silently protects nothing. Say what kind of value, never its content.
-        raise OverridesNotUsable("overrides.db holds a device id that is not non-empty text")
+        raise OverridesNotUsable("overrides.db holds an id that is not non-empty text")
     return set(values)
+
+
+def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
+    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets,
+    incident and candidate decisions, and both ends of every identity merge and link, undone
+    or revoked ones included. Fails closed (`_read_text_ids`)."""
+    return _read_text_ids(conn, PROTECTED_READS)
+
+
+def decided_suggestion_ids(conn: sqlite3.Connection | None) -> set[str]:
+    """Ids of the suggestions the owner accepted or rejected. Fails closed (`_read_text_ids`)."""
+    return _read_text_ids(conn, SUGGESTION_READS)
 
 
 def overrides_identity(path: Path) -> tuple[int, int]:

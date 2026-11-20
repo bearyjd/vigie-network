@@ -3,14 +3,20 @@ pruned. Deleting the observation would change what the other table's key resolve
 monitoring lineage key reads only the device's current MACs), so the pruner must leave it alone.
 
 Decided history does not pin forever, because neither table is ever deleted from. A candidate
-blocks in every state but `dismissed` (open, suggested, vetoed, cleared, or one this build does not
-know: a state that cannot be shown safe stays excluding). A dismissed row is the pipeline's
-memory of a closed pair; what the owner decided about the pair lives in overrides.db
-(`candidate_decisions`, `identity_merges`, both ends in `PROTECTED_READS`), so a device with such a
-decision is protected there whatever this table says. A suggestion blocks only while unexpired
-(`expires_at` is the only state it has: decisions are keyed by suggestion id in overrides.db, and
-the suggestion row itself is never deleted, so an expired one's decision stays attached to it; an
-accepted merge is protected through `identity_merges`).
+blocks while it is `open` or `suggested`, or in a state this build does not know (one that cannot be
+shown safe stays excluding). `dismissed`, `vetoed` and `cleared` do not: a veto is keyed by device
+id (`vetoed_between`) and the row survives the MAC rows, and what the owner decided about a pair
+lives in overrides.db (`candidate_decisions`, `identity_merges`, both ends in `PROTECTED_READS`), so
+a device with such a decision is protected there whatever this table says. An `open` or `suggested`
+candidate on a retired device settles when a rule settles one of its MACs
+(`dismiss_open_candidates`) or fresh evidence rewrites it; one that neither happens to keeps the
+device's MAC rows for good (accepted: the cost is a few rows, never a wrong deletion).
+
+A suggestion blocks while it is unexpired (`expires_at`), whatever its action, and for good once
+the owner decided it: that decision lives in overrides.db keyed by suggestion id
+(`suggestion_decisions`), so `suggestion_devices` turns the decided ids into the devices their
+inventory rows name, and the prune protects those like any other decision (accepted merges are
+also protected through `identity_merges`).
 
 Every probe is a point or index-prefix seek, never a scan: the collector set is tiny and each
 collector-keyed table leads its key with collector_id (the `_MEASURED` pattern of
@@ -19,6 +25,12 @@ it is evaluated at delete time inside the same transaction. Collector rows are n
 a monitoring row naming an unknown collector would not be seen (accepted, nothing writes one)."""
 
 from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Collection
+
+from vigie_pipeline.overrides import OverridesNotUsable
 
 # (table, column) pairs keyed collector_id first, then the device id / the MAC.
 _DEVICE_BY_COLLECTOR = (
@@ -33,6 +45,38 @@ LIVE_SUGGESTION_PARAMS = 2  # the one bound `expires_at>=?` per suggestion direc
 _SUGGESTION_ACTIONS = "('label','move_group','quarantine','merge_identity')"
 
 
+# candidate states that no longer pin a device (see above); every other state does
+_SETTLED = "('dismissed','vetoed','cleared')"
+SUGGESTION_ID_CHUNK = 500  # ids per IN list, under SQLite's bound-variable limit
+
+
+def _devices_of(raw: object) -> set[str]:
+    try:
+        parsed = json.loads(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise OverridesNotUsable("a decided suggestion's device list cannot be read") from exc
+    if not isinstance(parsed, list) or not all(isinstance(d, str) and d for d in parsed):
+        raise OverridesNotUsable("a decided suggestion's device list is not a list of ids")
+    return set(parsed)
+
+
+def suggestion_devices(inv: sqlite3.Connection, suggestion_ids: Collection[str]) -> set[str]:
+    """The devices named by the inventory rows of these decided suggestions, whatever their
+    action and whether or not they expired (a primary-key lookup per id). A decided id with no
+    row names nothing; a row whose device list cannot be read fails the prune closed."""
+    ids = sorted(suggestion_ids)
+    devices: set[str] = set()
+    for start in range(0, len(ids), SUGGESTION_ID_CHUNK):
+        chunk = ids[start : start + SUGGESTION_ID_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for (raw,) in inv.execute(
+            f"SELECT device_ids FROM suggestions WHERE id IN ({marks})",  # noqa: S608
+            chunk,
+        ):
+            devices |= _devices_of(raw)
+    return devices
+
+
 def _by_collector(table: str, column: str, key: str) -> str:
     return (
         "EXISTS (SELECT 1 FROM collectors c WHERE EXISTS"  # noqa: S608
@@ -42,8 +86,10 @@ def _by_collector(table: str, column: str, key: str) -> str:
 
 def _clauses() -> tuple[str, ...]:
     return (
-        "EXISTS (SELECT 1 FROM identity_candidates WHERE device_a=d.id AND state<>'dismissed')",
-        "EXISTS (SELECT 1 FROM identity_candidates WHERE device_b=d.id AND state<>'dismissed')",
+        "EXISTS (SELECT 1 FROM identity_candidates"  # noqa: S608
+        f" WHERE device_a=d.id AND state NOT IN {_SETTLED})",
+        "EXISTS (SELECT 1 FROM identity_candidates"  # noqa: S608
+        f" WHERE device_b=d.id AND state NOT IN {_SETTLED})",
         # the unary + drops d.id's column affinity, which would otherwise hide the index expression
         # naming expires_at lets the planner walk idx_suggestions_pair instead: pin the seek
         "EXISTS (SELECT 1 FROM suggestions INDEXED BY idx_suggestions_from_id"  # noqa: S608
