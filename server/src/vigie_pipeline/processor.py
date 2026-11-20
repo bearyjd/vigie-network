@@ -76,13 +76,14 @@ def run_once(
         # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
         # no identity links for the batches, no stitching, cursor progress is kept
         usable = _overrides_readable(inv, overrides, config, clock)
+        mark = _batch_mark(inv)
         totals = _process_batches(inv, overrides if usable else None, config, failures)
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
         promoted, retired = sweep_transients(inv, clock, config)
         if usable:  # prune_retired_macs itself fails closed on a missing/unusable overrides.db
-            prune_retired_macs(inv, overrides, clock)
+            prune_retired_macs(inv, overrides, clock, None if failures else mark)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -423,12 +424,66 @@ def sweep_transients(
 PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
 
 
-class _OverridesMoved(Exception):
+class _PruneDeferred(Exception):
+    """The pass cannot prove it is safe to prune; roll back and try next pass."""
+
+    reason = "unknown"
+
+
+class _OverridesMoved(_PruneDeferred):
     """overrides.db committed (or could not be asked) since the protected set was read."""
+
+    reason = "overrides_changed"
+
+
+class _BatchesMoved(_PruneDeferred):
+    """A batch arrived or was purged since the pass read its batches, or one was unreadable."""
+
+    reason = "batches_changed"
+
+
+# (batches.rowid, collector_id, batch_id) of the newest recorded batch; (0, "", "") when none.
+BatchMark = tuple[int, str, str]
+_UNCHECKED: BatchMark = (-1, "", "")  # direct callers with no run_once context
+
+
+def _batch_mark(inv: sqlite3.Connection) -> BatchMark:
+    row = inv.execute(
+        "SELECT rowid, collector_id, batch_id FROM batches ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    return (0, "", "") if row is None else (row[0], row[1], row[2])
+
+
+def _batches_settled(inv: sqlite3.Connection, mark: BatchMark | None) -> bool:
+    """True only when no batch can still carry a MAC this pass did not see. None (a batch was
+    unreadable, so a rowid at or below the mark is unprocessed) is never settled. The mark's own
+    row must still exist unchanged: a freed rowid is only reused after the newest row is purged,
+    so no rowid at or below the mark was reused. Every row above the mark is a batch that arrived
+    during this pass and must already be behind its collector's cursor; ingest commits batches in
+    this database, so under our write lock the answer is exact. Rowid range seeks only."""
+    if mark is None:
+        return False
+    rowid, collector, batch_id = mark
+    if (
+        rowid > 0
+        and not inv.execute(
+            "SELECT 1 FROM batches WHERE rowid=? AND collector_id=? AND batch_id=?",
+            (rowid, collector, batch_id),
+        ).fetchone()
+    ):
+        return False
+    return not inv.execute(
+        "SELECT 1 FROM batches b LEFT JOIN pipeline_cursor c ON c.collector_id=b.collector_id"
+        " WHERE b.rowid>? AND b.rowid>COALESCE(c.last_batch_rowid,0) LIMIT 1",
+        (rowid,),
+    ).fetchone()
 
 
 def prune_retired_macs(
-    inv: sqlite3.Connection, overrides: sqlite3.Connection | None, now: float
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    now: float,
+    batch_mark: BatchMark | None = _UNCHECKED,
 ) -> int:
     """Drop self-linked MAC rows of retired devices unseen for 90 days (PRP section 8). One
     bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
@@ -439,7 +494,9 @@ def prune_retired_macs(
     table, nothing is pruned. The protected set is re-validated just before COMMIT
     (`PRAGMA data_version`): a human decision committed meanwhile defers the whole pass, which
     rolls back. The two databases cannot share a transaction, so a commit landing after that
-    last check and before COMMIT (microseconds) is not seen, same as stitch_apply's attach."""
+    last check and before COMMIT (microseconds) is not seen, same as stitch_apply's attach.
+    run_once also passes the newest batch mark taken before it read batches (None when a batch
+    was unreadable); the pass is deferred unless no batch can still carry a returning MAC."""
     try:
         before = overrides_data_version(overrides)
         protected = protected_device_ids(overrides)
@@ -447,9 +504,9 @@ def prune_retired_macs(
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
     try:
-        return _delete_retired_rows(inv, overrides, protected, before, now)
-    except _OverridesMoved:
-        log(logger, logging.INFO, "prune_deferred", reason="overrides_changed")
+        return _delete_retired_rows(inv, overrides, protected, (before, batch_mark), now)
+    except _PruneDeferred as exc:
+        log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
         return 0
 
 
@@ -457,10 +514,13 @@ def _delete_retired_rows(
     inv: sqlite3.Connection,
     overrides: sqlite3.Connection | None,
     protected: set[str],
-    before: int,
+    checks: tuple[int, BatchMark | None],
     now: float,
 ) -> int:
+    before, batch_mark = checks
     with immediate(inv):
+        if batch_mark != _UNCHECKED and not _batches_settled(inv, batch_mark):
+            raise _BatchesMoved
         inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
         inv.execute("DELETE FROM prune_protected")
         inv.executemany(
