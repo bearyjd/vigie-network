@@ -408,17 +408,42 @@ def sweep_transients(
     hour = iso_utc(now)[:13]
     with immediate(inv):
         promoted = _promote(inv, hour, iso_utc(now), config)
-        retired = inv.execute(
-            "UPDATE devices SET status='retired' WHERE status='transient' AND id IN"
-            " (SELECT device_id FROM transient_state WHERE since<=?)",
-            (iso_utc(now - config.transient_window_s),),
-        ).rowcount
-        for table in ("transient_hours", "transient_state"):
-            inv.execute(
-                f"DELETE FROM {table} WHERE device_id IN"  # noqa: S608
-                " (SELECT id FROM devices WHERE status<>'transient')"
-            )
+        retired = _retire_due(inv, now, config)
+        inv.execute(
+            "DELETE FROM transient_hours WHERE device_id IN"
+            " (SELECT id FROM devices WHERE status<>'transient')"
+        )
+        # a retired device keeps its stamp: it is the prune's clock
+        inv.execute(
+            "DELETE FROM transient_state WHERE device_id IN"
+            " (SELECT id FROM devices WHERE status='active')"
+        )
+        inv.execute(  # retired before the stamp existed: the clock starts now
+            "INSERT OR IGNORE INTO transient_state (device_id, since)"
+            " SELECT id, ? FROM devices WHERE status='retired'",
+            (iso_utc(now),),
+        )
     return promoted, retired
+
+
+def _retire_due(inv: sqlite3.Connection, now: float, config: PipelineConfig) -> int:
+    """Retire the transients whose window elapsed and stamp them with the server moment of
+    retirement: transient_state.since means "since the current status began" (the prune ages a
+    retired device from it; a revival rewrites it)."""
+    due = [
+        (r[0],)
+        for r in inv.execute(
+            "SELECT s.device_id FROM transient_state s JOIN devices d ON d.id=s.device_id"
+            " WHERE d.status='transient' AND s.since<=?",
+            (iso_utc(now - config.transient_window_s),),
+        )
+    ]
+    inv.executemany("UPDATE devices SET status='retired' WHERE id=?", due)
+    inv.executemany(
+        "UPDATE transient_state SET since=? WHERE device_id=?",
+        [(iso_utc(now), device_id) for (device_id,) in due],
+    )
+    return len(due)
 
 
 PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
@@ -518,23 +543,14 @@ def _delete_retired_rows(
     now: float,
 ) -> int:
     before, batch_mark = checks
+    cutoff = _prune_cutoff(inv, now)
+    if cutoff is None:
+        return 0  # no accepted activity: the server clock cannot be checked, prune nothing
+    candidates = _prune_candidates(inv, protected, cutoff)  # selected before the write lock
     with immediate(inv):
         if batch_mark != _UNCHECKED and not _batches_settled(inv, batch_mark):
             raise _BatchesMoved
-        inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
-        inv.execute("DELETE FROM prune_protected")
-        inv.executemany(
-            "INSERT OR IGNORE INTO prune_protected (id) VALUES (?)", [(i,) for i in protected]
-        )
-        pruned = inv.execute(
-            "DELETE FROM observations WHERE mac IN (SELECT o.mac FROM observations o"  # noqa: S608
-            " JOIN devices d ON d.id=o.device_id WHERE d.status='retired'"
-            " AND o.link_source='self' AND o.last_seen<?"
-            f" AND d.id NOT IN (SELECT id FROM prune_protected){PRUNE_EXCLUSIONS_SQL}"
-            " ORDER BY o.last_seen LIMIT ?)",
-            (iso_utc(now - RETIRED_MAC_RETENTION_S), PRUNE_BATCH_ROWS),
-        ).rowcount
-        inv.execute("DROP TABLE prune_protected")
+        pruned = _delete_candidates(inv, candidates, cutoff)
         if pruned:
             inv.execute(
                 "INSERT INTO pipeline_meta (key, value) VALUES (?, ?)"
@@ -544,6 +560,59 @@ def _delete_retired_rows(
         if _overrides_moved(overrides, before):
             raise _OverridesMoved  # immediate() rolls the DELETEs back
     return pruned
+
+
+def _prune_cutoff(inv: sqlite3.Connection, now: float) -> str | None:
+    """Retention boundary on the clock the server can vouch for: the older of its own time and
+    the newest accepted collector activity. activity.py only accepts a stamp within
+    [received - ACTIVITY_MAX_REPORT_LAG_S, received + ACTIVITY_SKEW_S] (hi_ok/lo_ok in
+    _record_activity), so after a forward step of the server clock alone, or of a collector
+    alone, no stamp is accepted and the frontier stops: the cutoff stops with it. One seek on
+    idx_mac_activity_end; None (no activity) prunes nothing."""
+    frontier = inv.execute('SELECT MAX("end") FROM mac_activity').fetchone()[0]
+    return None if frontier is None else iso_utc(min(now, frontier) - RETIRED_MAC_RETENTION_S)
+
+
+# The whole prunable predicate, selected before the lock and repeated by the DELETE inside it.
+# Aliases: o observations, d devices, t transient_state (the server-clock retirement stamp; a
+# retired device without one is not prunable). Placeholders: stamp cutoff, last_seen cutoff.
+_PRUNABLE_SQL = (
+    "FROM observations o JOIN devices d ON d.id=o.device_id"  # noqa: S608
+    " JOIN transient_state t ON t.device_id=d.id"
+    " WHERE d.status='retired' AND o.link_source='self' AND t.since<? AND o.last_seen<?"
+    f" AND d.id NOT IN (SELECT id FROM prune_protected){PRUNE_EXCLUSIONS_SQL}"
+)
+
+
+def _prune_candidates(inv: sqlite3.Connection, protected: set[str], cutoff: str) -> list[str]:
+    """Up to PRUNE_BATCH_ROWS MACs, oldest retirement first, with every protection already
+    applied in SQL so a protected oldest batch cannot starve the LIMIT. The scan runs here, with
+    no write lock held; the temp table lives in the temp database, not the main one."""
+    inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
+    inv.execute("DELETE FROM prune_protected")
+    inv.executemany(
+        "INSERT OR IGNORE INTO prune_protected (id) VALUES (?)", [(i,) for i in protected]
+    )
+    return [
+        r[0]
+        for r in inv.execute(
+            f"SELECT o.mac {_PRUNABLE_SQL} ORDER BY t.since, o.mac LIMIT ?",  # noqa: S608
+            (cutoff, cutoff, PRUNE_BATCH_ROWS),
+        )
+    ]
+
+
+def _delete_candidates(inv: sqlite3.Connection, macs: list[str], cutoff: str) -> int:
+    """Inside the lock: one DELETE per candidate that repeats the whole predicate as point
+    lookups (a candidate revived, protected or stamped anew since the select is skipped)."""
+    return sum(
+        inv.execute(
+            "DELETE FROM observations WHERE mac=? AND mac IN"  # noqa: S608
+            f" (SELECT o.mac {_PRUNABLE_SQL} AND o.mac=?)",
+            (mac, cutoff, cutoff, mac),
+        ).rowcount
+        for mac in macs
+    )
 
 
 def _overrides_moved(overrides: sqlite3.Connection | None, before: int) -> bool:

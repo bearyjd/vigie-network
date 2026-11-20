@@ -16,7 +16,9 @@ from vigie_pipeline.overrides import open_overrides_ro
 from vigie_pipeline.processor import prune_retired_macs, run_once
 
 RETENTION = RETIRED_MAC_RETENTION_S
-LATER = T0 + 91 * 86400
+RETIRED_AT = T0 + 86400  # the server time `retire` retires its devices
+FRONTIER = T0 + 400 * 86400  # newest accepted collector stamp `retire` leaves: ahead of every `now`
+LATER = RETIRED_AT + RETENTION + 86400  # a day past the retention, counted from the retirement
 NIC = "00:11:22:33:44:55"
 STAMP = "2026-01-01T00:00:00Z"
 
@@ -46,8 +48,18 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
     """MAC -> device id of `count` transient devices that have been retired."""
     macs = [f"aa:bb:cc:00:00:{i:02x}" for i in range(1, count + 1)]
     data.add_batch(T0, neigh=macs)
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)
+    run_once(PipelineConfig(data_dir=data.root), now=RETIRED_AT)
+    set_frontier(data, FRONTIER)
     return {r["mac"]: r["device_id"] for r in data.q("SELECT mac, device_id FROM observations")}
+
+
+def set_frontier(data: Data, end: int | None) -> None:
+    """The newest `end` in mac_activity (None: no activity at all), the prune's trusted clock."""
+    data.inv.execute("DELETE FROM mac_activity")
+    if end is not None:
+        data.inv.execute(
+            'INSERT INTO mac_activity (mac, start, "end") VALUES (?,?,?)', (NIC, 0, end)
+        )
 
 
 def prune(data: Data, now: float = LATER) -> int:
@@ -226,9 +238,9 @@ def test_only_retired_devices_are_pruned(data):
 def test_the_retention_boundary_is_exclusive(data):
     retire(data)
     migrated_overrides(data.root)
-    assert prune(data, T0 + RETENTION) == 0  # exactly 90 days: kept
+    assert prune(data, RETIRED_AT + RETENTION) == 0  # exactly 90 days after retirement: kept
     assert rows(data) == 1
-    assert prune(data, T0 + RETENTION + 1) == 1  # one second past: pruned
+    assert prune(data, RETIRED_AT + RETENTION + 1) == 1  # one second past: pruned
     assert rows(data) == 0
 
 

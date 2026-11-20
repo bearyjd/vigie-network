@@ -39,13 +39,19 @@ def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     data.add_batch(T0, neigh=[mac])
     run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
     open_overrides(data.root / "overrides.db").close()  # pruning needs a real, migrated file
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 91 * 86400)
+    # 90 days after the retirement (server time), with a fresh batch proving the clock moved
+    late = T0 + 86400 + 90 * 86400 + 60
+    data.add_batch(late, neigh=["aa:bb:cc:00:00:02"])
+    run_once(PipelineConfig(data_dir=data.root), now=late)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
     # aggregated to a count; the device row is retired, never deleted
     assert (
         data.q("SELECT value FROM pipeline_meta WHERE key='retired_mac_rows_pruned'")[0][0] == "1"
     )
-    assert [r["status"] for r in data.q("SELECT status FROM devices")] == ["retired"]
+    assert [r["status"] for r in data.q("SELECT status FROM devices ORDER BY first_seen")] == [
+        "retired",
+        "transient",
+    ]
 
 
 def test_retired_transient_mac_rows_are_kept_within_90_days(data):

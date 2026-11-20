@@ -20,8 +20,16 @@ see `docs/monitoring.md`).
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
   window; a retired device seen again returns to transient (`device_reappeared`). Self-linked MAC
-  rows of retired devices unseen for 90 days are pruned (`observations`; cumulative count in
-  `pipeline_meta.retired_mac_rows_pruned`); the device row stays. Pruning fails closed: it runs
+  rows of retired devices are pruned (`observations`; cumulative count in
+  `pipeline_meta.retired_mac_rows_pruned`) 90 days after the SERVER retired the device; the
+  device row stays. `transient_state.since` means "since the current status began": the retirement
+  stamps it with the server clock and a retired device keeps it, a revival rewrites it. A retired
+  device without a stamp (retired before this existed) gets one on the next sweep, so on an
+  existing install such devices become prunable only 90 days after that backfill. The 90 days are
+  counted on `min(server now, newest mac_activity end)`: a server clock stepped forward leaves the
+  newest accepted collector stamp behind (activity.py accepts stamps only within a window around
+  the batch receipt), so the cutoff stops with it; no activity at all prunes nothing. Pruning
+  fails closed: it runs
   only when `overrides.db` exists, opens read-only, is at exactly the schema version this build
   supports, and has every table the protected-device query reads (devices named, grouped, marked
   essential, targeted by a rule, or on either end of a live link are never pruned). Otherwise it
