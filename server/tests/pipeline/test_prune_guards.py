@@ -270,3 +270,30 @@ def test_one_pass_prunes_at_most_the_batch_cap(data, monkeypatch):
     assert prune(data) == 1
     assert rows(data) == 1
     assert counter(data) == "1"
+
+
+def test_the_last_seen_boundary_is_exclusive(data):
+    retire(data)
+    migrated_overrides(data.root)
+    cutoff = iso_utc(LATER - RETENTION)  # the trusted clock is `now`: the frontier leads it
+    data.inv.execute("UPDATE observations SET last_seen=?", (cutoff,))
+    assert prune(data, LATER) == 0
+    data.inv.execute("UPDATE observations SET last_seen=?", (iso_utc(LATER - RETENTION - 1),))
+    assert prune(data, LATER) == 1
+
+
+def test_the_prunes_own_overrides_connection_is_closed_afterwards(data, monkeypatch):
+    retire(data)
+    migrated_overrides(data.root)
+    opened = []
+    real = prune_module.open_overrides_ro
+
+    def remember(*args, **kwargs):
+        opened.append(real(*args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(prune_module, "open_overrides_ro", remember)
+    prune(data)
+    (conn,) = opened
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")

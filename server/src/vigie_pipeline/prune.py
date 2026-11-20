@@ -96,8 +96,9 @@ def prune_retired_macs(
     bounded batch per pass; the running total is the aggregate kept in `pipeline_meta` and each
     pass logs only a count.
     Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
-    that overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
-    pruned: human decisions live there, not in `link_source`. Fails closed: with no
+    that overrides.db refers to (merge, rule, name, group, essential mark, decisions, and the
+    devices of every suggestion the owner decided) are never pruned: human decisions live there,
+    not in `link_source`. Fails closed: with no
     overrides.db (a DEBUG line: normal before the API ran) nothing is pruned, and with one that
     is unreadable, locked, of another schema version, missing a table or holding an id that is
     not text, an ERROR line; a busy inventory skips the pass. The protected set is read on a
@@ -105,7 +106,8 @@ def prune_retired_macs(
     `PRAGMA data_version` is unchanged): a human decision committed meanwhile defers the whole
     pass, which rolls back. The two databases cannot share a transaction, so a commit landing
     after that last check and before COMMIT (microseconds) is not seen, same as stitch_apply's
-    attach. A returning MAC whose rows were pruned gets a new device id (accepted)."""
+    attach. A file that once held a decision and now holds none skips the pass (a lost file). A
+    returning MAC whose rows were pruned gets a new device id (accepted)."""
     if not overrides_path.exists():
         log(logger, logging.DEBUG, "prune_skipped", reason="overrides_missing")
         return 0

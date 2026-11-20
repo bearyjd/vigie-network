@@ -84,8 +84,10 @@ def run_once(
         promoted, retired = sweep_transients(
             inv, clock, config, retired_at=(live or (lambda: clock))()
         )
-        if usable and not failures:  # an unread batch may carry a returning MAC: prune next pass
-            prune_retired_macs(inv, config.overrides_path, clock)  # fails closed on its own
+        # an unread batch may carry a returning MAC: prune next pass. `usable` is defence in depth:
+        # prune_retired_macs reads overrides.db itself and fails closed on an unusable file
+        if usable and not failures:
+            prune_retired_macs(inv, config.overrides_path, clock)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)

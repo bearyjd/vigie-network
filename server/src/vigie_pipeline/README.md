@@ -20,69 +20,78 @@ see `docs/monitoring.md`).
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
   window; a retired device seen again returns to transient (`device_reappeared`).
-- Retired-MAC prune (irreversible). `transient_state.since` means "since the current status
-  began": every retirement stamps it with the SERVER clock at the moment of the transition (the
-  transient sweep reads the clock again after the batches; the stitcher stamps the orphan it
-  retires), a retired device keeps it, a revival rewrites it, so a device revived and retired
-  again restarts its clock. A collector timestamp (`observations.last_seen`) is untrusted and
-  never sets the age by itself. A device's self-linked `observations` rows are deleted 90 days
-  after that stamp, at most `PRUNE_BATCH_ROWS` rows per pass, oldest retirement first; the device
-  row stays. A device retired before the stamp existed has none and is not prunable: ONE backfill
-  (marker `stitch_state` key `retired_stamp_backfilled`, never repeated) stamps it, so on an
-  existing install such devices become prunable only 90 days after that pass. Each pass logs
-  `retired_macs_pruned count=N` (a count, never a MAC) and adds N to
-  `pipeline_meta.retired_mac_rows_pruned`; the pruned MAC's `mac_last_ip` row goes with it.
-  `monitoring_assignment_versions`, `monitoring_dirty`, `characterization_*`,
+- Retired-MAC prune (irreversible; code in `prune.py`). `transient_state.since` means "since the
+  current status began". Every retirement stamps it with the SERVER clock at the transition, but
+  never earlier than the newest `batches.received_at` (so a clock set back cannot backdate a
+  stamp; no batch recorded means the clock itself): the transient sweep reads the clock again
+  after the batches, and the stitcher stamps the orphan it retires. A retired device keeps its
+  stamp, a revival rewrites it. A collector timestamp (`observations.last_seen`) is untrusted; it
+  only adds a second condition (older than the cutoff too). A device's self-linked `observations`
+  rows are deleted 90 days after the stamp, at most `PRUNE_BATCH_ROWS` rows per pass, oldest
+  retirement first; the device row stays, and the MAC's `mac_last_ip` row goes with it. Each pass
+  logs `retired_macs_pruned count=N` (a count, never a MAC) and adds N to
+  `pipeline_meta.retired_mac_rows_pruned`. A retired device without a stamp (retired before stamps
+  existed, or by a build rolled back to) is not prunable until stamped: the sweep stamps such
+  devices with the current clock once a day (`stitch_state` key `retired_stamp_backfilled` holds
+  the time of the last scan; one from the future counts as due), so they become prunable 90 days
+  after that. `monitoring_assignment_versions`, `monitoring_dirty`, `characterization_*`,
   `mac_first_received` and `mac_activity` are left alone (own retention or own meaning); a test
-  classifies every column of both databases that names a device or MAC as protected or left
-  alone, so a new one cannot slip by. A MAC that returns starts over as a new transient.
-  - Clock guard: the 90 days are counted on the MINIMUM of the server's `now`, the newest
-    `mac_activity` end, and every collector's own newest batch time (`window_end` of its newest
-    recorded batch, its receipt for a legacy row). activity.py accepts a stamp only within a
-    window around the batch receipt, so after a forward step of the server clock alone, or of a
-    collector alone, nothing new is accepted and the frontier, hence the cutoff, stops; a single
-    collector that followed the server's step cannot corroborate it. No activity or no recorded
-    batch prunes nothing. Consequence: a collector that goes silent holds the clock back until
-    its last batch is purged (7 days), so the prune waits (fails safe), never runs early.
+  classifies every column of both databases that names a device or MAC, directly or through a
+  suggestion, incident or candidate id, a target or a lineage, as protected, excluded or left alone
+  with a reason, so a new one cannot slip by. Accepted trade-off: a randomized MAC that returns
+  after its rows were pruned starts over as a new transient device with a NEW id instead of
+  reviving the old one (nothing the owner decided is affected: see Protected).
+  - Clock. The 90 days are counted on the older of the server's `now` and the oldest
+    `collectors.last_sent_ts` of the non-revoked collectors that ever sent. Ingest keeps that
+    column as a never-purged running maximum of accepted send times and accepts a send time only
+    within its skew window of the server clock, so a stepped server clock cannot drag it along
+    for a collector that kept true time, and purging batch rows does not erase it. No such
+    collector prunes nothing. Consequence: a collector that falls silent, or is retired without
+    being revoked, holds the clock back until it is revoked; the pass then logs the WARNING
+    `prune_clock_held_back` naming that collector once its last send is more than 7 days old
+    (every pass while it holds). With a single collector that follows a stepped server clock
+    nothing can tell, and that case is accepted.
   - Fails closed. It runs only when `overrides.db` exists, opens read-only, is at exactly the
     supported schema version (a reviewed literal, `SUPPORTED_USER_VERSION`), has every table the
-    protected-device query reads and holds only non-empty text device ids; otherwise it logs
-    `prune_skipped` (error text only) and deletes nothing. A missing `overrides.db` is normal
-    before the API first ran and logs at DEBUG only; a file that exists but is unusable logs at
-    ERROR. A busy or locked inventory skips the prune and the rest of the pass still runs.
-  - Deferred (the pass rolls back and logs `prune_deferred` with a reason, retried next pass):
-    `overrides_changed` when `overrides.db` committed (`PRAGMA data_version` on a connection
-    opened for the prune alone, so no earlier stage can hold it still), was removed or was
-    replaced (st_dev/st_ino taken before the open, re-read inside the lock) since the protected
-    set was read, or cannot be asked; `batches_unsettled` when a batch cannot be shown processed:
-    one arrived during the pass above a cursor that does not cover it, the newest batch was
-    purged or its rowid reused, a collector's cursor names no real row of its batch table (the
-    `_pending` check, so a stale cursor after retention cannot make a returning batch look done),
-    a batch was unreadable, or a batch was read after ingest retention had removed its raw
-    shards. Any of these would turn a returning MAC into a new device instead of a revived one.
+    protected read needs and holds only non-empty text ids; otherwise it logs `prune_skipped`
+    (error text only) and deletes nothing. A missing `overrides.db` is normal before the API
+    first ran and logs at DEBUG only; a file that exists but is unusable logs at ERROR. A busy or
+    locked inventory skips the prune and the rest of the pass still runs. A pass in which any
+    batch could not be read (`failures`) skips the prune. A lost `overrides.db`: once a read has
+    found a decision in any protected source the pipeline sets the `stitch_state` marker
+    `prune_overrides_seen`; if a later read finds none at all the prune is skipped and logged at
+    ERROR (`overrides_lost_decisions`: the file was probably lost or recreated empty). An install
+    that never had a decision prunes as usual. If the owner really did remove every decision,
+    delete that marker row to resume.
+  - Re-check. The protected set is read on a connection opened for the prune alone (no earlier
+    stage's open cursor can hold its `PRAGMA data_version` still), with the file's st_dev/st_ino
+    taken before the open. Inside the write lock, after the deletes and before `COMMIT`, both are
+    read again: a commit, removal or replacement since, or an inability to ask, rolls the whole
+    pass back and logs `prune_deferred reason=overrides_changed`.
   - Protected (never pruned): devices that `overrides.db` refers to (named or grouped, marked
     essential, targeted by an identity rule, named by an incident decision or a candidate
-    decision, or on either end of any identity merge or link, undone or revoked ones included).
-    A cleared incident decision still protects while its row exists, but the API deletes
-    `incident_decisions` rows together with their incident (120 days, after the pipeline pruned
-    it), so that protection ends with the incident. Also excluded while any inventory row still
-    names the device or MAC: `identity_candidates` (either end) in every state but `dismissed`,
-    `suggestions` of the label, move_group, quarantine and merge_identity actions only while
-    unexpired on the corroborated clock, `monitoring_profiles`, `monitoring_incidents`,
-    `monitoring_suspicious` and `monitoring_unavailable` (by device), `measurements_hourly` and
-    `monitoring_dirty` (by MAC), and `rule_attachments`. A dismissed candidate and an expired
-    suggestion no longer pin a device because neither table is ever deleted from; the owner's
-    decision about the pair lives in `candidate_decisions` and `identity_merges` (protected
-    above). Only `link_source='self'` rows of `retired` devices qualify, and the row's collector
-    `last_seen` must also be older than the cutoff.
+    decision, on either end of any identity merge or link, undone or revoked ones included) and
+    the devices of every suggestion the owner accepted or rejected (`suggestion_decisions` is
+    keyed by suggestion id, so the inventory's `suggestions` row names the devices), whatever its
+    action and whether or not it expired. An incident decision, cleared ones included, protects
+    while its row exists; the API deletes the row together with its incident. Also excluded while
+    an inventory row still names the device or MAC: `identity_candidates` (either end) while
+    `open`, `suggested` or in a state this build does not know (`dismissed`, `vetoed` and
+    `cleared` do not pin: a veto is keyed by device id and the row survives the MAC rows, and the
+    owner's decision lives in `candidate_decisions`, protected above); an `open` or `suggested`
+    candidate settles when a rule settles its MAC or fresh evidence rewrites it, and one that
+    never does keeps that device's MAC rows for good, an accepted limit (a few rows, never a wrong
+    deletion); `suggestions` of any action while unexpired on the trusted clock;
+    `monitoring_profiles`, `monitoring_incidents`, `monitoring_suspicious` and
+    `monitoring_unavailable` (by device); `measurements_hourly` and `monitoring_dirty` (by MAC);
+    and `rule_attachments`. Only `link_source='self'` rows of `retired` devices qualify.
   - Cost: candidates are selected before the write lock (protections applied in SQL, so a
-    protected oldest batch cannot starve the limit); inside the lock the batch check (rowid
-    range seek above the pass's mark plus a walk of the few collectors) runs, then one
-    point-lookup DELETE per candidate repeating the whole predicate, then the `overrides.db`
-    re-check, the counter bump and the commit. No statement inside that lock scans
-    `observations`, `devices` or `batches`.
+    protected oldest batch cannot starve the limit); inside the lock there is one point-lookup
+    DELETE per candidate repeating the whole predicate, then the `overrides.db` re-check, the
+    counter bump and the commit. No statement inside that lock scans `observations`, `devices`
+    or `batches`.
   - Accepted residual: `overrides.db` and `inventory.db` cannot share a transaction. A human
-    decision committed after the final `overrides.db` re-check and before `COMMIT` (a window of
+    decision committed after the final `data_version` read and before `COMMIT` (a window of
     microseconds) is not seen and can still lose its MAC. Closing it would need a write lock on
     `overrides.db`, which the pipeline deliberately never holds.
 - `dhcp_fingerprint` / `vendor_class` are first-wins. A differing value for the same MAC is not

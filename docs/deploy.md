@@ -211,14 +211,19 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   startup and hourly.
 - `batches` rows (dedupe records) are purged after 7 days; not configurable.
 - `VIGIE_MAX_SPOOL_AGE_S` - how old a collector window may be (default 24 h).
-- Retired transient devices: 90 days after the pipeline retired a device (server clock, counted on
-  a time every collector agrees with), its self-linked MAC rows in `inventory.db` are deleted, at
-  most 1000 per pass, oldest first, together with the MAC's `mac_last_ip` row; the device row itself
-  stays. Devices that `overrides.db` refers to (names, groups, merges, rules, essential marks,
-  decisions) and devices still named by an open candidate, a live suggestion or monitoring state
-  are never pruned. Nothing is pruned while `overrides.db` is missing or unusable, or while a
-  batch could still carry the MAC (the pass retries); a collector that stops reporting delays
-  pruning for up to 7 days. Not configurable. See `server/src/vigie_pipeline/README.md`.
+- Retired transient devices: 90 days after the pipeline retired a device (a server-clock stamp,
+  never earlier than the newest batch receipt; counted on the older of the server clock and the
+  oldest non-revoked collector's last accepted send time), its self-linked MAC rows in
+  `inventory.db` are deleted, at most 1000 per pass, oldest first, together with the MAC's
+  `mac_last_ip` row; the device row itself stays. A collector that falls silent holds the clock
+  back until it is revoked (a WARNING names it after 7 days): revoke collectors you retire.
+  Devices that `overrides.db` refers to (names, groups, merges, rules, essential marks,
+  decisions, suggestions you accepted or rejected) and devices still named by an open or
+  suggested candidate, a live suggestion or monitoring state are never pruned. Nothing is pruned
+  while `overrides.db` is missing or unusable, after it lost every decision it once held (delete
+  the `prune_overrides_seen` row of `stitch_state` if you really removed them all), or in a pass
+  that could not read a batch. A randomized MAC that returns after being pruned gets a new device
+  id. Not configurable. See `server/src/vigie_pipeline/README.md`.
 - `mac_last_ip` (last observed address per MAC) is deleted with its MAC row by the retired-device
   prune above and is otherwise never pruned: it holds at most one row per MAC in observations, and
   devices are retired, not deleted, so it is bounded by the MACs ever seen. It is visible to every
