@@ -473,14 +473,16 @@ def _handle(
 
 def _advance_cursor(inv: sqlite3.Connection, start: int) -> None:
     """Move the scan cursor past the contiguous run of DECIDED devices after `start`: noticed,
-    skipped, or whose first MAC is randomized (never eligible). It stops at the first undecided
+    skipped, whose first MAC is randomized (never eligible), or with no observations at all
+    (the candidate query joins observations, so such a device can never match: a pruned or
+    stitch-orphaned device would otherwise pin the cursor for good). It stops at the first undecided
     device (not yet dwelled, unmeasured, backed off, held), so nothing undecided is ever skipped;
     at most SCAN_ADVANCE events are examined per pass."""
     rows = inv.execute(
         "SELECT e.seq, EXISTS (SELECT 1 FROM pipeline_meta p"
         " WHERE p.key IN (? || e.device_id, ? || e.device_id))"
         " OR COALESCE((SELECT o.is_randomized FROM observations o WHERE o.device_id=e.device_id"
-        " ORDER BY o.first_seen, o.mac LIMIT 1), 0)=1"
+        " ORDER BY o.first_seen, o.mac LIMIT 1), 1)=1"
         " FROM events e WHERE e.kind='new_device' AND e.seq>? ORDER BY e.seq LIMIT ?",
         (NOTICED, SKIPPED, start, SCAN_ADVANCE),
     ).fetchall()
