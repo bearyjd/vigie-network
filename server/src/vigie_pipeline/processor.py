@@ -467,8 +467,9 @@ class _BatchesMoved(_PruneDeferred):
     reason = "batches_changed"
 
 
-# (batches.rowid, collector_id, batch_id) of the newest recorded batch; (0, "", "") when none.
+# (batches.rowid, collector_id, batch_id) of the newest recorded batch; _NO_BATCHES when none.
 BatchMark = tuple[int, str, str]
+_NO_BATCHES: BatchMark = (0, "", "")
 _UNCHECKED: BatchMark = (-1, "", "")  # direct callers with no run_once context
 
 
@@ -476,7 +477,7 @@ def _batch_mark(inv: sqlite3.Connection) -> BatchMark:
     row = inv.execute(
         "SELECT rowid, collector_id, batch_id FROM batches ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
-    return (0, "", "") if row is None else (row[0], row[1], row[2])
+    return _NO_BATCHES if row is None else (row[0], row[1], row[2])
 
 
 def _batches_settled(inv: sqlite3.Connection, mark: BatchMark | None) -> bool:
@@ -510,8 +511,10 @@ def prune_retired_macs(
     now: float,
     batch_mark: BatchMark | None = _UNCHECKED,
 ) -> int:
-    """Drop self-linked MAC rows of retired devices unseen for 90 days (PRP section 8). One
-    bounded batch per pass; the running total is the aggregate kept in `pipeline_meta`. Devices
+    """Drop self-linked MAC rows of retired devices 90 days after the server retired them
+    (transient_state.since; PRP section 8), on `min(now, newest mac_activity end)` so a stepped
+    server clock prunes nothing. One bounded batch per pass; the running total is the aggregate
+    kept in `pipeline_meta` and each pass logs only a count. Devices
     are never deleted; a pruned MAC that returns starts over as a new transient. Devices that
     overrides.db refers to (merge, rule, name, group, essential mark, decisions) are never
     pruned: human decisions live there, not in `link_source`. Fails closed: with no
@@ -529,10 +532,13 @@ def prune_retired_macs(
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
         return 0
     try:
-        return _delete_retired_rows(inv, overrides, protected, (before, batch_mark), now)
+        pruned = _delete_retired_rows(inv, overrides, protected, (before, batch_mark), now)
     except _PruneDeferred as exc:
         log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
         return 0
+    if pruned:
+        log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
+    return pruned
 
 
 def _delete_retired_rows(

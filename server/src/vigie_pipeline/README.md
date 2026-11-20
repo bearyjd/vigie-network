@@ -19,21 +19,48 @@ see `docs/monitoring.md`).
   in >= 2 distinct server hours (`batches.received_at`) and its first-to-last-seen dwell is >= the
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
-  window; a retired device seen again returns to transient (`device_reappeared`). Self-linked MAC
-  rows of retired devices are pruned (`observations`; cumulative count in
-  `pipeline_meta.retired_mac_rows_pruned`) 90 days after the SERVER retired the device; the
-  device row stays. `transient_state.since` means "since the current status began": the retirement
-  stamps it with the server clock and a retired device keeps it, a revival rewrites it. A retired
-  device without a stamp (retired before this existed) gets one on the next sweep, so on an
-  existing install such devices become prunable only 90 days after that backfill. The 90 days are
-  counted on `min(server now, newest mac_activity end)`: a server clock stepped forward leaves the
-  newest accepted collector stamp behind (activity.py accepts stamps only within a window around
-  the batch receipt), so the cutoff stops with it; no activity at all prunes nothing. Pruning
-  fails closed: it runs
-  only when `overrides.db` exists, opens read-only, is at exactly the schema version this build
-  supports, and has every table the protected-device query reads (devices named, grouped, marked
-  essential, targeted by a rule, or on either end of a live link are never pruned). Otherwise it
-  logs `prune_skipped` (error text only) and deletes nothing.
+  window; a retired device seen again returns to transient (`device_reappeared`).
+- Retired-MAC prune (irreversible). `transient_state.since` means "since the current status
+  began": the retirement stamps it with the SERVER clock, a retired device keeps it, a revival
+  rewrites it, so a device revived and retired again restarts its clock. A collector timestamp
+  (`observations.last_seen`) is untrusted and never sets the age by itself. A device's
+  self-linked `observations` rows are deleted 90 days after that stamp, at most
+  `PRUNE_BATCH_ROWS` rows per pass, oldest retirement first; the device row stays. A retired
+  device without a stamp (retired before the stamp existed) is not prunable: it gets one on the
+  next sweep, so on an existing install such devices become prunable only 90 days after that
+  backfill. Each pass logs `retired_macs_pruned count=N` (a count, never a MAC) and adds N to
+  `pipeline_meta.retired_mac_rows_pruned`; the pruned MAC's `mac_last_ip` row goes with it.
+  `monitoring_assignment_versions`, `monitoring_dirty`, `characterization_*`,
+  `mac_first_received` and `mac_activity` are left alone (own retention or own meaning).
+  A MAC that returns starts over as a new transient.
+  - Activity-frontier guard: the 90 days are counted on `min(server now, newest mac_activity
+    end)`. activity.py accepts a stamp only within a window around the batch receipt (lower
+    bound `received - ACTIVITY_MAX_REPORT_LAG_S`, upper `received + ACTIVITY_SKEW_S`), so after
+    a forward step of the server clock alone, or of a collector alone, nothing new is accepted
+    and the frontier, hence the cutoff, stops. No `mac_activity` at all prunes nothing.
+  - Fails closed. It runs only when `overrides.db` exists, opens read-only, is at exactly the
+    supported schema version and has every table the protected-device query reads; otherwise it
+    logs `prune_skipped` (error text only) and deletes nothing.
+  - Deferred (the pass rolls back and logs `prune_deferred` with a reason, retried next pass):
+    `overrides_changed` when `overrides.db` committed since the protected set was read (or
+    cannot be asked); `batches_changed` when a batch arrived or was purged during the pass, or
+    one was unreadable, because a returning MAC would become a new device instead of a revived
+    one.
+  - Protected (never pruned): devices that `overrides.db` refers to (named or grouped, marked
+    essential, targeted by an identity rule, named by an incident decision or a candidate
+    decision, or on either end of any identity merge or link, undone or revoked ones
+    included). Also excluded while any inventory row still names the device or MAC:
+    `identity_candidates` (either end), `suggestions` (any state) of the label, move_group,
+    quarantine and merge_identity actions,
+    `monitoring_profiles`, `monitoring_incidents`, `monitoring_suspicious` and
+    `monitoring_unavailable` (by device), `measurements_hourly` and `monitoring_dirty` (by
+    MAC), and `rule_attachments`. Only `link_source='self'` rows of `retired` devices qualify,
+    and the row's collector `last_seen` must also be older than the cutoff.
+  - Cost: candidates are selected before the write lock (protections applied in SQL, so a
+    protected oldest batch cannot starve the limit); inside the lock the batch check runs, then
+    one point-lookup DELETE per candidate repeating the whole predicate, then the
+    `overrides.db` re-check, the counter bump and the commit. No statement inside the lock scans
+    `observations` or `devices`.
 - `dhcp_fingerprint` / `vendor_class` are first-wins. A differing value for the same MAC is not
   stored; the device is set to `identity_state='conflict'` and one `identity_conflict` event per
   (device, field) per day is emitted (short hashes only). Hostnames may change freely.
