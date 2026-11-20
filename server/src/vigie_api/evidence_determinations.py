@@ -25,6 +25,7 @@ from vigie_api.evidence_types import (
     when,
 )
 from vigie_api.models import TOD_BUCKET_HOURS, new_device_evidence, tod_cohort_bucket_valid
+from vigie_pipeline.detectors import ALL, NEW_DEVICE
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -32,7 +33,7 @@ REASON_CODES = (
     "two_qualified_upload_hours",
     "two_qualified_upload_hours_in_cohort",
 )
-DETECTORS = ("large_upload", "upload_deviation", "new_device")
+DETECTORS = ALL
 INCIDENT_STATES = ("open", "resolved", "superseded")
 REVIEW_STATUSES = ("acknowledged", "snoozed", "expected")
 _INT = "int"
@@ -122,7 +123,7 @@ def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
         "baseline_id": sensitive("baseline_id", row["baseline_id"]),
         "evidence": (
             new_device_evidence(row["evidence"])
-            if row["detector"] == "new_device"
+            if row["detector"] == NEW_DEVICE
             else allowlisted_evidence(row["evidence"])
         ),
         "review": _review(row["review"]),

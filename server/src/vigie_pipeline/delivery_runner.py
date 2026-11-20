@@ -53,6 +53,7 @@ from vigie_pipeline.delivery_types import (
     tick_floor,
 )
 from vigie_pipeline.logs import log
+from vigie_pipeline.overrides import read_decisions
 
 logger = logging.getLogger("vigie_pipeline")
 DEFAULT_MAX_PER_RUN = 20
@@ -102,8 +103,7 @@ def _read_reviews(ro: sqlite3.Connection | None) -> dict[str, ReviewView]:
     if ro is None:
         raise DecisionsUnavailable("no decision store")
     try:
-        rows = ro.execute("SELECT incident_id,status,snooze_until FROM incident_decisions")
-        return {r[0]: ReviewView(r[1], r[2]) for r in rows.fetchall()}
+        return {r[0]: ReviewView(r[1], r[2]) for r in read_decisions(ro)}
     except sqlite3.Error as exc:
         raise DecisionsUnavailable(str(exc)) from exc
 
