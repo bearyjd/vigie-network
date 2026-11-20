@@ -16,7 +16,27 @@ QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 # The one overrides schema this build understands (same source of truth as backup verification).
 SUPPORTED_USER_VERSION = len(OVERRIDES_MIGRATIONS)
 # Tables the protected-device query reads; all must exist before anything is pruned on its word.
-PROTECTED_TABLES = ("device_overrides", "essential_devices", "identity_links", "identity_rules")
+PROTECTED_TABLES = (
+    "candidate_decisions",
+    "device_overrides",
+    "essential_devices",
+    "identity_links",
+    "identity_merges",
+    "identity_rules",
+    "incident_decisions",
+)
+# Every column below names a device a human decision refers to. Unfiltered on purpose: expired or
+# revoked rules, cleared marks and decisions, undone merges and revoked links still protect
+# (over-protecting fails safe). Kept in this module with the other identity_links SQL.
+PROTECTED_READS = (
+    "SELECT device_id FROM device_overrides",
+    "SELECT device_id FROM essential_devices",
+    "SELECT device_id FROM identity_rules",
+    "SELECT device_id FROM incident_decisions",
+    "SELECT from_device, into_device FROM identity_merges",
+    "SELECT device_a, device_b FROM candidate_decisions",
+    "SELECT from_device, into_device FROM identity_links",
+)
 logger = logging.getLogger("vigie_pipeline")
 
 
@@ -136,8 +156,9 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
 
 
 def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
-    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets
-    and both ends of every live identity link. FAILS CLOSED: raises OverridesNotUsable unless the
+    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets,
+    incident and candidate decisions, and both ends of every identity merge and link, undone
+    or revoked ones included. FAILS CLOSED: raises OverridesNotUsable unless the
     file is open, at exactly the supported schema version, and holds every table queried; an
     empty set must mean "nothing is protected", never "could not tell"."""
     if conn is None:
@@ -151,12 +172,4 @@ def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     missing = [t for t in PROTECTED_TABLES if t not in tables]
     if missing:
         raise OverridesNotUsable(f"overrides.db lacks table(s): {', '.join(missing)}")
-    singles = (
-        "SELECT device_id FROM device_overrides",
-        "SELECT device_id FROM essential_devices",
-        "SELECT device_id FROM identity_rules",
-    )
-    protected = {str(r[0]) for sql in singles for r in conn.execute(sql)}
-    for from_device, into_device in conn.execute(links_select_sql(conn)):
-        protected.update((str(from_device), str(into_device)))
-    return protected
+    return {str(value) for sql in PROTECTED_READS for row in conn.execute(sql) for value in row}

@@ -34,6 +34,7 @@ from vigie_pipeline.overrides import (
     protected_device_ids,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
+from vigie_pipeline.prune_exclusions import PRUNE_EXCLUSIONS_SQL
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
@@ -442,10 +443,11 @@ def prune_retired_macs(
             "INSERT OR IGNORE INTO prune_protected (id) VALUES (?)", [(i,) for i in protected]
         )
         pruned = inv.execute(
-            "DELETE FROM observations WHERE mac IN (SELECT o.mac FROM observations o"
+            "DELETE FROM observations WHERE mac IN (SELECT o.mac FROM observations o"  # noqa: S608
             " JOIN devices d ON d.id=o.device_id WHERE d.status='retired'"
             " AND o.link_source='self' AND o.last_seen<?"
-            " AND d.id NOT IN (SELECT id FROM prune_protected) ORDER BY o.last_seen LIMIT ?)",
+            f" AND d.id NOT IN (SELECT id FROM prune_protected){PRUNE_EXCLUSIONS_SQL}"
+            " ORDER BY o.last_seen LIMIT ?)",
             (iso_utc(now - RETIRED_MAC_RETENTION_S), PRUNE_BATCH_ROWS),
         ).rowcount
         inv.execute("DROP TABLE prune_protected")
