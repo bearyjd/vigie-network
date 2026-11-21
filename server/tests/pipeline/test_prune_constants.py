@@ -12,6 +12,7 @@ from test_prune_guards import RETIRED_AT, migrated_overrides, prune, retire, set
 from test_prune_stamp import CONFIG, stamps
 
 from vigie_ingest.db import iso_utc
+from vigie_pipeline.config import PRUNE_BATCH_ROWS
 from vigie_pipeline.processor import BACKFILL_KEY, sweep_transients
 
 DAY = 86400
@@ -34,7 +35,9 @@ def test_a_retired_device_is_kept_for_exactly_90_days(data):
 
 
 @pytest.mark.parametrize(
-    ("silent_s", "named"), [(7 * DAY - 1, False), (7 * DAY + 1, True)], ids=["under", "over"]
+    ("silent_s", "named"),
+    [(7 * DAY - 1, False), (7 * DAY, False), (7 * DAY + 1, True)],
+    ids=["under", "exactly", "over"],
 )
 def test_a_binding_collector_is_named_after_exactly_7_silent_days(data, caplog, silent_s, named):
     retire(data)
@@ -56,3 +59,8 @@ def test_the_stamp_backfill_rescans_devices_once_a_day(data, later_s, rescanned)
     sweep_transients(data.inv, RETIRED_AT + later_s, CONFIG, retired_at=RETIRED_AT + later_s)
     assert (stamps(data) != {}) is rescanned
     assert not rescanned or device in stamps(data)
+
+
+def test_a_prune_pass_deletes_at_most_1000_rows():
+    """Bounds how long the inventory write lock is held; a literal, not read back from config."""
+    assert PRUNE_BATCH_ROWS == 1000

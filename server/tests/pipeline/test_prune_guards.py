@@ -13,6 +13,7 @@ from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_ingest.db import iso_utc
 from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import RETIRED_MAC_RETENTION_S, PipelineConfig
+from vigie_pipeline.overrides import PROTECTED_TABLES
 from vigie_pipeline.processor import prune_retired_macs, run_once
 
 RETENTION = RETIRED_MAC_RETENTION_S
@@ -121,14 +122,32 @@ def test_a_newer_than_known_schema_prunes_nothing(data):
     assert rows(data) == 1
 
 
-@pytest.mark.parametrize(
-    "table", ["device_overrides", "identity_links", "identity_rules", "essential_devices"]
-)
-def test_a_missing_required_table_prunes_nothing(data, table):
+# Spelled out on purpose: read back from PROTECTED_TABLES, the list would follow any edit of it.
+REQUIRED_TABLES = [
+    "candidate_decisions",
+    "device_overrides",
+    "essential_devices",
+    "identity_links",
+    "identity_merges",
+    "identity_rules",
+    "incident_decisions",
+    "suggestion_decisions",
+]
+
+
+def test_the_required_tables_are_exactly_these():
+    assert sorted(PROTECTED_TABLES) == REQUIRED_TABLES
+
+
+@pytest.mark.parametrize("table", REQUIRED_TABLES)
+def test_a_missing_required_table_prunes_nothing(data, table, caplog):
+    """The guard names the table; without it the next SELECT would fail with a bare sqlite error."""
     retire(data)
     sql(migrated_overrides(data.root), f"DROP TABLE {table}")
-    assert prune(data) == 0
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        assert prune(data) == 0
     assert rows(data) == 1
+    assert any(f"lacks table(s): {table}" in r.fields.get("error", "") for r in caplog.records)
 
 
 def test_an_unreadable_table_is_skipped_not_raised(data, caplog):
@@ -252,6 +271,21 @@ def test_the_running_total_adds_up_across_pruning_passes(data, monkeypatch):
     assert counter(data) == "2"
     assert prune(data) == 1
     assert counter(data) == "3"
+
+
+def test_the_running_total_adds_each_pass_by_the_rows_it_pruned(data, monkeypatch):
+    retire(data, count=5)
+    migrated_overrides(data.root)
+    monkeypatch.setattr(prune_module, "PRUNE_BATCH_ROWS", 2)
+    assert [prune(data), prune(data), prune(data)] == [2, 2, 1]
+    assert counter(data) == "5"
+
+
+def test_a_pass_that_prunes_nothing_leaves_pipeline_meta_alone(data):
+    retire(data)
+    migrated_overrides(data.root)
+    assert prune(data, RETIRED_AT + RETENTION) == 0  # trusted clock, nothing past 90 days yet
+    assert data.q("SELECT 1 FROM pipeline_meta WHERE key=?", prune_module.PRUNED_COUNTER_KEY) == []
 
 
 def test_the_retention_boundary_is_exclusive(data):
