@@ -184,3 +184,17 @@ def test_deleting_the_marker_rows_resumes_the_prune(data):
     data.inv.execute("DELETE FROM stitch_state WHERE key LIKE 'prune_overrides_%'")
     assert prune(data) == 1
     assert rows(data) == 0
+
+
+def test_lost_decisions_are_latched_even_when_the_audit_counter_never_fell(data):
+    macs = retire(data, count=2)
+    path = migrated_overrides(data.root)
+    sql(path, PROTECTIONS["identity_rules"], macs[sorted(macs)[0]], STAMP)
+    for n in range(2):
+        sql(path, AUDIT, f"a{n}", STAMP)
+    assert prune(data) == 1
+    sql(path, "DELETE FROM identity_rules")  # decisions gone, audit rows (and the mark) intact
+    assert prune(data) == 0
+    decide(path, "unrelated", 1)  # a decision again: the presence marker would pass
+    assert prune(data) == 0
+    assert rows(data) == 1
