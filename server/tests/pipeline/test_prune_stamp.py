@@ -147,6 +147,22 @@ def test_a_backfill_marker_from_the_future_counts_as_due(data):
     assert stamps(data) == {device: iso_utc(LATER)}
 
 
+# all sort before the stamp, so they reach the parse
+@pytest.mark.parametrize("junk", ["", "0", "2026-99-99T99:00:00Z"])
+def test_an_unreadable_backfill_marker_counts_as_due_and_is_rewritten(data, junk):
+    (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
+    data.inv.execute("DELETE FROM transient_state")
+    data.inv.execute(
+        "INSERT OR REPLACE INTO stitch_state (key, value) VALUES (?, ?)", (BACKFILL_KEY, junk)
+    )
+    sweep_transients(data.inv, LATER, CONFIG)
+    assert stamps(data) == {device: iso_utc(LATER)}
+    assert data.q("SELECT value FROM stitch_state WHERE key=?", BACKFILL_KEY)[0][0] == iso_utc(
+        LATER
+    )
+
+
 # ---- a clock set back cannot backdate a stamp ----------------------------------------------
 
 
@@ -208,7 +224,7 @@ def test_a_retired_device_leaves_no_transient_hours_behind(data):
 
 
 def test_the_stamp_floor_survives_purged_batch_rows(data):
-    """purge_batches deletes the receipts the floor reads; collectors.last_sent_ts is never purged."""
+    """purge_batches deletes the receipts the floor reads; `last_sent_ts` is never purged."""
     make_transient(data)
     sent = RETIRED_AT + 5 * 86400
     data.inv.execute("DELETE FROM batches")

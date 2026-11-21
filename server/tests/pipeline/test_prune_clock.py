@@ -21,8 +21,8 @@ from test_prune_guards import (
 )
 
 from vigie_ingest import store
-from vigie_ingest.db import iso_utc
 from vigie_ingest.config import Settings
+from vigie_ingest.db import iso_utc
 from vigie_ingest.retention import purge_batches
 
 SILENT_DAYS = 8  # past the 7 days after which a collector that holds the clock back is named

@@ -240,7 +240,8 @@ def _trusted_now(inv: sqlite3.Connection, now: float) -> float | None:
     PRUNE_CLOCK_WARN_S. None (no collector with an accepted send) prunes nothing; a live collector
     whose `last_sent_ts` is not a number raises sqlite3.DataError (the pass is skipped)."""
     if inv.execute(
-        "SELECT 1 FROM collectors WHERE revoked=0 AND typeof(last_sent_ts) NOT IN ('integer','real')"
+        "SELECT 1 FROM collectors"
+        " WHERE revoked=0 AND typeof(last_sent_ts) NOT IN ('integer','real')"
     ).fetchone():  # text sorts after every number and would silently leave the minimum
         raise sqlite3.DataError("collectors.last_sent_ts holds a value that is not a number")
     row = inv.execute(

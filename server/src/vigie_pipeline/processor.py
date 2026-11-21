@@ -458,12 +458,15 @@ def _backfill_stamps(inv: sqlite3.Connection, stamp: str) -> None:
     stitch_apply), but one retired before the stamp existed, or by a build rolled back to, has
     none and is not prunable until stamped. The scan of devices therefore repeats daily, not each
     pass. The marker holds the stamp of the last scan; one from the future (the clock was set
-    back) counts as due. It is a `stitch_state` row, not `pipeline_meta`: that table's contents
-    are pinned byte for byte by the freeze tests for runs that prune nothing (the prune
-    keeps its running total there)."""
+    back) or one that is not a time counts as due. It is a `stitch_state` row, not `pipeline_meta`:
+    that table's contents are pinned byte for byte by the freeze tests for runs that prune
+    nothing (the prune keeps its running total there)."""
     last = state_get(inv, BACKFILL_KEY)
-    if last is not None and last <= stamp < iso_utc(_epoch(last) + RETIRED_BACKFILL_INTERVAL_S):
-        return
+    try:
+        if last is not None and last <= stamp < iso_utc(_epoch(last) + RETIRED_BACKFILL_INTERVAL_S):
+            return
+    except ValueError:  # an unreadable marker cannot show a scan is recent: scan and rewrite it
+        pass
     inv.execute(
         "INSERT OR IGNORE INTO transient_state (device_id, since)"
         " SELECT id, ? FROM devices WHERE status='retired'",

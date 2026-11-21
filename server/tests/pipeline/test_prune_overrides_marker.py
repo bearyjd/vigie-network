@@ -7,6 +7,7 @@ import logging
 
 import pytest
 from pipeline_helpers import data  # noqa: F401
+from test_prune_exclusions import OVERRIDES_SOURCES
 from test_prune_guards import (
     LATER,
     PROTECTIONS,
@@ -19,7 +20,6 @@ from test_prune_guards import (
 )
 
 from vigie_api.schema import open_overrides
-from test_prune_exclusions import OVERRIDES_SOURCES
 from vigie_pipeline.prune import OVERRIDES_SEEN_KEY
 
 
