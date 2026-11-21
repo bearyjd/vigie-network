@@ -59,7 +59,8 @@ see `docs/monitoring.md`).
     a file that exists but is unusable logs at ERROR. A busy or
     locked inventory skips the prune and the rest of the pass still runs. A pass in which any
     batch could not be read (`failures`) skips the prune. A lost `overrides.db`: once a read has
-    found a decision in any protected source the pipeline sets the `stitch_state` marker
+    found a decision that does not expire (any protected source except incident decisions, which
+    the API deletes with their incident) the pipeline sets the `stitch_state` marker
     `prune_overrides_seen`; if a later read finds none at all the prune is skipped and logged at
     ERROR (`overrides_lost_decisions`: the file was probably lost or recreated empty). An install
     that never had a decision prunes as usual. A rolled-back `overrides.db`: the pipeline also

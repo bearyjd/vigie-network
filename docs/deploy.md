@@ -231,7 +231,8 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   never deleted, so on a monitoring install a device that was ever measured is never pruned. The
   device's `events` rows (`new device <MAC>`, `retired device <MAC> reappeared`) are not touched
   and keep the MAC until event retention exists (below). Nothing is pruned
-  while `overrides.db` is missing or unusable, after it lost every decision it once held, or
+  while `overrides.db` is missing or unusable, after it lost every lasting decision it once held (incident decisions do not count: they
+  expire with their incident), or
   went back to an older state (a restored backup, a recreated file: the pipeline keeps the file's
   audit counter high-water mark and logs ERROR `overrides_rolled_back`; after a deliberate restore
   or removal delete the `prune_overrides_seen` and `prune_overrides_audit_mark` rows of

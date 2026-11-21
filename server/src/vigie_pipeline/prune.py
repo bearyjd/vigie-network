@@ -20,6 +20,7 @@ from vigie_pipeline.logs import log
 from vigie_pipeline.overrides import (
     OverridesNotUsable,
     decided_suggestion_ids,
+    durable_decisions_found,
     open_overrides_ro,
     overrides_data_version,
     overrides_identity,
@@ -124,7 +125,8 @@ def prune_retired_macs(
         read = _open_overrides_read(overrides_path)
         protected = protected_device_ids(read.conn)
         decided = decided_suggestion_ids(read.conn)
-        if not _decisions_not_lost(inv, bool(protected or decided), _audit_high_water(read.conn)):
+        found = durable_decisions_found(read.conn) or bool(decided)
+        if not _decisions_not_lost(inv, found, _audit_high_water(read.conn)):
             return 0
         protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
         pruned = _delete_retired_rows(inv, read, protected, now)

@@ -19,6 +19,7 @@ from test_prune_guards import (
 )
 
 from vigie_api.schema import open_overrides
+from test_prune_exclusions import OVERRIDES_SOURCES
 from vigie_pipeline.prune import OVERRIDES_SEEN_KEY
 
 
@@ -66,3 +67,19 @@ def test_a_fresh_install_whose_file_is_empty_is_not_mistaken_for_a_lost_one(data
     retire(data, count=2)
     migrated_overrides(data.root)
     assert prune(data, LATER) == 2
+
+
+def test_an_incident_decision_alone_never_sets_the_marker_nor_latches_the_prune(data, caplog):
+    """The API deletes an incident decision with its incident, so one must not count as a decision
+    the install once held: its expiry would otherwise stop the prune for good."""
+    macs = retire(data, count=2)
+    protected = sorted(macs)[0]
+    path = migrated_overrides(data.root)
+    sql(path, OVERRIDES_SOURCES["incident_decisions"], macs[protected], STAMP)
+    assert prune(data, LATER) == 1  # the incident decision still protects its own device
+    assert marker(data) == []
+    sql(path, "DELETE FROM incident_decisions")  # the incident expired and took its decision
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        assert prune(data, LATER) == 1
+    assert rows(data) == 0
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)

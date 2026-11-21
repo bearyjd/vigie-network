@@ -32,15 +32,18 @@ PROTECTED_TABLES = (
 # fails safe). Incident decisions, cleared ones (status NULL) included, protect while their row
 # exists; the API deletes the row together with its incident (vigie_api.incident_decisions), and
 # the protection ends with it. Kept in this module with the other identity_links SQL.
-PROTECTED_READS = (
+DURABLE_READS = (
     "SELECT device_id FROM device_overrides",
     "SELECT device_id FROM essential_devices",
     "SELECT device_id FROM identity_rules",
-    "SELECT device_id FROM incident_decisions",
     "SELECT from_device, into_device FROM identity_merges",
     "SELECT device_a, device_b FROM candidate_decisions",
     "SELECT from_device, into_device FROM identity_links",
 )
+# Incident decisions are the one source that expires on its own, so it is kept out of
+# DURABLE_READS: it protects, but its disappearance is not a lost decision.
+INCIDENT_READS = ("SELECT device_id FROM incident_decisions",)
+PROTECTED_READS = DURABLE_READS + INCIDENT_READS
 # The owner's decision on a suggestion (accepted or rejected) is keyed by suggestion id, not by
 # device: the devices it concerns are in the inventory's `suggestions` row (prune_exclusions).
 SUGGESTION_READS = ("SELECT suggestion_id FROM suggestion_decisions",)
@@ -200,6 +203,12 @@ def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     incident and candidate decisions, and both ends of every identity merge and link, undone
     or revoked ones included. Fails closed (`_read_text_ids`)."""
     return _read_text_ids(conn, PROTECTED_READS)
+
+
+def durable_decisions_found(conn: sqlite3.Connection | None) -> bool:
+    """True when a decision that does not expire with an incident is on file (`DURABLE_READS`).
+    Fails closed (`_read_text_ids`)."""
+    return bool(_read_text_ids(conn, DURABLE_READS))
 
 
 def decided_suggestion_ids(conn: sqlite3.Connection | None) -> set[str]:
