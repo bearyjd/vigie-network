@@ -140,3 +140,32 @@ def test_no_warning_when_the_server_clock_is_the_binding_minimum(data, caplog):
     with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
         prune(data, LATER)  # every collector is ahead of the server
     assert "prune_clock_held_back" not in caplog.text
+
+
+@pytest.mark.parametrize("junk", ["not-a-time", b"\x00\x01"], ids=["text", "blob"])
+def test_a_last_sent_ts_that_is_not_a_number_skips_the_pass_instead_of_dropping_out(
+    data, caplog, junk
+):
+    """Sorted among numbers it would sit last and silently leave the minimum; compared with a
+    number it would crash the pass."""
+    retire(data)
+    migrated_overrides(data.root)
+    add_collector(data, "junk-rtr", junk)
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        assert prune(data, LATER) == 0
+    assert rows(data) == 1
+    assert any(r.getMessage() == "prune_skipped" for r in caplog.records)
+
+
+def test_a_revoked_collector_with_a_junk_last_sent_ts_is_ignored(data):
+    retire(data)
+    migrated_overrides(data.root)
+    add_collector(data, "junk-rtr", "not-a-time", revoked=1)
+    assert prune(data, LATER) == 1
+
+
+def test_a_fractional_last_sent_ts_is_still_a_time(data):
+    retire(data)
+    migrated_overrides(data.root)
+    set_clock(data, RETIRED_AT + RETENTION + 1.5)
+    assert prune(data, LATER) == 1
