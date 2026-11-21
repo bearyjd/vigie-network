@@ -20,7 +20,15 @@ see `docs/monitoring.md`).
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
   window; a retired device seen again returns to transient (`device_reappeared`).
-- Retired-MAC prune (irreversible; code in `prune.py`). `transient_state.since` means "since the
+- Retired-MAC prune (irreversible; code in `prune.py`). OPT-IN: `VIGIE_PRUNE_RETIRED_MACS`
+  (`PipelineConfig.prune_retired_macs`) is OFF by default and only 1/true/yes turn it on; any
+  other value, an unparsable one included, reads as off. Off, a pass never calls the prune, logs
+  nothing about it and writes none of its markers (`prune_*` rows of `stitch_state`, the
+  `retired_mac_rows_pruned` total); retirement stamping below still runs (it deletes nothing).
+  The flag is in no policy dataclass, so the monitoring policy version is unchanged. Enabling it
+  is the owner's decision: it needs a configured collector (the trusted clock below) and an
+  `overrides.db` at the supported schema version, and what it deletes cannot be restored.
+  `transient_state.since` means "since the
   current status began". Every retirement stamps it with the SERVER clock at the transition, but
   never earlier than the newest `batches.received_at` nor the newest `collectors.last_sent_ts` (the
   latter is never purged, so a clock set back cannot backdate a stamp even after the batch rows
@@ -109,7 +117,9 @@ see `docs/monitoring.md`).
     deletion); `suggestions` of any action while unexpired on the trusted clock;
     `monitoring_profiles`, `monitoring_incidents`, `monitoring_suspicious` and
     `monitoring_unavailable` (by device); `measurements_hourly` and `monitoring_dirty` (by MAC);
-    and `rule_attachments`. Only `link_source='self'` rows of `retired` devices qualify.
+    and `rule_attachments`. The six collector-keyed tables protect a device only through rows
+    whose `collector_id` is a row of `collectors` (never deleted); a row naming an unknown
+    collector is not seen. Only `link_source='self'` rows of `retired` devices qualify.
   - Accepted, monitoring: `monitoring_profiles` is upserted for every analysed MAC and never
     deleted, so on an install with monitoring a device that was ever measured (any flow or DNS
     traffic, visitor phones included) is never pruned; only devices monitoring never analysed
