@@ -125,10 +125,10 @@ def test_a_revived_then_retired_again_device_restarts_the_clock(data):
     revived = RETIRED_AT + 60 * 86400
     set_clock(data, None)  # no send floor: the passes are driven by the clock they are given
     data.add_batch(revived, neigh=[mac])
-    run_once(PipelineConfig(data_dir=data.root), now=revived)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=revived)
     assert data.q("SELECT status FROM devices")[0][0] == "transient"
     again = revived + 86400
-    run_once(PipelineConfig(data_dir=data.root), now=again)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=again)
     assert stamp(data) == [(device, iso_utc(again))]
     set_clock(data, FRONTIER)
     assert prune(data, again + RETENTION) == 0  # the first retirement's clock would be long up
@@ -210,7 +210,7 @@ def test_the_prune_lock_of_a_real_pass_never_scans_observations_devices_or_batch
         return conn
 
     monkeypatch.setattr(processor, "open_pipeline_inventory", traced_open)
-    run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER)
     (lock,) = [w for w in windows if any("DELETE FROM observations" in s for s in w)]
     data.inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
     scans = []

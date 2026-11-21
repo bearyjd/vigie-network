@@ -37,13 +37,13 @@ def test_opt55_short_list_untouched():
 def test_retired_transient_mac_rows_are_pruned_after_90_days(data):
     mac = "aa:bb:cc:00:00:01"
     data.add_batch(T0, neigh=[mac])
-    run_once(PipelineConfig(data_dir=data.root), now=T0 + 86400)  # retired
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=T0 + 86400)  # retired
     open_overrides(data.root / "overrides.db").close()  # pruning needs a real, migrated file
     # 90 days after the retirement (server time), with a fresh batch proving the clock moved
     late = T0 + 86400 + 90 * 86400 + 60
     data.add_batch(late, neigh=["aa:bb:cc:00:00:02"])
     data.inv.execute("UPDATE collectors SET last_sent_ts=?", (late,))  # what ingest records
-    run_once(PipelineConfig(data_dir=data.root), now=late)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=late)
     assert data.q("SELECT * FROM observations WHERE mac=?", mac) == []
     # aggregated to a count; the device row is retired, never deleted
     assert (
@@ -62,7 +62,7 @@ CLOCK_MOVED_BY = "02:00:5e:00:00:02"  # a fresh batch's MAC
 
 def retire_one(data):
     data.add_batch(T0, neigh=[LA_MAC])
-    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=RETIRED)
     assert data.q("SELECT status FROM devices")[0][0] == "retired"
 
 
@@ -70,7 +70,7 @@ def run_at(data, now):
     """A pass whose fresh batch moves the clock the prune trusts, so only the guards decide."""
     data.add_batch(now, neigh=[CLOCK_MOVED_BY])
     data.inv.execute("UPDATE collectors SET last_sent_ts=?", (now,))  # what ingest records
-    run_once(PipelineConfig(data_dir=data.root), now=now)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=now)
 
 
 def rows_of(data, mac):
@@ -104,7 +104,7 @@ def test_retired_transient_merged_by_a_human_keeps_its_mac_row(data):
 
 def test_the_same_retired_transient_is_pruned_without_the_link(data):
     data.add_batch(T0, neigh=[LA_MAC, NIC])
-    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=RETIRED)
     open_overrides(data.root / "overrides.db").close()
     run_at(data, RETIRED + 91 * 86400)
     assert rows_of(data, LA_MAC) == 0  # the link in the test above is what kept it
@@ -119,7 +119,7 @@ def test_pruning_is_skipped_when_overrides_is_unreadable(data):
 
 def test_active_device_mac_rows_are_never_pruned(data):
     data.add_batch(T0, neigh=[NIC])  # globally administered: active, not transient
-    run_once(PipelineConfig(data_dir=data.root), now=RETIRED)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=RETIRED)
     open_overrides(data.root / "overrides.db").close()
     run_at(data, RETIRED + 91 * 86400)
     assert rows_of(data, NIC) == 1

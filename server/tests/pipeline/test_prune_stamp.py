@@ -80,7 +80,7 @@ def test_a_retirement_is_stamped_at_the_transition_time_not_the_pass_start(data)
 
 def test_run_once_stamps_with_a_fresh_clock_read(data, monkeypatch):
     data.add_batch(T0, neigh=["02:00:5e:00:00:41"])
-    processor.run_once(PipelineConfig(data_dir=data.root), now=T0 + 60)
+    processor.run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=T0 + 60)
     ticks = iter(range(int(RETIRED_AT), int(RETIRED_AT) + 100_000))
     monkeypatch.setattr(processor, "time", SimpleNamespace(time=lambda: float(next(ticks))))
     processor.run_once(PipelineConfig(data_dir=data.root))  # pass start = the first tick
@@ -105,7 +105,7 @@ def test_the_retirement_path_that_never_stamped_is_not_prunable(data):
     retire(data)
     migrated_overrides(data.root)
     data.inv.execute("DELETE FROM transient_state")
-    processor.run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    processor.run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER)
     assert rows(data) == 1
     assert FRONTIER > LATER
 

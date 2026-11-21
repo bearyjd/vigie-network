@@ -25,7 +25,7 @@ def _visible_pipeline_log(monkeypatch):
 
 
 def run(data, now=LATER):
-    return processor.run_once(PipelineConfig(data_dir=data.root), now=now)
+    return processor.run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=now)
 
 
 def test_a_quiet_pass_still_prunes(data):

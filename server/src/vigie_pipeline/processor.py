@@ -85,7 +85,8 @@ def run_once(
         promoted, retired = sweep_transients(
             inv, clock, config, retired_at=(live or (lambda: clock))()
         )
-        _prune_stage(inv, config, clock, usable, len(failures))
+        if config.prune_retired_macs:  # default off: nothing of the prune runs, logs or writes
+            _prune_stage(inv, config, clock, usable, len(failures))
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)

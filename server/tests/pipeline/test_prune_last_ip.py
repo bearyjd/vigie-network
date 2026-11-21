@@ -38,7 +38,7 @@ def test_a_dns_only_return_shows_no_old_ip_on_the_new_device(data):
     assert prune(data) == 1
     assert data.q("SELECT 1 FROM mac_last_ip") == []
     data.add_batch(LATER, dns=[(mac, LATER)])
-    run_once(PipelineConfig(data_dir=data.root), now=LATER + 60)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER + 60)
     returned = data.q("SELECT device_id FROM observations WHERE mac=?", mac)
     assert returned and returned[0][0] != old_device  # a new device, not the pruned one
     assert data.q(SHOWN_ON_A_DEVICE) == []

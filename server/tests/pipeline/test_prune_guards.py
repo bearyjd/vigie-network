@@ -51,7 +51,7 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
     macs = [f"aa:bb:cc:00:00:{i:02x}" for i in range(1, count + 1)]
     data.add_batch(T0, neigh=macs)
     set_clock(data, None)  # a floor left by an earlier call would stamp the retirement ahead
-    run_once(PipelineConfig(data_dir=data.root), now=RETIRED_AT)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=RETIRED_AT)
     set_clock(data, FRONTIER)
     return {r["mac"]: r["device_id"] for r in data.q("SELECT mac, device_id FROM observations")}
 
@@ -97,7 +97,7 @@ def test_a_missing_overrides_db_prunes_nothing(data, caplog):
 
 def test_run_once_with_no_overrides_db_prunes_nothing(data):
     retire(data)
-    run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER)
     assert rows(data) == 1
 
 
@@ -220,7 +220,7 @@ def test_a_human_merged_retired_device_survives_through_run_once(data):
     transient = macs["aa:bb:cc:00:00:01"]
     path = migrated_overrides(data.root)
     sql(path, PROTECTIONS["link_from"].replace("someone-else", "active-dev"), transient, STAMP)
-    run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER)
     assert rows(data) == 1
 
 
