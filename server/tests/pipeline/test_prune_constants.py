@@ -51,6 +51,7 @@ def test_a_binding_collector_is_named_after_exactly_7_silent_days(data, caplog, 
 @pytest.mark.parametrize(("later_s", "rescanned"), [(DAY - 1, False), (DAY, True)])
 def test_the_stamp_backfill_rescans_devices_once_a_day(data, later_s, rescanned):
     (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: the sweep is driven by the clock it is given
     data.inv.execute("DELETE FROM transient_state")
     data.inv.execute(
         "INSERT OR REPLACE INTO stitch_state (key, value) VALUES (?, ?)",

@@ -22,6 +22,7 @@ from vigie_pipeline.characterization_store import (
 )
 from vigie_pipeline.config import (
     RETIRED_BACKFILL_INTERVAL_S,
+    RETIRED_STAMP_AHEAD_WARN_S,
     PipelineConfig,
 )
 from vigie_pipeline.delivery_wiring import run_delivery_stage
@@ -475,6 +476,8 @@ def _retire_due(inv: sqlite3.Connection, now: float, stamp: str, config: Pipelin
             (iso_utc(now - config.transient_window_s),),
         )
     ]
+    if due and stamp > iso_utc(now + RETIRED_STAMP_AHEAD_WARN_S):
+        log(logger, logging.WARNING, "retirement_stamp_ahead", retired=len(due), stamp=stamp)
     inv.executemany("UPDATE devices SET status='retired' WHERE id=?", due)
     inv.executemany(
         "UPDATE transient_state SET since=? WHERE device_id=?",

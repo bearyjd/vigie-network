@@ -19,6 +19,7 @@ from test_prune_guards import (
     prune,
     retire,
     rows,
+    set_clock,
 )
 
 from vigie_ingest.db import iso_utc
@@ -42,6 +43,7 @@ def stamps(data):
 
 def test_the_backfill_stamps_legacy_retired_devices_once(data):
     (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     data.inv.execute("DELETE FROM transient_state")
     data.inv.execute("DELETE FROM stitch_state WHERE key=?", (BACKFILL_KEY,))
     sweep_transients(data.inv, LATER, CONFIG)
@@ -59,6 +61,7 @@ def test_a_second_sweep_does_not_backfill_again(data):
 
 def test_the_sweep_does_not_scan_devices_for_a_backfill_within_the_interval(data):
     retire(data)
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     seen = []
     data.inv.set_trace_callback(seen.append)
     try:
@@ -112,6 +115,7 @@ def test_the_retirement_path_that_never_stamped_is_not_prunable(data):
 
 def test_stamps_erased_by_a_rollback_are_derived_again_once_the_interval_passed(data):
     (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     data.inv.execute("DELETE FROM transient_state")  # the previous build's sweep erased them
     sweep_transients(data.inv, RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S - 1, CONFIG)
     assert stamps(data) == {}  # bounded: not on every pass
@@ -123,15 +127,18 @@ def test_stamps_erased_by_a_rollback_are_derived_again_once_the_interval_passed(
 def test_a_rederived_stamp_makes_the_device_prunable_90_days_later(data):
     retire(data)
     migrated_overrides(data.root)
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     data.inv.execute("DELETE FROM transient_state")
     due = RETIRED_AT + RETIRED_BACKFILL_INTERVAL_S
     sweep_transients(data.inv, due, CONFIG)
+    set_clock(data, FRONTIER)
     assert prune(data, due + RETENTION) == 0
     assert prune(data, due + RETENTION + 1) == 1
 
 
 def test_a_backfill_marker_from_the_future_counts_as_due(data):
     (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     data.inv.execute("DELETE FROM transient_state")
     data.inv.execute(  # the clock was set back since the last scan
         "UPDATE stitch_state SET value=? WHERE key=?", (iso_utc(LATER + 86400), BACKFILL_KEY)
@@ -171,6 +178,7 @@ def test_a_clock_ahead_of_every_batch_is_stamped_as_it_is(data):
 
 def test_the_backfill_stamp_is_clamped_too(data):
     (device,) = retire(data).values()
+    set_clock(data, None)  # no send floor: these sweeps are driven by the clock they are given
     data.inv.execute("DELETE FROM transient_state")
     data.inv.execute("DELETE FROM stitch_state WHERE key=?", (BACKFILL_KEY,))
     newest = LATER + 7 * 86400
@@ -197,3 +205,46 @@ def test_a_retired_device_leaves_no_transient_hours_behind(data):
     """The sweep clears the hours of every device that is no longer transient, retired ones too."""
     retire(data)
     assert data.q("SELECT 1 FROM transient_hours") == []
+
+
+def test_the_stamp_floor_survives_purged_batch_rows(data):
+    """purge_batches deletes the receipts the floor reads; collectors.last_sent_ts is never purged."""
+    make_transient(data)
+    sent = RETIRED_AT + 5 * 86400
+    data.inv.execute("DELETE FROM batches")
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (sent,))
+    sweep_transients(data.inv, RETIRED_AT, CONFIG)
+    assert set(stamps(data).values()) == {iso_utc(sent)}
+
+
+def test_a_junk_last_sent_ts_does_not_move_the_stamp(data):
+    make_transient(data)
+    data.inv.execute("DELETE FROM batches")
+    data.inv.execute("UPDATE collectors SET last_sent_ts='zzz'")
+    sweep_transients(data.inv, RETIRED_AT, CONFIG)
+    assert set(stamps(data).values()) == {iso_utc(RETIRED_AT)}
+
+
+@pytest.mark.parametrize(
+    ("ahead_s", "warned"), [(86400, False), (86401, True)], ids=["exactly-a-day", "past-a-day"]
+)
+def test_a_stamp_pushed_ahead_by_a_stepped_clock_is_named_in_a_warning(
+    data, caplog, ahead_s, warned
+):
+    """A batch received under a forward-stepped clock makes every later retirement unprunable
+    until that date; say so once per sweep that retires something."""
+    make_transient(data)
+    data.inv.execute("DELETE FROM batches")
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (RETIRED_AT + ahead_s,))
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        sweep_transients(data.inv, RETIRED_AT, CONFIG)
+    assert ("retirement_stamp_ahead" in [r.getMessage() for r in caplog.records]) is warned
+
+
+def test_no_stamp_warning_when_nothing_is_retired(data, caplog):
+    make_transient(data)  # still inside its window: nothing is due
+    data.inv.execute("UPDATE collectors SET last_sent_ts=?", (RETIRED_AT + 30 * 86400,))
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        sweep_transients(data.inv, RETIRED_AT - 3000, CONFIG)
+    assert data.q("SELECT status FROM devices")[0][0] == "transient"
+    assert "retirement_stamp_ahead" not in caplog.text

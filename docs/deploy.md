@@ -218,7 +218,7 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
 - `batches` rows (dedupe records) are purged after 7 days; not configurable.
 - `VIGIE_MAX_SPOOL_AGE_S` - how old a collector window may be (default 24 h).
 - Retired transient devices: 90 days after the pipeline retired a device (a server-clock stamp,
-  never earlier than the newest batch receipt; counted on the older of the server clock and the
+  never earlier than the newest batch receipt or collector send time; counted on the older of the server clock and the
   oldest non-revoked collector's last accepted send time), its self-linked MAC rows in
   `inventory.db` are deleted, at most 1000 per pass, oldest first, together with the MAC's
   `mac_last_ip` row; the device row itself stays. A collector that falls silent holds the clock

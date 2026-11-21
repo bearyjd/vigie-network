@@ -22,8 +22,11 @@ see `docs/monitoring.md`).
   window; a retired device seen again returns to transient (`device_reappeared`).
 - Retired-MAC prune (irreversible; code in `prune.py`). `transient_state.since` means "since the
   current status began". Every retirement stamps it with the SERVER clock at the transition, but
-  never earlier than the newest `batches.received_at` (so a clock set back cannot backdate a
-  stamp; no batch recorded means the clock itself): the transient sweep reads the clock again
+  never earlier than the newest `batches.received_at` nor the newest `collectors.last_sent_ts` (the
+  latter is never purged, so a clock set back cannot backdate a stamp even after the batch rows
+  are gone; neither recorded means the clock itself). A stamp more than a day ahead of the server
+  clock (a batch received under a stepped-forward clock: those devices cannot be pruned until that
+  date) is named once per sweep that retires something, WARNING `retirement_stamp_ahead`: the transient sweep reads the clock again
   after the batches, and the stitcher stamps the orphan it retires. A retired device keeps its
   stamp, a revival rewrites it. A collector timestamp (`observations.last_seen`) is untrusted; it
   only adds a second condition (older than the cutoff too). A device's self-linked `observations`

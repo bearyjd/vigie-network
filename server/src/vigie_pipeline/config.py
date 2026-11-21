@@ -38,6 +38,9 @@ RETIRED_MAC_RETENTION_S = 90 * 86400
 # erases the stamps without a trace)
 PRUNE_CLOCK_WARN_S = 7 * 86400
 RETIRED_BACKFILL_INTERVAL_S = 86400
+# a retirement stamped further ahead of the server clock than this (a batch received under a
+# stepped clock) is named in a WARNING: such a device is not prunable until that date
+RETIRED_STAMP_AHEAD_WARN_S = 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 # Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
 # SERVER time it was first received (mac_first_received): older stamps are back-fill and count

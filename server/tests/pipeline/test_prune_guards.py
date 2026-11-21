@@ -49,6 +49,7 @@ def retire(data: Data, count: int = 1) -> dict[str, str]:
     """MAC -> device id of `count` transient devices that have been retired."""
     macs = [f"aa:bb:cc:00:00:{i:02x}" for i in range(1, count + 1)]
     data.add_batch(T0, neigh=macs)
+    set_clock(data, None)  # a floor left by an earlier call would stamp the retirement ahead
     run_once(PipelineConfig(data_dir=data.root), now=RETIRED_AT)
     set_clock(data, FRONTIER)
     return {r["mac"]: r["device_id"] for r in data.q("SELECT mac, device_id FROM observations")}

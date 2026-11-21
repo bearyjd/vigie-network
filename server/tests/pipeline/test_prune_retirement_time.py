@@ -98,8 +98,10 @@ def test_a_legacy_retired_device_without_a_stamp_is_not_prunable_until_90_days_a
     data.inv.execute("DELETE FROM transient_state")  # retired before the stamp existed
     data.inv.execute("DELETE FROM stitch_state WHERE key=?", (processor.BACKFILL_KEY,))
     assert prune(data, LATER) == 0  # no stamp: not old
+    set_clock(data, None)  # no send floor: the sweep is driven by the clock it is given
     sweep_transients(data.inv, LATER, CONFIG)
     assert stamp(data) == [(device, iso_utc(LATER))]
+    set_clock(data, FRONTIER)
     assert prune(data, LATER + RETENTION) == 0
     assert prune(data, LATER + RETENTION + 1) == 1
 
@@ -121,6 +123,7 @@ def test_a_revived_then_retired_again_device_restarts_the_clock(data):
     ((mac, device),) = retire(data).items()
     migrated_overrides(data.root)
     revived = RETIRED_AT + 60 * 86400
+    set_clock(data, None)  # no send floor: the passes are driven by the clock they are given
     data.add_batch(revived, neigh=[mac])
     run_once(PipelineConfig(data_dir=data.root), now=revived)
     assert data.q("SELECT status FROM devices")[0][0] == "transient"
