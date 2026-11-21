@@ -39,16 +39,9 @@ logger = logging.getLogger("vigie_pipeline")
 PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
 
 
-class _PruneDeferred(Exception):
-    """The pass cannot prove it is safe to prune; roll back and try next pass."""
-
-    reason = "unknown"
-
-
-class _OverridesMoved(_PruneDeferred):
-    """overrides.db committed (or could not be asked) since the protected set was read."""
-
-    reason = "overrides_changed"
+class _OverridesMoved(Exception):
+    """overrides.db committed (or could not be asked) since the protected set was read: the pass
+    cannot prove it is safe to prune; roll back and try next pass."""
 
 
 @dataclass(frozen=True)
@@ -94,33 +87,20 @@ def prune_retired_macs(
 ) -> int:
     """Drop self-linked MAC rows of retired devices 90 days after the server retired them
     (transient_state.since; PRP section 8), on the older of the server clock and the oldest live
-    collector's `last_sent_ts` (`_trusted_now`), so a stepped server clock prunes nothing. One
-    bounded batch per pass; the running total is the aggregate kept in `pipeline_meta` and each
-    pass logs only a count.
-    Devices are never deleted; a pruned MAC that returns starts over as a new transient. Devices
-    that overrides.db refers to (merge, rule, name, group, essential mark, decisions, and the
-    devices of every suggestion the owner decided) are never pruned: human decisions live there,
-    not in `link_source`. Fails closed: with no
-    overrides.db (a DEBUG line: normal before the API ran) nothing is pruned, and with one that
-    is unreadable, locked, of another schema version, missing a table or holding an id that is
-    not text, an ERROR line; a busy inventory skips the pass. The protected set is read on a
-    connection of its own and re-validated just before COMMIT (the file is the same one and
-    `PRAGMA data_version` is unchanged): a human decision committed meanwhile defers the whole
-    pass, which rolls back. The two databases cannot share a transaction, so a commit landing
-    after that last check and before COMMIT (microseconds) is not seen, same as stitch_apply's
-    attach. A file that once held a decision and now holds none, or whose audit counter fell below
-    its stored high-water mark (an older backup restored, a file recreated), skips the pass. A
-    returning MAC whose rows were pruned gets a new device id (accepted). Either skip is latched."""
+    collector's `last_sent_ts` (`_trusted_now`). One bounded batch per pass; the running total is
+    kept in `pipeline_meta` and each pass logs only a count. Devices are never deleted; a pruned
+    MAC that returns starts over as a new transient (a new device id, accepted).
+
+    Devices that overrides.db refers to, and those of every suggestion the owner decided, are
+    never pruned: human decisions live there, not in `link_source`. Fails closed: no overrides.db
+    (DEBUG: normal before the API ran), an unusable one, a lost or rolled-back one
+    (`_decisions_not_lost`, latched) or a busy inventory skips the pass. The protected set is read
+    on a connection of its own and re-validated just before COMMIT (same file, unchanged
+    `PRAGMA data_version`): a decision committed meanwhile rolls the pass back. The two databases
+    cannot share a transaction, so a commit landing after that last check is not seen, same as
+    stitch_apply's attach (accepted)."""
     if not overrides_path.exists():
-        # normal before the API ran; an ERROR once this install has seen a decision (a lost file)
-        seen = _marks_set(inv)
-        log(
-            logger,
-            logging.ERROR if seen else logging.DEBUG,
-            "prune_skipped",
-            reason="overrides_missing",
-        )
-        return 0
+        return _overrides_missing(inv)
     read = None
     try:
         read = _open_overrides_read(overrides_path)
@@ -131,8 +111,8 @@ def prune_retired_macs(
             return 0
         protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
         pruned = _delete_retired_rows(inv, read, protected, now)
-    except _PruneDeferred as exc:
-        log(logger, logging.INFO, "prune_deferred", reason=exc.reason)
+    except _OverridesMoved:
+        log(logger, logging.INFO, "prune_deferred", reason="overrides_changed")
         return 0
     except (sqlite3.Error, OverridesNotUsable) as exc:  # busy, locked, unusable: skip the pass
         log(logger, logging.ERROR, "prune_skipped", error=str(exc))
@@ -143,6 +123,13 @@ def prune_retired_macs(
     if pruned:
         log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
     return pruned
+
+
+def _overrides_missing(inv: sqlite3.Connection) -> int:
+    """Normal before the API ran; an ERROR once this install has seen a decision (a lost file)."""
+    level = logging.ERROR if _marks_set(inv) else logging.DEBUG
+    log(logger, level, "prune_skipped", reason="overrides_missing")
+    return 0
 
 
 OVERRIDES_SEEN_KEY = "prune_overrides_seen"
@@ -293,9 +280,7 @@ def _prune_candidates(
     no write lock held; the temp table lives in the temp database, not the main one."""
     inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
     inv.execute("DELETE FROM prune_protected")
-    inv.executemany(
-        "INSERT OR IGNORE INTO prune_protected (id) VALUES (?)", [(i,) for i in protected]
-    )
+    inv.executemany("INSERT INTO prune_protected (id) VALUES (?)", [(i,) for i in protected])
     return [
         r[0]
         for r in inv.execute(

@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 MAX_LINK_DEPTH = 32
+OVERRIDES_BUSY_TIMEOUT_S = 5.0  # how long a read waits for a writer of overrides.db
 # Review statuses that quiet an incident; a pinned mirror of vigie_api.incident_decisions.
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 # The one overrides schema this build understands. A LITERAL on purpose: derived from the
@@ -59,7 +60,7 @@ def overrides_uri(path: Path) -> str:
     return f"file:{quote(str(path.resolve()))}?mode=ro"
 
 
-def open_overrides_ro(path: Path, timeout: float = 5.0) -> sqlite3.Connection | None:
+def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
     """Open overrides.db with mode=ro (URI) plus query_only.
 
     Returns None when there is nothing usable: the file does not exist yet, or it cannot be read
@@ -70,7 +71,7 @@ def open_overrides_ro(path: Path, timeout: float = 5.0) -> sqlite3.Connection | 
     if not path.exists():
         return None
     try:
-        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=timeout)
+        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=OVERRIDES_BUSY_TIMEOUT_S)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # really readable?

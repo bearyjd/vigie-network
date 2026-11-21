@@ -85,18 +85,7 @@ def run_once(
         promoted, retired = sweep_transients(
             inv, clock, config, retired_at=(live or (lambda: clock))()
         )
-        # an unread batch may carry a returning MAC: prune next pass. `usable` is defence in depth:
-        # prune_retired_macs reads overrides.db itself and fails closed on an unusable file
-        if usable and not failures:
-            prune_retired_macs(inv, config.overrides_path, clock)
-        elif failures:  # the only trace of why a persistently unreadable shard prunes nothing
-            log(
-                logger,
-                logging.INFO,
-                "prune_skipped",
-                reason="failed_read",
-                failed_collectors=len(failures),
-            )
+        _prune_stage(inv, config, clock, usable, len(failures))
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
@@ -171,6 +160,18 @@ def _overrides_readable(
                       iso_utc(now)[:10], now)  # fmt: skip
         return False
     return True
+
+
+def _prune_stage(
+    inv: sqlite3.Connection, config: PipelineConfig, clock: float, usable: bool, failed: int
+) -> None:
+    """An unread batch may carry a returning MAC: prune next pass, and say so, the only trace of
+    why a persistently unreadable shard prunes nothing. `usable` is defence in depth:
+    prune_retired_macs reads overrides.db itself and fails closed on an unusable file."""
+    if failed:
+        log(logger, logging.INFO, "prune_skipped", reason="failed_read", failed_collectors=failed)
+    elif usable:
+        prune_retired_macs(inv, config.overrides_path, clock)
 
 
 def _stitch(

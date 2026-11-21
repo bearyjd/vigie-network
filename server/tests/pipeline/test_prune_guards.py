@@ -11,6 +11,7 @@ from pipeline_helpers import T0, Data, data  # noqa: F401
 
 from vigie_api.schema import OVERRIDES_MIGRATIONS, open_overrides
 from vigie_ingest.db import iso_utc
+from vigie_pipeline import overrides as overrides_module
 from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import RETIRED_MAC_RETENTION_S, PipelineConfig
 from vigie_pipeline.overrides import PROTECTED_TABLES
@@ -166,8 +167,7 @@ def test_an_exclusively_locked_overrides_db_prunes_nothing(data, monkeypatch):
     retire(data)
     path = migrated_overrides(data.root)
     sql(path, "PRAGMA journal_mode=DELETE")
-    real = prune_module.open_overrides_ro
-    monkeypatch.setattr(prune_module, "open_overrides_ro", lambda p: real(p, timeout=0.05))
+    monkeypatch.setattr(overrides_module, "OVERRIDES_BUSY_TIMEOUT_S", 0.05)
     writer = sqlite3.connect(path, isolation_level=None)
     writer.execute("BEGIN EXCLUSIVE")
     try:
