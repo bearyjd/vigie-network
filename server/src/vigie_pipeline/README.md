@@ -22,9 +22,14 @@ see `docs/monitoring.md`).
   window; a retired device seen again returns to transient (`device_reappeared`).
 - Retired-MAC prune (irreversible; code in `prune.py`). OPT-IN: `VIGIE_PRUNE_RETIRED_MACS`
   (`PipelineConfig.prune_retired_macs`) is OFF by default and only 1/true/yes turn it on; any
-  other value, an unparsable one included, reads as off. Off, a pass never calls the prune, logs
-  nothing about it and writes none of its markers (`prune_*` rows of `stitch_state`, the
-  `retired_mac_rows_pruned` total); retirement stamping below still runs (it deletes nothing).
+  other value, an unparsable one included, reads as off. Off, a pass deletes nothing, never touches
+  observations, `mac_last_ip` or any inventory row, and logs at most DEBUG about it
+  (`track_overrides_history`); the only rows it writes are the `overrides.db` history markers
+  (`prune_*` rows of `stitch_state`: audit high-water mark, presence marker, lost-decisions latch),
+  kept exactly as the enabled prune keeps them (one shared look, `_track_history`), so a restore
+  or loss made while off is detected when it is turned on. It writes no counter
+  (`retired_mac_rows_pruned`) or clock warning; retirement stamping below still runs (it deletes
+  nothing).
   The flag is in no policy dataclass, so the monitoring policy version is unchanged. Enabling it
   is the owner's decision: it needs a configured collector (the trusted clock below) and an
   `overrides.db` at the supported schema version, and what it deletes cannot be restored.

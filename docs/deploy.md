@@ -201,11 +201,13 @@ your labels. Never `podman-compose down -v` without a backup: it deletes this vo
    old live rows (the backup is lost; `integrity_check` still says `ok`).
 5. Copy the verified backup over the database, then `chown 10001` and `chmod 0600` it.
 6. Start the services you stopped.
-7. After restoring `overrides.db`, expect the retired-device prune to stay off (ERROR
-   `overrides_rolled_back`, then `overrides_latched`: it stays off even once the audit counter
-   catches up) until you delete the `prune_overrides_seen`, `prune_overrides_audit_mark`,
-   `prune_overrides_audit_id` and `prune_overrides_latched` rows of `stitch_state` in
-   `inventory.db` (all four); do that only once the
+7. After restoring `overrides.db`, expect the retired-device prune to refuse to delete anything
+   (ERROR `overrides_rolled_back`, then `overrides_latched`, once the flag is on): the pipeline
+   tracks the file's history on every pass, the flag on or off, so a restore made while the flag
+   is off latches silently (DEBUG only) and is reported on the first pass after you turn it on.
+   The latch stays even once the audit counter catches up, and it ends only when you delete all
+   four rows `prune_overrides_seen`, `prune_overrides_audit_mark`, `prune_overrides_audit_id` and
+   `prune_overrides_latched` of `stitch_state` in `inventory.db`; delete them only once the
    decisions you made since the backup are re-entered, because the prune deletes the MAC rows of
    a retired device the restored file no longer protects.
 
@@ -222,11 +224,13 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   any other value reads as off, pipeline service only). The deletion is irreversible and
   enabling it is the owner's decision. It needs a configured (non-revoked) collector, which
   gives the trusted clock below, and an `overrides.db` at the supported schema version; while it
-  is off the pipeline never calls the prune, logs nothing about it and writes none of the
-  `prune_*` rows of `stitch_state`, history markers included. So the restore and loss guards
-  below only compare against what the prune itself recorded while it was on: turn it on only
-  while `overrides.db` is the live, current file, because a restore or loss made while it was off
-  is not detected. Retirement itself (stamping the device) is unchanged.
+  is off the pipeline never deletes anything and never touches observations, `mac_last_ip` or any
+  inventory row, and it logs at most DEBUG. The only thing it writes is the history markers of
+  `overrides.db` in `stitch_state` (`prune_overrides_seen`, `prune_overrides_audit_mark`,
+  `prune_overrides_audit_id`, and the latch `prune_overrides_latched`), kept exactly as when it
+  is on, so a restore or loss of `overrides.db` made while it is off is detected when you turn it
+  on, and the first pass after that deletes nothing until you clear the markers. Retirement
+  itself (stamping the device) is unchanged.
   When on: 90 days after the pipeline retired a device (a server-clock stamp,
   never earlier than the newest batch receipt or collector send time; counted on the older of the server clock and the
   oldest non-revoked collector's last accepted send time), its self-linked MAC rows in
