@@ -14,7 +14,9 @@ from test_prune_guards import LATER, PROTECTIONS, STAMP, migrated_overrides, ret
 from test_prune_overrides_rollback import AUDIT, decide
 
 from vigie_pipeline import processor
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.overrides import open_overrides_ro
 from vigie_pipeline.prune import (
     OVERRIDES_AUDIT_ID_KEY,
     OVERRIDES_AUDIT_KEY,
@@ -142,7 +144,7 @@ def test_an_existing_latch_is_respected(data):
     assert prune_state(data) == {OVERRIDES_LATCH_KEY: "mine"}
 
 
-def test_a_missing_overrides_db_changes_no_marker(data):
+def test_a_missing_overrides_db_changes_no_marker(data, caplog):
     retire(data)
     path = migrated_overrides(data.root)
     decide(path, "d1", 3)
@@ -151,8 +153,10 @@ def test_a_missing_overrides_db_changes_no_marker(data):
     assert OVERRIDES_AUDIT_KEY in before
     sql(data.root / "inventory.db", "SELECT 1")
     path.rename(path.with_name("moved-away.db"))
-    off(data, 1)
+    with caplog.at_level(logging.DEBUG, logger="vigie_pipeline"):
+        off(data, 1)
     assert prune_state(data) == before
+    assert [r for r in caplog.records if r.getMessage().startswith("prune")] == []
 
 
 def test_an_unreadable_overrides_db_changes_no_marker(data):
@@ -182,22 +186,49 @@ def test_a_latched_off_pass_stays_quiet_every_pass(data, caplog):
     _overridden(path)
     off(data)
     sql(path, "DELETE FROM identity_rules")
-    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+    with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
         for n in range(1, 4):
             off(data, n)
     assert prune_state(data)[OVERRIDES_LATCH_KEY] == "overrides_lost_decisions"
-    # (the malformed rule is the stitcher's own, unrelated complaint)
-    loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # (the malformed rule is the stitcher's own complaint); an off pass logs DEBUG at most
+    loud = [r for r in caplog.records if r.levelno >= logging.INFO]
     assert [r for r in loud if r.getMessage().startswith(("prune", "overrides"))] == []
 
 
 def test_a_corrupt_overrides_db_while_off_logs_no_prune_error(data, caplog):
     retire(data)
     (data.root / "overrides.db").write_bytes(b"not a database" * 100)
-    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+    with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
         for n in range(3):
             off(data, n)
-    names = [r.getMessage().split()[0] for r in caplog.records if r.levelno >= logging.WARNING]
+    names = [r.getMessage().split()[0] for r in caplog.records if r.levelno >= logging.INFO]
     assert names.count("overrides_unreadable") == 3  # the processor's own: one per pass, no second
     assert not [n for n in names if n.startswith(("prune", "overrides_history"))]
     assert rows(data) == 1
+
+
+class _Spy:
+    def __init__(self, conn):
+        self.conn, self.closed = conn, False
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+    def close(self):
+        self.closed = True
+        self.conn.close()
+
+
+def test_the_off_tracker_closes_its_overrides_connection(data, monkeypatch):
+    retire(data)
+    decide(migrated_overrides(data.root), "d1", 3)
+    spies = []
+
+    def spying_open(p, **kwargs):
+        spies.append(_Spy(open_overrides_ro(p, **kwargs)))
+        return spies[-1]
+
+    monkeypatch.setattr(prune_module, "open_overrides_ro", spying_open)
+    off(data)
+    assert spies
+    assert all(s.closed for s in spies)
