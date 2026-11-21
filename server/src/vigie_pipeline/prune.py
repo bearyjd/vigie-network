@@ -99,10 +99,10 @@ def prune_retired_macs(
     `PRAGMA data_version`): a decision committed meanwhile rolls the pass back. The two databases
     cannot share a transaction, so a commit landing after that last check is not seen, same as
     stitch_apply's attach (accepted)."""
-    if not overrides_path.exists():
-        return _overrides_missing(inv)
     read = None
     try:
+        if not overrides_path.exists():
+            return _overrides_missing(inv)
         read = _open_overrides_read(overrides_path)
         protected = protected_device_ids(read.conn)
         decided = decided_suggestion_ids(read.conn)

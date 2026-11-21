@@ -134,3 +134,13 @@ def test_a_stamp_pushed_ahead_is_logged_at_warning_level(data, caplog):
         sweep_transients(data.inv, RETIRED_AT, CONFIG)
     (record,) = [r for r in caplog.records if r.getMessage() == "retirement_stamp_ahead"]
     assert record.levelno == logging.WARNING
+
+
+def test_a_locked_inventory_while_overrides_db_is_missing_skips_only_the_prune(data, monkeypatch):
+    retire(data)  # no overrides.db: the missing-file branch reads the markers from inventory
+
+    def locked(*_args):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(prune_module, "state_get", locked)
+    assert prune(data) == 0

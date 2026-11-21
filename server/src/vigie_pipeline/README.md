@@ -35,7 +35,9 @@ see `docs/monitoring.md`).
   logs `retired_macs_pruned count=N` (a count, never a MAC) and adds N to
   `pipeline_meta.retired_mac_rows_pruned`. A retired device without a stamp (retired before stamps
   existed, or by a build rolled back to) is not prunable until stamped: the sweep stamps such
-  devices with the current clock once a day (`stitch_state` key `retired_stamp_backfilled` holds
+  devices once a day with the retirement stamp (the clock, floored like a retirement's: the newest
+  batch receipt and collector send time, so after a forward-stepped receipt the stamp is ahead of
+  the server clock and the device is unprunable until then, silently; only `_retire_due` warns) (`stitch_state` key `retired_stamp_backfilled` holds
   the time of the last scan; one from the future counts as due), so they become prunable 90 days
   after that. `monitoring_assignment_versions`, `monitoring_dirty`, `characterization_*`,
   `mac_first_received` and `mac_activity` are left alone (own retention or own meaning); a test
@@ -54,7 +56,12 @@ see `docs/monitoring.md`).
     `prune_clock_held_back` naming that collector once its last send is more than 7 days old
     (at most once a day: the instant of the last one is the `stitch_state` row `prune_clock_warned`).
     A live collector whose `last_sent_ts` is not a number skips the pass (ERROR `prune_skipped`). With a single collector that follows a stepped server clock
-    nothing can tell, and that case is accepted.
+    nothing can tell, and that case is accepted. Re-provisioning a collector with `--force`
+    resets its `last_sent_ts` to 0, and a collector that never sent is not counted: if it was the
+    one holding the clock back (its true-time batches rejected after a forward server step), the
+    clock then follows the others and recently retired devices can become prunable early. Revoke
+    rather than re-provision a collector whose clock you cannot vouch for, and avoid re-provisioning
+    while the server clock is known to be wrong (accepted, not guarded).
   - Fails closed. It runs only when `overrides.db` exists, opens read-only, is at exactly the
     supported schema version (a reviewed literal, `SUPPORTED_USER_VERSION`), has every table the
     protected read needs and holds only non-empty text ids; otherwise it logs `prune_skipped`
