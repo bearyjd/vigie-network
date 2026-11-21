@@ -510,6 +510,8 @@ def self_test() -> None:
            {"services": {**prune_doc["services"], "pipeline": {"environment": {}}}}, prune_example)
     _fails("prune flag forwarded to the api", check_prune_flag,
            {"services": {**prune_doc["services"], "api": {"environment": {prune: "0"}}}}, prune_example)
+    _fails("prune flag forwarded to ingest", check_prune_flag,
+           {"services": {**prune_doc["services"], "ingest": {"environment": {prune: "0"}}}}, prune_example)
     # and the checks accept the real inputs
     check_mounts(good, deploy_md)
     check_firewall(readme)

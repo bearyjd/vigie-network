@@ -1,12 +1,10 @@
 """The retired-MAC prune is OPT-IN (VIGIE_PRUNE_RETIRED_MACS): off, a pass never calls it, deletes
-nothing, logs nothing about it and writes no counter, latch or clock-warning row. It still
-records overrides.db's history markers (read-only bookkeeping), so a rollback or loss that
-happens while it is off is seen by the first pass after it is turned on."""
+nothing, logs nothing about it and writes none of its stitch_state/pipeline_meta markers (no
+`prune_*` row at all, history markers included)."""
 
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 import pytest
@@ -48,8 +46,10 @@ def test_the_default_config_has_the_prune_off():
     assert PipelineConfig.from_env({}).prune_retired_macs is False
 
 
-def test_default_config_prunes_nothing_and_writes_no_prune_action_row(data, caplog):
+def test_default_config_prunes_nothing_and_writes_no_prune_marker(data, caplog):
     retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "d1", 3)
     _decided_overrides(data)
     caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="vigie_pipeline"):
@@ -57,23 +57,8 @@ def test_default_config_prunes_nothing_and_writes_no_prune_action_row(data, capl
             processor.run_once(PipelineConfig(data_dir=data.root), now=LATER + n)
     assert rows(data) == 1
     assert data.q("SELECT 1 FROM pipeline_meta WHERE key=?", prune_module.PRUNED_COUNTER_KEY) == []
-    assert not _state_keys(data) & {
-        prune_module.OVERRIDES_LATCH_KEY,
-        prune_module.CLOCK_WARNED_KEY,
-    }
-    assert not [r for r in caplog.records if "prune" in r.getMessage()]
-
-
-def test_default_config_still_records_the_overrides_history_markers(data):
-    retire(data)
-    path = migrated_overrides(data.root)
-    decide(path, "d1", 3)
-    processor.run_once(PipelineConfig(data_dir=data.root), now=LATER)
-    keys = _state_keys(data)
-    assert {prune_module.OVERRIDES_SEEN_KEY, prune_module.OVERRIDES_AUDIT_KEY} <= keys
-    assert prune_module.OVERRIDES_AUDIT_ID_KEY in keys
-    marks = data.q("SELECT value FROM stitch_state WHERE key=?", prune_module.OVERRIDES_AUDIT_KEY)
-    assert marks[0][0] == "3"
+    assert not {k for k in _state_keys(data) if k.startswith("prune_")}
+    assert not [r for r in caplog.records if "overrides" in r.getMessage()]
 
 
 def break_shard(data) -> None:
@@ -86,52 +71,6 @@ def _off(data, n=0):
     processor.run_once(PipelineConfig(data_dir=data.root), now=LATER + n)
 
 
-def _on(data, n=10):
-    processor.run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER + n)
-
-
-def test_a_restore_while_off_is_caught_by_the_first_pass_after_turning_on(data):
-    macs = retire(data, count=2)
-    named = sorted(macs)[0]
-    path = migrated_overrides(data.root)
-    decide(path, "unrelated", 2)
-    backup = Path(shutil.copy(path, path.with_name("backup.db")))
-    decide(path, macs[named], 2)
-    _off(data)
-    shutil.copy(backup, path)  # restored while off: the decision on `named` is gone
-    _off(data, 1)
-    _on(data)
-    assert rows(data) == 2  # nothing pruned
-    assert prune_module.OVERRIDES_LATCH_KEY in _state_keys(data)
-
-
-def test_a_recreated_file_while_off_is_caught_by_the_first_pass_after_turning_on(data):
-    retire(data)
-    path = migrated_overrides(data.root)
-    decide(path, "d1", 1)
-    _off(data)
-    path.unlink()
-    migrated_overrides(data.root)  # recreated, empty: every decision lost
-    _off(data, 1)
-    _on(data)
-    assert rows(data) == 1
-    assert prune_module.OVERRIDES_LATCH_KEY in _state_keys(data)
-
-
-def test_a_file_recreated_and_grown_past_the_counter_while_off_is_caught_on_turning_on(data):
-    retire(data)
-    path = migrated_overrides(data.root)
-    decide(path, "d1", 2)
-    _off(data)
-    path.unlink()
-    path = migrated_overrides(data.root)
-    decide(path, "d2", 5)  # a different history whose counter passed the stored one
-    _off(data, 1)
-    _on(data)
-    assert rows(data) == 1
-    assert prune_module.OVERRIDES_LATCH_KEY in _state_keys(data)
-
-
 def test_an_unreadable_overrides_db_while_off_logs_nothing_about_the_prune(data, caplog):
     retire(data)
     (data.root / "overrides.db").write_bytes(b"not a database" * 100)
@@ -139,6 +78,10 @@ def test_an_unreadable_overrides_db_while_off_logs_nothing_about_the_prune(data,
         _off(data)
     assert rows(data) == 1
     assert not [r for r in caplog.records if "prune" in r.getMessage()]
+    assert (
+        len([r for r in caplog.records if r.getMessage().startswith("overrides_unreadable")]) == 1
+    )
+    assert not {k for k in _state_keys(data) if k.startswith("prune_")}
 
 
 def test_a_failed_batch_read_with_the_flag_off_logs_nothing_about_the_prune(data, caplog):
