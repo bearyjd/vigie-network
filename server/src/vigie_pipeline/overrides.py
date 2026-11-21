@@ -60,13 +60,14 @@ def overrides_uri(path: Path) -> str:
     return f"file:{quote(str(path.resolve()))}?mode=ro"
 
 
-def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
+def open_overrides_ro(path: Path, *, quiet: bool = False) -> sqlite3.Connection | None:
     """Open overrides.db with mode=ro (URI) plus query_only.
 
     Returns None when there is nothing usable: the file does not exist yet, or it cannot be read
     (corrupt, unreadable, or a read-only mount whose writer holds no connection). None means "no
     identity links, no rules": the pipeline then trusts nothing from overrides.db (it never
-    reads None as permission), and an unreadable file is logged at ERROR so it is noticed.
+    reads None as permission), and an unreadable file is logged at ERROR so it is noticed (DEBUG
+    with `quiet`: a second look at a file the pipeline already reported this pass).
     The file is never created, written, or migrated from here."""
     if not path.exists():
         return None
@@ -76,8 +77,11 @@ def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # really readable?
     except sqlite3.Error as exc:
-        logger.error(
-            "overrides_unreadable path=%s error=%s: continuing with no identity links", path, exc
+        logger.log(
+            logging.DEBUG if quiet else logging.ERROR,
+            "overrides_unreadable path=%s error=%s: continuing with no identity links",
+            path,
+            exc,
         )
         return None
     return conn

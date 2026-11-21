@@ -104,8 +104,8 @@ def test_a_failed_first_read_closes_the_overrides_connection(data, monkeypatch):
     path = migrated_overrides(data.root)
     spies = []
 
-    def spying_open(p):
-        spies.append(_Spy(open_overrides_ro(p)))
+    def spying_open(p, **kwargs):
+        spies.append(_Spy(open_overrides_ro(p, **kwargs)))
         return spies[-1]
 
     def broken(_conn):

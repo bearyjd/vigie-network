@@ -1,6 +1,6 @@
 """The retired-MAC prune is OPT-IN (VIGIE_PRUNE_RETIRED_MACS): off, a pass never calls it, deletes
-nothing, logs nothing about it and writes none of its stitch_state/pipeline_meta markers (no
-`prune_*` row at all, history markers included)."""
+nothing and logs nothing about it; the only thing it keeps is the overrides.db history markers
+(test_prune_off_tracking.py)."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def test_the_default_config_has_the_prune_off():
     assert PipelineConfig.from_env({}).prune_retired_macs is False
 
 
-def test_default_config_prunes_nothing_and_writes_no_prune_marker(data, caplog):
+def test_default_config_prunes_nothing_and_writes_no_prune_counter(data, caplog):
     retire(data)
     path = migrated_overrides(data.root)
     decide(path, "d1", 3)
@@ -57,8 +57,7 @@ def test_default_config_prunes_nothing_and_writes_no_prune_marker(data, caplog):
             processor.run_once(PipelineConfig(data_dir=data.root), now=LATER + n)
     assert rows(data) == 1
     assert data.q("SELECT 1 FROM pipeline_meta WHERE key=?", prune_module.PRUNED_COUNTER_KEY) == []
-    assert not {k for k in _state_keys(data) if k.startswith("prune_")}
-    assert not [r for r in caplog.records if "overrides" in r.getMessage()]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def break_shard(data) -> None:
@@ -79,9 +78,17 @@ def test_an_unreadable_overrides_db_while_off_logs_nothing_about_the_prune(data,
     assert rows(data) == 1
     assert not [r for r in caplog.records if "prune" in r.getMessage()]
     assert (
-        len([r for r in caplog.records if r.getMessage().startswith("overrides_unreadable")]) == 1
+        len(
+            [
+                r
+                for r in caplog.records
+                if r.levelno >= logging.WARNING
+                and r.getMessage().startswith("overrides_unreadable")
+            ]
+        )
+        == 1
     )
-    assert not {k for k in _state_keys(data) if k.startswith("prune_")}
+    assert prune_module.OVERRIDES_SEEN_KEY not in _state_keys(data)  # nothing readable, no marker
 
 
 def test_a_failed_batch_read_with_the_flag_off_logs_nothing_about_the_prune(data, caplog):

@@ -65,12 +65,12 @@ class _OverridesRead:
             return True
 
 
-def _open_overrides_read(path: Path) -> _OverridesRead:
+def _open_overrides_read(path: Path, *, quiet: bool = False) -> _OverridesRead:
     """The identity is taken BEFORE the open: a file swapped in between is seen as moved. This
     connection is opened here for the prune alone, so no cursor an earlier stage left open on the
     pipeline's own connection can hold its `data_version` still."""
     identity = overrides_identity(path)
-    conn = open_overrides_ro(path)
+    conn = open_overrides_ro(path, quiet=quiet)
     if conn is None:
         raise OverridesNotUsable("overrides.db could not be opened")
     try:
@@ -104,14 +104,10 @@ def prune_retired_macs(
         if not overrides_path.exists():
             return _overrides_missing(inv)
         read = _open_overrides_read(overrides_path)
-        protected = protected_device_ids(read.conn)
-        decided = decided_suggestion_ids(read.conn)
-        found = durable_decisions_found(read.conn) or bool(decided)
-        audit_mark = _audit_high_water(read.conn)
-        replaced = _audit_history_replaced(inv, read.conn)
-        audit_id = _audit_id_at(read.conn, audit_mark)
-        if not _decisions_not_lost(inv, found, audit_mark, audit_id, replaced):
+        decided = _track_history(inv, read.conn)
+        if decided is None:
             return 0
+        protected = protected_device_ids(read.conn)
         protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
         pruned = _delete_retired_rows(inv, read, protected, now)
     except _OverridesMoved:
@@ -126,6 +122,41 @@ def prune_retired_macs(
     if pruned:
         log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
     return pruned
+
+
+def _track_history(
+    inv: sqlite3.Connection, conn: sqlite3.Connection, *, quiet: bool = False
+) -> set[str] | None:
+    """The one look at overrides.db's history, shared by the prune and the flag-off tracker: the
+    decided suggestion ids, or None when the prune must not go on (`_decisions_not_lost`). It
+    advances or latches the `stitch_state` markers; it deletes nothing."""
+    decided = decided_suggestion_ids(conn)
+    found = durable_decisions_found(conn) or bool(decided)  # a decided suggestion counts
+    audit_mark = _audit_high_water(conn)
+    replaced = _audit_history_replaced(inv, conn)
+    audit_id = _audit_id_at(conn, audit_mark)
+    if not _decisions_not_lost(inv, found, audit_mark, audit_id, replaced, quiet=quiet):
+        return None
+    return decided
+
+
+def track_overrides_history(inv: sqlite3.Connection, overrides_path: Path) -> None:
+    """Prune OFF (the default): delete nothing and touch nothing but the `stitch_state` history
+    markers (audit high-water mark, presence marker, lost-decisions latch), kept exactly as the
+    enabled prune keeps them, so a restore or loss made while off is seen when it is turned on.
+    Quiet: DEBUG at most, never a WARNING/ERROR per pass. A missing, unreadable or busy file
+    changes no marker."""
+    read = None
+    try:
+        if not overrides_path.exists():
+            return
+        read = _open_overrides_read(overrides_path, quiet=True)
+        _track_history(inv, read.conn, quiet=True)
+    except (sqlite3.Error, OverridesNotUsable) as exc:
+        log(logger, logging.DEBUG, "overrides_history_untracked", error=str(exc))
+    finally:
+        if read is not None:
+            read.conn.close()
 
 
 def _overrides_missing(inv: sqlite3.Connection) -> int:
@@ -174,12 +205,38 @@ def _audit_history_replaced(inv: sqlite3.Connection, conn: sqlite3.Connection) -
     return not expected or expected != _audit_id_at(conn, seq)
 
 
+def _history_verdict(
+    inv: sqlite3.Connection, found: bool, audit_mark: int, audit_id: str, replaced: bool
+) -> tuple[str | None, dict[str, str]]:
+    """The finding against the stored markers (None: the file is the same history or a richer
+    one) and, when there is none, the marker rows this look advances. Writes nothing."""
+    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
+    try:
+        high_water = 0 if stored is None else int(stored)
+    except ValueError:
+        high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
+    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
+    if replaced or audit_mark < high_water:
+        return "overrides_rolled_back", {}
+    if seen and not found:
+        return "overrides_lost_decisions", {}
+    writes = {}
+    if found and not seen:
+        writes[OVERRIDES_SEEN_KEY] = "1"
+    if audit_mark > high_water:
+        writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
+        writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
+    return None, writes
+
+
 def _decisions_not_lost(
     inv: sqlite3.Connection,
     found: bool,
     audit_mark: int,
     audit_id: str = "",
     replaced: bool = False,
+    *,
+    quiet: bool = False,
 ) -> bool:
     """False when overrides.db looks like a different, poorer file than the one this install has
     read before, so an empty or shrunken protected set would protect nothing. Three signs against
@@ -190,39 +247,21 @@ def _decisions_not_lost(
     grown past the old counter before this look). Any finding LATCHES the prune off
     (`OVERRIDES_LATCH_KEY`): the counter catching up later does not show the decisions came back,
     so only the operator's deletion of the marker rows resumes it. An install that never had
-    either marker (nothing to lose) prunes as usual."""
+    either marker (nothing to lose) prunes as usual. `quiet` (the prune is off) logs at DEBUG."""
+    level = logging.DEBUG if quiet else logging.ERROR
     latched = state_get(inv, OVERRIDES_LATCH_KEY)
     if latched is not None:
-        log(logger, logging.ERROR, "prune_skipped", reason="overrides_latched", latched=latched)
+        log(logger, level, "prune_skipped", reason="overrides_latched", latched=latched)
         return False
-    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
-    try:
-        high_water = 0 if stored is None else int(stored)
-    except ValueError:
-        high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
-    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
-    reason = (
-        "overrides_rolled_back"
-        if replaced or audit_mark < high_water
-        else "overrides_lost_decisions"
-        if seen and not found
-        else None
-    )
-    writes = {}
+    reason, writes = _history_verdict(inv, found, audit_mark, audit_id, replaced)
     if reason is not None:
-        writes[OVERRIDES_LATCH_KEY] = reason
-    else:
-        if found and not seen:
-            writes[OVERRIDES_SEEN_KEY] = "1"
-        if audit_mark > high_water:
-            writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
-            writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
+        writes = {OVERRIDES_LATCH_KEY: reason}
     if writes:  # a pass that changes no marker takes no write lock
         with immediate(inv):
             for key, value in writes.items():
                 state_set(inv, key, value)
     if reason is not None:
-        log(logger, logging.ERROR, "prune_skipped", reason=reason)
+        log(logger, level, "prune_skipped", reason=reason)
     return reason is None
 
 
