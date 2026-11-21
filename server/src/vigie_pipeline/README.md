@@ -19,13 +19,97 @@ see `docs/monitoring.md`).
   in >= 2 distinct server hours (`batches.received_at`) and its first-to-last-seen dwell is >= the
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
-  window; a retired device seen again returns to transient (`device_reappeared`). Self-linked MAC
-  rows of retired devices unseen for 90 days are pruned (`observations`; cumulative count in
-  `pipeline_meta.retired_mac_rows_pruned`); the device row stays. Pruning fails closed: it runs
-  only when `overrides.db` exists, opens read-only, is at exactly the schema version this build
-  supports, and has every table the protected-device query reads (devices named, grouped, marked
-  essential, targeted by a rule, or on either end of a live link are never pruned). Otherwise it
-  logs `prune_skipped` (error text only) and deletes nothing.
+  window; a retired device seen again returns to transient (`device_reappeared`).
+- Retired-MAC prune (irreversible; code in `prune.py`). `transient_state.since` means "since the
+  current status began". Every retirement stamps it with the SERVER clock at the transition, but
+  never earlier than the newest `batches.received_at` (so a clock set back cannot backdate a
+  stamp; no batch recorded means the clock itself): the transient sweep reads the clock again
+  after the batches, and the stitcher stamps the orphan it retires. A retired device keeps its
+  stamp, a revival rewrites it. A collector timestamp (`observations.last_seen`) is untrusted; it
+  only adds a second condition (older than the cutoff too). A device's self-linked `observations`
+  rows are deleted 90 days after the stamp, at most `PRUNE_BATCH_ROWS` rows per pass, oldest
+  retirement first; the device row stays, and the MAC's `mac_last_ip` row goes with it. Each pass
+  logs `retired_macs_pruned count=N` (a count, never a MAC) and adds N to
+  `pipeline_meta.retired_mac_rows_pruned`. A retired device without a stamp (retired before stamps
+  existed, or by a build rolled back to) is not prunable until stamped: the sweep stamps such
+  devices with the current clock once a day (`stitch_state` key `retired_stamp_backfilled` holds
+  the time of the last scan; one from the future counts as due), so they become prunable 90 days
+  after that. `monitoring_assignment_versions`, `monitoring_dirty`, `characterization_*`,
+  `mac_first_received` and `mac_activity` are left alone (own retention or own meaning); a test
+  classifies every column of both databases that names a device or MAC, directly or through a
+  suggestion, incident or candidate id, a target or a lineage, as protected, excluded or left alone
+  with a reason, so a new one cannot slip by. Accepted trade-off: a randomized MAC that returns
+  after its rows were pruned starts over as a new transient device with a NEW id instead of
+  reviving the old one (nothing the owner decided is affected: see Protected).
+  - Clock. The 90 days are counted on the older of the server's `now` and the oldest
+    `collectors.last_sent_ts` of the non-revoked collectors that ever sent. Ingest keeps that
+    column as a never-purged running maximum of accepted send times and accepts a send time only
+    within its skew window of the server clock, so a stepped server clock cannot drag it along
+    for a collector that kept true time, and purging batch rows does not erase it. No such
+    collector prunes nothing. Consequence: a collector that falls silent, or is retired without
+    being revoked, holds the clock back until it is revoked; the pass then logs the WARNING
+    `prune_clock_held_back` naming that collector once its last send is more than 7 days old
+    (every pass while it holds). With a single collector that follows a stepped server clock
+    nothing can tell, and that case is accepted.
+  - Fails closed. It runs only when `overrides.db` exists, opens read-only, is at exactly the
+    supported schema version (a reviewed literal, `SUPPORTED_USER_VERSION`), has every table the
+    protected read needs and holds only non-empty text ids; otherwise it logs `prune_skipped`
+    (error text only) and deletes nothing. A missing `overrides.db` is normal before the API
+    first ran and logs at DEBUG only (at ERROR once either marker below is set: a lost file);
+    a file that exists but is unusable logs at ERROR. A busy or
+    locked inventory skips the prune and the rest of the pass still runs. A pass in which any
+    batch could not be read (`failures`) skips the prune. A lost `overrides.db`: once a read has
+    found a decision in any protected source the pipeline sets the `stitch_state` marker
+    `prune_overrides_seen`; if a later read finds none at all the prune is skipped and logged at
+    ERROR (`overrides_lost_decisions`: the file was probably lost or recreated empty). An install
+    that never had a decision prunes as usual. A rolled-back `overrides.db`: the pipeline also
+    keeps the file's largest `audit_log.seq` (AUTOINCREMENT, written with every decision) as the
+    `stitch_state` row `prune_overrides_audit_mark`; a read that shows a smaller one, or a mark
+    that cannot be read, skips the prune and logs ERROR `overrides_rolled_back` (an older backup
+    restored over the file, or a file recreated and given one new decision, which the presence
+    marker cannot tell). If the owner really did remove every decision, or restored a backup on
+    purpose, delete both marker rows (`prune_overrides_seen`, `prune_overrides_audit_mark`) to
+    resume; until then nothing is pruned.
+  - Re-check. The protected set is read on a connection opened for the prune alone (no earlier
+    stage's open cursor can hold its `PRAGMA data_version` still), with the file's st_dev/st_ino
+    taken before the open. Inside the write lock, after the deletes and before `COMMIT`, both are
+    read again: a commit, removal or replacement since, or an inability to ask, rolls the whole
+    pass back and logs `prune_deferred reason=overrides_changed`.
+  - Protected (never pruned): devices that `overrides.db` refers to (named or grouped, marked
+    essential, targeted by an identity rule, named by an incident decision or a candidate
+    decision, on either end of any identity merge or link, undone or revoked ones included) and
+    the devices of every suggestion the owner accepted or rejected (`suggestion_decisions` is
+    keyed by suggestion id, so the inventory's `suggestions` row names the devices), whatever its
+    action and whether or not it expired. An incident decision, cleared ones included, protects
+    while its row exists; the API deletes the row together with its incident. Also excluded while
+    an inventory row still names the device or MAC: `identity_candidates` (either end) while
+    `open`, `suggested` or in a state this build does not know (`dismissed`, `vetoed` and
+    `cleared` do not pin: a veto is keyed by device id and the row survives the MAC rows, and the
+    owner's decision lives in `candidate_decisions`, protected above); an `open` or `suggested`
+    candidate settles when a rule settles its MAC or fresh evidence rewrites it, and one that
+    never does keeps that device's MAC rows for good, an accepted limit (a few rows, never a wrong
+    deletion); `suggestions` of any action while unexpired on the trusted clock;
+    `monitoring_profiles`, `monitoring_incidents`, `monitoring_suspicious` and
+    `monitoring_unavailable` (by device); `measurements_hourly` and `monitoring_dirty` (by MAC);
+    and `rule_attachments`. Only `link_source='self'` rows of `retired` devices qualify.
+  - Accepted, monitoring: `monitoring_profiles` is upserted for every analysed MAC and never
+    deleted, so on an install with monitoring a device that was ever measured (any flow or DNS
+    traffic, visitor phones included) is never pruned; only devices monitoring never analysed
+    are. This errs on the safe side and is a documented limit, not a bug.
+  - Accepted, events: the prune deletes observation rows, not `events`. The `new_device` and
+    `device_reappeared` events (and `identity_conflict`, as a short hash) carry the MAC in their
+    `summary`, joined to the surviving device row by `device_id`, and stay until event retention
+    exists (not implemented, see docs/deploy.md). Redacting them would need a scan of `events`
+    (no index leads with `device_id` for those kinds) which the prune lock must not do.
+  - Cost: candidates are selected before the write lock (protections applied in SQL, so a
+    protected oldest batch cannot starve the limit); inside the lock there is one point-lookup
+    DELETE per candidate repeating the whole predicate, then the `overrides.db` re-check, the
+    counter bump and the commit. No statement inside that lock scans `observations`, `devices`
+    or `batches`.
+  - Accepted residual: `overrides.db` and `inventory.db` cannot share a transaction. A human
+    decision committed after the final `data_version` read and before `COMMIT` (a window of
+    microseconds) is not seen and can still lose its MAC. Closing it would need a write lock on
+    `overrides.db`, which the pipeline deliberately never holds.
 - `dhcp_fingerprint` / `vendor_class` are first-wins. A differing value for the same MAC is not
   stored; the device is set to `identity_state='conflict'` and one `identity_conflict` event per
   (device, field) per day is emitted (short hashes only). Hostnames may change freely.
