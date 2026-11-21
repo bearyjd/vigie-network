@@ -202,8 +202,9 @@ your labels. Never `podman-compose down -v` without a backup: it deletes this vo
 5. Copy the verified backup over the database, then `chown 10001` and `chmod 0600` it.
 6. Start the services you stopped.
 7. After restoring `overrides.db`, expect the retired-device prune to stay off (ERROR
-   `overrides_rolled_back`) until you delete the `prune_overrides_seen` and
-   `prune_overrides_audit_mark` rows of `stitch_state` in `inventory.db`; do that only once the
+   `overrides_rolled_back`, then `overrides_latched`: it stays off even once the audit counter
+   catches up) until you delete the `prune_overrides_seen`, `prune_overrides_audit_mark` and
+   `prune_overrides_latched` rows of `stitch_state` in `inventory.db`; do that only once the
    decisions you made since the backup are re-entered, because the prune deletes the MAC rows of
    a retired device the restored file no longer protects.
 
@@ -235,7 +236,8 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   expire with their incident), or
   went back to an older state (a restored backup, a recreated file: the pipeline keeps the file's
   audit counter high-water mark and logs ERROR `overrides_rolled_back`; after a deliberate restore
-  or removal delete the `prune_overrides_seen` and `prune_overrides_audit_mark` rows of
+  or removal delete the `prune_overrides_seen`, `prune_overrides_audit_mark` and
+  `prune_overrides_latched` rows of
   `stitch_state` to resume), or in a pass
   that could not read a batch. A randomized MAC that returns after being pruned gets a new device
   id. Not configurable. See `server/src/vigie_pipeline/README.md`.

@@ -135,3 +135,52 @@ def test_a_fresh_install_with_no_audit_rows_sets_no_mark(data):
     migrated_overrides(data.root)
     assert prune(data, LATER) == 1
     assert mark(data) == []
+
+
+def restore_older_file(data, macs):
+    """The owner decided on one device after the backup; the backup is then restored over the file
+    (that decision gone) and the prune notices. Returns the overrides path."""
+    named = sorted(macs)[0]
+    path = migrated_overrides(data.root)
+    decide(path, "unrelated", 2)
+    backup = path.with_name("backup.db")
+    shutil.copy(path, backup)
+    decide(path, macs[named], 2)
+    assert prune(data) == 1
+    shutil.copy(backup, path)
+    assert prune(data) == 0
+    return path
+
+
+def test_a_restored_file_stays_skipped_once_its_audit_counter_catches_up(data, caplog):
+    macs = retire(data, count=2)
+    path = restore_older_file(data, macs)
+    for n in range(4):  # unrelated audit rows (a token, an evidence write): no decision
+        sql(path, AUDIT, f"catch-up{n}", STAMP)
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        assert prune(data) == 0
+    assert rows(data) == 1
+    assert any(r.fields.get("reason") == "overrides_latched" for r in caplog.records)
+
+
+def test_a_recreated_file_that_regrows_a_decision_stays_skipped(data):
+    macs = retire(data, count=2)
+    path = migrated_overrides(data.root)
+    decide(path, macs[sorted(macs)[0]], 2)
+    assert prune(data) == 1
+    path.unlink()
+    open_overrides(path).close()
+    assert prune(data) == 0  # empty: the decision is lost
+    decide(path, "unrelated", 5)  # one decision again, and the counter is past the mark
+    assert prune(data) == 0
+    assert rows(data) == 1
+
+
+def test_deleting_the_marker_rows_resumes_the_prune(data):
+    macs = retire(data, count=2)
+    path = restore_older_file(data, macs)
+    for n in range(4):
+        sql(path, AUDIT, f"catch-up{n}", STAMP)
+    data.inv.execute("DELETE FROM stitch_state WHERE key LIKE 'prune_overrides_%'")
+    assert prune(data) == 1
+    assert rows(data) == 0

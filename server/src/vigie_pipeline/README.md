@@ -69,8 +69,11 @@ see `docs/monitoring.md`).
     that cannot be read, skips the prune and logs ERROR `overrides_rolled_back` (an older backup
     restored over the file, or a file recreated and given one new decision, which the presence
     marker cannot tell). If the owner really did remove every decision, or restored a backup on
-    purpose, delete both marker rows (`prune_overrides_seen`, `prune_overrides_audit_mark`) to
-    resume; until then nothing is pruned.
+    purpose, delete the marker rows (`prune_overrides_seen`, `prune_overrides_audit_mark` and
+    `prune_overrides_latched`) to resume. Either finding is latched in `prune_overrides_latched`
+    (later passes log ERROR `overrides_latched`): the audit counter catching up through unrelated
+    audit rows does not show the lost decisions came back, so until the rows are deleted nothing is
+    pruned.
   - Re-check. The protected set is read on a connection opened for the prune alone (no earlier
     stage's open cursor can hold its `PRAGMA data_version` still), with the file's st_dev/st_ino
     taken before the open. Inside the write lock, after the deletes and before `COMMIT`, both are

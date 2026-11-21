@@ -109,7 +109,7 @@ def prune_retired_macs(
     after that last check and before COMMIT (microseconds) is not seen, same as stitch_apply's
     attach. A file that once held a decision and now holds none, or whose audit counter fell below
     its stored high-water mark (an older backup restored, a file recreated), skips the pass. A
-    returning MAC whose rows were pruned gets a new device id (accepted)."""
+    returning MAC whose rows were pruned gets a new device id (accepted). Either skip is latched."""
     if not overrides_path.exists():
         # normal before the API ran; an ERROR once this install has seen a decision (a lost file)
         seen = _marks_set(inv)
@@ -146,6 +146,7 @@ def prune_retired_macs(
 
 OVERRIDES_SEEN_KEY = "prune_overrides_seen"
 OVERRIDES_AUDIT_KEY = "prune_overrides_audit_mark"
+OVERRIDES_LATCH_KEY = "prune_overrides_latched"
 
 
 def _marks_set(inv: sqlite3.Connection) -> bool:
@@ -163,28 +164,40 @@ def _decisions_not_lost(inv: sqlite3.Connection, found: bool, audit_mark: int) -
     """False when overrides.db looks like a different, poorer file than the one this install has
     read before, and an empty or shrunken protected set would then protect nothing. Two markers,
     both `stitch_state` rows, set by the first read that finds a decision / an audit row:
-    `found` (this read saw a decision in some protected source) against the presence marker, and
-    `audit_mark` (the file's audit counter) against its high-water mark, which catches an older
-    backup restored over the file and a file recreated and given one new decision. An install
+    `found` (this read saw a lasting decision) against the presence marker, and `audit_mark` (the
+    file's audit counter) against its high-water mark, which catches an older backup restored over
+    the file and a file recreated and given one new decision. Either finding LATCHES the prune off
+    (`OVERRIDES_LATCH_KEY`): the counter catching up later (unrelated audit rows) does not show the
+    decisions came back, so only the operator's deletion of the marker rows resumes it. An install
     that never had either (nothing to lose) prunes as usual."""
+    latched = state_get(inv, OVERRIDES_LATCH_KEY)
+    if latched is not None:
+        log(logger, logging.ERROR, "prune_skipped", reason="overrides_latched", latched=latched)
+        return False
     stored = state_get(inv, OVERRIDES_AUDIT_KEY)
     try:
         high_water = 0 if stored is None else int(stored)
     except ValueError:
         high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
-    if audit_mark < high_water:
-        log(logger, logging.ERROR, "prune_skipped", reason="overrides_rolled_back")
-        return False
     seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
-    if seen and not found:
-        log(logger, logging.ERROR, "prune_skipped", reason="overrides_lost_decisions")
-        return False
+    reason = (
+        "overrides_rolled_back"
+        if audit_mark < high_water
+        else "overrides_lost_decisions"
+        if seen and not found
+        else None
+    )
     with immediate(inv):
-        if found and not seen:
-            state_set(inv, OVERRIDES_SEEN_KEY, "1")
-        if audit_mark > high_water:
-            state_set(inv, OVERRIDES_AUDIT_KEY, str(audit_mark))
-    return True
+        if reason is not None:
+            state_set(inv, OVERRIDES_LATCH_KEY, reason)
+        else:
+            if found and not seen:
+                state_set(inv, OVERRIDES_SEEN_KEY, "1")
+            if audit_mark > high_water:
+                state_set(inv, OVERRIDES_AUDIT_KEY, str(audit_mark))
+    if reason is not None:
+        log(logger, logging.ERROR, "prune_skipped", reason=reason)
+    return reason is None
 
 
 def _delete_retired_rows(
