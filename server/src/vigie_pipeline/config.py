@@ -37,6 +37,7 @@ RETIRED_MAC_RETENTION_S = 90 * 86400
 # WARNING; the unstamped retired devices are looked for again this often (a rolled-back build
 # erases the stamps without a trace)
 PRUNE_CLOCK_WARN_S = 7 * 86400
+PRUNE_CLOCK_WARN_REPEAT_S = 86400  # ... and then at most this often
 RETIRED_BACKFILL_INTERVAL_S = 86400
 # a retirement stamped further ahead of the server clock than this (a batch received under a
 # stepped clock) is named in a WARNING: such a device is not prunable until that date

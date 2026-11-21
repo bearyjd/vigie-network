@@ -13,6 +13,7 @@ from pathlib import Path
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.config import (
     PRUNE_BATCH_ROWS,
+    PRUNE_CLOCK_WARN_REPEAT_S,
     PRUNE_CLOCK_WARN_S,
     RETIRED_MAC_RETENTION_S,
 )
@@ -147,6 +148,7 @@ def prune_retired_macs(
 OVERRIDES_SEEN_KEY = "prune_overrides_seen"
 OVERRIDES_AUDIT_KEY = "prune_overrides_audit_mark"
 OVERRIDES_LATCH_KEY = "prune_overrides_latched"
+CLOCK_WARNED_KEY = "prune_clock_warned"
 
 
 def _marks_set(inv: sqlite3.Connection) -> bool:
@@ -248,8 +250,20 @@ def _trusted_now(inv: sqlite3.Connection, now: float) -> float | None:
     if row is None:
         return None
     if row[1] < now - PRUNE_CLOCK_WARN_S:
-        log(logger, logging.WARNING, "prune_clock_held_back", collector=row[0], last_sent_ts=row[1])
+        _warn_clock_held_back(inv, now, row[0], row[1])
     return min(now, float(row[1]))
+
+
+def _warn_clock_held_back(inv: sqlite3.Connection, now: float, collector: str, sent: int) -> None:
+    """The WARNING, at most once per PRUNE_CLOCK_WARN_REPEAT_S (a silent collector would
+    otherwise repeat it every pass); the instant of the last one is a `stitch_state` row, and one
+    from the future (the clock was set back) counts as due."""
+    last = state_get(inv, CLOCK_WARNED_KEY)
+    if last is not None and iso_utc(now - PRUNE_CLOCK_WARN_REPEAT_S) < last <= iso_utc(now):
+        return
+    with immediate(inv):
+        state_set(inv, CLOCK_WARNED_KEY, iso_utc(now))
+    log(logger, logging.WARNING, "prune_clock_held_back", collector=collector, last_sent_ts=sent)
 
 
 def _prune_args(trusted: float) -> tuple[str, ...]:

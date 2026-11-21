@@ -52,7 +52,8 @@ see `docs/monitoring.md`).
     collector prunes nothing. Consequence: a collector that falls silent, or is retired without
     being revoked, holds the clock back until it is revoked; the pass then logs the WARNING
     `prune_clock_held_back` naming that collector once its last send is more than 7 days old
-    (every pass while it holds). With a single collector that follows a stepped server clock
+    (at most once a day: the instant of the last one is the `stitch_state` row `prune_clock_warned`).
+    A live collector whose `last_sent_ts` is not a number skips the pass (ERROR `prune_skipped`). With a single collector that follows a stepped server clock
     nothing can tell, and that case is accepted.
   - Fails closed. It runs only when `overrides.db` exists, opens read-only, is at exactly the
     supported schema version (a reviewed literal, `SUPPORTED_USER_VERSION`), has every table the

@@ -21,6 +21,7 @@ from test_prune_guards import (
 )
 
 from vigie_ingest import store
+from vigie_ingest.db import iso_utc
 from vigie_ingest.config import Settings
 from vigie_ingest.retention import purge_batches
 
@@ -169,3 +170,35 @@ def test_a_fractional_last_sent_ts_is_still_a_time(data):
     migrated_overrides(data.root)
     set_clock(data, RETIRED_AT + RETENTION + 1.5)
     assert prune(data, LATER) == 1
+
+
+def held_back_warnings(caplog):
+    return [r for r in caplog.records if r.getMessage() == "prune_clock_held_back"]
+
+
+def test_the_held_back_warning_repeats_at_most_once_a_day(data, caplog):
+    retire(data)
+    migrated_overrides(data.root)
+    add_collector(data, "silent-rtr", RETIRED_AT)
+    first = RETIRED_AT + SILENT_DAYS * 86400
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        prune(data, first)
+        prune(data, first + 60)
+        prune(data, first + 86400 - 1)
+        assert len(held_back_warnings(caplog)) == 1
+        prune(data, first + 86400)
+        assert len(held_back_warnings(caplog)) == 2
+
+
+def test_a_held_back_warning_marker_from_the_future_does_not_silence_it(data, caplog):
+    retire(data)
+    migrated_overrides(data.root)
+    add_collector(data, "silent-rtr", RETIRED_AT)
+    now = RETIRED_AT + SILENT_DAYS * 86400
+    data.inv.execute(  # the clock was set back since the last warning
+        "INSERT INTO stitch_state (key, value) VALUES ('prune_clock_warned', ?)",
+        (iso_utc(now + 10 * 86400),),
+    )
+    with caplog.at_level(logging.WARNING, logger="vigie_pipeline"):
+        prune(data, now)
+    assert len(held_back_warnings(caplog)) == 1
