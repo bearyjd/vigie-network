@@ -138,7 +138,7 @@ def test_an_open_cursor_on_the_pipelines_own_overrides_connection_cannot_hide_a_
 
     monkeypatch.setattr(processor, "open_overrides_ro", open_and_hold_a_cursor)
     commit_after_protected_read(monkeypatch, path, ESSENTIAL, next(iter(macs.values())))
-    processor.run_once(PipelineConfig(data_dir=data.root), now=LATER)
+    processor.run_once(PipelineConfig(data_dir=data.root, prune_retired_macs=True), now=LATER)
     assert held
     assert rows(data) == 1
 
