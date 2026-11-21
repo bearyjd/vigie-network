@@ -174,6 +174,58 @@ def _audit_history_replaced(inv: sqlite3.Connection, conn: sqlite3.Connection) -
     return not expected or expected != _audit_id_at(conn, seq)
 
 
+def _history_verdict(
+    inv: sqlite3.Connection, found: bool, audit_mark: int, audit_id: str, replaced: bool
+) -> tuple[str | None, dict[str, str]]:
+    """The finding against the stored markers (None: the file is the same history or a richer
+    one) and, when there is none, the marker rows this look advances. Writes nothing."""
+    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
+    try:
+        high_water = 0 if stored is None else int(stored)
+    except ValueError:
+        high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
+    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
+    if replaced or audit_mark < high_water:
+        return "overrides_rolled_back", {}
+    if seen and not found:
+        return "overrides_lost_decisions", {}
+    writes = {}
+    if found and not seen:
+        writes[OVERRIDES_SEEN_KEY] = "1"
+    if audit_mark > high_water:
+        writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
+        writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
+    return None, writes
+
+
+def track_overrides_history(inv: sqlite3.Connection, overrides_path: Path) -> None:
+    """Prune OFF (the default): keep only the history markers moving forward, so a lost, restored
+    or recreated overrides.db is still seen by the first pass after the prune is turned on. It
+    deletes nothing, latches nothing and logs nothing at ERROR/INFO: a finding changes no row (the
+    markers stay as they were, and the pass that is switched on reports it). Any failure skips the
+    look."""
+    read = None
+    try:
+        if not overrides_path.exists() or state_get(inv, OVERRIDES_LATCH_KEY) is not None:
+            return
+        read = _open_overrides_read(overrides_path)
+        decided = decided_suggestion_ids(read.conn)
+        found = durable_decisions_found(read.conn) or bool(decided)
+        audit_mark = _audit_high_water(read.conn)
+        replaced = _audit_history_replaced(inv, read.conn)
+        audit_id = _audit_id_at(read.conn, audit_mark)
+        _reason, writes = _history_verdict(inv, found, audit_mark, audit_id, replaced)
+        if writes:
+            with immediate(inv):
+                for key, value in writes.items():
+                    state_set(inv, key, value)
+    except (sqlite3.Error, OverridesNotUsable) as exc:
+        log(logger, logging.DEBUG, "overrides_history_untracked", error=str(exc))
+    finally:
+        if read is not None:
+            read.conn.close()
+
+
 def _decisions_not_lost(
     inv: sqlite3.Connection,
     found: bool,
@@ -195,28 +247,9 @@ def _decisions_not_lost(
     if latched is not None:
         log(logger, logging.ERROR, "prune_skipped", reason="overrides_latched", latched=latched)
         return False
-    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
-    try:
-        high_water = 0 if stored is None else int(stored)
-    except ValueError:
-        high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
-    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
-    reason = (
-        "overrides_rolled_back"
-        if replaced or audit_mark < high_water
-        else "overrides_lost_decisions"
-        if seen and not found
-        else None
-    )
-    writes = {}
+    reason, writes = _history_verdict(inv, found, audit_mark, audit_id, replaced)
     if reason is not None:
-        writes[OVERRIDES_LATCH_KEY] = reason
-    else:
-        if found and not seen:
-            writes[OVERRIDES_SEEN_KEY] = "1"
-        if audit_mark > high_water:
-            writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
-            writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
+        writes = {OVERRIDES_LATCH_KEY: reason}
     if writes:  # a pass that changes no marker takes no write lock
         with immediate(inv):
             for key, value in writes.items():

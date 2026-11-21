@@ -36,7 +36,7 @@ from vigie_pipeline.overrides import (
     open_overrides_ro,
 )
 from vigie_pipeline.probes import fold_probes, retire_status
-from vigie_pipeline.prune import prune_retired_macs
+from vigie_pipeline.prune import prune_retired_macs, track_overrides_history
 from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
@@ -85,8 +85,10 @@ def run_once(
         promoted, retired = sweep_transients(
             inv, clock, config, retired_at=(live or (lambda: clock))()
         )
-        if config.prune_retired_macs:  # default off: nothing of the prune runs, logs or writes
+        if config.prune_retired_macs:
             _prune_stage(inv, config, clock, usable, len(failures))
+        else:  # default off: no deletion, no log; only the overrides.db history markers move
+            track_overrides_history(inv, config.overrides_path)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)
