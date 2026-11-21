@@ -89,6 +89,14 @@ def run_once(
         # prune_retired_macs reads overrides.db itself and fails closed on an unusable file
         if usable and not failures:
             prune_retired_macs(inv, config.overrides_path, clock)
+        elif failures:  # the only trace of why a persistently unreadable shard prunes nothing
+            log(
+                logger,
+                logging.INFO,
+                "prune_skipped",
+                reason="failed_read",
+                failed_collectors=len(failures),
+            )
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         purge_activity(inv, clock, config.activity_retention_s)

@@ -53,6 +53,32 @@ def test_an_unreadable_batch_skips_the_prune_and_the_next_clean_pass_prunes(data
     assert rows(data) == 1
 
 
+def test_a_prune_skipped_for_an_unread_batch_says_so_without_naming_a_mac(data, caplog):
+    ((mac, _),) = retire(data).items()
+    migrated_overrides(data.root)
+    data.add_batch(LATER, neigh=[mac])
+    conn = connect(data.root / shard_name(utc_day(LATER)))
+    conn.execute("ALTER TABLE raw_neigh RENAME TO raw_neigh_gone")
+    conn.close()
+    with caplog.at_level(logging.INFO, logger="vigie_pipeline"), pytest.raises(ShardReadError):
+        run(data)
+    (skipped,) = [r for r in caplog.records if r.getMessage() == "prune_skipped"]
+    assert skipped.levelno == logging.INFO
+    assert skipped.fields == {"reason": "failed_read", "failed_collectors": 1}
+
+
+@pytest.mark.parametrize("overrides", ["usable", "unreadable"])
+def test_a_pass_without_a_failed_read_logs_no_failed_read_skip(data, caplog, overrides):
+    retire(data)
+    if overrides == "usable":
+        migrated_overrides(data.root)
+    else:
+        (data.root / "overrides.db").write_bytes(b"not a database")
+    with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
+        run(data)
+    assert not [r for r in caplog.records if r.getMessage() == "prune_skipped"]
+
+
 # ---- a locked or busy database does not stop the rest of the pass ---------------------------
 
 
