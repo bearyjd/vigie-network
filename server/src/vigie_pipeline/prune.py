@@ -107,7 +107,10 @@ def prune_retired_macs(
         protected = protected_device_ids(read.conn)
         decided = decided_suggestion_ids(read.conn)
         found = durable_decisions_found(read.conn) or bool(decided)
-        if not _decisions_not_lost(inv, found, _audit_high_water(read.conn)):
+        audit_mark = _audit_high_water(read.conn)
+        replaced = _audit_history_replaced(inv, read.conn)
+        audit_id = _audit_id_at(read.conn, audit_mark)
+        if not _decisions_not_lost(inv, found, audit_mark, audit_id, replaced):
             return 0
         protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
         pruned = _delete_retired_rows(inv, read, protected, now)
@@ -134,6 +137,7 @@ def _overrides_missing(inv: sqlite3.Connection) -> int:
 
 OVERRIDES_SEEN_KEY = "prune_overrides_seen"
 OVERRIDES_AUDIT_KEY = "prune_overrides_audit_mark"
+OVERRIDES_AUDIT_ID_KEY = "prune_overrides_audit_id"  # the audit row id at that counter
 OVERRIDES_LATCH_KEY = "prune_overrides_latched"
 CLOCK_WARNED_KEY = "prune_clock_warned"
 
@@ -144,21 +148,49 @@ def _marks_set(inv: sqlite3.Connection) -> bool:
 
 def _audit_high_water(conn: sqlite3.Connection) -> int:
     """`audit_log.seq` is AUTOINCREMENT and the API writes a row with every decision, so the
-    largest one only grows for as long as this is the same file's history. sqlite3.Error
-    propagates (the pass is skipped)."""
+    largest one only grows for as long as this is the same file's history (trimming old rows
+    keeps it, which a row count would not). sqlite3.Error propagates (the pass is skipped)."""
     return int(conn.execute("SELECT COALESCE(MAX(seq), 0) FROM audit_log").fetchone()[0])
 
 
-def _decisions_not_lost(inv: sqlite3.Connection, found: bool, audit_mark: int) -> bool:
+def _audit_id_at(conn: sqlite3.Connection, seq: int) -> str:
+    """The unique id of the audit row at `seq` ('' when there is none)."""
+    row = conn.execute("SELECT id FROM audit_log WHERE seq=?", (seq,)).fetchone()
+    return "" if row is None else str(row[0])
+
+
+def _audit_history_replaced(inv: sqlite3.Connection, conn: sqlite3.Connection) -> bool:
+    """True when the audit row at the stored high-water `seq` is not the one stored with it (or
+    the stored id is missing, or there is no such row): a different file that merely grew a
+    counter at least as large, which no number comparison can tell from the same file."""
+    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
+    if stored is None:
+        return False  # nothing was ever stored: no history to compare with
+    try:
+        seq = int(stored)
+    except ValueError:
+        return False  # `_decisions_not_lost` treats an unreadable mark as a rollback
+    expected = state_get(inv, OVERRIDES_AUDIT_ID_KEY)
+    return not expected or expected != _audit_id_at(conn, seq)
+
+
+def _decisions_not_lost(
+    inv: sqlite3.Connection,
+    found: bool,
+    audit_mark: int,
+    audit_id: str = "",
+    replaced: bool = False,
+) -> bool:
     """False when overrides.db looks like a different, poorer file than the one this install has
-    read before, and an empty or shrunken protected set would then protect nothing. Two markers,
-    both `stitch_state` rows, set by the first read that finds a decision / an audit row:
-    `found` (this read saw a lasting decision) against the presence marker, and `audit_mark` (the
-    file's audit counter) against its high-water mark, which catches an older backup restored over
-    the file and a file recreated and given one new decision. Either finding LATCHES the prune off
-    (`OVERRIDES_LATCH_KEY`): the counter catching up later (unrelated audit rows) does not show the
-    decisions came back, so only the operator's deletion of the marker rows resumes it. An install
-    that never had either (nothing to lose) prunes as usual."""
+    read before, so an empty or shrunken protected set would protect nothing. Three signs against
+    `stitch_state` markers set by the first read that finds a decision / an audit row: `found`
+    against the presence marker; `audit_mark` (the file's audit counter) against its high-water
+    mark (an older backup restored over the file); `replaced` (`_audit_history_replaced`; the id
+    of the row at the high-water counter is stored beside it as `audit_id`: a file recreated and
+    grown past the old counter before this look). Any finding LATCHES the prune off
+    (`OVERRIDES_LATCH_KEY`): the counter catching up later does not show the decisions came back,
+    so only the operator's deletion of the marker rows resumes it. An install that never had
+    either marker (nothing to lose) prunes as usual."""
     latched = state_get(inv, OVERRIDES_LATCH_KEY)
     if latched is not None:
         log(logger, logging.ERROR, "prune_skipped", reason="overrides_latched", latched=latched)
@@ -171,7 +203,7 @@ def _decisions_not_lost(inv: sqlite3.Connection, found: bool, audit_mark: int) -
     seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
     reason = (
         "overrides_rolled_back"
-        if audit_mark < high_water
+        if replaced or audit_mark < high_water
         else "overrides_lost_decisions"
         if seen and not found
         else None
@@ -184,6 +216,7 @@ def _decisions_not_lost(inv: sqlite3.Connection, found: bool, audit_mark: int) -
             writes[OVERRIDES_SEEN_KEY] = "1"
         if audit_mark > high_water:
             writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
+            writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
     if writes:  # a pass that changes no marker takes no write lock
         with immediate(inv):
             for key, value in writes.items():

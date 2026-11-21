@@ -69,11 +69,14 @@ see `docs/monitoring.md`).
     ERROR (`overrides_lost_decisions`: the file was probably lost or recreated empty). An install
     that never had a decision prunes as usual. A rolled-back `overrides.db`: the pipeline also
     keeps the file's largest `audit_log.seq` (AUTOINCREMENT, written with every decision) as the
-    `stitch_state` row `prune_overrides_audit_mark`; a read that shows a smaller one, or a mark
-    that cannot be read, skips the prune and logs ERROR `overrides_rolled_back` (an older backup
-    restored over the file, or a file recreated and given one new decision, which the presence
-    marker cannot tell). If the owner really did remove every decision, or restored a backup on
-    purpose, delete the marker rows (`prune_overrides_seen`, `prune_overrides_audit_mark` and
+    `stitch_state` row `prune_overrides_audit_mark`, and the unique id of the audit row at that
+    `seq` as `prune_overrides_audit_id`. A read that shows a smaller counter, a different (or no)
+    row at the stored one, or a mark that cannot be read, skips the prune and logs ERROR
+    `overrides_rolled_back` (an older backup restored over the file, or a file recreated and given
+    new decisions, which the presence marker cannot tell, and which may have grown past the old
+    counter before any pass looked: only the id at the stored `seq` tells). If the owner really did
+    remove every decision, or restored a backup on purpose, delete the marker rows
+    (`prune_overrides_seen`, `prune_overrides_audit_mark`, `prune_overrides_audit_id` and
     `prune_overrides_latched`) to resume. Either finding is latched in `prune_overrides_latched`
     (later passes log ERROR `overrides_latched`): the audit counter catching up through unrelated
     audit rows does not show the lost decisions came back, so until the rows are deleted nothing is
@@ -111,8 +114,8 @@ see `docs/monitoring.md`).
     (no index leads with `device_id` for those kinds) which the prune lock must not do.
   - Cost: candidates are selected before the write lock (protections applied in SQL, so a
     protected oldest batch cannot starve the limit); inside the lock there is one point-lookup
-    DELETE per candidate repeating the whole predicate, then the `overrides.db` re-check, the
-    counter bump and the commit. No statement inside that lock scans `observations`, `devices`
+    DELETE per candidate repeating the whole predicate, then the counter bump, the `overrides.db` re-check
+    and the commit. No statement inside that lock scans `observations`, `devices`
     or `batches`.
   - Accepted residual: `overrides.db` and `inventory.db` cannot share a transaction. A human
     decision committed after the final `data_version` read and before `COMMIT` (a window of

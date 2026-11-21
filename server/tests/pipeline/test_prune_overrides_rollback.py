@@ -22,6 +22,7 @@ from test_prune_guards import (
 )
 
 from vigie_api.schema import open_overrides
+from vigie_pipeline import prune as prune_module
 from vigie_pipeline.prune import OVERRIDES_AUDIT_KEY, OVERRIDES_SEEN_KEY, _decisions_not_lost
 
 AUDIT = (
@@ -210,3 +211,47 @@ def test_unchanged_markers_take_no_write_lock(data):
     assert _decisions_not_lost(data.inv, True, 2)
     data.inv.set_trace_callback(None)
     assert not [s for s in traced if s.upper().startswith("BEGIN")]
+
+
+def test_a_recreated_file_whose_counter_passed_the_mark_before_the_next_look_stays_skipped(
+    data, caplog
+):
+    """The mark is a counter AND the id of the row at that counter: a new file that collected as
+    many audit rows as the old one held (while a skipped pass looked away) is another history."""
+    macs = retire(data, count=2)
+    protected = macs[sorted(macs)[0]]
+    path = migrated_overrides(data.root)
+    decide(path, protected, 3)
+    assert prune(data) == 1  # `other` goes, the mark is 3
+    path.unlink()
+    open_overrides(path).close()
+    decide(path, "unrelated", 5)  # a new decision and a counter past the old mark
+    with caplog.at_level(logging.ERROR, logger="vigie_pipeline"):
+        assert prune(data) == 0
+    assert rows(data) == 1  # the formerly protected MAC row is still there
+    assert any(r.fields.get("reason") == "overrides_rolled_back" for r in caplog.records)
+    assert data.q("SELECT 1 FROM stitch_state WHERE key=?", prune_module.OVERRIDES_LATCH_KEY)
+
+
+def test_a_mark_without_the_id_of_its_row_fails_closed(data):
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "unrelated", 2)
+    assert prune(data) == 1
+    data.inv.execute("DELETE FROM stitch_state WHERE key=?", (prune_module.OVERRIDES_AUDIT_ID_KEY,))
+    retire(data)
+    assert prune(data) == 0
+    assert rows(data) == 1
+
+
+def test_trimmed_older_audit_rows_do_not_look_like_a_rollback(data):
+    """The high-water mark is the largest `seq`, never a row count: trimming old rows keeps it."""
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "unrelated", 5)
+    assert prune(data) == 1
+    sql(path, "DELETE FROM audit_log WHERE seq<=3")
+    retire(data)
+    assert prune(data) == 1
+    assert rows(data) == 0
+    assert mark(data) == ["5"]
