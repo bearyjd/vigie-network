@@ -187,14 +187,18 @@ def _decisions_not_lost(inv: sqlite3.Connection, found: bool, audit_mark: int) -
         if seen and not found
         else None
     )
-    with immediate(inv):
-        if reason is not None:
-            state_set(inv, OVERRIDES_LATCH_KEY, reason)
-        else:
-            if found and not seen:
-                state_set(inv, OVERRIDES_SEEN_KEY, "1")
-            if audit_mark > high_water:
-                state_set(inv, OVERRIDES_AUDIT_KEY, str(audit_mark))
+    writes = {}
+    if reason is not None:
+        writes[OVERRIDES_LATCH_KEY] = reason
+    else:
+        if found and not seen:
+            writes[OVERRIDES_SEEN_KEY] = "1"
+        if audit_mark > high_water:
+            writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
+    if writes:  # a pass that changes no marker takes no write lock
+        with immediate(inv):
+            for key, value in writes.items():
+                state_set(inv, key, value)
     if reason is not None:
         log(logger, logging.ERROR, "prune_skipped", reason=reason)
     return reason is None

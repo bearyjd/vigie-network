@@ -22,7 +22,7 @@ from test_prune_guards import (
 )
 
 from vigie_api.schema import open_overrides
-from vigie_pipeline.prune import OVERRIDES_AUDIT_KEY, OVERRIDES_SEEN_KEY
+from vigie_pipeline.prune import OVERRIDES_AUDIT_KEY, OVERRIDES_SEEN_KEY, _decisions_not_lost
 
 AUDIT = (
     "INSERT INTO audit_log (id, ts, principal, action, target, detail)"
@@ -198,3 +198,15 @@ def test_lost_decisions_are_latched_even_when_the_audit_counter_never_fell(data)
     decide(path, "unrelated", 1)  # a decision again: the presence marker would pass
     assert prune(data) == 0
     assert rows(data) == 1
+
+
+def test_unchanged_markers_take_no_write_lock(data):
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "unrelated", 2)
+    assert prune(data) == 1  # sets both markers
+    traced = []
+    data.inv.set_trace_callback(traced.append)
+    assert _decisions_not_lost(data.inv, True, 2)
+    data.inv.set_trace_callback(None)
+    assert not [s for s in traced if s.upper().startswith("BEGIN")]
