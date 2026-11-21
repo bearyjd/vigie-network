@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sqlite3
 
 import pytest
 from pipeline_helpers import data  # noqa: F401
@@ -13,6 +14,7 @@ from test_prune_decided_suggestions import DECIDE
 from test_prune_guards import LATER, PROTECTIONS, STAMP, migrated_overrides, retire, rows, sql
 from test_prune_overrides_rollback import AUDIT, decide
 
+from vigie_ingest.db import connect, shard_name, utc_day
 from vigie_pipeline import processor
 from vigie_pipeline import prune as prune_module
 from vigie_pipeline.config import PipelineConfig
@@ -24,6 +26,7 @@ from vigie_pipeline.prune import (
     OVERRIDES_SEEN_KEY,
     PRUNED_COUNTER_KEY,
 )
+from vigie_pipeline.sources import ShardReadError
 
 
 @pytest.fixture(autouse=True)
@@ -232,3 +235,104 @@ def test_the_off_tracker_closes_its_overrides_connection(data, monkeypatch):
     off(data)
     assert spies
     assert all(s.closed for s in spies)
+
+
+def test_kill_m14_a_different_file_with_a_larger_counter_latches_while_off(data):
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "d1", 2)
+    off(data)
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "2"
+    other = path.with_name("other.db")
+    shutil.copy(path, other)
+    sql(other, "DELETE FROM audit_log")
+    for n in range(6):
+        sql(other, AUDIT, f"other{n}", STAMP)  # another file whose counter is past the stored one
+    shutil.copy(other, path)
+    off(data, 1)
+    assert prune_state(data)[OVERRIDES_LATCH_KEY] == "overrides_rolled_back"
+    on(data, 2)
+    assert rows(data) == 1
+
+
+def test_kill_m15_a_busy_inventory_while_off_does_not_crash(data, monkeypatch):
+    retire(data)
+    decide(migrated_overrides(data.root), "d1", 3)
+
+    def busy(_inv):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(prune_module, "immediate", busy)
+    off(data)  # the tracker swallows it: the pass goes on
+    assert OVERRIDES_AUDIT_KEY not in prune_state(data)
+
+
+def _break_shard(data, mac):
+    data.add_batch(LATER, neigh=[mac])
+    conn = connect(data.root / shard_name(utc_day(LATER)))
+    conn.execute("ALTER TABLE raw_neigh RENAME TO raw_neigh_gone")
+    conn.close()
+
+
+def _unusable_snapshot(path) -> None:
+    conn = sqlite3.connect(path)
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+        conn.execute(f'DROP TRIGGER "{name}"')
+    conn.execute("DELETE FROM identity_version")
+    conn.commit()
+    conn.close()
+
+
+def test_kill_m21_off_tracks_even_on_a_failed_batch_read(data):
+    ((mac, _),) = retire(data).items()
+    decide(migrated_overrides(data.root), "d1", 3)
+    _break_shard(data, mac)
+    with pytest.raises(ShardReadError):
+        off(data)
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "3"
+
+
+def test_kill_m22_off_tracks_even_when_the_snapshot_is_unusable(data):
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "d1", 3)
+    _unusable_snapshot(path)
+    off(data)
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "3"
+
+
+def test_on_tracks_even_on_a_failed_batch_read(data):
+    ((mac, _),) = retire(data).items()
+    decide(migrated_overrides(data.root), "d1", 3)
+    _break_shard(data, mac)
+    with pytest.raises(ShardReadError):
+        on(data)
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "3"
+    assert rows(data) == 1
+
+
+def test_on_tracks_even_when_the_snapshot_is_unusable(data):
+    retire(data)
+    path = migrated_overrides(data.root)
+    decide(path, "d1", 3)
+    _unusable_snapshot(path)
+    on(data)
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "3"
+    assert rows(data) == 1
+
+
+def test_a_restore_during_an_on_pass_with_an_unread_batch_still_latches(data):
+    ((mac, _),) = retire(data).items()
+    path = migrated_overrides(data.root)
+    decide(path, "unrelated", 2)
+    backup = path.with_name("backup.db")
+    shutil.copy(path, backup)
+    decide(path, "d2", 2)
+    _break_shard(data, mac)
+    with pytest.raises(ShardReadError):
+        on(data)  # the file is at mark 4 while a shard keeps failing
+    assert prune_state(data)[OVERRIDES_AUDIT_KEY] == "4"
+    shutil.copy(backup, path)  # restored from the older backup
+    with pytest.raises(ShardReadError):
+        on(data, 1)
+    assert prune_state(data)[OVERRIDES_LATCH_KEY] == "overrides_rolled_back"

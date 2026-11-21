@@ -170,11 +170,16 @@ def _prune_stage(
 ) -> None:
     """An unread batch may carry a returning MAC: prune next pass, and say so, the only trace of
     why a persistently unreadable shard prunes nothing. `usable` is defence in depth:
-    prune_retired_macs reads overrides.db itself and fails closed on an unusable file."""
+    prune_retired_macs reads overrides.db itself and fails closed on an unusable file. A pass
+    that skips the prune still takes the quiet history look (deletes nothing), so a restore made
+    while a shard keeps failing is latched, as the flag-off pass does."""
     if failed:
         log(logger, logging.INFO, "prune_skipped", reason="failed_read", failed_collectors=failed)
+        track_overrides_history(inv, config.overrides_path)
     elif usable:
         prune_retired_macs(inv, config.overrides_path, clock)
+    else:
+        track_overrides_history(inv, config.overrides_path)
 
 
 def _stitch(
