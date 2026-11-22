@@ -319,6 +319,29 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
           DELETE FROM essential_pending WHERE collector_id=OLD.collector_id
             AND batch_id=OLD.batch_id; END""",
     ),
+    (
+        """CREATE TABLE monitoring_dns_profiles (
+          collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT NOT NULL,
+          config_version TEXT NOT NULL,training_since INTEGER NOT NULL,state TEXT NOT NULL,
+          baseline_id TEXT,updated_hour INTEGER NOT NULL,sample_hours INTEGER NOT NULL,
+          distinct_days INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id))""",
+        """CREATE TABLE monitoring_dns_baselines (
+          id TEXT PRIMARY KEY,collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT
+          NOT NULL,algorithm TEXT NOT NULL,config_version TEXT NOT NULL,config_json TEXT NOT NULL,
+          median_twice TEXT NOT NULL,sample_hours INTEGER NOT NULL,distinct_days INTEGER NOT NULL,
+          trained_until INTEGER NOT NULL,created_hour INTEGER NOT NULL,training_hours TEXT NOT NULL)
+          """,
+        "CREATE INDEX idx_monitoring_dns_baseline_age ON monitoring_dns_baselines(created_hour,id)",
+        "CREATE INDEX idx_monitoring_dns_profile_baseline ON monitoring_dns_profiles(baseline_id)",
+        """CREATE TABLE monitoring_dns_suspicious (
+          collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT NOT NULL,
+          hour INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id,lineage,hour))""",
+        "CREATE INDEX idx_monitoring_dns_suspicious_age ON monitoring_dns_suspicious(hour)",
+        """CREATE TABLE monitoring_dns_retries (
+          collector_id TEXT NOT NULL,device_id TEXT NOT NULL,lineage TEXT NOT NULL,
+          hour INTEGER NOT NULL,PRIMARY KEY(collector_id,device_id))""",
+        "CREATE INDEX idx_monitoring_dns_retry_age ON monitoring_dns_retries(hour)",
+    ),
 )
 
 PIPELINE_TABLES = (

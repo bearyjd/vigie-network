@@ -414,6 +414,18 @@ assert.match(text(absent), /Essential device not seen/); assert.doesNotMatch(tex
 const absentPanel = text(views.incidentView({...inc('e1', {detector: 'essential_absence', observed_bytes: 0, threshold_bytes: 0}), evidence: {reason_code: 'essential_absent', absent_for_hours: 30, threshold_hours: 24}}, () => {}));
 assert.match(absentPanel, /Essential device not seen/); assert.match(absentPanel, /Hours not seen/); assert.match(absentPanel, /essential_absent/); assert.match(absentPanel, /30/);
 assert.doesNotMatch(absentPanel, /Observed upload|No mature baseline|Hours present when noticed/, 'an absence panel carries no upload or new-device facts');
+const dns = inc('dns1', {detector: 'dns_deviation', observed_bytes: 1301, threshold_bytes: 1202});
+assert.match(text(render([dns])), /DNS above reference/);
+assert.match(text(render([dns])), /1301 queries \/ 1202 queries/);
+const dnsPanel = text(views.incidentView({...dns, evidence: {reason_code: 'dns_deviation_threshold', unit: 'queries', observed_bytes: 1301, threshold_bytes: 1202, baseline_median_queries: 300.5}}, () => {}));
+assert.match(dnsPanel, /DNS above reference/);
+assert.match(dnsPanel, /1301 queries/);
+assert.match(dnsPanel, /1202 queries/);
+assert.match(dnsPanel, /300.5 queries/);
+assert.doesNotMatch(dnsPanel, /Observed upload|Previous hour/);
+const dnsActivity = text(views.activityView({device_id: 'd1', hours: [], baseline: {state: 'learning'}, dns_baseline: {state: 'mature', median_queries: 300.5}}));
+assert.match(dnsActivity, /DNS baseline/);
+assert.match(dnsActivity, /300.5 queries/);
 // XSS: hostile strings are inert text; only the expected tags exist
 const hostile = render([inc('<img src=x onerror=alert(1)>', {detector: '</script><script>alert(1)</script>', device_id: '<img onerror=alert(2)>', review: {status: '<b onmouseover=x>'}})]);
 const tags = new Set(); (function walk(el) { tags.add(el.tag); el.children.forEach(c => c instanceof FakeElement && walk(c)); })(hostile);

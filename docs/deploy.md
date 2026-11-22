@@ -289,6 +289,18 @@ Run ingest and pipeline from the same build before enabling observation recordin
 build cannot certify observations, so the detector must build fresh history from new batches.
 See “Essential-device absence (F6)” in `docs/monitoring.md`.
 
+**DNS volume deviation (off by default).** For Compose, set `VIGIE_MONITORING_DNS=1` and optionally
+set `VIGIE_MONITORING_DNS_MIN_QUERIES` (default 200, integer 1 through 1,000,000). In the persistent
+renderer, use the JSON fields `monitoring_dns` (boolean) and `monitoring_dns_min_queries` (integer).
+Both settings go to the pipeline. The floor applies to the observed hourly DNS median used as a
+reference. For notifications, explicitly allowlist `dns_deviation` in `VIGIE_DELIVERY_DETECTORS`
+and enable delivery. See [DNS volume deviation (F7)](monitoring.md#dns-volume-deviation-f7).
+
+The pipeline applies additive inventory migration v13 at startup, including when the detector is
+off. Verify a pre-upgrade inventory snapshot with the old image. To roll back to the old build,
+restore that inventory snapshot along with the previous image. This migration touches inventory
+only. Follow the existing backup policy for overrides and leave raw shards out of backups.
+
 ## Upgrades and migrations
 
 1. `git pull`, then `podman build -f deploy/Containerfile -t localhost/vigie-server:dev .` (or a new

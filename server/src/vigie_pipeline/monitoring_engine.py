@@ -10,9 +10,11 @@ import time
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.baselines import BaselineConfig, InvalidInput, Sample
+from vigie_pipeline.baselines_dns import DnsBaselineConfig
 from vigie_pipeline.baselines_tod import TodConfig
-from vigie_pipeline.detectors import ENGINE
+from vigie_pipeline.detectors import DNS_DEVIATION, ENGINE
 from vigie_pipeline.logs import log
+from vigie_pipeline.monitoring_dns import prepare_dns, prune_dns, publish_dns, record_dns_retry
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 from vigie_pipeline.monitoring_strategy import strategy_for
 
@@ -65,7 +67,7 @@ def samples_for(inv, collector, identity, now):
     ]
 
 
-def analyze_entity(inv, ov, collector, device, policy, now):
+def analyze_entity(inv, ov, collector, device, policy, now, *, dns_policy=None):
     strategy = strategy_for(policy)
     deadline = time.monotonic() + 0.5
     inv.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
@@ -79,6 +81,18 @@ def analyze_entity(inv, ov, collector, device, policy, now):
         series = samples_for(inv, collector, identity, now)
     finally:
         inv.set_progress_handler(None, 0)
+    dns_result = None
+    dns_retry = False
+    if dns_policy is not None:
+        dns_deadline = time.monotonic() + 0.5
+        inv.set_progress_handler(lambda: int(time.monotonic() >= dns_deadline), 1000)
+        try:
+            dns_result = prepare_dns(inv, collector, identity, dns_policy, now)
+        except (sqlite3.DatabaseError, InvalidInput) as exc:
+            _dns_retry(collector, identity.device_id, exc)
+            dns_retry = True
+        finally:
+            inv.set_progress_handler(None, 0)
     current_hour = int(now) // 3600 * 3600 - 3600
     changed = old is not None and (
         old["lineage"] != identity.key or old["config_version"] != policy.version
@@ -282,12 +296,34 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                         "UPDATE monitoring_incidents SET state='resolved' WHERE id=?",
                         (active["id"],),
                     )
+        if dns_result is not None:
+            inv.execute("SAVEPOINT dns_analysis")
+            try:
+                publish_dns(inv, collector, identity, dns_policy, now, dns_result)
+            except (sqlite3.DatabaseError, InvalidInput) as exc:
+                inv.execute("ROLLBACK TO dns_analysis")
+                _dns_retry(collector, identity.device_id, exc)
+                dns_retry = True
+            finally:
+                inv.execute("RELEASE dns_analysis")
+        dns_queue_at = None
+        if dns_retry:
+            dns_queue_at = int(now) + 60
+            try:
+                record_dns_retry(inv, collector, identity, current_hour)
+            except sqlite3.DatabaseError as exc:
+                _dns_retry(collector, identity.device_id, exc)
+        elif dns_result is not None and dns_result.hour < current_hour:
+            # A cross-hour retry scored its original closed hour. Revisit the latest next pass.
+            dns_queue_at = int(now)
         for mac in identity.macs:
             future = inv.execute(
                 "SELECT MIN(hour+3600) FROM measurements_hourly "
                 "WHERE collector_id=? AND mac=? AND hour>=?",
                 (collector, mac, int(now) // 3600 * 3600),
             ).fetchone()[0]
+            if dns_queue_at is not None and mac == identity.macs[0]:
+                future = dns_queue_at if future is None else min(future, dns_queue_at)
             if future is None:
                 inv.execute(
                     "DELETE FROM monitoring_dirty WHERE collector_id=? AND mac=?", (collector, mac)
@@ -300,7 +336,20 @@ def analyze_entity(inv, ov, collector, device, policy, now):
                 )
 
 
-def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
+def _dns_retry(collector, device, error):
+    log(
+        logger,
+        logging.ERROR,
+        "monitoring_dns_retry",
+        collector=collector,
+        device=device,
+        error=type(error).__name__,
+    )
+
+
+def analyze_monitoring(
+    inv, ov, policy: BaselineConfig | TodConfig, now, *, dns_policy: DnsBaselineConfig | None = None
+):
     drain_quality_work(inv, now)
     queue = inv.execute(
         "SELECT collector_id,mac FROM monitoring_dirty WHERE queued_at<=? "
@@ -322,7 +371,10 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
             if scope in seen:
                 continue
             seen.add(scope)
-            analyze_entity(inv, ov, collector, row[0], policy, now)
+            if dns_policy is None:
+                analyze_entity(inv, ov, collector, row[0], policy, now)
+            else:
+                analyze_entity(inv, ov, collector, row[0], policy, now, dns_policy=dns_policy)
             with immediate(inv):
                 inv.execute(
                     "DELETE FROM monitoring_unavailable WHERE collector_id=? AND device_id=?",
@@ -362,7 +414,7 @@ def analyze_monitoring(inv, ov, policy: BaselineConfig | TodConfig, now):
             continue
 
 
-def prune_monitoring(inv, now):
+def prune_monitoring(inv, now, *, dns_enabled=False):
     """Bound deletion work per table; keep receipts while original batches can replay."""
     detail = iso_utc(now - DETAIL_DAYS * 86400)
     cutoff = int(now) // 3600 * 3600 - AGGREGATE_DAYS * 86400
@@ -391,13 +443,19 @@ def prune_monitoring(inv, now):
                 f"(SELECT rowid FROM {table} WHERE hour<? ORDER BY hour LIMIT 1000)",
                 (cutoff,),
             )
+        dns_guard = "" if dns_enabled else "AND detector<>? "
+        # Keep DNS incident provenance while any delivery still needs its detector identity.
+        # An old DNS incident without a delivery ages out even if it remained open.
         inv.execute(
             "DELETE FROM monitoring_incidents WHERE seq IN "  # noqa: S608
             "(SELECT seq FROM monitoring_incidents WHERE last_hour<? "
-            "AND NOT (detector NOT IN (" + _ENGINE_IN + ") AND (state='open' OR EXISTS "
+            + dns_guard
+            + "AND NOT (detector NOT IN ("
+            + _ENGINE_IN
+            + ") AND ((state='open' AND detector<>?) OR EXISTS "
             "(SELECT 1 FROM incident_deliveries d WHERE d.incident_id=monitoring_incidents.id))) "
             "ORDER BY last_hour LIMIT 1000)",
-            (cutoff, *ENGINE_DETECTORS),
+            (cutoff, *(() if dns_enabled else (DNS_DEVIATION,)), *ENGINE_DETECTORS, DNS_DEVIATION),
         )
         inv.execute(
             "DELETE FROM monitoring_baselines WHERE id IN "
@@ -407,6 +465,8 @@ def prune_monitoring(inv, now):
             "LIMIT 1000)",
             (cutoff,),
         )
+        if dns_enabled:
+            prune_dns(inv, cutoff)
 
 
 def drain_quality_work(inv, now):

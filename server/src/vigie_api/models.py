@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from typing import Annotated, Any, Literal, Self, get_args
 
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StrictInt,
@@ -404,7 +406,7 @@ class ActivityHour(CoverageHour):
     dns_queries: int | None
 
 
-class BaselineView(BaseModel):
+class _BaselineStatus(BaseModel):
     state: Literal["learning", "mature", "rebuilding", "rebuilding_quality", "lineage_unavailable"]
     baseline_id: str | None
     algorithm: str | None
@@ -413,7 +415,37 @@ class BaselineView(BaseModel):
     distinct_days: int
     training_since: int | None
     trained_until: int | None
+
+
+class BaselineView(_BaselineStatus):
     median_upload_bytes: float | None
+
+
+_DNS_REFERENCE_PATTERN = r"^[0-9a-f]{64}$"
+_DNS_REFERENCE = re.compile(_DNS_REFERENCE_PATTERN)
+_DnsAlgorithmName = Literal["pooled-median-dns-v1"]
+_DNS_ALGORITHMS = get_args(_DnsAlgorithmName)
+
+
+def dns_reference_id(value: Any) -> str | None:
+    """Keep only the digest format written by the DNS engine."""
+    return value if isinstance(value, str) and _DNS_REFERENCE.fullmatch(value) else None
+
+
+def dns_algorithm(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in _DNS_ALGORITHMS else None
+
+
+_DnsReferenceDigest = Annotated[str, Field(pattern=_DNS_REFERENCE_PATTERN)]
+_DnsReferenceId = Annotated[_DnsReferenceDigest | None, BeforeValidator(dns_reference_id)]
+_DnsAlgorithm = Annotated[_DnsAlgorithmName | None, BeforeValidator(dns_algorithm)]
+
+
+class DnsBaselineView(_BaselineStatus):
+    baseline_id: _DnsReferenceId
+    algorithm: _DnsAlgorithm
+    config_version: _DnsReferenceId
+    median_queries: int | float | None
 
 
 class ActivityData(BaseModel):
@@ -422,6 +454,12 @@ class ActivityData(BaseModel):
     lineage: str
     hours: list[ActivityHour]
     baseline: BaselineView
+    dns_baseline: DnsBaselineView | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="DNS query-count reference for this collector and identity. "
+        "Omitted when no DNS profile exists.",
+    )
 
 
 class ActivityResponse(_Envelope):
@@ -588,21 +626,50 @@ def essential_absence_evidence(raw: Any) -> dict[str, Any]:
     }
 
 
+class DnsIncidentEvidence(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    reason_code: Literal["dns_deviation_threshold"]
+    unit: Literal["queries"]
+    hour: int
+    observed_bytes: int = Field(description="Number of DNS queries in the observed UTC hour.")
+    threshold_bytes: int = Field(description="DNS query-count threshold for the hour.")
+    baseline_id: _DnsReferenceId = None
+    algorithm: _DnsAlgorithm = None
+    config_version: _DnsReferenceId = None
+    coverage_required_seconds: int | None = None
+    lineage: _DnsReferenceId = None
+    unusual_is_not_malicious: Literal[True]
+    baseline_median_queries: int | float | None = None
+    multiplier: int | None = None
+    minimum_queries: int | None = None
+    sample_hours: int | None = None
+    distinct_days: int | None = None
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
     device_id: str
-    lineage: str
+    lineage: str = Field(description="Lineage digest. Empty if stored DNS lineage is invalid.")
     current_lineage: bool
-    detector: Literal["large_upload", "upload_deviation", "new_device", "essential_absence"]
+    detector: Literal[
+        "large_upload", "upload_deviation", "new_device", "essential_absence", "dns_deviation"
+    ]
     state: Literal["open", "resolved", "superseded"]
     episode_start: int
     last_hour: int
     detected_at: str
-    observed_bytes: int
-    threshold_bytes: int
+    observed_bytes: int = Field(
+        description="Observed upload bytes for upload detectors. Query count for dns_deviation. "
+        "Zero for new_device and essential_absence."
+    )
+    threshold_bytes: int = Field(
+        description="Threshold in bytes for upload detectors. Query-count threshold for "
+        "dns_deviation. Zero for new_device and essential_absence."
+    )
     baseline_id: str | None
-    evidence: IncidentEvidence | NewDeviceEvidence | EssentialAbsenceEvidence
+    evidence: IncidentEvidence | NewDeviceEvidence | EssentialAbsenceEvidence | DnsIncidentEvidence
     review: IncidentReview | None = Field(
         description="Current human decision, or null. A separate axis from `state`: `expected` "
         "is a per-incident label, not a suppression."

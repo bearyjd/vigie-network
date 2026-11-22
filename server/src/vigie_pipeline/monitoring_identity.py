@@ -23,6 +23,8 @@ class Lineage:
     key: str
     versioned: bool
     rule_attached: bool
+    aliases: tuple[str, ...] = ()
+    history_changed: bool = False
 
 
 def has_table(db, name):
@@ -69,6 +71,7 @@ def lineage(inv, ov, device):
     )
     link_versions = []
     assignments = []
+    assignment_changed = False
     if versioned:
         if ov is not None:
             link_versions = [
@@ -83,6 +86,7 @@ def lineage(inv, ov, device):
             version = inv.execute(
                 "SELECT version FROM monitoring_assignment_versions WHERE mac=?", (row["mac"],)
             ).fetchone()
+            assignment_changed |= version is not None
             assignments.append((*tuple(row), version[0] if version else 0))
     else:
         assignments = [tuple(row) for row in rows]
@@ -97,4 +101,6 @@ def lineage(inv, ov, device):
         key,
         versioned,
         any(row["link_source"] == "rule" for row in rows),
+        tuple(sorted(members - {canonical})),
+        assignment_changed or bool(link_versions),
     )

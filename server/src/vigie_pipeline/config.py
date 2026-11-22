@@ -13,6 +13,8 @@ TRANSIENT_WINDOW_DEFAULT_S = 24 * 3600
 TRANSIENT_MIN_DWELL_DEFAULT_S = 2 * 3600
 PROMOTION_CAP_DEFAULT = 20
 MONITORING_BASELINES = ("pooled", "tod")
+DNS_MIN_QUERIES_DEFAULT = 200
+DNS_MIN_QUERIES_LIMIT = 1_000_000
 
 # Identity stitching (docs/stitching.md). Weights sum to 1.0; a candidate additionally REQUIRES
 # opt55 AND opt60 AND (hostname OR mdns_name) equal, so with these weights every structurally
@@ -279,6 +281,8 @@ class PipelineConfig:
     pass_interval_s: int = PASS_INTERVAL_DEFAULT_S  # set from --loop; F5 derives its resume gap
     # F6-b essential-device absence (docs/monitoring.md). DEFAULT OFF; in no policy dataclass.
     essential_absence: bool = False
+    monitoring_dns: bool = False
+    monitoring_dns_min_queries: int = DNS_MIN_QUERIES_DEFAULT
 
     def __post_init__(self) -> None:
         if type(self.new_device_max_per_day) is not int or not (
@@ -294,6 +298,12 @@ class PipelineConfig:
             )
         if not 1 <= self.monitoring_large_upload_bytes <= 2**50:
             raise ValueError("monitoring_large_upload_bytes outside supported bounds")
+        if type(self.monitoring_dns_min_queries) is not int or not (
+            1 <= self.monitoring_dns_min_queries <= DNS_MIN_QUERIES_LIMIT
+        ):
+            raise ValueError(
+                f"VIGIE_MONITORING_DNS_MIN_QUERIES must be in 1..{DNS_MIN_QUERIES_LIMIT}"
+            )
         if self.monitoring_baseline not in MONITORING_BASELINES:
             raise ValueError("monitoring_baseline must be one of: pooled, tod")
         if self.transient_window_s < 1:
@@ -345,5 +355,9 @@ class PipelineConfig:
             new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
             new_device_max_per_day=_env_cap(source),
             essential_absence=_env_flag(source, "VIGIE_ESSENTIAL_ABSENCE"),
+            monitoring_dns=_env_flag(source, "VIGIE_MONITORING_DNS"),
+            monitoring_dns_min_queries=_env_int(
+                source, "VIGIE_MONITORING_DNS_MIN_QUERIES", DNS_MIN_QUERIES_DEFAULT
+            ),
             prune_retired_macs=_env_flag_or_off(source, "VIGIE_PRUNE_RETIRED_MACS"),
         )
