@@ -129,8 +129,9 @@ see `docs/monitoring.md`).
     never does keeps that device's MAC rows for good, an accepted limit (a few rows, never a wrong
     deletion); `suggestions` of any action while unexpired on the trusted clock;
     `monitoring_profiles`, `monitoring_incidents`, `monitoring_suspicious` and
-    `monitoring_unavailable` (by device); `measurements_hourly` and `monitoring_dirty` (by MAC);
-    and `rule_attachments`. The six collector-keyed tables protect a device only through rows
+    `monitoring_unavailable` (by device), `measurements_hourly`, `monitoring_dirty`,
+    `essential_activity` (by MAC), and `rule_attachments`. The seven collector-keyed tables
+    protect a device only through rows
     whose `collector_id` is a row of `collectors` (never deleted); a row naming an unknown
     collector is not seen. Only `link_source='self'` rows of `retired` devices qualify.
   - Accepted, monitoring: `monitoring_profiles` is upserted for every analysed MAC and never

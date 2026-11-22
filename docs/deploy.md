@@ -242,12 +242,11 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   Devices that `overrides.db` refers to (names, groups, merges, rules, essential marks,
   decisions, suggestions you accepted or rejected) and devices still named by an open or
   suggested candidate (or one in a state this build does not know), a live suggestion, a
-  rule attachment, or a row in one of six tables (`monitoring_profiles`, `monitoring_incidents`,
-  `monitoring_suspicious`, `monitoring_unavailable` by device id; `measurements_hourly`,
-  `monitoring_dirty` by MAC) that belongs to a collector registered in `collectors`, are never
-  pruned. A row in those tables naming an unknown collector does not protect, and no other
-  monitoring table is checked. Monitoring profiles are never deleted, so on a monitoring install
-  a device that was ever analysed for a known collector is never pruned. The
+  rule attachment, or a row in one of seven tables (`monitoring_profiles`, `monitoring_incidents`,
+  `monitoring_suspicious`, `monitoring_unavailable` by device id, or `measurements_hourly`,
+  `monitoring_dirty`, `essential_activity` by MAC) that belongs to a collector registered in
+  `collectors`, are never pruned. Monitoring profiles are kept indefinitely, so a device ever
+  analysed for a known collector is protected from pruning. The
   device's `events` rows (`new device <MAC>`, `retired device <MAC> reappeared`) are not touched
   and keep the MAC until event retention exists (below). Nothing is pruned
   while `overrides.db` is missing or unusable, after it lost every lasting decision it once held (incident decisions do not count: they

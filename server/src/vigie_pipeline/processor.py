@@ -81,12 +81,7 @@ def run_once(
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
     try:
-        recording_failed = False
-        try:
-            configure_recording(inv, config.essential_absence, clock)
-        except sqlite3.Error as exc:
-            recording_failed = True
-            log(logger, logging.ERROR, "essential_recording_failed", error=type(exc).__name__)
+        recording_ready = _recording_ready(inv, config, clock)
         # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
         # no identity links for the batches, no stitching, cursor progress is kept
         usable = _overrides_readable(inv, overrides, config, clock)
@@ -103,17 +98,8 @@ def run_once(
             track_overrides_history(inv, config.overrides_path)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
-        _late_stages(
-            inv,
-            overrides,
-            config,
-            usable,
-            clock,
-            live,
-            should_stop,
-            bool(failures),
-            recording_failed,
-        )
+        hold_absence = not recording_ready or (config.essential_absence and bool(failures))
+        _late_stages(inv, overrides, config, usable, clock, live, should_stop, hold_absence)
     finally:
         inv.close()
         if overrides is not None:
@@ -131,6 +117,15 @@ def run_once(
     return stats
 
 
+def _recording_ready(inv: sqlite3.Connection, config: PipelineConfig, clock: float) -> bool:
+    try:
+        configure_recording(inv, config.essential_absence, clock)
+        return True
+    except sqlite3.Error as exc:
+        log(logger, logging.ERROR, "essential_recording_failed", error=type(exc).__name__)
+        return False
+
+
 def _late_stages(
     inv: sqlite3.Connection,
     overrides: sqlite3.Connection | None,
@@ -139,13 +134,9 @@ def _late_stages(
     clock: float,
     live: Callable[[], float] | None,
     should_stop: Callable[[], bool],
-    stale: bool,
-    recording_failed: bool = False,
+    hold_absence: bool,
 ) -> None:
-    """F6-b (default off), the activity purge, then monitoring and delivery. `stale`: a shard could
-    not be read, so the view may hold an "absent" device that is back in the unread batch: the
-    sweep is skipped and, with F6-b on, no absence notice is sent this pass (others still are)."""
-    hold_absence = (config.essential_absence and stale) or recording_failed
+    """Hold absence when recording setup fails or an enabled pass has unread shards."""
     if config.essential_absence and usable and not hold_absence:
         sweep_essential_absence(inv, overrides, clock)
     purge_activity(inv, clock, config.activity_retention_s)

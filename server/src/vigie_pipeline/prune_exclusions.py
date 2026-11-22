@@ -39,7 +39,11 @@ _DEVICE_BY_COLLECTOR = (
     ("monitoring_suspicious", "device_id"),
     ("monitoring_unavailable", "device_id"),
 )
-_MAC_BY_COLLECTOR = (("measurements_hourly", "mac"), ("monitoring_dirty", "mac"))
+_MAC_BY_COLLECTOR = (
+    ("measurements_hourly", "mac"),
+    ("monitoring_dirty", "mac"),
+    ("essential_activity", "mac"),
+)
 LIVE_SUGGESTION_PARAMS = 2  # the one bound `expires_at>=?` per suggestion direction
 # suggestions.action is CHECK-constrained to exactly these; the id indexes lead with action.
 _SUGGESTION_ACTIONS = "('label','move_group','quarantine','merge_identity')"
