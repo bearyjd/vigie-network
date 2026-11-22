@@ -210,6 +210,7 @@ When the engine has a DNS profile for that collector and identity, `data.dns_bas
 its state, reference ID, algorithm, config version, training counts and times, and the
 `median_queries` per qualified UTC hour. The median is null until a mature reference is usable.
 Older inventories and collector/identity pairs without a DNS profile omit `dns_baseline`.
+Malformed stored algorithm or digest values are null.
 
 ## Incidents and review lifecycle
 
@@ -237,7 +238,10 @@ A `dns_deviation` incident records aggregate DNS volume for one UTC hour. The le
 `observed_bytes` and `threshold_bytes` carry query counts for this detector, including within
 its evidence. DNS evidence includes `reason_code: "dns_deviation_threshold"`,
 `unit: "queries"`, and the training reference, including `baseline_median_queries`. It contains
-no DNS names or answers. The evidence pack carries the same unit and counts.
+no DNS names or answers. DNS provenance accepts the known algorithm and 64-character lowercase
+hexadecimal digests. Invalid provenance inside the evidence is null in the incident response and
+omitted from the pack's evidence. An invalid top-level incident lineage is an empty string in the API.
+The evidence pack carries the same unit and counts.
 In OpenAPI, `evidence` is a union of the four evidence shapes. Use the incident's `detector`
 to choose the corresponding shape.
 

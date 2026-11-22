@@ -1520,9 +1520,10 @@ detector abstains while the reference is immature or its median is below
 integers from 1 to 1,000,000. Existing upload baseline and incident settings continue to apply.
 
 Initial training can use retained qualified DNS measurements for an unchanged device lineage.
-A known identity merge or rule attachment, a later lineage or DNS policy change, or a loss of
-qualification in the frozen cohort starts a fresh training window. The new window starts at the
-next UTC hour boundary and must meet the same 20-hour and 14-date minimums.
+A known identity merge or rule attachment, including one later undone, starts a fresh training
+window. Later lineage or DNS policy changes and a loss of qualification in the frozen cohort also
+start a fresh window. Each new window starts at the next UTC hour boundary and must meet the same
+20-hour and 14-date minimums.
 
 Consecutive triggering hours extend the same incident. A qualified hour below or equal to the
 trigger threshold resolves it. If another burst follows a gap, it starts a new incident and

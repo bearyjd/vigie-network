@@ -11,8 +11,8 @@ from datetime import UTC, datetime
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
-from vigie_api.models import essential_absence_evidence, new_device_evidence
-from vigie_pipeline.detectors import ESSENTIAL_ABSENCE, NEW_DEVICE
+from vigie_api.models import dns_reference_id, essential_absence_evidence, new_device_evidence
+from vigie_pipeline.detectors import DNS_DEVIATION, ESSENTIAL_ABSENCE, NEW_DEVICE
 from vigie_pipeline.monitoring_dns import dns_baseline_view
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
@@ -360,25 +360,30 @@ def _evidence(detector, stored):
 
 
 def incident_row(inv, ov, row, review, now):
+    detector = row["detector"]
+    key, baseline_id = row["lineage"], row["baseline_id"]
+    if detector == DNS_DEVIATION:
+        key = dns_reference_id(key) or ""
+        baseline_id = dns_reference_id(baseline_id)
     try:
-        current = device_macs(inv, ov, row["device_id"])[2] == row["lineage"]
+        current = device_macs(inv, ov, row["device_id"])[2] == key
     except ApiError:
         current = False
     return {
         "id": row["id"],
         "collector_id": row["collector_id"],
         "device_id": row["device_id"],
-        "lineage": row["lineage"],
+        "lineage": key,
         "current_lineage": current,
-        "detector": row["detector"],
+        "detector": detector,
         "state": row["state"],
         "episode_start": row["episode_start"],
         "last_hour": row["last_hour"],
         "detected_at": row["detected_at"],
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
-        "baseline_id": row["baseline_id"],
-        "evidence": _evidence(row["detector"], row["evidence"]),
+        "baseline_id": baseline_id,
+        "evidence": _evidence(detector, row["evidence"]),
         "review": review_view(review),
         "decision_version": review["version"] if review else 0,
         "attention": attention(row["state"], review, now),

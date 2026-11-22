@@ -177,6 +177,7 @@ class DnsAnalysis:
     sample_hours: int
     distinct_days: int
     current: DnsSample | None
+    invalid_episode: tuple[str, int] | None
 
 
 def prepare_dns(inv, collector, identity: Lineage, policy: DnsBaselineConfig, now) -> DnsAnalysis:
@@ -219,7 +220,8 @@ def prepare_dns(inv, collector, identity: Lineage, policy: DnsBaselineConfig, no
             baseline_id = profile["baseline_id"]
     # A new continuity can bootstrap from stored qualified measurements. A known assignment,
     # merge, past profile change or quality fault starts a fresh prospective training window.
-    if reset or quality_reset or (profile is None and (identity.rule_attached or identity.aliases)):
+    known_history_change = identity.rule_attached or identity.aliases or identity.history_changed
+    if reset or quality_reset or (profile is None and known_history_change):
         training_since = until + HOUR_S
     training = [sample for sample in series if sample.hour >= training_since]
     if reference is None and identity.versioned:
@@ -240,6 +242,11 @@ def prepare_dns(inv, collector, identity: Lineage, policy: DnsBaselineConfig, no
             )
             state = "rebuilding_quality" if rebuild else "learning"
     current = by_hour.get(until - HOUR_S) if until - HOUR_S >= training_since else None
+    invalid_episode = None
+    if reference is not None and identity.versioned:
+        invalid_episode = _invalid_open_episode(
+            inv, collector, identity, reference, policy, by_hour, lower, until
+        )
     return DnsAnalysis(
         until - HOUR_S,
         state,
@@ -250,7 +257,33 @@ def prepare_dns(inv, collector, identity: Lineage, policy: DnsBaselineConfig, no
         sample_hours,
         distinct_days,
         current,
+        invalid_episode,
     )
+
+
+def _triggered(sample: DnsSample | None, threshold: int) -> bool:
+    return (
+        sample is not None
+        and sample.eligible
+        and not sample.saturated
+        and sample.dns_queries > threshold
+    )
+
+
+def _invalid_open_episode(inv, collector, identity, reference, policy, samples, lower, until):
+    active = inv.execute(
+        """SELECT id,episode_start,last_hour FROM monitoring_incidents
+           WHERE collector_id=? AND device_id=? AND lineage=? AND detector=? AND state='open'""",
+        (collector, identity.device_id, identity.key, DNS_DEVIATION),
+    ).fetchone()
+    if active is None or active["last_hour"] >= until:
+        return None  # an older evaluation cannot change a newer open episode
+    start, last = active["episode_start"], active["last_hour"]
+    threshold = reference.median_twice * policy.multiplier // 2
+    retained = range(max(start, lower), last + HOUR_S, HOUR_S)
+    if any(not _triggered(samples.get(hour), threshold) for hour in retained):
+        return active["id"], last
+    return None
 
 
 def _median_queries(reference: DnsReference) -> int | float:
@@ -324,6 +357,14 @@ def publish_dns(
             result.distinct_days,
         ),
     )
+    if result.invalid_episode is not None:
+        # Late coverage changes retire the decision scope, even without a new eligible hour.
+        inv.execute(
+            "UPDATE monitoring_incidents SET state='superseded' "
+            "WHERE id=? AND last_hour=? AND state='open'",
+            result.invalid_episode,
+        )
+
     current = result.current
     if current is None or not identity.versioned:
         return
@@ -516,7 +557,15 @@ def _dns_notice_deliverable(inv, ov, policy, incident_id, kind, now) -> bool:
 def _notice_evidence_qualified(inv, collector, identity, row, reference, policy, kind, now):
     until = int(now) // HOUR_S * HOUR_S
     lower = until - MAX_DAYS * DAY_S
-    trigger_hours = {row["episode_start"], row["last_hour"]}
+    start, last = row["episode_start"], row["last_hour"]
+    if not (
+        type(start) is int
+        and type(last) is int
+        and max(lower, reference.trained_until + HOUR_S) <= start <= last < until
+        and start % HOUR_S == last % HOUR_S == 0
+    ):
+        return False
+    trigger_hours = set(range(start, last + HOUR_S, HOUR_S))
     recovery = None
     if kind == "recover":
         evidence = json.loads(row["evidence"])
@@ -524,11 +573,7 @@ def _notice_evidence_qualified(inv, collector, identity, row, reference, policy,
         if type(recovery) is not int or recovery <= row["last_hour"]:
             return False
     required = trigger_hours | ({recovery} if recovery is not None else set())
-    if any(
-        type(hour) is not int or not lower <= hour < until or hour % HOUR_S for hour in required
-    ):
-        return False
-    if min(trigger_hours) <= reference.trained_until:
+    if recovery is not None and (recovery >= until or recovery % HOUR_S):
         return False
 
     # Training outside retention has already passed inspection. All retained evidence must
@@ -553,7 +598,7 @@ def _notice_evidence_qualified(inv, collector, identity, row, reference, policy,
     ):
         return False
     threshold = reference.median_twice * policy.multiplier // 2
-    return all(samples[hour].dns_queries > threshold for hour in trigger_hours) and (
+    return all(_triggered(samples[hour], threshold) for hour in trigger_hours) and (
         recovery is None or samples[recovery].dns_queries <= threshold
     )
 

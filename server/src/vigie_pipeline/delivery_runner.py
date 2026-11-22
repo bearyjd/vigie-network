@@ -23,7 +23,7 @@ import math
 import sqlite3
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -371,7 +371,14 @@ def _due(
     return [_delivery(r) for r in rows.fetchall()]
 
 
-def _due_dns(inv, now, config, busy, held_incidents) -> list[DeliveryView]:
+@dataclass(frozen=True)
+class _DnsDuePage:
+    rows: list[DeliveryView]
+    end: int
+    previous_cursor: str | None
+
+
+def _due_dns(inv, now, config, busy, held_incidents) -> _DnsDuePage:
     """Page through real due rows so one set of unclaimable DNS notices cannot block the rest."""
     with immediate(inv):
         saved = inv.execute(
@@ -398,23 +405,52 @@ def _due_dns(inv, now, config, busy, held_incidents) -> list[DeliveryView]:
             held_incidents,
             dns_range=(after, end),
         )
-        last = rows[-1].row_id if rows else after
-        if len(rows) == DNS_DUE_SCAN_ROWS and last < end:
+    return _DnsDuePage(rows, end, saved[0] if saved is not None else None)
+
+
+def _advance_dns_page(inv, page: _DnsDuePage, examined: int) -> None:
+    if page.rows and examined == 0:
+        return
+    last = page.rows[examined - 1].row_id if examined else 0
+    more = examined < len(page.rows) or (len(page.rows) == DNS_DUE_SCAN_ROWS and last < page.end)
+    updated = f"{last}:{page.end}" if more else None
+    if updated == page.previous_cursor:
+        return
+    with immediate(inv):
+        current = inv.execute(
+            "SELECT value FROM pipeline_meta WHERE key=?", (_DNS_DUE_CURSOR,)
+        ).fetchone()
+        if (current[0] if current is not None else None) != page.previous_cursor:
+            return
+        if updated is None:
+            inv.execute("DELETE FROM pipeline_meta WHERE key=?", (_DNS_DUE_CURSOR,))
+        else:
             inv.execute(
                 "INSERT INTO pipeline_meta VALUES (?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (_DNS_DUE_CURSOR, f"{last}:{end}"),
+                (_DNS_DUE_CURSOR, updated),
             )
-        elif saved is not None:
-            inv.execute("DELETE FROM pipeline_meta WHERE key=?", (_DNS_DUE_CURSOR,))
-    return rows
+
+
+def _merge_due_rows(normal, dns_rows):
+    """Preserve each stream's order and let its oldest available head go first."""
+    pending = deque(normal)
+    for row in dns_rows:
+        while pending and (pending[0].next_attempt_at, pending[0].row_id) <= (
+            row.next_attempt_at,
+            row.row_id,
+        ):
+            yield pending.popleft()
+        yield row
+    yield from pending
 
 
 def _drain(
     inv, ro, publisher, rows, config, clock, limits, labels, max_per_run, dns_rows, dns_policy
-) -> Counter:
+) -> tuple[Counter, int]:
     monotonic, max_abandoned, budget, should_stop = limits
     counts: Counter[str] = Counter()
+    dns_examined = 0
     started = monotonic()
     for row in rows:
         if counts.total() - counts["skipped"] >= max_per_run:
@@ -428,17 +464,19 @@ def _drain(
         slot = _reserve(max_abandoned, delivery_id(row.incident_id, row.kind))
         if slot is None:
             break  # reserved BEFORE the claim, so a dead transport burns no attempts
+        is_dns = row.row_id in dns_rows
+        dns_examined += is_dns
         if slot is _BUSY:
             continue  # a worker started since the SELECT still holds this very delivery
         try:
-            policy = dns_policy if row.row_id in dns_rows else None
+            policy = dns_policy if is_dns else None
             outcome = _send_one(inv, ro, publisher, row, config, clock, slot, labels, policy)
         finally:
             _release(slot)
         counts[outcome] += 1
         if outcome == "timeout":
             break  # the transport is wedged: do not strand more worker threads this run
-    return counts
+    return counts, dns_examined
 
 
 def run_delivery(
@@ -479,16 +517,16 @@ def run_delivery(
     normal_held = held | {DNS_DEVIATION} if dns_dispatch else held
     rows = _due(inv, now, config, max_per_run, busy, normal_held, held_incidents)
     dns_rows = set()
+    page = None
     if dns_dispatch:
         try:
             page = _due_dns(inv, now, config, busy, held_incidents)
         except sqlite3.DatabaseError as exc:
             log(logger, logging.WARNING, "dns_delivery_scan_failed", error=type(exc).__name__)
         else:
-            dns_rows = {row.row_id for row in page}
-            rows.extend(page)
-            rows.sort(key=lambda row: (row.next_attempt_at, row.row_id))
-    counts = _drain(
+            dns_rows = {row.row_id for row in page.rows}
+            rows = _merge_due_rows(rows, page.rows)
+    counts, dns_examined = _drain(
         inv,
         overrides,
         publisher,
@@ -501,6 +539,11 @@ def run_delivery(
         dns_rows,
         dns_policy,
     )
+    if page is not None:
+        try:
+            _advance_dns_page(inv, page, dns_examined)
+        except sqlite3.DatabaseError as exc:
+            log(logger, logging.WARNING, "dns_delivery_cursor_failed", error=type(exc).__name__)
     return RunReport(
         planned=planned,
         claimed=sum(counts.values()) - counts["skipped"],

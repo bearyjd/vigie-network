@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from typing import Annotated, Any, Literal, Self, get_args
 
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StrictInt,
@@ -419,7 +421,30 @@ class BaselineView(_BaselineStatus):
     median_upload_bytes: float | None
 
 
+_DNS_REFERENCE_PATTERN = r"^[0-9a-f]{64}$"
+_DNS_REFERENCE = re.compile(_DNS_REFERENCE_PATTERN)
+_DnsAlgorithmName = Literal["pooled-median-dns-v1"]
+_DNS_ALGORITHMS = get_args(_DnsAlgorithmName)
+
+
+def dns_reference_id(value: Any) -> str | None:
+    """Keep only the digest format written by the DNS engine."""
+    return value if isinstance(value, str) and _DNS_REFERENCE.fullmatch(value) else None
+
+
+def dns_algorithm(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in _DNS_ALGORITHMS else None
+
+
+_DnsReferenceDigest = Annotated[str, Field(pattern=_DNS_REFERENCE_PATTERN)]
+_DnsReferenceId = Annotated[_DnsReferenceDigest | None, BeforeValidator(dns_reference_id)]
+_DnsAlgorithm = Annotated[_DnsAlgorithmName | None, BeforeValidator(dns_algorithm)]
+
+
 class DnsBaselineView(_BaselineStatus):
+    baseline_id: _DnsReferenceId
+    algorithm: _DnsAlgorithm
+    config_version: _DnsReferenceId
     median_queries: int | float | None
 
 
@@ -607,11 +632,11 @@ class DnsIncidentEvidence(BaseModel):
     hour: int
     observed_bytes: int = Field(description="Number of DNS queries in the observed UTC hour.")
     threshold_bytes: int = Field(description="DNS query-count threshold for the hour.")
-    baseline_id: str
-    algorithm: str
-    config_version: str
+    baseline_id: _DnsReferenceId = None
+    algorithm: _DnsAlgorithm = None
+    config_version: _DnsReferenceId = None
     coverage_required_seconds: int
-    lineage: str
+    lineage: _DnsReferenceId = None
     unusual_is_not_malicious: Literal[True]
     baseline_median_queries: int | float
     multiplier: int
@@ -624,7 +649,7 @@ class IncidentOut(BaseModel):
     id: str
     collector_id: str
     device_id: str
-    lineage: str
+    lineage: str = Field(description="Lineage digest. Empty if stored DNS lineage is invalid.")
     current_lineage: bool
     detector: Literal[
         "large_upload", "upload_deviation", "new_device", "essential_absence", "dns_deviation"

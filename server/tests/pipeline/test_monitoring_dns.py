@@ -547,7 +547,7 @@ def test_dns_late_overlap_blocks_open_after_dirty_marker_has_drained(inventory, 
     inv.execute("INSERT INTO pipeline_meta VALUES (?,?)", (WATERMARK_KEY, str(CURRENT + 3610)))
     clock = CURRENT + 7210
     run_once(_dns_delivery_config(tmp_path), now=clock)
-    assert incidents(inv)[DNS]["state"] == "open"
+    assert incidents(inv)[DNS]["state"] == "superseded"
     assert inv.execute("SELECT COUNT(*) FROM monitoring_dirty").fetchone()[0] == 0
     assert not (tmp_path / "delivery.jsonl").exists()
 
@@ -598,3 +598,137 @@ def test_dns_recovery_send_requires_a_still_qualified_hour(
     run_once(config, now=recovery + 7210)
     notices = [json.loads(line)["kind"] for line in path.read_text().splitlines()]
     assert notices == (["open"] if invalidate_recovery else ["open", "recover"])
+
+
+def test_late_middle_overlap_blocks_delivery_and_retires_disqualified_episode(inventory, tmp_path):
+    from vigie_pipeline.delivery_wiring import WATERMARK_KEY
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    middle = CURRENT + 3600
+    last = CURRENT + 7200
+    for stamp in (CURRENT, middle, last):
+        dns_hour(inv, stamp, 801)
+        analyze(inv, ov, stamp)
+    opened = incidents(inv)[DNS]
+    assert (opened["episode_start"], opened["last_hour"]) == (CURRENT, last)
+
+    _overlap(inv, middle)
+    inv.execute(
+        "INSERT INTO monitoring_quality_work VALUES ('another-collector',?,'')", (middle - 3600,)
+    )
+    inv.execute("INSERT INTO pipeline_meta VALUES (?,?)", (WATERMARK_KEY, str(CURRENT + 3610)))
+    config = _dns_delivery_config(tmp_path)
+    path = tmp_path / "delivery.jsonl"
+
+    # The invalidation has reached coverage, but the oldest fanout belongs to another collector.
+    run_once(config, now=last + 7210)
+    assert (
+        inv.execute("SELECT hour FROM monitoring_quality_work WHERE collector_id='c1'").fetchone()[
+            0
+        ]
+        == middle
+    )
+    assert not path.exists()
+
+    # A qualified normal hour cannot make a disqualified episode eligible for a recovery notice.
+    normal = last + 7200
+    dns_hour(inv, normal, 200)
+    run_once(config, now=normal + 3610)
+    assert incidents(inv)[DNS]["state"] == "superseded"
+    assert not path.exists()
+
+    fresh = normal + 3600
+    dns_hour(inv, fresh, 801)
+    run_once(config, now=fresh + 3610)
+    new = incidents(inv)[DNS]
+    assert new["id"] != opened["id"]
+    assert (new["state"], new["episode_start"]) == ("open", fresh)
+    assert [json.loads(line)["kind"] for line in path.read_text().splitlines()] == ["open"]
+
+
+@pytest.mark.parametrize("page_size", [18, 128])
+@pytest.mark.parametrize("interruption", ["budget", "stop"])
+def test_bounded_dns_delivery_resumes_after_last_examined_row(inventory, page_size, interruption):
+    from itertools import count
+
+    from test_f5_s2a_plumbing import put
+
+    from vigie_ingest.db import iso_utc
+    from vigie_pipeline.delivery_publish import FakePublisher
+    from vigie_pipeline.delivery_runner import run_delivery
+    from vigie_pipeline.delivery_types import DeliveryConfig
+
+    inv, ov = inventory
+    now = CURRENT + 3610
+    for index in range(page_size - 1):
+        identifier = f"000-obsolete-{index:03}"
+        put(inv, identifier, DNS, "resolved")
+        inv.execute(
+            "UPDATE monitoring_incidents SET lineage=?,detected_at=?,state='open' WHERE id=?",
+            (identifier, iso_utc(now), identifier),
+        )
+    dns_hour(inv, CURRENT, 801)
+    analyze(inv, ov)
+    budget = 60 if page_size == 128 else 7
+    actual = FakePublisher()
+    for _ in range(3):
+        ticks = count()
+        signals = count()
+        run_delivery(
+            inv,
+            ov,
+            actual,
+            DeliveryConfig(eligible_since=now, transmit_deadline_seconds=1),
+            lambda: now,
+            detectors=(DNS,),
+            dns_policy=DnsBaselineConfig(),
+            drain_budget_seconds=budget,
+            monotonic=(lambda ticks=ticks: next(ticks))
+            if interruption == "budget"
+            else (lambda: 0),
+            should_stop=lambda signals=signals: (
+                interruption == "stop" and next(signals) >= budget - 1
+            ),
+        )
+    assert len(actual.sent) == 1
+    assert inv.execute("SELECT SUM(attempts) FROM incident_deliveries").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("change", ["rule_attach_then_undo", "merge_then_undo"])
+def test_dns_first_enable_does_not_bootstrap_across_historic_lineage_change(
+    inventory, tmp_path, change
+):
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    if change == "rule_attach_then_undo":
+        inv.execute(
+            "UPDATE observations SET device_id='d2',link_source='rule',link_rule_id='rule' "
+            "WHERE mac=?",
+            (MAC,),
+        )
+    else:
+        ov.execute("INSERT INTO identity_links VALUES ('d1','d2','m','t','u',NULL)")
+    off = PipelineConfig(tmp_path)
+    run_once(off, now=CURRENT + 3610)
+    if change == "rule_attach_then_undo":
+        inv.execute(
+            "UPDATE observations SET device_id='d1',link_source='self',link_rule_id=NULL "
+            "WHERE mac=?",
+            (MAC,),
+        )
+    else:
+        ov.execute("UPDATE identity_links SET revoked_at='u' WHERE from_device='d1'")
+
+    assert inv.execute("SELECT COUNT(*) FROM monitoring_dns_profiles").fetchone()[0] == 0
+    identity = lineage(inv, ov, "d1")
+    assert not identity.rule_attached and not identity.aliases
+    burst = CURRENT + 3600
+    dns_hour(inv, burst, 801)
+    run_once(PipelineConfig(tmp_path, monitoring_dns=True), now=burst + 3610)
+    profile = inv.execute(
+        "SELECT state,baseline_id,training_since,sample_hours FROM monitoring_dns_profiles"
+    ).fetchone()
+    assert tuple(profile) == ("learning", None, burst + 7200, 0)
+    assert DNS not in incidents(inv)

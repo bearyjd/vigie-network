@@ -1198,6 +1198,7 @@
           "algorithm": {
             "anyOf": [
               {
+                "const": "pooled-median-dns-v1",
                 "type": "string"
               },
               {
@@ -1209,6 +1210,7 @@
           "baseline_id": {
             "anyOf": [
               {
+                "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
               },
               {
@@ -1220,6 +1222,7 @@
           "config_version": {
             "anyOf": [
               {
+                "pattern": "^[0-9a-f]{64}$",
                 "type": "string"
               },
               {
@@ -1301,12 +1304,28 @@
       "DnsIncidentEvidence": {
         "properties": {
           "algorithm": {
-            "title": "Algorithm",
-            "type": "string"
+            "anyOf": [
+              {
+                "const": "pooled-median-dns-v1",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Algorithm"
           },
           "baseline_id": {
-            "title": "Baseline Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Id"
           },
           "baseline_median_queries": {
             "anyOf": [
@@ -1320,8 +1339,16 @@
             "title": "Baseline Median Queries"
           },
           "config_version": {
-            "title": "Config Version",
-            "type": "string"
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Version"
           },
           "coverage_required_seconds": {
             "title": "Coverage Required Seconds",
@@ -1336,8 +1363,16 @@
             "type": "integer"
           },
           "lineage": {
-            "title": "Lineage",
-            "type": "string"
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lineage"
           },
           "minimum_queries": {
             "title": "Minimum Queries",
@@ -1383,11 +1418,7 @@
           "hour",
           "observed_bytes",
           "threshold_bytes",
-          "baseline_id",
-          "algorithm",
-          "config_version",
           "coverage_required_seconds",
-          "lineage",
           "unusual_is_not_malicious",
           "baseline_median_queries",
           "multiplier",
@@ -2390,6 +2421,7 @@
             "type": "integer"
           },
           "lineage": {
+            "description": "Lineage digest. Empty if stored DNS lineage is invalid.",
             "title": "Lineage",
             "type": "string"
           },

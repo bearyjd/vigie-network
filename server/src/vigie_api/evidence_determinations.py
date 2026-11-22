@@ -27,6 +27,8 @@ from vigie_api.evidence_types import (
 from vigie_api.models import (
     TOD_BUCKET_HOURS,
     DnsIncidentEvidence,
+    dns_algorithm,
+    dns_reference_id,
     essential_absence_evidence,
     new_device_evidence,
     tod_cohort_bucket_valid,
@@ -106,6 +108,14 @@ def _evidence_value(kind: str, value: Any) -> Any:
     return safe_id(value)
 
 
+def _dns_evidence_value(key: str, kind: str, value: Any) -> Any:
+    if key == "algorithm":
+        return dns_algorithm(value)
+    if key in ("baseline_id", "config_version", "lineage"):
+        value = dns_reference_id(value)
+    return _evidence_value(kind, value)
+
+
 def allowlisted_evidence(evidence: Any) -> dict[str, Any]:
     if not isinstance(evidence, dict):
         return {}
@@ -136,7 +146,8 @@ def _evidence_for(row: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(evidence, dict):
             return {}
         kept = {
-            k: _evidence_value(kind, evidence.get(k)) for k, kind in DNS_EVIDENCE_FIELDS.items()
+            k: _dns_evidence_value(k, kind, evidence.get(k))
+            for k, kind in DNS_EVIDENCE_FIELDS.items()
         }
         return {k: v for k, v in kept.items() if v is not None}
     return allowlisted_evidence(row["evidence"])
