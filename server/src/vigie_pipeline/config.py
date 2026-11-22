@@ -30,8 +30,18 @@ OVERLAP_GRACE_DEFAULT_S = 600
 PEER_TAIL_MIN_GRACE_MULT = 2
 ACTIVITY_GAP_DEFAULT_S = 300
 ACTIVITY_RETENTION_DEFAULT_S = 7 * 86400
-# MAC rows of retired transient devices are kept this long after last seen, then aggregated.
+# MAC rows of retired transient devices are kept this long after the server retired them
+# (transient_state.since, server clock), then deleted; only a count is kept.
 RETIRED_MAC_RETENTION_S = 90 * 86400
+# a collector whose last_sent_ts holds the prune's clock back for longer than this is named in a
+# WARNING; the unstamped retired devices are looked for again this often (a rolled-back build
+# erases the stamps without a trace)
+PRUNE_CLOCK_WARN_S = 7 * 86400
+PRUNE_CLOCK_WARN_REPEAT_S = 86400  # ... and then at most this often
+RETIRED_BACKFILL_INTERVAL_S = 86400
+# a retirement stamped further ahead of the server clock than this (a batch received under a
+# stepped clock) is named in a WARNING: such a device is not prunable until that date
+RETIRED_STAMP_AHEAD_WARN_S = 86400
 ACTIVITY_SKEW_S = 300  # a row stamp may lead the batch receipt by this much (collector clock skew)
 # Collector stamps are untrusted. Stitching only counts a MAC's activity from this long before the
 # SERVER time it was first received (mac_first_received): older stamps are back-fill and count
@@ -99,6 +109,16 @@ def _env_flag(source: dict[str, str], name: str) -> bool:
     if value in ("", "0", "false", "no", "off"):
         return False
     raise ValueError(f"{name} must be one of 1/true/yes or 0/false/no/off")
+
+
+def _env_flag_or_off(source: dict[str, str], name: str) -> bool:
+    """Like `_env_flag`, but an unparsable value reads as OFF: this flag arms an irreversible
+    deletion, so no spelling other than 1/true/yes may enable it, and a typo must not stop the
+    pipeline either."""
+    try:
+        return _env_flag(source, name)
+    except ValueError:
+        return False
 
 
 DETECTOR_ID = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -252,6 +272,9 @@ class PipelineConfig:
     # F5 new-device notice (docs/monitoring.md). DEFAULT OFF; deliberately NOT in any policy
     # dataclass, so the monitoring policy versions are unchanged.
     new_device_notice: bool = False
+    # Retired-MAC prune (README, prune.py): IRREVERSIBLE row deletion, DEFAULT OFF, owner decision.
+    # Not in any policy dataclass either, so the monitoring policy versions are unchanged.
+    prune_retired_macs: bool = False
     new_device_max_per_day: int = NEW_DEVICE_MAX_PER_DAY_DEFAULT
     pass_interval_s: int = PASS_INTERVAL_DEFAULT_S  # set from --loop; F5 derives its resume gap
 
@@ -319,4 +342,5 @@ class PipelineConfig:
             probes=ProbeSettings.from_env(source),
             new_device_notice=_env_flag(source, "VIGIE_NEW_DEVICE_NOTICE"),
             new_device_max_per_day=_env_cap(source),
+            prune_retired_macs=_env_flag_or_off(source, "VIGIE_PRUNE_RETIRED_MACS"),
         )

@@ -8,15 +8,46 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
-from vigie_api.schema import OVERRIDES_MIGRATIONS
-
 MAX_LINK_DEPTH = 32
+OVERRIDES_BUSY_TIMEOUT_S = 5.0  # how long a read waits for a writer of overrides.db
 # Review statuses that quiet an incident; a pinned mirror of vigie_api.incident_decisions.
 QUIET_STATUSES = frozenset({"acknowledged", "expected"})
-# The one overrides schema this build understands (same source of truth as backup verification).
-SUPPORTED_USER_VERSION = len(OVERRIDES_MIGRATIONS)
+# The one overrides schema this build understands. A LITERAL on purpose: derived from the
+# migration list it would follow every new migration silently, and a new table or column that names
+# a device would be pruned from under. Bump only after reviewing PROTECTED_READS (and the
+# classification test in tests/pipeline/test_prune_protected_set.py) against the new schema.
+SUPPORTED_USER_VERSION = 10
 # Tables the protected-device query reads; all must exist before anything is pruned on its word.
-PROTECTED_TABLES = ("device_overrides", "essential_devices", "identity_links", "identity_rules")
+PROTECTED_TABLES = (
+    "candidate_decisions",
+    "device_overrides",
+    "essential_devices",
+    "identity_links",
+    "identity_merges",
+    "identity_rules",
+    "incident_decisions",
+    "suggestion_decisions",
+)
+# Every column below names a device a human decision refers to. Unfiltered on purpose: expired or
+# revoked rules, cleared marks, undone merges and revoked links still protect (over-protecting
+# fails safe). Incident decisions, cleared ones (status NULL) included, protect while their row
+# exists; the API deletes the row together with its incident (vigie_api.incident_decisions), and
+# the protection ends with it. Kept in this module with the other identity_links SQL.
+DURABLE_READS = (
+    "SELECT device_id FROM device_overrides",
+    "SELECT device_id FROM essential_devices",
+    "SELECT device_id FROM identity_rules",
+    "SELECT from_device, into_device FROM identity_merges",
+    "SELECT device_a, device_b FROM candidate_decisions",
+    "SELECT from_device, into_device FROM identity_links",
+)
+# Incident decisions are the one source that expires on its own, so it is kept out of
+# DURABLE_READS: it protects, but its disappearance is not a lost decision.
+INCIDENT_READS = ("SELECT device_id FROM incident_decisions",)
+PROTECTED_READS = DURABLE_READS + INCIDENT_READS
+# The owner's decision on a suggestion (accepted or rejected) is keyed by suggestion id, not by
+# device: the devices it concerns are in the inventory's `suggestions` row (prune_exclusions).
+SUGGESTION_READS = ("SELECT suggestion_id FROM suggestion_decisions",)
 logger = logging.getLogger("vigie_pipeline")
 
 
@@ -29,24 +60,28 @@ def overrides_uri(path: Path) -> str:
     return f"file:{quote(str(path.resolve()))}?mode=ro"
 
 
-def open_overrides_ro(path: Path) -> sqlite3.Connection | None:
+def open_overrides_ro(path: Path, *, quiet: bool = False) -> sqlite3.Connection | None:
     """Open overrides.db with mode=ro (URI) plus query_only.
 
     Returns None when there is nothing usable: the file does not exist yet, or it cannot be read
     (corrupt, unreadable, or a read-only mount whose writer holds no connection). None means "no
     identity links, no rules": the pipeline then trusts nothing from overrides.db (it never
-    reads None as permission), and an unreadable file is logged at ERROR so it is noticed.
+    reads None as permission), and an unreadable file is logged at ERROR so it is noticed (DEBUG
+    with `quiet`: a second look at a file the pipeline already reported this pass).
     The file is never created, written, or migrated from here."""
     if not path.exists():
         return None
     try:
-        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=5.0)
+        conn = sqlite3.connect(overrides_uri(path), uri=True, timeout=OVERRIDES_BUSY_TIMEOUT_S)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # really readable?
     except sqlite3.Error as exc:
-        logger.error(
-            "overrides_unreadable path=%s error=%s: continuing with no identity links", path, exc
+        logger.log(
+            logging.DEBUG if quiet else logging.ERROR,
+            "overrides_unreadable path=%s error=%s: continuing with no identity links",
+            path,
+            exc,
         )
         return None
     return conn
@@ -135,11 +170,20 @@ def canonical_device(conn: sqlite3.Connection | None, device_id: str) -> str:
     return current
 
 
-def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
-    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets
-    and both ends of every live identity link. FAILS CLOSED: raises OverridesNotUsable unless the
-    file is open, at exactly the supported schema version, and holds every table queried; an
-    empty set must mean "nothing is protected", never "could not tell"."""
+def overrides_data_version(conn: sqlite3.Connection | None) -> int:
+    """SQLite's `PRAGMA data_version` of overrides.db: it changes when ANOTHER connection commits
+    anything (on this mode=ro connection it really moves, unlike with immutable=1). Not
+    identity_version, whose triggers miss names, essential marks, merges and incident decisions.
+    sqlite3.Error propagates; None raises OverridesNotUsable."""
+    if conn is None:
+        raise OverridesNotUsable("overrides.db is missing or could not be opened")
+    return int(conn.execute("PRAGMA data_version").fetchone()[0])
+
+
+def _read_text_ids(conn: sqlite3.Connection | None, statements: Iterable[str]) -> set[str]:
+    """The non-empty text values of `statements`. FAILS CLOSED: raises OverridesNotUsable unless
+    the file is open, at exactly the supported schema version, and holds every table the prune
+    reads; an empty set must mean "nothing is protected", never "could not tell"."""
     if conn is None:
         raise OverridesNotUsable("overrides.db is missing or could not be opened")
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -151,12 +195,38 @@ def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
     missing = [t for t in PROTECTED_TABLES if t not in tables]
     if missing:
         raise OverridesNotUsable(f"overrides.db lacks table(s): {', '.join(missing)}")
-    singles = (
-        "SELECT device_id FROM device_overrides",
-        "SELECT device_id FROM essential_devices",
-        "SELECT device_id FROM identity_rules",
-    )
-    protected = {str(r[0]) for sql in singles for r in conn.execute(sql)}
-    for from_device, into_device in conn.execute(links_select_sql(conn)):
-        protected.update((str(from_device), str(into_device)))
-    return protected
+    values = [value for sql in statements for row in conn.execute(sql) for value in row]
+    if not all(isinstance(value, str) and value for value in values):
+        # str(b"..") or str(7) would name an id that never matches a row: a protection that
+        # silently protects nothing. Say what kind of value, never its content.
+        raise OverridesNotUsable("overrides.db holds an id that is not non-empty text")
+    return set(values)
+
+
+def protected_device_ids(conn: sqlite3.Connection | None) -> set[str]:
+    """Devices a human decision refers to: names/groups, essential marks, identity-rule targets,
+    incident and candidate decisions, and both ends of every identity merge and link, undone
+    or revoked ones included. Fails closed (`_read_text_ids`)."""
+    return _read_text_ids(conn, PROTECTED_READS)
+
+
+def durable_decisions_found(conn: sqlite3.Connection | None) -> bool:
+    """True when a decision that does not expire with an incident is on file (`DURABLE_READS`).
+    Fails closed (`_read_text_ids`)."""
+    return bool(_read_text_ids(conn, DURABLE_READS))
+
+
+def decided_suggestion_ids(conn: sqlite3.Connection | None) -> set[str]:
+    """Ids of the suggestions the owner accepted or rejected. Fails closed (`_read_text_ids`)."""
+    return _read_text_ids(conn, SUGGESTION_READS)
+
+
+def overrides_identity(path: Path) -> tuple[int, int]:
+    """(st_dev, st_ino) of the file at `path`: a removed or replaced overrides.db (a restored
+    backup, a recreated file) is a different file than the one a connection reads."""
+    try:
+        info = path.stat()
+    except OSError as exc:
+        reason = type(exc).__name__
+        raise OverridesNotUsable(f"overrides.db cannot be inspected ({reason})") from exc
+    return (info.st_dev, info.st_ino)
