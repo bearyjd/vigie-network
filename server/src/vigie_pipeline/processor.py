@@ -26,6 +26,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.delivery_wiring import run_delivery_stage
+from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
 from vigie_pipeline.essential_absence import sweep_essential_absence
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
@@ -122,14 +123,13 @@ def _late_stages(
 ) -> None:
     """F6-b (default off), the activity purge, then monitoring and delivery. `stale`: a shard could
     not be read, so the view may hold an "absent" device that is back in the unread batch: the
-    sweep is skipped and, with F6-b on, nothing is sent this pass (rows are still planned)."""
+    sweep is skipped and, with F6-b on, no absence notice is sent this pass (others still are)."""
     if config.essential_absence and usable and not stale:
         sweep_essential_absence(inv, overrides, clock)
     purge_activity(inv, clock, config.activity_retention_s)
-    quiet = config.essential_absence and stale
-    _monitor_deliver_probe(
-        inv, overrides, config, usable, clock, live, (lambda: True) if quiet else should_stop
-    )
+    # a stale pass holds back only the absence detector; every other detector still delivers
+    held = frozenset({ESSENTIAL_ABSENCE}) if config.essential_absence and stale else frozenset()
+    _monitor_deliver_probe(inv, overrides, config, usable, clock, live, should_stop, held)
 
 
 def _monitor_deliver_probe(
@@ -140,6 +140,7 @@ def _monitor_deliver_probe(
     clock: float,
     live: Callable[[], float] | None,
     should_stop: Callable[[], bool],
+    held: frozenset[str] = frozenset(),
 ) -> None:
     """The stages after the prune; they need a readable overrides.db except the probes."""
     if usable:
@@ -150,6 +151,7 @@ def _monitor_deliver_probe(
             config,
             live or (lambda: clock),
             should_stop=should_stop,
+            held=held,
             # F6-b: its incidents are stamped with the pass start, so the first run's watermark
             # must not be later than that (else the first push is hidden for good)
             watermark_at=clock if config.essential_absence else None,

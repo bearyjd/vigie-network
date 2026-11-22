@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -106,6 +107,27 @@ def test_a_stale_pass_with_the_flag_off_still_delivers(env, monkeypatch):
     with pytest.raises(processor.ShardReadError):
         run_once(cfg, now=now_after(2) + 5)
     assert sent(out) == 1
+
+
+def test_a_stale_pass_with_the_flag_on_still_delivers_other_detectors(env, monkeypatch):
+    """R2-1: only the absence notice is held; an upload incident is not lost to a stale view."""
+    now = now_after(2) + 5
+    env.inv.execute(
+        "INSERT INTO monitoring_incidents(id,collector_id,device_id,lineage,detector,state,"
+        "episode_start,last_hour,detected_at,baseline_id,observed_bytes,threshold_bytes,evidence)"
+        " VALUES ('up1','c1','d9','up1','large_upload','open',?,?,?,NULL,999999999,1,'{}')",
+        (now - 60, now - 60, "2026-11-15T00:00:00Z"),
+    )
+    env.inv.commit()
+    two_hours(env)
+    env.sweep(now_after(2))
+    old_watermark(env)
+    cfg, out = deliver_cfg(env, essential_absence=True)
+    stale_shard(monkeypatch)
+    with pytest.raises(processor.ShardReadError):
+        run_once(cfg, now=now)
+    links = [json.loads(line)["link"] for line in out.read_text().splitlines()]
+    assert links == ["/ui/#incident=up1"]  # the upload notice, and no absence notice
 
 
 @pytest.mark.parametrize(("flag", "at_pass_start"), [(True, True), (False, False)])

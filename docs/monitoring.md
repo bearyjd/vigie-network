@@ -1458,7 +1458,7 @@ canonical (merged), or its lineage has no MAC left. A marks table that cannot be
 locked) closes nothing: that is not an unmark. A newer overrides.db schema than this build
 understands abstains entirely (one `essential_unjudged` event per day, nothing opened or closed).
 The mark is re-read inside the write transaction, so an unmark committed during a pass opens
-nothing. With the flag on, a pass whose shard read failed sends nothing. With more than 32 active marks (only
+nothing. With the flag on, a pass whose shard read failed sends no absence notice (every other detector still delivers). With more than 32 active marks (only
 possible by editing the database) the read is incomplete and nothing is closed as "unmarked". A mark
 that cannot be resolved (no known MAC, more than 64 MACs, an unusable identity graph) or has an
 out-of-range value protects only ITS OWN device from being closed as unmarked; other marks' closes
