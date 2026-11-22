@@ -16,6 +16,31 @@ from vigie_ingest.db import iso_utc
 from vigie_pipeline import essential_absence as ea
 
 
+class Tap(logging.Handler):
+    """Records the pipeline logger directly: caplog loses records in a full run when an earlier
+    test reconfigured the logger."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def tap():
+    handler, logger = Tap(), logging.getLogger("vigie_pipeline")
+    before = (logger.level, logger.propagate, logger.disabled)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.disabled = False
+    yield handler
+    logger.removeHandler(handler)
+    logger.setLevel(before[0])
+    logger.propagate, logger.disabled = before[1], before[2]
+
+
 def events(env, kind=None):
     sql = "SELECT kind, severity, device_id, summary, dedup FROM events"
     sql += " WHERE kind=?" if kind else " WHERE ?1 IS NULL"
@@ -180,7 +205,7 @@ def test_every_open_incident_of_the_device_blocks_a_second_one(env):
 
 
 # ---- _reviewed failure paths and the missing overrides (R1-27) --------------------------------
-def test_a_review_lookup_failure_closes_nothing_and_is_named(env, monkeypatch, caplog):
+def test_a_review_lookup_failure_closes_nothing_and_is_named(env, monkeypatch, tap):
     two_hours(env)
     env.sweep(now_after(2))
     env.decide(env.rows()[0], "acknowledged")
@@ -189,20 +214,18 @@ def test_a_review_lookup_failure_closes_nothing_and_is_named(env, monkeypatch, c
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(ea, "decided_incident_ids", locked)
-    with caplog.at_level(logging.INFO, logger="vigie_pipeline"):
-        env.sweep(now_after(2) + 5)
+    env.sweep(now_after(2) + 5)
     assert [r["state"] for r in env.rows()] == ["open"]
-    text = logged(caplog)
+    text = logged(tap)
     assert "essential_absence_review_failed" in text and "OperationalError" in text
     assert "essential_absence_failed" not in text and "locked" not in text
 
 
-def test_a_missing_overrides_db_is_a_silent_no_op(env, caplog):
+def test_a_missing_overrides_db_is_a_silent_no_op(env, tap):
     two_hours(env)
-    with caplog.at_level(logging.DEBUG, logger="vigie_pipeline"):
-        assert ea.sweep_essential_absence(env.inv, None, now_after(2)) == 0
+    assert ea.sweep_essential_absence(env.inv, None, now_after(2)) == 0
     assert env.inv.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
-    assert "essential_absence_failed" not in logged(caplog)
+    assert tap.records == []
 
 
 # ---- unjudged and failure event keys (R1-28) ---------------------------------------------------
@@ -239,11 +262,10 @@ def test_a_daily_reason_repeats_each_day_and_not_per_version(env):
     assert not any(":v" in r for r in reasons)
 
 
-def test_the_failure_event_repeats_each_day_and_logs_debug_after_the_first(env, caplog):
-    with caplog.at_level(logging.DEBUG, logger="vigie_pipeline"):
-        for dt in (0, 5, 86400):
-            ea.sweep_essential_absence(env.inv, Boom(sqlite3.OperationalError("x")), H + dt)
-    levels = [r.levelno for r in caplog.records if "essential_absence_failed" in r.getMessage()]
+def test_the_failure_event_repeats_each_day_and_logs_debug_after_the_first(env, tap):
+    for dt in (0, 5, 86400):
+        ea.sweep_essential_absence(env.inv, Boom(sqlite3.OperationalError("x")), H + dt)
+    levels = [r.levelno for r in tap.records if "essential_absence_failed" in r.getMessage()]
     assert levels == [logging.ERROR, logging.DEBUG, logging.ERROR]
     assert len(events(env, "essential_failed")) == 2
 
