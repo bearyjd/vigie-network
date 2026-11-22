@@ -564,11 +564,13 @@ def test_the_existing_new_device_event_still_carries_the_mac_known_followup(data
 
 def test_known_detectors_all_have_notification_text_or_engine_semantics():
     from vigie_api.models import IncidentOut
-    from vigie_pipeline.delivery_publish import DETECTOR_TITLES
+    from vigie_pipeline.delivery_publish import DETECTOR_BODIES, DETECTOR_TITLES
     from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS
     from vigie_pipeline.monitoring_engine import ENGINE_DETECTORS
 
     known = set(IncidentOut.model_fields["detector"].annotation.__args__)
     for detector in known - set(ENGINE_DETECTORS):
-        assert detector in OPEN_ONLY_DETECTORS and (detector, "open") in DETECTOR_TITLES
+        required = {"open"} if detector in OPEN_ONLY_DETECTORS else {"open", "recover"}
+        for templates in (DETECTOR_TITLES, DETECTOR_BODIES):
+            assert {kind for key, kind in templates if key == detector} == required
     assert iso_utc(0)  # keep the import used

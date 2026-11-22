@@ -129,6 +129,13 @@ INVENTORY_SOURCES = {
     "suggestion_from": _SUGGESTION.format(ids='["{dev}","z"]', expires=LIVE),
     "suggestion_into": _SUGGESTION.format(ids='["z","{dev}"]', expires=LIVE),
     "monitoring_profiles": _PROFILE,
+    "monitoring_dns_profiles": _PROFILE.replace("monitoring_profiles", "monitoring_dns_profiles"),
+    "monitoring_dns_suspicious": (
+        "INSERT INTO monitoring_dns_suspicious VALUES ('rtr-1', '{dev}', 'l', 0)"
+    ),
+    "monitoring_dns_retries": (
+        "INSERT INTO monitoring_dns_retries VALUES ('rtr-1', '{dev}', 'l', 0)"
+    ),
     "monitoring_incidents": _INCIDENT,
     "monitoring_suspicious": (
         "INSERT INTO monitoring_suspicious (collector_id, device_id, lineage, hour)"

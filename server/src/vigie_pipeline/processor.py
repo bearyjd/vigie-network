@@ -36,7 +36,6 @@ from vigie_pipeline.essential_absence import (
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
-from vigie_pipeline.monitoring_dns import deferred_dns_notices
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.new_device_notice import sweep_new_devices
 from vigie_pipeline.overrides import (
@@ -173,12 +172,9 @@ def _monitor_deliver_probe(
                 held = frozenset({ESSENTIAL_ABSENCE})
             else:
                 held_incidents = deferred
-        if config.delivery.enabled and DNS_DEVIATION in config.delivery.detectors:
-            pending = deferred_dns_notices(inv, overrides, dns, clock) if dns else None
-            if pending is None:
-                held |= {DNS_DEVIATION}
-            else:
-                held_incidents |= pending
+        dns_opted_in = config.delivery.enabled and DNS_DEVIATION in config.delivery.detectors
+        if dns_opted_in and dns is None:
+            held |= {DNS_DEVIATION}
         run_delivery_stage(
             inv,
             overrides,
@@ -187,6 +183,7 @@ def _monitor_deliver_probe(
             should_stop=should_stop,
             held=held,
             held_incidents=held_incidents,
+            **({"dns_policy": dns} if dns_opted_in and dns is not None else {}),
             # F6-b: its incidents are stamped with the pass start, so the first run's watermark
             # must not be later than that (else the first push is hidden for good)
             watermark_at=clock

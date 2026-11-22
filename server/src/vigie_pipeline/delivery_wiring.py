@@ -7,6 +7,7 @@ from collections.abc import Callable
 from sqlite3 import Connection
 
 from vigie_ingest.db import immediate
+from vigie_pipeline.baselines_dns import DnsBaselineConfig
 from vigie_pipeline.config import PipelineConfig
 from vigie_pipeline.delivery_publish import FilePublisher, Publisher
 from vigie_pipeline.delivery_runner import RunReport, run_delivery
@@ -49,6 +50,7 @@ def run_delivery_stage(
     held: frozenset[str] = frozenset(),
     *,
     held_incidents: frozenset[str] = frozenset(),
+    dns_policy: DnsBaselineConfig | None = None,
 ) -> RunReport | None:
     """Disabled: do nothing at all. Enabled: any exception is contained and logged.
     `watermark_at` stamps the first run's watermark instead of the delivery clock.
@@ -72,6 +74,7 @@ def run_delivery_stage(
             held=held,
             should_stop=should_stop,
             **({"held_incidents": held_incidents} if held_incidents else {}),
+            **({"dns_policy": dns_policy} if dns_policy is not None else {}),
         )
     except Exception as exc:  # noqa: BLE001 - delivery must never fail the pipeline pass
         _report_failure(exc)

@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 
 from vigie_ingest.db import immediate
+from vigie_pipeline.baselines_dns import DnsBaselineConfig
 from vigie_pipeline.delivery_plan import (
     DeliveryConfig,
     DeliveryView,
@@ -53,13 +54,17 @@ from vigie_pipeline.delivery_types import (
     tick_ceil,
     tick_floor,
 )
+from vigie_pipeline.detectors import DNS_DEVIATION
 from vigie_pipeline.logs import log
+from vigie_pipeline.monitoring_dns import dns_notice_deliverable
 from vigie_pipeline.overrides import read_decisions
 
 logger = logging.getLogger("vigie_pipeline")
 DEFAULT_MAX_PER_RUN = 20
 DEFAULT_MAX_ABANDONED = 2
 DEFAULT_DRAIN_BUDGET = 60
+DNS_DUE_SCAN_ROWS = 128
+_DNS_DUE_CURSOR = "dns_delivery_scan_cursor"
 LOG_WEDGED_EVERY = 20  # a wedged transport is logged on the first run and every 20th after
 # Publish workers abandoned at their deadline and still running. Process-wide: it is the bound
 # on stranded threads across runs. A worker that finishes late has its result discarded; only the
@@ -144,9 +149,15 @@ def _plan_pass(
     return len(actions), now
 
 
-def _claim(inv, row: DeliveryView, config, clock) -> tuple[DeliveryView, int] | None:
+def _claim(
+    inv, row: DeliveryView, config, clock, *, ro=None, dns_policy=None
+) -> tuple[DeliveryView, int] | None:
     with immediate(inv):
         now = clock()
+        if dns_policy is not None and not dns_notice_deliverable(
+            inv, ro, dns_policy, row.incident_id, row.kind, now
+        ):
+            return None
         if inv.execute(CLAIM, claim_params(row, now, config)).rowcount != 1:
             return None
     stamp = tick_ceil(now)
@@ -287,8 +298,12 @@ def _complete(inv, claimed: DeliveryView, ok: bool, config, clock) -> bool:
         return inv.execute(sql, params).rowcount == 1
 
 
-def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot, labels) -> str:
-    taken = _claim(inv, row, config, clock)
+def _send_one(
+    inv, ro, publisher, row: DeliveryView, config, clock, slot, labels, dns_policy
+) -> str:
+    taken = _claim(
+        inv, row, config, clock, **({"ro": ro, "dns_policy": dns_policy} if dns_policy else {})
+    )
     if taken is None:
         return "skipped"
     claimed, stamp = taken
@@ -314,8 +329,10 @@ def _due(
     busy: frozenset[str],
     held: frozenset[str],
     held_incidents: frozenset[str],
+    *,
+    dns_range: tuple[int, int] | None = None,
 ) -> list[DeliveryView]:
-    """Due pending rows, oldest first, excluding busy and held deliveries before the limit."""
+    """Due pending rows with held and busy deliveries removed before applying the limit."""
     skip = ",".join("?" * len(busy))
     hold_filter = ""
     if held:
@@ -328,27 +345,80 @@ def _due(
     if held_incidents:
         hold_filter += " AND incident_id NOT IN (SELECT value FROM json_each(?))"
         incident_params = (json.dumps(sorted(held_incidents)),)
+    dns_params = ()
+    order = "next_attempt_at,row_id"
+    if dns_range is not None:
+        hold_filter += (
+            " AND row_id>? AND row_id<=? AND EXISTS (SELECT 1 FROM monitoring_incidents i "
+            "WHERE i.id=incident_deliveries.incident_id AND i.detector=?)"
+        )
+        dns_params = (*dns_range, DNS_DEVIATION)
+        order = "row_id"
     rows = inv.execute(
         f"SELECT {_ROW} FROM incident_deliveries WHERE state='pending' AND next_attempt_at<=?"  # noqa: S608
         f" AND attempts<?{f' AND delivery_id NOT IN ({skip})' if busy else ''}{hold_filter}"
-        " ORDER BY next_attempt_at,row_id LIMIT ?",
+        f" ORDER BY {order} LIMIT ?",
         (
             tick_floor(now),
             config.max_attempts,
             *sorted(busy),
             *sorted(held),
             *incident_params,
+            *dns_params,
             limit,
         ),
     )
     return [_delivery(r) for r in rows.fetchall()]
 
 
-def _drain(inv, ro, publisher, rows, config, clock, limits, labels) -> Counter:
+def _due_dns(inv, now, config, busy, held_incidents) -> list[DeliveryView]:
+    """Page through real due rows so one set of unclaimable DNS notices cannot block the rest."""
+    with immediate(inv):
+        saved = inv.execute(
+            "SELECT value FROM pipeline_meta WHERE key=?", (_DNS_DUE_CURSOR,)
+        ).fetchone()
+        after, end = 0, 0
+        if saved is not None:
+            try:
+                after, end = map(int, saved[0].split(":"))
+            except (ValueError, AttributeError):
+                pass
+        if not 0 < after < end <= 2**63 - 1:
+            after = 0
+            end = inv.execute("SELECT COALESCE(MAX(row_id),0) FROM incident_deliveries").fetchone()[
+                0
+            ]
+        rows = _due(
+            inv,
+            now,
+            config,
+            DNS_DUE_SCAN_ROWS,
+            busy,
+            frozenset(),
+            held_incidents,
+            dns_range=(after, end),
+        )
+        last = rows[-1].row_id if rows else after
+        if len(rows) == DNS_DUE_SCAN_ROWS and last < end:
+            inv.execute(
+                "INSERT INTO pipeline_meta VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_DNS_DUE_CURSOR, f"{last}:{end}"),
+            )
+        elif saved is not None:
+            inv.execute("DELETE FROM pipeline_meta WHERE key=?", (_DNS_DUE_CURSOR,))
+    return rows
+
+
+def _drain(
+    inv, ro, publisher, rows, config, clock, limits, labels, max_per_run, dns_rows, dns_policy
+) -> Counter:
     monotonic, max_abandoned, budget, should_stop = limits
     counts: Counter[str] = Counter()
     started = monotonic()
     for row in rows:
+        if counts.total() - counts["skipped"] >= max_per_run:
+            break
         if should_stop():  # a stop request: only the in-flight claim (already finished) completes
             log(logger, logging.INFO, "delivery_drain_stopped")
             break
@@ -361,7 +431,8 @@ def _drain(inv, ro, publisher, rows, config, clock, limits, labels) -> Counter:
         if slot is _BUSY:
             continue  # a worker started since the SELECT still holds this very delivery
         try:
-            outcome = _send_one(inv, ro, publisher, row, config, clock, slot, labels)
+            policy = dns_policy if row.row_id in dns_rows else None
+            outcome = _send_one(inv, ro, publisher, row, config, clock, slot, labels, policy)
         finally:
             _release(slot)
         counts[outcome] += 1
@@ -386,6 +457,7 @@ def run_delivery(
     detectors: Iterable[str] = DEFAULT_DETECTORS,
     held: frozenset[str] = frozenset(),
     held_incidents: frozenset[str] = frozenset(),
+    dns_policy: DnsBaselineConfig | None = None,
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
     the database; `monotonic` (never steps back) measures the drain budget.
@@ -395,12 +467,27 @@ def run_delivery(
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
     held = detectors.intersection(held)
+    dns_dispatch = dns_policy is not None and DNS_DEVIATION in detectors - held
+    if DNS_DEVIATION in detectors and dns_policy is None:
+        held |= {DNS_DEVIATION}
     try:
         planned, now = _plan_pass(inv, overrides, config, clock, detectors, held, held_incidents)
     except DecisionsUnavailable as exc:
         log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
         return RunReport(skipped="decisions_unavailable")
-    rows = _due(inv, now, config, max_per_run, busy_deliveries(), held, held_incidents)
+    busy = busy_deliveries()
+    normal_held = held | {DNS_DEVIATION} if dns_dispatch else held
+    rows = _due(inv, now, config, max_per_run, busy, normal_held, held_incidents)
+    dns_rows = set()
+    if dns_dispatch:
+        try:
+            page = _due_dns(inv, now, config, busy, held_incidents)
+        except sqlite3.DatabaseError as exc:
+            log(logger, logging.WARNING, "dns_delivery_scan_failed", error=type(exc).__name__)
+        else:
+            dns_rows = {row.row_id for row in page}
+            rows.extend(page)
+            rows.sort(key=lambda row: (row.next_attempt_at, row.row_id))
     counts = _drain(
         inv,
         overrides,
@@ -410,6 +497,9 @@ def run_delivery(
         clock,
         (monotonic, max_abandoned, drain_budget_seconds, should_stop),
         include_label,
+        max_per_run,
+        dns_rows,
+        dns_policy,
     )
     return RunReport(
         planned=planned,

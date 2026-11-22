@@ -38,6 +38,9 @@ _DEVICE_BY_COLLECTOR = (
     ("monitoring_incidents", "device_id"),
     ("monitoring_suspicious", "device_id"),
     ("monitoring_unavailable", "device_id"),
+    ("monitoring_dns_profiles", "device_id"),
+    ("monitoring_dns_suspicious", "device_id"),
+    ("monitoring_dns_retries", "device_id"),
 )
 _MAC_BY_COLLECTOR = (
     ("measurements_hourly", "mac"),

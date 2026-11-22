@@ -24,11 +24,10 @@ from vigie_pipeline.baselines_dns import (
 )
 from vigie_pipeline.detectors import DNS_DEVIATION
 from vigie_pipeline.measurements import HOUR_S, MAX_VALUE
-from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, has_table, lineage
+from vigie_pipeline.monitoring_identity import Lineage, has_table, lineage
 
 COVERAGE_SECONDS = 3420
 MAX_TRAINING_HOURS_JSON = MAX_TRAINING_HOURS * 18 + 2
-MAX_NOTICE_CHECKS = 128
 
 
 def _digest(parts) -> str:
@@ -52,10 +51,14 @@ def _training_eligible(sample: DnsSample) -> bool:
     return sample.eligible and not sample.suspicious and not sample.saturated
 
 
-def _read_samples(inv, collector, identity: Lineage, lower, until) -> list[DnsSample]:
+def _read_samples(
+    inv, collector, identity: Lineage, lower, until, *, only_hours: tuple[int, ...] | None = None
+) -> list[DnsSample]:
     if not identity.macs:
         return []
     marks = ",".join("?" for _ in identity.macs)
+    hour_filter = "" if only_hours is None else "AND m.hour IN (SELECT value FROM json_each(?))"
+    hour_params = () if only_hours is None else (json.dumps(only_hours),)
     rows = inv.execute(
         f"""SELECT m.hour, SUM(m.dns_queries) AS queries, MAX(m.dns_queries) AS max_queries,
                 MIN(m.dns_queries) AS min_queries,
@@ -66,7 +69,7 @@ def _read_samples(inv, collector, identity: Lineage, lower, until) -> list[DnsSa
             LEFT JOIN monitoring_dns_suspicious s ON s.collector_id=m.collector_id
                 AND s.device_id=? AND s.lineage=? AND s.hour=m.hour
             WHERE m.collector_id=? AND m.mac IN ({marks}) AND m.hour>=? AND m.hour<?
-            GROUP BY m.hour ORDER BY m.hour LIMIT ?""",  # noqa: S608
+            {hour_filter} GROUP BY m.hour ORDER BY m.hour LIMIT ?""",  # noqa: S608
         (
             identity.device_id,
             identity.key,
@@ -74,6 +77,7 @@ def _read_samples(inv, collector, identity: Lineage, lower, until) -> list[DnsSa
             *identity.macs,
             lower,
             until,
+            *hour_params,
             MAX_TRAINING_HOURS + 1,
         ),
     ).fetchall()
@@ -357,8 +361,17 @@ def _publish_episode(
             return
         if active["last_hour"] < hour and (not findings or active["last_hour"] < hour - HOUR_S):
             # A gap followed by a fresh burst ends continuity without showing a recovery.
-            state = "superseded" if findings else "resolved"
-            inv.execute("UPDATE monitoring_incidents SET state=? WHERE id=?", (state, active["id"]))
+            if findings:
+                inv.execute(
+                    "UPDATE monitoring_incidents SET state='superseded' WHERE id=?",
+                    (active["id"],),
+                )
+            else:
+                inv.execute(
+                    """UPDATE monitoring_incidents SET state='resolved',
+                       evidence=json_set(evidence,'$.recovery_hour',?) WHERE id=?""",
+                    (hour, active["id"]),
+                )
             active = None
     if not findings:
         return
@@ -449,62 +462,100 @@ def dns_baseline_view(inv, collector, device, key):
     }
 
 
-def deferred_dns_notices(inv, ov, policy: DnsBaselineConfig, now) -> frozenset[str] | None:
-    """Pause stale or unverified DNS notices before handing them to the delivery runner."""
+def dns_notice_deliverable(inv, ov, policy: DnsBaselineConfig, incident_id, kind, now) -> bool:
+    """Check the current lineage, frozen cohort, and evidence hours for one due DNS notice."""
     deadline = time.monotonic() + 0.5
     inv.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     try:
-        rows = inv.execute(
-            """SELECT i.id,i.collector_id,i.device_id,i.lineage,i.baseline_id,
-                      p.state AS profile_state,p.config_version,p.baseline_id AS profile_baseline,
-                      r.hour AS retry_hour
-               FROM monitoring_incidents i
-               LEFT JOIN monitoring_dns_profiles p
-                 ON p.collector_id=i.collector_id AND p.device_id=i.device_id
-                 AND p.lineage=i.lineage
-               LEFT JOIN monitoring_dns_retries r
-                 ON r.collector_id=i.collector_id AND r.device_id=i.device_id
-                 AND r.lineage=i.lineage
-               LEFT JOIN incident_deliveries d ON d.incident_id=i.id
-                 AND d.kind=CASE i.state WHEN 'open' THEN 'open' ELSE 'recover' END
-               WHERE i.detector=?
-                 AND (d.state IS NULL OR d.state IN ('pending','sending','suppressed'))
-                 AND (i.state='open' OR (i.state='resolved' AND EXISTS
-                   (SELECT 1 FROM incident_deliveries o
-                    WHERE o.incident_id=i.id AND o.kind='open' AND o.state='sent')))
-               LIMIT ?""",
-            (DNS_DEVIATION, MAX_NOTICE_CHECKS + 1),
-        ).fetchall()
-        if len(rows) > MAX_NOTICE_CHECKS:
-            return None
-
-        held = set()
-        version = policy.version
-        for row in rows:
-            if (
-                row["profile_state"] != "mature"
-                or row["profile_baseline"] != row["baseline_id"]
-                or row["config_version"] != version
-                or row["retry_hour"] is not None
-            ):
-                held.add(row["id"])
-                continue
-            try:
-                identity = lineage(inv, ov, row["device_id"])
-            except LineageUnavailable:
-                held.add(row["id"])
-                continue
-            if not (
-                identity.versioned
-                and identity.device_id == row["device_id"]
-                and identity.key == row["lineage"]
-            ) or _has_due_work(inv, row["collector_id"], identity.macs, now):
-                held.add(row["id"])
-        return frozenset(held)
-    except sqlite3.DatabaseError:
-        return None
+        return _dns_notice_deliverable(inv, ov, policy, incident_id, kind, now)
+    except (sqlite3.DatabaseError, ValueError, TypeError, RecursionError):
+        return False
     finally:
         inv.set_progress_handler(None, 0)
+
+
+def _dns_notice_deliverable(inv, ov, policy, incident_id, kind, now) -> bool:
+    row = inv.execute(
+        """SELECT collector_id,device_id,lineage,baseline_id,state,episode_start,last_hour,evidence
+           FROM monitoring_incidents WHERE id=? AND detector=?""",
+        (incident_id, DNS_DEVIATION),
+    ).fetchone()
+    expected_state = "open" if kind == "open" else "resolved"
+    if row is None or row["state"] != expected_state:
+        return False
+
+    collector, device, key = row["collector_id"], row["device_id"], row["lineage"]
+    profile = inv.execute(
+        """SELECT * FROM monitoring_dns_profiles
+           WHERE collector_id=? AND device_id=? AND lineage=? AND state='mature'
+             AND baseline_id=? AND config_version=?""",
+        (collector, device, key, row["baseline_id"], policy.version),
+    ).fetchone()
+    if (
+        profile is None
+        or inv.execute(
+            "SELECT 1 FROM monitoring_dns_retries WHERE collector_id=? AND device_id=? "
+            "AND lineage=?",
+            (collector, device, key),
+        ).fetchone()
+    ):
+        return False
+
+    identity = lineage(inv, ov, device)
+    if not (
+        identity.versioned and identity.device_id == device and identity.key == key
+    ) or _has_due_work(inv, collector, identity.macs, now):
+        return False
+
+    reference = _load_reference(inv, collector, device, profile)
+    if reference.median_twice < 2 * policy.minimum_queries:
+        return False
+    return _notice_evidence_qualified(inv, collector, identity, row, reference, policy, kind, now)
+
+
+def _notice_evidence_qualified(inv, collector, identity, row, reference, policy, kind, now):
+    until = int(now) // HOUR_S * HOUR_S
+    lower = until - MAX_DAYS * DAY_S
+    trigger_hours = {row["episode_start"], row["last_hour"]}
+    recovery = None
+    if kind == "recover":
+        evidence = json.loads(row["evidence"])
+        recovery = evidence.get("recovery_hour") if isinstance(evidence, dict) else None
+        if type(recovery) is not int or recovery <= row["last_hour"]:
+            return False
+    required = trigger_hours | ({recovery} if recovery is not None else set())
+    if any(
+        type(hour) is not int or not lower <= hour < until or hour % HOUR_S for hour in required
+    ):
+        return False
+    if min(trigger_hours) <= reference.trained_until:
+        return False
+
+    # Training outside retention has already passed inspection. All retained evidence must
+    # still be qualified, even if its invalidation has not reached this device's dirty row.
+    training = {hour for hour in reference.training_hours if hour >= lower}
+    checked = tuple(sorted(training | required))
+    if inv.execute(
+        """SELECT 1 FROM monitoring_quality_work WHERE collector_id=?
+             AND hour IN (SELECT value FROM json_each(?)) LIMIT 1""",
+        (collector, json.dumps(checked)),
+    ).fetchone():
+        return False
+    samples = {
+        sample.hour: sample
+        for sample in _read_samples(inv, collector, identity, lower, until, only_hours=checked)
+    }
+    if any(hour not in samples or not _training_eligible(samples[hour]) for hour in training):
+        return False
+    if any(
+        hour not in samples or not samples[hour].eligible or samples[hour].saturated
+        for hour in required
+    ):
+        return False
+    threshold = reference.median_twice * policy.multiplier // 2
+    return all(samples[hour].dns_queries > threshold for hour in trigger_hours) and (
+        recovery is None or samples[recovery].dns_queries <= threshold
+    )
 
 
 def _has_due_work(inv, collector, macs, now) -> bool:

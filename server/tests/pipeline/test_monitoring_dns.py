@@ -449,10 +449,152 @@ def test_explicit_dns_delivery_validates_open(inventory, tmp_path, continuity_br
     )
     run_once(config, now=clock)
     assert incidents(inv)[DNS]["state"] == "open"
-    deliveries = inv.execute("SELECT state FROM incident_deliveries").fetchall()
+    deliveries = inv.execute("SELECT state,attempts FROM incident_deliveries").fetchall()
     if continuity_break is None:
         assert [row["state"] for row in deliveries] == ["sent"]
         assert "Unusual DNS activity" in path.read_text()
     else:
-        assert deliveries == []
+        # The normal planner may enqueue it, but an unverified dispatch never takes an attempt.
+        assert [tuple(row) for row in deliveries] == [("pending", 0)]
         assert not path.exists()
+
+
+def _dns_delivery_config(root, **kwargs):
+    from vigie_pipeline.config import DeliverySettings
+
+    return PipelineConfig(
+        root,
+        monitoring_dns=True,
+        delivery=DeliverySettings(
+            enabled=True, file=root / "delivery.jsonl", detectors=(DNS,), **kwargs
+        ),
+    )
+
+
+@pytest.mark.parametrize("above_watermark", [False, True])
+def test_dns_delivery_reaches_valid_candidate_past_older_backlog(
+    inventory, tmp_path, above_watermark
+):
+    from test_f5_s2a_plumbing import put
+
+    from vigie_ingest.db import iso_utc
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    clock = CURRENT + 3610
+    for index in range(140):
+        identifier = f"000-obsolete-{index:03}"
+        put(inv, identifier, DNS, "resolved")
+        inv.execute(
+            "UPDATE monitoring_incidents SET lineage=?,detected_at=?,state='open' WHERE id=?",
+            (identifier, iso_utc(clock if above_watermark else clock - 1), identifier),
+        )
+    dns_hour(inv, CURRENT, 801)
+    analyze(inv, ov)
+    active = inv.execute(
+        "SELECT id FROM monitoring_incidents WHERE baseline_id IS NOT NULL"
+    ).fetchone()[0]
+
+    config = _dns_delivery_config(tmp_path, max_per_run=1)
+    run_once(config, now=clock)
+    if above_watermark:
+        run_once(config, now=clock + 1)
+    assert [
+        (row["incident_id"], row["state"])
+        for row in inv.execute("SELECT incident_id,state FROM incident_deliveries WHERE attempts>0")
+    ] == [(active, "sent")]
+    if not above_watermark:
+        assert inv.execute("SELECT COUNT(*) FROM incident_deliveries").fetchone()[0] == 1
+
+
+def _overlap(inv, stamp):
+    from vigie_ingest.db import iso_utc
+    from vigie_pipeline.measurements import Measurements, apply_measurements
+
+    inv.execute(
+        "INSERT INTO measurement_batches VALUES ('c1',?,?,?,?,?,'[]')",
+        (f"first-{stamp}", stamp, stamp + 3500, iso_utc(stamp + 3500), stamp),
+    )
+    apply_measurements(
+        inv,
+        Measurements(
+            "c1",
+            f"overlap-{stamp}",
+            stamp + 3400,
+            stamp + 3600,
+            iso_utc(stamp + 3600),
+            (),
+            {MAC: (0, 0, 1, 1)},
+        ),
+    )
+    assert (
+        inv.execute(
+            "SELECT qualified_seconds FROM coverage_hourly WHERE collector_id='c1' AND hour=?",
+            (stamp,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_dns_late_overlap_blocks_open_after_dirty_marker_has_drained(inventory, tmp_path):
+    from vigie_pipeline.delivery_wiring import WATERMARK_KEY
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    dns_hour(inv, CURRENT, 801)
+    analyze(inv, ov)
+    _overlap(inv, CURRENT)
+    inv.execute("INSERT INTO pipeline_meta VALUES (?,?)", (WATERMARK_KEY, str(CURRENT + 3610)))
+    clock = CURRENT + 7210
+    run_once(_dns_delivery_config(tmp_path), now=clock)
+    assert incidents(inv)[DNS]["state"] == "open"
+    assert inv.execute("SELECT COUNT(*) FROM monitoring_dirty").fetchone()[0] == 0
+    assert not (tmp_path / "delivery.jsonl").exists()
+
+
+def test_dns_late_training_overlap_blocks_open_before_quality_fanout(inventory, tmp_path):
+    from vigie_pipeline.delivery_wiring import WATERMARK_KEY
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    dns_hour(inv, CURRENT, 801)
+    analyze(inv, ov)
+    _overlap(inv, HOUR)
+    inv.execute(
+        "INSERT INTO monitoring_quality_work VALUES ('another-collector',?,'')", (HOUR - 3600,)
+    )
+    clock = CURRENT + 3610
+    inv.execute("INSERT INTO pipeline_meta VALUES (?,?)", (WATERMARK_KEY, str(clock)))
+    run_once(_dns_delivery_config(tmp_path), now=clock)
+    assert (
+        inv.execute("SELECT hour FROM monitoring_quality_work WHERE collector_id='c1'").fetchone()[
+            0
+        ]
+        == HOUR
+    )
+    assert inv.execute("SELECT COUNT(*) FROM monitoring_dirty").fetchone()[0] == 0
+    assert not (tmp_path / "delivery.jsonl").exists()
+
+
+@pytest.mark.parametrize("invalidate_recovery", [False, True])
+def test_dns_recovery_send_requires_a_still_qualified_hour(
+    inventory, tmp_path, invalidate_recovery
+):
+    from vigie_pipeline.processor import run_once
+
+    inv, ov = inventory
+    config = _dns_delivery_config(tmp_path)
+    path = tmp_path / "delivery.jsonl"
+    dns_hour(inv, CURRENT, 801)
+    run_once(config, now=CURRENT + 3610)
+    assert len(path.read_text().splitlines()) == 1
+
+    recovery = CURRENT + 3600
+    dns_hour(inv, recovery, 200)
+    analyze(inv, ov, recovery)
+    assert incidents(inv)[DNS]["state"] == "resolved"
+    if invalidate_recovery:
+        _overlap(inv, recovery)
+    run_once(config, now=recovery + 7210)
+    notices = [json.loads(line)["kind"] for line in path.read_text().splitlines()]
+    assert notices == (["open"] if invalidate_recovery else ["open", "recover"])
