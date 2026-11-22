@@ -201,6 +201,15 @@ your labels. Never `podman-compose down -v` without a backup: it deletes this vo
    old live rows (the backup is lost; `integrity_check` still says `ok`).
 5. Copy the verified backup over the database, then `chown 10001` and `chmod 0600` it.
 6. Start the services you stopped.
+7. After restoring `overrides.db`, expect the retired-device prune to refuse to delete anything
+   (ERROR `overrides_rolled_back`, then `overrides_latched`, once the flag is on): the pipeline
+   tracks the file's history on every pass, the flag on or off, so a restore made while the flag
+   is off latches silently (DEBUG only) and is reported on the first pass after you turn it on.
+   The latch stays even once the audit counter catches up, and it ends only when you delete all
+   four rows `prune_overrides_seen`, `prune_overrides_audit_mark`, `prune_overrides_audit_id` and
+   `prune_overrides_latched` of `stitch_state` in `inventory.db`; delete them only once the
+   decisions you made since the backup are re-entered, because the prune deletes the MAC rows of
+   a retired device the restored file no longer protects.
 
 ## Retention
 
@@ -211,10 +220,50 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
   startup and hourly.
 - `batches` rows (dedupe records) are purged after 7 days; not configurable.
 - `VIGIE_MAX_SPOOL_AGE_S` - how old a collector window may be (default 24 h).
-- `mac_last_ip` (last observed address per MAC) is never pruned. It holds at most one row per MAC
-  in observations, and devices are retired, not deleted, so it is bounded by the MACs ever seen.
-  It is visible to every API token scope that can read `/devices` (no per-field gating); no IP
-  addresses were exposed by the API before it was added.
+- Retired transient devices (OFF by default; `VIGIE_PRUNE_RETIRED_MACS=1`, only 1/true/yes enable,
+  any other value reads as off, pipeline service only). The deletion is irreversible and
+  enabling it is the owner's decision. It needs a configured (non-revoked) collector, which
+  gives the trusted clock below, and an `overrides.db` at the supported schema version; while it
+  is off the pipeline never deletes anything and never touches observations, `mac_last_ip` or any
+  inventory row, and it logs at most DEBUG. The only thing it writes is the history markers of
+  `overrides.db` in `stitch_state` (`prune_overrides_seen`, `prune_overrides_audit_mark`,
+  `prune_overrides_audit_id`, and the latch `prune_overrides_latched`), kept exactly as when it
+  is on, so a restore or loss of `overrides.db` made while it is off is detected when you turn it
+  on, and the first pass after that deletes nothing until you clear the markers. Retirement
+  itself (stamping the device) is unchanged.
+  When on: 90 days after the pipeline retired a device (a server-clock stamp,
+  never earlier than the newest batch receipt or collector send time; counted on the older of the server clock and the
+  oldest non-revoked collector's last accepted send time), its self-linked MAC rows in
+  `inventory.db` are deleted, at most 1000 per pass, oldest first, together with the MAC's
+  `mac_last_ip` row; the device row itself stays. A collector that falls silent holds the clock
+  back until it is revoked (a WARNING names it after 7 days): revoke collectors you retire.
+  `provision --force` resets a collector's last accepted send time to 0, which drops it from the
+  clock until it next sends, as a revocation would.
+  Devices that `overrides.db` refers to (names, groups, merges, rules, essential marks,
+  decisions, suggestions you accepted or rejected) and devices still named by an open or
+  suggested candidate (or one in a state this build does not know), a live suggestion, a
+  rule attachment, or a row in one of six tables (`monitoring_profiles`, `monitoring_incidents`,
+  `monitoring_suspicious`, `monitoring_unavailable` by device id; `measurements_hourly`,
+  `monitoring_dirty` by MAC) that belongs to a collector registered in `collectors`, are never
+  pruned. A row in those tables naming an unknown collector does not protect, and no other
+  monitoring table is checked. Monitoring profiles are never deleted, so on a monitoring install
+  a device that was ever analysed for a known collector is never pruned. The
+  device's `events` rows (`new device <MAC>`, `retired device <MAC> reappeared`) are not touched
+  and keep the MAC until event retention exists (below). Nothing is pruned
+  while `overrides.db` is missing or unusable, after it lost every lasting decision it once held (incident decisions do not count: they
+  expire with their incident), or
+  went back to an older state (a restored backup, a recreated file: the pipeline keeps the file's
+  audit counter high-water mark and logs ERROR `overrides_rolled_back`; after a deliberate restore
+  or removal delete the four rows `prune_overrides_seen`, `prune_overrides_audit_mark`,
+  `prune_overrides_audit_id` and `prune_overrides_latched` of
+  `stitch_state` to resume), or in a pass
+  that could not read a batch. A randomized MAC that returns after being pruned gets a new device
+  id. See `server/src/vigie_pipeline/README.md`.
+- `mac_last_ip` (last observed address per MAC) is deleted with its MAC row by the retired-device
+  prune above and is otherwise never pruned: it holds at most one row per MAC in observations, and
+  devices are retired, not deleted, so it is bounded by the MACs ever seen. It is visible to every
+  API token scope that can read `/devices` (no per-field gating); no IP addresses were exposed by
+  the API before it was added.
 - `incident_decisions` (human incident reviews, `overrides.db`) keeps the current decision only;
   history is in `audit_log`. Each incident write deletes up to 100 rows whose `decided_at` is older
   than 120 days and whose incident the pipeline has already pruned (incidents live 90 days).
@@ -228,6 +277,8 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
 
 Retention shortens how long raw data sits on disk; it is not a substitute for encrypting the volume.
 Put the data directory on an encrypted filesystem (PRP section 9).
+
+**Essential-device absence (off by default).** `VIGIE_ESSENTIAL_ABSENCE=1` (only 1/true/yes enable; garbage is a startup error) turns on the pipeline sweep that opens one incident when a device the owner marked essential is unseen past its own threshold. It needs no migration and nothing fires until a device is marked. Compose forwards it with `${VIGIE_ESSENTIAL_ABSENCE-0}`; notifications additionally need delivery enabled and `essential_absence` in `VIGIE_DELIVERY_DETECTORS`. See "Essential-device absence (F6)" in `docs/monitoring.md`.
 
 ## Upgrades and migrations
 

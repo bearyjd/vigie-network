@@ -207,7 +207,8 @@ fields; terminal viewers should use `.get` for compatibility with older APIs.
 
 Monitoring incidents (`GET /incidents`, `GET /incidents/{id}?collector_id=`) carry two independent axes.
 The pipeline alone owns `state` (`open`, `resolved`, `superseded`). Humans own `review`, an overlay kept
-in `overrides.db`; the API never writes `inventory.db` and the pipeline never reads decisions.
+in `overrides.db`; the API never writes `inventory.db`. The pipeline reads decisions read-only (it never writes them)
+and, for `new_device` incidents only, closes the incident when it is acknowledged or expected.
 `review` is `null` or `{status, snooze_until, version, decided_by, decided_at}` (`decided_by` is `app`;
 the token id is not exposed). `attention` is derived: true only while `state` is `open` and no decision
 covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers it strictly before

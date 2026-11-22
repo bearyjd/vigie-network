@@ -76,12 +76,14 @@ import uuid
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.config import ACTIVITY_SKEW_S, PipelineConfig
+from vigie_pipeline.detectors import NEW_DEVICE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
+from vigie_pipeline.overrides import QUIET_STATUSES, decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
-DETECTOR = "new_device"
+DETECTOR = NEW_DEVICE
 SWEEP_MAX = 20  # devices handled per run
 FETCH_MAX = 200  # candidates read and hold-stamped per run
 CLOSE_MAX = 200  # open incidents examined per run for an owner decision (cursor-rotated)
@@ -103,7 +105,6 @@ SKIPPED = "f5_skipped:"  # + device id; value = "<ISO> <reason>"; permanent
 RETRY = "f5_retry:"  # + device id; value = "<failures>|<retry after, epoch>"
 ELIGIBLE = "f5_eligible:"  # + device id; value = epoch of the first pass it was a candidate
 DROPPED = "f5_dropped:"  # + UTC day; value = stale drops that day (older days are cleaned)
-QUIET = ("acknowledged", "expected")  # incident_decisions.status values that close the incident
 
 _SELECT = (
     "SELECT d.id AS id, o.mac AS mac, mf.received AS received,"  # noqa: S608
@@ -472,14 +473,16 @@ def _handle(
 
 def _advance_cursor(inv: sqlite3.Connection, start: int) -> None:
     """Move the scan cursor past the contiguous run of DECIDED devices after `start`: noticed,
-    skipped, or whose first MAC is randomized (never eligible). It stops at the first undecided
+    skipped, whose first MAC is randomized (never eligible), or with no observations at all
+    (the candidate query joins observations, so such a device can never match: a pruned or
+    stitch-orphaned device would otherwise pin the cursor for good). It stops at the first undecided
     device (not yet dwelled, unmeasured, backed off, held), so nothing undecided is ever skipped;
     at most SCAN_ADVANCE events are examined per pass."""
     rows = inv.execute(
         "SELECT e.seq, EXISTS (SELECT 1 FROM pipeline_meta p"
         " WHERE p.key IN (? || e.device_id, ? || e.device_id))"
         " OR COALESCE((SELECT o.is_randomized FROM observations o WHERE o.device_id=e.device_id"
-        " ORDER BY o.first_seen, o.mac LIMIT 1), 0)=1"
+        " ORDER BY o.first_seen, o.mac LIMIT 1), 1)=1"
         " FROM events e WHERE e.kind='new_device' AND e.seq>? ORDER BY e.seq LIMIT ?",
         (NOTICED, SKIPPED, start, SCAN_ADVANCE),
     ).fetchall()
@@ -534,17 +537,8 @@ def _close_reviewed(inv: sqlite3.Connection, ov: sqlite3.Connection | None) -> i
         if not batch:
             return 0
         ids = [r[1] for r in batch]
-        marks = ",".join("?" * len(ids))
-        quiet = ",".join("?" * len(QUIET))
         try:
-            reviewed = [
-                r[0]
-                for r in ov.execute(
-                    f"SELECT incident_id FROM incident_decisions WHERE status IN ({quiet})"  # noqa: S608
-                    f" AND incident_id IN ({marks})",
-                    (*QUIET, *ids),
-                )
-            ]
+            reviewed = decided_incident_ids(ov, ids, QUIET_STATUSES)
         except sqlite3.Error as exc:
             log(logger, logging.ERROR, "new_device_close_failed", error=type(exc).__name__)
             return 0

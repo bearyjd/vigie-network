@@ -30,6 +30,7 @@ from vigie_api.models import (
     new_device_evidence,
     tod_cohort_bucket_valid,
 )
+from vigie_pipeline.detectors import ALL, ESSENTIAL_ABSENCE, NEW_DEVICE
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -37,7 +38,7 @@ REASON_CODES = (
     "two_qualified_upload_hours",
     "two_qualified_upload_hours_in_cohort",
 )
-DETECTORS = ("large_upload", "upload_deviation", "new_device", "essential_absence")
+DETECTORS = ALL
 INCIDENT_STATES = ("open", "resolved", "superseded")
 REVIEW_STATUSES = ("acknowledged", "snoozed", "expected")
 _INT = "int"
@@ -112,9 +113,9 @@ def _review(review: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _evidence_for(row: dict[str, Any]) -> dict[str, Any]:
-    if row["detector"] == "new_device":
+    if row["detector"] == NEW_DEVICE:
         return new_device_evidence(row["evidence"])
-    if row["detector"] == "essential_absence":
+    if row["detector"] == ESSENTIAL_ABSENCE:
         return essential_absence_evidence(row["evidence"])
     return allowlisted_evidence(row["evidence"])
 

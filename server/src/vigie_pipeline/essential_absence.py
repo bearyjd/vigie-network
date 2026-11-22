@@ -52,12 +52,14 @@ import uuid
 from dataclasses import dataclass
 
 from vigie_ingest.db import immediate, iso_utc
+from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
+from vigie_pipeline.overrides import QUIET_STATUSES, decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once
 
 logger = logging.getLogger("vigie_pipeline")
-DETECTOR = "essential_absence"
+DETECTOR = ESSENTIAL_ABSENCE
 REASON = "essential_absent"
 HOUR_S = 3600
 MIN_S = 3600  # keep equal to vigie_api.essential.MIN_S / MAX_S / MAX_ESSENTIAL (asserted by a test)
@@ -78,7 +80,6 @@ FLOOD_KEYS = (
     "dns_out_of_window",
     "truncated_other",  # a merged count of unknown keys: 'something else was lost'
 )
-QUIET = ("acknowledged", "expected")  # incident_decisions.status values that close the incident
 SUMMARIES = {
     "never_measured": "no traffic has ever been measured for it",
     "randomized": "its address is randomized (only fixed-address devices can be judged)",
@@ -253,12 +254,7 @@ def _reviewed(ov: sqlite3.Connection, rows: list[sqlite3.Row]) -> set[str]:
     if not rows:
         return set()
     try:
-        found = ov.execute(
-            f"SELECT incident_id FROM incident_decisions WHERE status IN ({','.join('?' * 2)})"  # noqa: S608
-            f" AND incident_id IN ({','.join('?' * len(rows))})",
-            (*QUIET, *(r["id"] for r in rows)),
-        )
-        return {r[0] for r in found}
+        return set(decided_incident_ids(ov, [r["id"] for r in rows], QUIET_STATUSES))
     except sqlite3.Error as exc:
         log(logger, logging.ERROR, "essential_absence_review_failed", error=type(exc).__name__)
         return set()

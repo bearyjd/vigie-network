@@ -23,6 +23,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.logs import log
+from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.snapshot import OverridesUnreadable, Snapshot, read_identity_version
 from vigie_pipeline.stitch_db import (
     Attachment,
@@ -328,6 +329,21 @@ class Applier:
             return False
         return True
 
+    def _retire_orphan(self, device_id: str) -> None:
+        """The orphaned self device is retired (never deleted), and the prune's clock starts when
+        the status does, whatever stamp it carried."""
+        retired = self.inv.execute(
+            "UPDATE devices SET status='retired' WHERE id=? AND NOT EXISTS"
+            " (SELECT 1 FROM observations WHERE device_id=?)",
+            (device_id, device_id),
+        ).rowcount
+        if retired:
+            self.inv.execute(
+                "INSERT INTO transient_state (device_id, since) VALUES (?,?)"
+                " ON CONFLICT(device_id) DO UPDATE SET since=excluded.since",
+                (device_id, retirement_stamp(self.inv, self.at)),
+            )
+
     def _attach(self, d: Attach) -> None:
         if not self._vetoes_unchanged() or not self._plan_allows(d.from_device, d.target):
             return
@@ -366,11 +382,7 @@ class Applier:
             " WHERE id=?",
             (d.from_device, d.from_device, d.target),
         )
-        self.inv.execute(  # the orphaned self device is retired (never deleted)
-            "UPDATE devices SET status='retired' WHERE id=? AND NOT EXISTS"
-            " (SELECT 1 FROM observations WHERE device_id=?)",
-            (d.from_device, d.from_device),
-        )
+        self._retire_orphan(d.from_device)
         # settled by the rule: its open suggestions are expired and its candidate rows dismissed
         # under the remaining row cap, the rest on later passes (Settle)
         self._cleanup(d.from_device)

@@ -6,6 +6,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+from vigie_pipeline.overrides import link_sources, link_target
+
 MAX_MACS = 64
 MAX_ALIASES = 256
 
@@ -39,25 +41,18 @@ def lineage(inv, ov, device):
         if canonical in seen or len(seen) >= MAX_ALIASES:
             raise LineageUnavailable("identity graph is invalid or too large")
         seen.add(canonical)
-        row = ov.execute(
-            "SELECT into_device FROM identity_links WHERE from_device=? AND revoked_at IS NULL",
-            (canonical,),
-        ).fetchone()
-        if row is None:
+        target = link_target(ov, canonical)
+        if target is None:
             break
-        canonical = row[0]
+        canonical = target
     members = {canonical}
     queue = [canonical]
     while queue and ov is not None:
         current = queue.pop()
-        for row in ov.execute(
-            "SELECT from_device FROM identity_links WHERE into_device=? "
-            "AND revoked_at IS NULL LIMIT 257",
-            (current,),
-        ):
-            if row[0] not in members:
-                members.add(row[0])
-                queue.append(row[0])
+        for source in link_sources(ov, current):
+            if source not in members:
+                members.add(source)
+                queue.append(source)
                 if len(members) > MAX_ALIASES:
                     raise LineageUnavailable("identity component is too large")
     marks = ",".join("?" for _ in members)

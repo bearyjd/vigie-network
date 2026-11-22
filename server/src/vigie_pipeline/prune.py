@@ -1,0 +1,380 @@
+"""Pruning the MAC rows of devices the server retired 90 days ago (PRP section 8).
+
+Everything here fails closed: an unusable overrides.db, an unread batch, a clock that cannot be
+checked or a decision that cannot be ruled out all mean nothing is deleted this pass."""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+from vigie_ingest.db import immediate, iso_utc
+from vigie_pipeline.config import (
+    PRUNE_BATCH_ROWS,
+    PRUNE_CLOCK_WARN_REPEAT_S,
+    PRUNE_CLOCK_WARN_S,
+    RETIRED_MAC_RETENTION_S,
+)
+from vigie_pipeline.logs import log
+from vigie_pipeline.overrides import (
+    OverridesNotUsable,
+    decided_suggestion_ids,
+    durable_decisions_found,
+    open_overrides_ro,
+    overrides_data_version,
+    overrides_identity,
+    protected_device_ids,
+)
+from vigie_pipeline.prune_exclusions import (
+    LIVE_SUGGESTION_PARAMS,
+    PRUNE_EXCLUSIONS_SQL,
+    suggestion_devices,
+)
+from vigie_pipeline.stitch_db import state_get, state_set
+
+logger = logging.getLogger("vigie_pipeline")
+
+PRUNED_COUNTER_KEY = "retired_mac_rows_pruned"
+
+
+class _OverridesMoved(Exception):
+    """overrides.db committed (or could not be asked) since the protected set was read: the pass
+    cannot prove it is safe to prune; roll back and try next pass."""
+
+
+@dataclass(frozen=True)
+class _OverridesRead:
+    """A dedicated read-only connection to overrides.db and what it must still show at the end:
+    the file's identity from before the open and `PRAGMA data_version` from before the read."""
+
+    conn: sqlite3.Connection
+    path: Path
+    identity: tuple[int, int]
+    version: int
+
+    def moved(self) -> bool:
+        """True when overrides.db changed or was replaced since, or cannot say (fail closed)."""
+        try:
+            return (
+                overrides_identity(self.path) != self.identity
+                or overrides_data_version(self.conn) != self.version
+            )
+        except (sqlite3.Error, OverridesNotUsable):
+            return True
+
+
+def _open_overrides_read(path: Path, *, quiet: bool = False) -> _OverridesRead:
+    """The identity is taken BEFORE the open: a file swapped in between is seen as moved. This
+    connection is opened here for the prune alone, so no cursor an earlier stage left open on the
+    pipeline's own connection can hold its `data_version` still."""
+    identity = overrides_identity(path)
+    conn = open_overrides_ro(path, quiet=quiet)
+    if conn is None:
+        raise OverridesNotUsable("overrides.db could not be opened")
+    try:
+        return _OverridesRead(conn, path, identity, overrides_data_version(conn))
+    except BaseException:
+        conn.close()
+        raise
+
+
+def prune_retired_macs(
+    inv: sqlite3.Connection,
+    overrides_path: Path,
+    now: float,
+) -> int:
+    """Drop self-linked MAC rows of retired devices 90 days after the server retired them
+    (transient_state.since; PRP section 8), on the older of the server clock and the oldest live
+    collector's `last_sent_ts` (`_trusted_now`). One bounded batch per pass; the running total is
+    kept in `pipeline_meta` and each pass logs only a count. Devices are never deleted; a pruned
+    MAC that returns starts over as a new transient (a new device id, accepted).
+
+    Devices that overrides.db refers to, and those of every suggestion the owner decided, are
+    never pruned: human decisions live there, not in `link_source`. Fails closed: no overrides.db
+    (DEBUG: normal before the API ran), an unusable one, a lost or rolled-back one
+    (`_decisions_not_lost`, latched) or a busy inventory skips the pass. The protected set is read
+    on a connection of its own and re-validated just before COMMIT (same file, unchanged
+    `PRAGMA data_version`): a decision committed meanwhile rolls the pass back. The two databases
+    cannot share a transaction, so a commit landing after that last check is not seen, same as
+    stitch_apply's attach (accepted)."""
+    read = None
+    try:
+        if not overrides_path.exists():
+            return _overrides_missing(inv)
+        read = _open_overrides_read(overrides_path)
+        decided = _track_history(inv, read.conn)
+        if decided is None:
+            return 0
+        protected = protected_device_ids(read.conn)
+        protected = protected | suggestion_devices(inv, decided)  # a new set: nothing mutated
+        pruned = _delete_retired_rows(inv, read, protected, now)
+    except _OverridesMoved:
+        log(logger, logging.INFO, "prune_deferred", reason="overrides_changed")
+        return 0
+    except (sqlite3.Error, OverridesNotUsable) as exc:  # busy, locked, unusable: skip the pass
+        log(logger, logging.ERROR, "prune_skipped", error=str(exc))
+        return 0
+    finally:
+        if read is not None:
+            read.conn.close()
+    if pruned:
+        log(logger, logging.INFO, "retired_macs_pruned", count=pruned)  # a count, never a MAC
+    return pruned
+
+
+def _track_history(
+    inv: sqlite3.Connection, conn: sqlite3.Connection, *, quiet: bool = False
+) -> set[str] | None:
+    """The one look at overrides.db's history, shared by the prune and the flag-off tracker: the
+    decided suggestion ids, or None when the prune must not go on (`_decisions_not_lost`). It
+    advances or latches the `stitch_state` markers; it deletes nothing."""
+    decided = decided_suggestion_ids(conn)
+    found = durable_decisions_found(conn) or bool(decided)  # a decided suggestion counts
+    audit_mark = _audit_high_water(conn)
+    replaced = _audit_history_replaced(inv, conn)
+    audit_id = _audit_id_at(conn, audit_mark)
+    if not _decisions_not_lost(inv, found, audit_mark, audit_id, replaced, quiet=quiet):
+        return None
+    return decided
+
+
+def track_overrides_history(inv: sqlite3.Connection, overrides_path: Path) -> None:
+    """Prune OFF (the default): delete nothing and touch nothing but the `stitch_state` history
+    markers (audit high-water mark, presence marker, lost-decisions latch), kept exactly as the
+    enabled prune keeps them, so a restore or loss made while off is seen when it is turned on.
+    Quiet: DEBUG at most, never a WARNING/ERROR per pass. A missing, unreadable or busy file
+    changes no marker."""
+    read = None
+    try:
+        if not overrides_path.exists():
+            return
+        read = _open_overrides_read(overrides_path, quiet=True)
+        _track_history(inv, read.conn, quiet=True)
+    except (sqlite3.Error, OverridesNotUsable) as exc:
+        log(logger, logging.DEBUG, "overrides_history_untracked", error=str(exc))
+    finally:
+        if read is not None:
+            read.conn.close()
+
+
+def _overrides_missing(inv: sqlite3.Connection) -> int:
+    """Normal before the API ran; an ERROR once this install has seen a decision (a lost file)."""
+    level = logging.ERROR if _marks_set(inv) else logging.DEBUG
+    log(logger, level, "prune_skipped", reason="overrides_missing")
+    return 0
+
+
+OVERRIDES_SEEN_KEY = "prune_overrides_seen"
+OVERRIDES_AUDIT_KEY = "prune_overrides_audit_mark"
+OVERRIDES_AUDIT_ID_KEY = "prune_overrides_audit_id"  # the audit row id at that counter
+OVERRIDES_LATCH_KEY = "prune_overrides_latched"
+CLOCK_WARNED_KEY = "prune_clock_warned"
+
+
+def _marks_set(inv: sqlite3.Connection) -> bool:
+    return any(state_get(inv, key) is not None for key in (OVERRIDES_SEEN_KEY, OVERRIDES_AUDIT_KEY))
+
+
+def _audit_high_water(conn: sqlite3.Connection) -> int:
+    """`audit_log.seq` is AUTOINCREMENT and the API writes a row with every decision, so the
+    largest one only grows for as long as this is the same file's history (trimming old rows
+    keeps it, which a row count would not). sqlite3.Error propagates (the pass is skipped)."""
+    return int(conn.execute("SELECT COALESCE(MAX(seq), 0) FROM audit_log").fetchone()[0])
+
+
+def _audit_id_at(conn: sqlite3.Connection, seq: int) -> str:
+    """The unique id of the audit row at `seq` ('' when there is none)."""
+    row = conn.execute("SELECT id FROM audit_log WHERE seq=?", (seq,)).fetchone()
+    return "" if row is None else str(row[0])
+
+
+def _audit_history_replaced(inv: sqlite3.Connection, conn: sqlite3.Connection) -> bool:
+    """True when the audit row at the stored high-water `seq` is not the one stored with it (or
+    the stored id is missing, or there is no such row): a different file that merely grew a
+    counter at least as large, which no number comparison can tell from the same file."""
+    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
+    if stored is None:
+        return False  # nothing was ever stored: no history to compare with
+    try:
+        seq = int(stored)
+    except ValueError:
+        return False  # `_decisions_not_lost` treats an unreadable mark as a rollback
+    expected = state_get(inv, OVERRIDES_AUDIT_ID_KEY)
+    return not expected or expected != _audit_id_at(conn, seq)
+
+
+def _history_verdict(
+    inv: sqlite3.Connection, found: bool, audit_mark: int, audit_id: str, replaced: bool
+) -> tuple[str | None, dict[str, str]]:
+    """The finding against the stored markers (None: the file is the same history or a richer
+    one) and, when there is none, the marker rows this look advances. Writes nothing."""
+    stored = state_get(inv, OVERRIDES_AUDIT_KEY)
+    try:
+        high_water = 0 if stored is None else int(stored)
+    except ValueError:
+        high_water = audit_mark + 1  # unreadable mark: cannot show the file is the same history
+    seen = state_get(inv, OVERRIDES_SEEN_KEY) is not None
+    if replaced or audit_mark < high_water:
+        return "overrides_rolled_back", {}
+    if seen and not found:
+        return "overrides_lost_decisions", {}
+    writes = {}
+    if found and not seen:
+        writes[OVERRIDES_SEEN_KEY] = "1"
+    if audit_mark > high_water:
+        writes[OVERRIDES_AUDIT_KEY] = str(audit_mark)
+        writes[OVERRIDES_AUDIT_ID_KEY] = audit_id
+    return None, writes
+
+
+def _decisions_not_lost(
+    inv: sqlite3.Connection,
+    found: bool,
+    audit_mark: int,
+    audit_id: str = "",
+    replaced: bool = False,
+    *,
+    quiet: bool = False,
+) -> bool:
+    """False when overrides.db looks like a different, poorer file than the one this install has
+    read before, so an empty or shrunken protected set would protect nothing. Three signs against
+    `stitch_state` markers set by the first read that finds a decision / an audit row: `found`
+    against the presence marker; `audit_mark` (the file's audit counter) against its high-water
+    mark (an older backup restored over the file); `replaced` (`_audit_history_replaced`; the id
+    of the row at the high-water counter is stored beside it as `audit_id`: a file recreated and
+    grown past the old counter before this look). Any finding LATCHES the prune off
+    (`OVERRIDES_LATCH_KEY`): the counter catching up later does not show the decisions came back,
+    so only the operator's deletion of the marker rows resumes it. An install that never had
+    either marker (nothing to lose) prunes as usual. `quiet` (the prune is off) logs at DEBUG."""
+    level = logging.DEBUG if quiet else logging.ERROR
+    latched = state_get(inv, OVERRIDES_LATCH_KEY)
+    if latched is not None:
+        log(logger, level, "prune_skipped", reason="overrides_latched", latched=latched)
+        return False
+    reason, writes = _history_verdict(inv, found, audit_mark, audit_id, replaced)
+    if reason is not None:
+        writes = {OVERRIDES_LATCH_KEY: reason}
+    if writes:  # a pass that changes no marker takes no write lock
+        with immediate(inv):
+            for key, value in writes.items():
+                state_set(inv, key, value)
+    if reason is not None:
+        log(logger, level, "prune_skipped", reason=reason)
+    return reason is None
+
+
+def _delete_retired_rows(
+    inv: sqlite3.Connection,
+    read: _OverridesRead,
+    protected: set[str],
+    now: float,
+) -> int:
+    trusted = _trusted_now(inv, now)
+    if trusted is None:
+        return 0  # no collector has ever sent: the server clock cannot be checked, prune nothing
+    args = _prune_args(trusted)
+    candidates = _prune_candidates(inv, protected, args)  # selected before the write lock
+    with immediate(inv):
+        pruned = _delete_candidates(inv, candidates, args)
+        if pruned:
+            inv.execute(
+                "INSERT INTO pipeline_meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+?",
+                (PRUNED_COUNTER_KEY, str(pruned), pruned),
+            )
+        if read.moved():
+            raise _OverridesMoved  # immediate() rolls the DELETEs back
+    return pruned
+
+
+def _trusted_now(inv: sqlite3.Connection, now: float) -> float | None:
+    """The instant the server can vouch for: the older of its own time and the oldest
+    `collectors.last_sent_ts` among live collectors that ever sent. Ingest keeps that column as a
+    never-purged running maximum of accepted send times and accepts a send time only within its
+    skew window of the server clock, so a stepped server clock cannot drag it along for a collector
+    that kept true time, and purging batch rows cannot erase it. A silent collector holds the clock
+    back until it is revoked: fail safe, and named in a WARNING once it has been silent for
+    PRUNE_CLOCK_WARN_S. None (no collector with an accepted send) prunes nothing; a live collector
+    whose `last_sent_ts` is not a number raises sqlite3.DataError (the pass is skipped)."""
+    if inv.execute(
+        "SELECT 1 FROM collectors"
+        " WHERE revoked=0 AND typeof(last_sent_ts) NOT IN ('integer','real')"
+    ).fetchone():  # text sorts after every number and would silently leave the minimum
+        raise sqlite3.DataError("collectors.last_sent_ts holds a value that is not a number")
+    row = inv.execute(
+        "SELECT id, last_sent_ts FROM collectors WHERE revoked=0 AND last_sent_ts>0"
+        " ORDER BY last_sent_ts LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    if row[1] < now - PRUNE_CLOCK_WARN_S:
+        _warn_clock_held_back(inv, now, row[0], row[1])
+    return min(now, float(row[1]))
+
+
+def _warn_clock_held_back(inv: sqlite3.Connection, now: float, collector: str, sent: int) -> None:
+    """The WARNING, at most once per PRUNE_CLOCK_WARN_REPEAT_S (a silent collector would
+    otherwise repeat it every pass); the instant of the last one is a `stitch_state` row, and one
+    from the future (the clock was set back) counts as due."""
+    last = state_get(inv, CLOCK_WARNED_KEY)
+    if last is not None and iso_utc(now - PRUNE_CLOCK_WARN_REPEAT_S) < last <= iso_utc(now):
+        return
+    with immediate(inv):
+        state_set(inv, CLOCK_WARNED_KEY, iso_utc(now))
+    log(logger, logging.WARNING, "prune_clock_held_back", collector=collector, last_sent_ts=sent)
+
+
+def _prune_args(trusted: float) -> tuple[str, ...]:
+    """Binds of the prunable predicate, in order: stamp cutoff, last_seen cutoff, then the instant
+    a suggestion must still be live at, once per direction."""
+    cutoff = iso_utc(trusted - RETIRED_MAC_RETENTION_S)
+    return (cutoff, cutoff, *(iso_utc(trusted),) * LIVE_SUGGESTION_PARAMS)
+
+
+# The whole prunable predicate, selected before the lock and repeated by the DELETE inside it.
+# Aliases: o observations, d devices, t transient_state (the server-clock retirement stamp; a
+# retired device without one is not prunable). Placeholders: see `_prune_args`.
+_PRUNABLE_SQL = (
+    "FROM observations o JOIN devices d ON d.id=o.device_id"  # noqa: S608
+    " JOIN transient_state t ON t.device_id=d.id"
+    " WHERE d.status='retired' AND o.link_source='self' AND t.since<? AND o.last_seen<?"
+    f" AND d.id NOT IN (SELECT id FROM prune_protected){PRUNE_EXCLUSIONS_SQL}"
+)
+
+
+def _prune_candidates(
+    inv: sqlite3.Connection, protected: set[str], args: tuple[str, ...]
+) -> list[str]:
+    """Up to PRUNE_BATCH_ROWS MACs, oldest retirement first, with every protection already
+    applied in SQL so a protected oldest batch cannot starve the LIMIT. The scan runs here, with
+    no write lock held; the temp table lives in the temp database, not the main one."""
+    inv.execute("CREATE TEMP TABLE IF NOT EXISTS prune_protected (id TEXT PRIMARY KEY)")
+    inv.execute("DELETE FROM prune_protected")
+    inv.executemany("INSERT INTO prune_protected (id) VALUES (?)", [(i,) for i in protected])
+    return [
+        r[0]
+        for r in inv.execute(
+            f"SELECT o.mac {_PRUNABLE_SQL} ORDER BY t.since, o.mac LIMIT ?",  # noqa: S608
+            (*args, PRUNE_BATCH_ROWS),
+        )
+    ]
+
+
+def _delete_candidates(inv: sqlite3.Connection, macs: list[str], args: tuple[str, ...]) -> int:
+    """Inside the lock: one DELETE per candidate that repeats the whole predicate as point
+    lookups (a candidate revived, protected or stamped anew since the select is skipped). A
+    pruned MAC's last-known IP goes with it: the MAC returning with traffic that carries no
+    address (DNS only) would otherwise show the old IP on its new device."""
+    pruned = 0
+    for mac in macs:
+        deleted = inv.execute(
+            "DELETE FROM observations WHERE mac=? AND mac IN"  # noqa: S608
+            f" (SELECT o.mac {_PRUNABLE_SQL} AND o.mac=?)",
+            (mac, *args, mac),
+        ).rowcount
+        if deleted:
+            inv.execute("DELETE FROM mac_last_ip WHERE mac=?", (mac,))
+        pruned += deleted
+    return pruned

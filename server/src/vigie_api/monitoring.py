@@ -12,6 +12,7 @@ from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_api.models import essential_absence_evidence, new_device_evidence
+from vigie_pipeline.detectors import ESSENTIAL_ABSENCE, NEW_DEVICE
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -340,7 +341,10 @@ def baseline_view(inv, collector, device, key):
     }
 
 
-_SANITISED = {"new_device": new_device_evidence, "essential_absence": essential_absence_evidence}
+_SANITISED = {
+    NEW_DEVICE: new_device_evidence,
+    ESSENTIAL_ABSENCE: essential_absence_evidence,
+}
 
 
 def _evidence(detector, stored):

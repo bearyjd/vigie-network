@@ -20,7 +20,11 @@ from vigie_pipeline.characterization_store import (
     refresh_characterization,
     save_services,
 )
-from vigie_pipeline.config import PipelineConfig
+from vigie_pipeline.config import (
+    RETIRED_BACKFILL_INTERVAL_S,
+    RETIRED_STAMP_AHEAD_WARN_S,
+    PipelineConfig,
+)
 from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.essential_absence import sweep_essential_absence
 from vigie_pipeline.last_ip import save_last_ips
@@ -28,13 +32,18 @@ from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.new_device_notice import sweep_new_devices
-from vigie_pipeline.overrides import canonical_device, open_overrides_ro
+from vigie_pipeline.overrides import (
+    canonical_device,
+    open_overrides_ro,
+)
 from vigie_pipeline.probes import fold_probes, retire_status
+from vigie_pipeline.prune import prune_retired_macs, track_overrides_history
+from vigie_pipeline.retirement import retirement_stamp
 from vigie_pipeline.schema import open_pipeline_inventory
 from vigie_pipeline.snapshot import EMPTY, OverridesUnreadable, Snapshot, load_snapshot
 from vigie_pipeline.sources import MacActivity, ShardReadError, is_randomized, read_batch
 from vigie_pipeline.stitch import StitchStats, stitch
-from vigie_pipeline.stitch_db import emit_once
+from vigie_pipeline.stitch_db import emit_once, state_get, state_set
 from vigie_pipeline.stitch_types import fold
 
 logger = logging.getLogger("vigie_pipeline")
@@ -74,24 +83,20 @@ def run_once(
         stitched = (
             _stitch(inv, overrides, config, live or (lambda: clock)) if usable else StitchStats()
         )
-        promoted, retired = sweep_transients(inv, clock, config)
+        promoted, retired = sweep_transients(
+            inv, clock, config, retired_at=(live or (lambda: clock))()
+        )
+        if config.prune_retired_macs:
+            _prune_stage(inv, config, clock, usable, len(failures))
+        else:  # default off: deletes nothing, quiet; only the overrides.db history markers move
+            track_overrides_history(inv, config.overrides_path)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
         # F6-b, default off. Not after a failed shard read: a stale view must not page "absent"
         if config.essential_absence and usable and not failures:
             sweep_essential_absence(inv, overrides, clock)
         purge_activity(inv, clock, config.activity_retention_s)
-        if usable:
-            analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
-            run_delivery_stage(
-                inv, overrides, config, live or (lambda: clock), should_stop=should_stop
-            )
-            refresh_characterization(inv, overrides, clock)
-        prune_monitoring(inv, clock)
-        if config.probes.enabled:  # needs no overrides; contains its own errors
-            fold_probes(inv, config.probes, live or (lambda: clock))
-        else:  # a status stored while it was on must not keep saying ok (a read when none exists)
-            retire_status(inv, live or (lambda: clock))
+        _monitor_deliver_probe(inv, overrides, config, usable, clock, live, should_stop)
     finally:
         inv.close()
         if overrides is not None:
@@ -107,6 +112,27 @@ def run_once(
     if failures:
         raise failures[0]
     return stats
+
+
+def _monitor_deliver_probe(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    usable: bool,
+    clock: float,
+    live: Callable[[], float] | None,
+    should_stop: Callable[[], bool],
+) -> None:
+    """The stages after the prune; they need a readable overrides.db except the probes."""
+    if usable:
+        analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
+        run_delivery_stage(inv, overrides, config, live or (lambda: clock), should_stop=should_stop)
+        refresh_characterization(inv, overrides, clock)
+    prune_monitoring(inv, clock)
+    if config.probes.enabled:  # needs no overrides; contains its own errors
+        fold_probes(inv, config.probes, live or (lambda: clock))
+    else:  # a status stored while it was on must not keep saying ok (a read when none exists)
+        retire_status(inv, live or (lambda: clock))
 
 
 def monitoring_policy(config: PipelineConfig) -> BaselineConfig | TodConfig:
@@ -141,6 +167,23 @@ def _overrides_readable(
                       iso_utc(now)[:10], now)  # fmt: skip
         return False
     return True
+
+
+def _prune_stage(
+    inv: sqlite3.Connection, config: PipelineConfig, clock: float, usable: bool, failed: int
+) -> None:
+    """An unread batch may carry a returning MAC: prune next pass, and say so, the only trace of
+    why a persistently unreadable shard prunes nothing. `usable` is defence in depth:
+    prune_retired_macs reads overrides.db itself and fails closed on an unusable file. A pass
+    that skips the prune still takes the quiet history look (deletes nothing), so a restore made
+    while a shard keeps failing is latched, as the flag-off pass does."""
+    if failed:
+        log(logger, logging.INFO, "prune_skipped", reason="failed_read", failed_collectors=failed)
+        track_overrides_history(inv, config.overrides_path)
+    elif usable:
+        prune_retired_macs(inv, config.overrides_path, clock)
+    else:
+        track_overrides_history(inv, config.overrides_path)
 
 
 def _stitch(
@@ -393,26 +436,78 @@ def _record_hours(inv: sqlite3.Connection, device_id: str, received: str) -> Non
 
 
 def sweep_transients(
-    inv: sqlite3.Connection, now: float, config: PipelineConfig
+    inv: sqlite3.Connection, now: float, config: PipelineConfig, retired_at: float | None = None
 ) -> tuple[int, int]:
     """Promote transients seen in >=2 server-received hours with >= min dwell between first and
     last seen, at most `promotion_cap_per_hour` per server hour; retire the rest once the window
     has elapsed since they became transient. Devices are retired, never deleted. A hostname is
-    attacker-controlled and is never a promotion signal."""
+    attacker-controlled and is never a promotion signal. `retired_at` is the server moment the
+    retirement is stamped with (default `now`), never earlier than the newest batch receipt
+    (`retirement_stamp`): a fresh clock read, not the pass start."""
     hour = iso_utc(now)[:13]
+    stamp = retirement_stamp(inv, now if retired_at is None else retired_at)
     with immediate(inv):
         promoted = _promote(inv, hour, iso_utc(now), config)
-        retired = inv.execute(
-            "UPDATE devices SET status='retired' WHERE status='transient' AND id IN"
-            " (SELECT device_id FROM transient_state WHERE since<=?)",
-            (iso_utc(now - config.transient_window_s),),
-        ).rowcount
-        for table in ("transient_hours", "transient_state"):
-            inv.execute(
-                f"DELETE FROM {table} WHERE device_id IN"  # noqa: S608
-                " (SELECT id FROM devices WHERE status<>'transient')"
-            )
+        retired = _retire_due(inv, now, stamp, config)
+        inv.execute(
+            "DELETE FROM transient_hours WHERE device_id IN"
+            " (SELECT id FROM devices WHERE status<>'transient')"
+        )
+        # a retired device keeps its stamp: it is the prune's clock
+        inv.execute(
+            "DELETE FROM transient_state WHERE device_id IN"
+            " (SELECT id FROM devices WHERE status='active')"
+        )
+        _backfill_stamps(inv, stamp)
     return promoted, retired
+
+
+BACKFILL_KEY = "retired_stamp_backfilled"
+
+
+def _backfill_stamps(inv: sqlite3.Connection, stamp: str) -> None:
+    """Retired devices without a stamp start their clock now, at most once per
+    RETIRED_BACKFILL_INTERVAL_S: every retirement of this build stamps itself (`_retire_due`,
+    stitch_apply), but one retired before the stamp existed, or by a build rolled back to, has
+    none and is not prunable until stamped. The scan of devices therefore repeats daily, not each
+    pass. The marker holds the stamp of the last scan; one from the future (the clock was set
+    back) or one that is not a time counts as due. It is a `stitch_state` row, not `pipeline_meta`:
+    that table's contents are pinned byte for byte by the freeze tests for runs that prune
+    nothing (the prune keeps its running total there)."""
+    last = state_get(inv, BACKFILL_KEY)
+    try:
+        if last is not None and last <= stamp < iso_utc(_epoch(last) + RETIRED_BACKFILL_INTERVAL_S):
+            return
+    except ValueError:  # an unreadable marker cannot show a scan is recent: scan and rewrite it
+        pass
+    inv.execute(
+        "INSERT OR IGNORE INTO transient_state (device_id, since)"
+        " SELECT id, ? FROM devices WHERE status='retired'",
+        (stamp,),
+    )
+    state_set(inv, BACKFILL_KEY, stamp)
+
+
+def _retire_due(inv: sqlite3.Connection, now: float, stamp: str, config: PipelineConfig) -> int:
+    """Retire the transients whose window elapsed and stamp them with the server moment of
+    retirement: transient_state.since means "since the current status began" (the prune ages a
+    retired device from it; a revival rewrites it)."""
+    due = [
+        (r[0],)
+        for r in inv.execute(
+            "SELECT s.device_id FROM transient_state s JOIN devices d ON d.id=s.device_id"
+            " WHERE d.status='transient' AND s.since<=?",
+            (iso_utc(now - config.transient_window_s),),
+        )
+    ]
+    if due and stamp > iso_utc(now + RETIRED_STAMP_AHEAD_WARN_S):
+        log(logger, logging.WARNING, "retirement_stamp_ahead", retired=len(due), stamp=stamp)
+    inv.executemany("UPDATE devices SET status='retired' WHERE id=?", due)
+    inv.executemany(
+        "UPDATE transient_state SET since=? WHERE device_id=?",
+        [(stamp, device_id) for (device_id,) in due],
+    )
+    return len(due)
 
 
 def _promote(inv: sqlite3.Connection, hour: str, now_iso: str, config: PipelineConfig) -> int:

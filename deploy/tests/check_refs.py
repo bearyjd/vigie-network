@@ -309,6 +309,19 @@ def check_monitoring_config(doc: dict, example: str) -> None:
             err(f"monitoring baseline selector belongs only to pipeline, not {service}")
 
 
+def check_prune_flag(doc: dict, example: str) -> None:
+    """The irreversible retired-MAC prune is opt-in: off in the example and by compose default,
+    forwarded to the pipeline alone."""
+    name = "VIGIE_PRUNE_RETIRED_MACS"
+    if not re.search(rf"(?m)^{name}=0\b", example):
+        err(f"{name} must be documented in .env.example as 0 (off)")
+    if doc["services"]["pipeline"]["environment"].get(name) != "${" + name + "-0}":
+        err(f"pipeline must forward {name} with a default of 0")
+    for service in ("ingest", "api"):
+        if name in doc["services"][service]["environment"]:
+            err(f"{name} belongs only to pipeline, not {service}")
+
+
 def check_env_names() -> None:
     src = set(re.findall(r"VIGIE_[A-Z0-9_]+", source_text("server/src")))
     deploy_only = {  # consumed by deploy/ scripts and compose, not by the Python services
@@ -330,6 +343,8 @@ def check_env_names() -> None:
             err(f"server/src reads {var} but .env.example does not document it")
     check_monitoring_config(yaml.safe_load((ROOT / "deploy/compose.yaml").read_text()),
                             (ROOT / "deploy/.env.example").read_text())
+    check_prune_flag(yaml.safe_load((ROOT / "deploy/compose.yaml").read_text()),
+                     (ROOT / "deploy/.env.example").read_text())
     print("env names: ok")
 
 
@@ -482,6 +497,21 @@ def self_test() -> None:
     del contract["services"]["api"]["environment"][setting]
     del contract["services"]["pipeline"]["environment"][setting]
     _fails("monitoring threshold not forwarded", check_monitoring_config, contract, example)
+    prune = "VIGIE_PRUNE_RETIRED_MACS"
+    prune_doc = {"services": {svc: {"environment": {}} for svc in ("pipeline", "ingest", "api")}}
+    prune_doc["services"]["pipeline"]["environment"][prune] = "${VIGIE_PRUNE_RETIRED_MACS-0}"
+    prune_example = "VIGIE_PRUNE_RETIRED_MACS=0        # 1/true/yes enable\n"
+    check_prune_flag(prune_doc, prune_example)
+    _fails("prune flag defaulting to on in compose", check_prune_flag,
+           {"services": {**prune_doc["services"], "pipeline": {"environment": {prune: "${VIGIE_PRUNE_RETIRED_MACS-1}"}}}}, prune_example)
+    _fails("prune flag enabled in .env.example", check_prune_flag, prune_doc, prune_example.replace("=0", "=1"))
+    _fails("prune flag undocumented in .env.example", check_prune_flag, prune_doc, "")
+    _fails("prune flag not forwarded to pipeline", check_prune_flag,
+           {"services": {**prune_doc["services"], "pipeline": {"environment": {}}}}, prune_example)
+    _fails("prune flag forwarded to the api", check_prune_flag,
+           {"services": {**prune_doc["services"], "api": {"environment": {prune: "0"}}}}, prune_example)
+    _fails("prune flag forwarded to ingest", check_prune_flag,
+           {"services": {**prune_doc["services"], "ingest": {"environment": {prune: "0"}}}}, prune_example)
     # and the checks accept the real inputs
     check_mounts(good, deploy_md)
     check_firewall(readme)

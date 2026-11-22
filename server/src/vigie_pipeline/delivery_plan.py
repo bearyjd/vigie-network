@@ -66,7 +66,6 @@ from collections.abc import Iterable, Mapping
 from vigie_pipeline.delivery_types import (  # noqa: F401 - re-exported
     CLOSED_STATES,
     KINDS,
-    QUIET_STATUSES,
     STATES,
     TERMINAL,
     UNRECOGNISED,
@@ -90,6 +89,7 @@ from vigie_pipeline.delivery_types import (  # noqa: F401 - re-exported
     tick_floor,
 )
 from vigie_pipeline.delivery_types import is_number as _num
+from vigie_pipeline.overrides import QUIET_STATUSES
 
 
 def _exp(d: DeliveryView) -> Expected:

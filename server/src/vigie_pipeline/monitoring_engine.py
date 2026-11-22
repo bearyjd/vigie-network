@@ -11,6 +11,7 @@ import time
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.baselines import BaselineConfig, InvalidInput, Sample
 from vigie_pipeline.baselines_tod import TodConfig
+from vigie_pipeline.detectors import ENGINE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 from vigie_pipeline.monitoring_strategy import strategy_for
@@ -20,7 +21,7 @@ MAX_ENTITIES = 20
 AGGREGATE_DAYS = 90
 DETAIL_DAYS = 7
 # The only detectors this engine's incident lifecycle may resolve or supersede.
-ENGINE_DETECTORS = ("large_upload", "upload_deviation")
+ENGINE_DETECTORS = ENGINE
 _ENGINE_IN = ",".join("?" * len(ENGINE_DETECTORS))
 
 

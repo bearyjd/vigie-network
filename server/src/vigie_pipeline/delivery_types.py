@@ -8,13 +8,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from vigie_pipeline.detectors import ENGINE, OPEN_ONLY
+
 KINDS = ("open", "recover")
 # Detectors whose incidents may be delivered (VIGIE_DELIVERY_DETECTORS); the default is today's set.
-DEFAULT_DETECTORS = ("large_upload", "upload_deviation")
-OPEN_ONLY_DETECTORS = ("new_device", "essential_absence")  # announced once; never a recover
+DEFAULT_DETECTORS = ENGINE
+OPEN_ONLY_DETECTORS = OPEN_ONLY  # announced once on open; never a "back to normal" send
 STATES = frozenset({"pending", "sending", "sent", "failed", "suppressed", "expired", "withdrawn"})
 TERMINAL = frozenset({"sent", "failed", "suppressed", "expired", "withdrawn"})
-QUIET_STATUSES = frozenset({"acknowledged", "expected"})
 CLOSED_STATES = frozenset({"resolved", "superseded"})
 UNRECOGNISED = "unrecognised_state"
 
