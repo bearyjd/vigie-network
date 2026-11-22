@@ -79,7 +79,7 @@ const requests = [];  // every request the page makes, for the read-only contrac
 globalThis.fetch = async (url, options) => {
   requests.push({url: String(url), options});
   if (gate) await gate;
-  if (new URL(String(url)).pathname === '/coverage' && holdCoverage) { const held = holdCoverage; holdCoverage = null; await held.promise; return new Response('{}', {status: 503}); }  // one slow, soon obsolete coverage response
+  if (new URL(String(url)).pathname === '/coverage' && holdCoverage) { const held = holdCoverage; holdCoverage = null; await held.promise; return new Response('{}', {status: held.status ?? 503}); }  // one slow, soon obsolete coverage response
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
@@ -564,10 +564,11 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
 // Round 3: an obsolete coverage response must not overwrite a fresher banner.
 {
   collectorOver = {}; hourState = 'eligible'; lastHourState = 'eligible'; location.hash = ''; view('overview'); await flush(); await reload(); assert.equal(tone(), 'ok');
-  let releaseStale; holdCoverage = {promise: new Promise(resolve => { releaseStale = resolve; })};
+  let releaseStale; holdCoverage = {status: 401, promise: new Promise(resolve => { releaseStale = resolve; })};
   view('inventory'); await flush();  // its coverage request is held
   view('overview'); await flush(); assert.equal(tone(), 'ok', 'the fresh overview owns the banner');
   releaseStale(); await flush(); intervalTick(); assert.equal(tone(), 'ok', 'the obsolete response must not flip the banner'); assert.match(bannerText(), /^OK/);
+  assert.equal(elements.workspace.hidden, false, 'an obsolete 401 cannot disconnect the current view');
 }
 // Round 4: an automatic refresh that is still waiting on coverage must not replace content the user has since started using.
 {
@@ -808,8 +809,21 @@ assert.deepEqual(violations, [], 'no HTML sink was touched');
   content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'incident:inc-review').fire('click'); await flush();
   assert.equal(form('review-action'), undefined, 'navigation clears the writer');
   enable();
-  elements.disconnect.fire('click');
-  assert.equal(writes().length, 7);
+  const activeWriterForm = form('review-action');
+  const readsBefore401 = detailReads();
+  let releaseUnauthorized;
+  holdCoverage = {status: 401, promise: new Promise(resolve => { releaseUnauthorized = resolve; })};
+  await reload();
+  assert.equal(detailReads(), readsBefore401 + 1, 'incident detail finishes before the background coverage 401');
+  assert.match(elements['connection-state'].textContent, /incident editing/);
+  releaseUnauthorized(); await flush();
+  assert.equal(elements.workspace.hidden, true, 'a background coverage 401 disconnects the read session');
+  assert.equal(content.textContent, '', 'observed incident data is cleared');
+  assert.equal(elements['overview-probes'].textContent, '');
+  assert.match(elements['connection-state'].textContent, /Disconnected/);
+  activeWriterForm.querySelector('select').value = 'acknowledge';
+  activeWriterForm.fire('submit');
+  assert.equal(writes().length, 7, 'the former writer form cannot send a write');
   elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
   elements['connect-form'].fire('submit'); await flush();
   reviewFixture = null; incidents = [];

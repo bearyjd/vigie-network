@@ -232,8 +232,14 @@ async function load(clear = false, focus = null, automatic = false) {
   let banner = null;  // coverage for non-overview views; it never rejects
   try {
     const cursor = state.cursors[state.page]; let content; let next = null; let coverage = null;
-    // Other views still fetch coverage (same endpoint) so the banner is never absent; its failure never fails the view.
-    banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
+    // Non-Overview views still fetch coverage for the banner. A refused bearer ends the session.
+    banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(
+      result => ({phase: 'ready', data: result.data}),
+      error => {
+        if (generation === state.generation && error instanceof ApiError && error.status === 401) failure(error);
+        return {phase: 'error'};
+      },
+    );
     if (state.view === 'overview') {
       const observations = client.coverage(state.collector, range());
       overviewProbes(generation);
