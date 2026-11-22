@@ -7,11 +7,19 @@ from typing import get_args
 from vigie_api import evidence_determinations
 from vigie_api.models import IncidentOut
 from vigie_pipeline import delivery_types, essential_absence, monitoring_engine, new_device_notice
-from vigie_pipeline.detectors import ALL, ENGINE, ESSENTIAL_ABSENCE, NEW_DEVICE, OPEN_ONLY
+from vigie_pipeline.detectors import (
+    ALL,
+    DNS_DEVIATION,
+    ENGINE,
+    ESSENTIAL_ABSENCE,
+    NEW_DEVICE,
+    OPEN_ONLY,
+)
 
 
 def test_registry_sets_are_consistent():
-    assert set(ENGINE) | set(OPEN_ONLY) == set(ALL)
+    assert set(ENGINE) | set(OPEN_ONLY) | {DNS_DEVIATION} == set(ALL)
+    assert DNS_DEVIATION not in ENGINE + OPEN_ONLY
     assert not set(ENGINE) & set(OPEN_ONLY)
 
 

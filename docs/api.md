@@ -203,6 +203,14 @@ MACs. Device filtering and pagination are unchanged, with one indexed address
 query scoped to each returned page. Existing clients can ignore the additive
 fields; terminal viewers should use `.get` for compatibility with older APIs.
 
+## Activity and baseline status
+
+`GET /devices/{device_id}/activity?collector_id=` includes the upload reference in `baseline`.
+When the engine has a DNS profile for that collector and identity, `data.dns_baseline` contains
+its state, reference ID, algorithm, config version, training counts and times, and the
+`median_queries` per qualified UTC hour. The median is null until a mature reference is usable.
+Older inventories and collector/identity pairs without a DNS profile omit `dns_baseline`.
+
 ## Incidents and review lifecycle
 
 Monitoring incidents (`GET /incidents`, `GET /incidents/{id}?collector_id=`) carry two independent axes.
@@ -216,17 +224,22 @@ covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers
 A snooze on an incident that later resolves stays as history with `attention` false. `GET /incidents`
 also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
 
-`detector` is `large_upload`, `upload_deviation`, (additive, F5) `new_device` or (additive, F6-b)
-`essential_absence`. An `essential_absence` incident also has bytes of 0 and its `evidence` is exactly
+`detector` is `large_upload`, `upload_deviation`, (additive, F5) `new_device`, (additive, F6-b)
+`essential_absence`, or `dns_deviation`. An `essential_absence` incident also has bytes of 0 and its `evidence` is exactly
 `{"reason_code":"essential_absent","absent_for_hours":Q,"threshold_hours":N}` (a count null if implausible);
 no MAC, hostname, vendor or IP, any other key is dropped. A `new_device` incident
 has `observed_bytes` and `threshold_bytes` of 0 and its `evidence` is exactly
 `{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}` (`dwell_hours` null if the
 stored value is implausible): never a MAC, hostname, vendor or IP; any other stored key is dropped. The
-same shape appears in the evidence pack. Upload evidence is unchanged.
-In `api/openapi.yaml` `evidence` is a union (`anyOf` of the upload evidence and the new-device
-evidence, and the essential-absence evidence) with no discriminator: a typed client sees the union, so branch on the incident's `detector`
-(`new_device` means the new-device shape) rather than on the shape.
+same shapes appear in the evidence pack.
+
+A `dns_deviation` incident records aggregate DNS volume for one UTC hour. The legacy fields
+`observed_bytes` and `threshold_bytes` carry query counts for this detector, including within
+its evidence. DNS evidence includes `reason_code: "dns_deviation_threshold"`,
+`unit: "queries"`, and the training reference, including `baseline_median_queries`. It contains
+no DNS names or answers. The evidence pack carries the same unit and counts.
+In OpenAPI, `evidence` is a union of the four evidence shapes. Use the incident's `detector`
+to choose the corresponding shape.
 
 The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
 `bucket_hours` (one of 1, 2, 3, 4, 6, 8, 12, 24), `cohort_is_weekend` (boolean), `cohort_bucket` (integer 0 to 23,

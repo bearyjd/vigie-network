@@ -277,6 +277,23 @@ def check_compose_config() -> None:
                     err(f"rendered pipeline monitoring baseline differs from {expected}")
                 elif role != "pipeline" and actual is not None:
                     err(f"rendered {role} unexpectedly receives the monitoring baseline selector")
+        dns_flag = "VIGIE_MONITORING_DNS"
+        dns_floor = "VIGIE_MONITORING_DNS_MIN_QUERIES"
+        clean_dns = {k: v for k, v in os.environ.items() if k not in (dns_flag, dns_floor)}
+        for overrides in ({}, {dns_flag: "1", dns_floor: "350"}):
+            ok = subprocess.run([*base, "config"], capture_output=True, text=True,
+                                env={**clean_dns, **overrides}, check=False)
+            if ok.returncode != 0:
+                err(f"podman-compose config failed: {ok.stderr[-300:]}")
+                continue
+            expected = {dns_flag: "0", dns_floor: "200"} | overrides
+            for role, svc in yaml.safe_load(ok.stdout)["services"].items():
+                for name, value in expected.items():
+                    actual = svc["environment"].get(name)
+                    if role == "pipeline" and str(actual) != value:
+                        err(f"rendered pipeline {name} differs from {value}")
+                    elif role != "pipeline" and actual is not None:
+                        err(f"rendered {role} unexpectedly receives {name}")
         env = {k: v for k, v in os.environ.items() if k != "VIGIE_LAN_ADDR"}
         bare = Path(tmp) / "empty"
         bare.write_text("")
@@ -307,6 +324,18 @@ def check_monitoring_config(doc: dict, example: str) -> None:
     for service in ("ingest", "api"):
         if selector in doc["services"][service]["environment"]:
             err(f"monitoring baseline selector belongs only to pipeline, not {service}")
+
+    for name, default in (
+        ("VIGIE_MONITORING_DNS", "0"),
+        ("VIGIE_MONITORING_DNS_MIN_QUERIES", "200"),
+    ):
+        if not re.search(rf"(?m)^{name}={default}(?:\s|$)", example):
+            err(f"{name} must be documented with default {default}")
+        if doc["services"]["pipeline"]["environment"].get(name) != f"${{{name}-{default}}}":
+            err(f"pipeline must forward {name} with default {default}")
+        for service in ("ingest", "api"):
+            if name in doc["services"][service]["environment"]:
+                err(f"{name} belongs only to the pipeline")
 
 
 def check_prune_flag(doc: dict, example: str) -> None:
@@ -480,6 +509,22 @@ def self_test() -> None:
     contract["services"]["pipeline"]["environment"][setting] = "${VIGIE_MONITORING_LARGE_UPLOAD_BYTES:-1073741824}"
     contract["services"]["pipeline"]["environment"]["VIGIE_MONITORING_BASELINE"] = "${VIGIE_MONITORING_BASELINE:-pooled}"
     example = "VIGIE_MONITORING_LARGE_UPLOAD_BYTES=1073741824\nVIGIE_MONITORING_BASELINE=pooled\n"
+    for name, default in (
+        ("VIGIE_MONITORING_DNS", "0"),
+        ("VIGIE_MONITORING_DNS_MIN_QUERIES", "200"),
+    ):
+        contract["services"]["pipeline"]["environment"][name] = f"${{{name}-{default}}}"
+        example += f"{name}={default}\n"
+    for name, default, override in (
+        ("VIGIE_MONITORING_DNS", "0", "1"),
+        ("VIGIE_MONITORING_DNS_MIN_QUERIES", "200", "350"),
+    ):
+        _fails(f"{name} default not documented", check_monitoring_config, contract,
+               example.replace(f"{name}={default}", f"{name}={override}"))
+        api_env = contract["services"]["api"]["environment"]
+        api_env[name] = override
+        _fails(f"{name} forwarded to wrong role", check_monitoring_config, contract, example)
+        del api_env[name]
     check_monitoring_config(contract, example)
     _fails("baseline selector default not documented", check_monitoring_config, contract, example.replace("=pooled", "=tod"))
     api_env = contract["services"]["api"]["environment"]

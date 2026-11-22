@@ -26,11 +26,12 @@ from vigie_api.evidence_types import (
 )
 from vigie_api.models import (
     TOD_BUCKET_HOURS,
+    DnsIncidentEvidence,
     essential_absence_evidence,
     new_device_evidence,
     tod_cohort_bucket_valid,
 )
-from vigie_pipeline.detectors import ALL, ESSENTIAL_ABSENCE, NEW_DEVICE
+from vigie_pipeline.detectors import ALL, DNS_DEVIATION, ESSENTIAL_ABSENCE, NEW_DEVICE
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -68,6 +69,15 @@ EVIDENCE_FIELDS = {
 }
 
 
+DNS_EVIDENCE_FIELDS = {
+    **{k: v for k, v in EVIDENCE_FIELDS.items() if k in DnsIncidentEvidence.model_fields},
+    "reason_code": "dns_reason",
+    "unit": "dns_unit",
+    "baseline_median_queries": "number",
+    "minimum_queries": _INT,
+}
+
+
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -89,6 +99,10 @@ def _evidence_value(kind: str, value: Any) -> Any:
         return sensitive(kind, value) if isinstance(value, str) else None
     if kind == "reason":
         return choice(value, REASON_CODES)
+    if kind == "dns_reason":
+        return choice(value, ("dns_deviation_threshold",))
+    if kind == "dns_unit":
+        return choice(value, ("queries",))
     return safe_id(value)
 
 
@@ -117,6 +131,14 @@ def _evidence_for(row: dict[str, Any]) -> dict[str, Any]:
         return new_device_evidence(row["evidence"])
     if row["detector"] == ESSENTIAL_ABSENCE:
         return essential_absence_evidence(row["evidence"])
+    if row["detector"] == DNS_DEVIATION:
+        evidence = row["evidence"]
+        if not isinstance(evidence, dict):
+            return {}
+        kept = {
+            k: _evidence_value(kind, evidence.get(k)) for k, kind in DNS_EVIDENCE_FIELDS.items()
+        }
+        return {k: v for k, v in kept.items() if v is not None}
     return allowlisted_evidence(row["evidence"])
 
 

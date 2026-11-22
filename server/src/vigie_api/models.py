@@ -404,7 +404,7 @@ class ActivityHour(CoverageHour):
     dns_queries: int | None
 
 
-class BaselineView(BaseModel):
+class _BaselineStatus(BaseModel):
     state: Literal["learning", "mature", "rebuilding", "rebuilding_quality", "lineage_unavailable"]
     baseline_id: str | None
     algorithm: str | None
@@ -413,7 +413,14 @@ class BaselineView(BaseModel):
     distinct_days: int
     training_since: int | None
     trained_until: int | None
+
+
+class BaselineView(_BaselineStatus):
     median_upload_bytes: float | None
+
+
+class DnsBaselineView(_BaselineStatus):
+    median_queries: int | float | None
 
 
 class ActivityData(BaseModel):
@@ -422,6 +429,12 @@ class ActivityData(BaseModel):
     lineage: str
     hours: list[ActivityHour]
     baseline: BaselineView
+    dns_baseline: DnsBaselineView | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="DNS query-count reference for this collector and identity. "
+        "Omitted when no DNS profile exists.",
+    )
 
 
 class ActivityResponse(_Envelope):
@@ -588,21 +601,48 @@ def essential_absence_evidence(raw: Any) -> dict[str, Any]:
     }
 
 
+class DnsIncidentEvidence(BaseModel):
+    reason_code: Literal["dns_deviation_threshold"]
+    unit: Literal["queries"]
+    hour: int
+    observed_bytes: int = Field(description="Number of DNS queries in the observed UTC hour.")
+    threshold_bytes: int = Field(description="DNS query-count threshold for the hour.")
+    baseline_id: str
+    algorithm: str
+    config_version: str
+    coverage_required_seconds: int
+    lineage: str
+    unusual_is_not_malicious: Literal[True]
+    baseline_median_queries: int | float
+    multiplier: int
+    minimum_queries: int
+    sample_hours: int
+    distinct_days: int
+
+
 class IncidentOut(BaseModel):
     id: str
     collector_id: str
     device_id: str
     lineage: str
     current_lineage: bool
-    detector: Literal["large_upload", "upload_deviation", "new_device", "essential_absence"]
+    detector: Literal[
+        "large_upload", "upload_deviation", "new_device", "essential_absence", "dns_deviation"
+    ]
     state: Literal["open", "resolved", "superseded"]
     episode_start: int
     last_hour: int
     detected_at: str
-    observed_bytes: int
-    threshold_bytes: int
+    observed_bytes: int = Field(
+        description="Observed upload bytes for upload detectors. Query count for dns_deviation. "
+        "Zero for new_device and essential_absence."
+    )
+    threshold_bytes: int = Field(
+        description="Threshold in bytes for upload detectors. Query-count threshold for "
+        "dns_deviation. Zero for new_device and essential_absence."
+    )
     baseline_id: str | None
-    evidence: IncidentEvidence | NewDeviceEvidence | EssentialAbsenceEvidence
+    evidence: IncidentEvidence | NewDeviceEvidence | EssentialAbsenceEvidence | DnsIncidentEvidence
     review: IncidentReview | None = Field(
         description="Current human decision, or null. A separate axis from `state`: `expected` "
         "is a per-incident label, not a suppression."

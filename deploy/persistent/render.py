@@ -57,6 +57,8 @@ _PROBE_STATE_NAME = "probe-state.json"  # must match VIGIE_PROBE_FILE below
 _OPTIONAL = {
     "monitoring_large_upload_bytes",
     "monitoring_baseline",
+    "monitoring_dns",
+    "monitoring_dns_min_queries",
     "probes_enabled",
     "probe_allow",
 }
@@ -139,6 +141,12 @@ def render(config: dict) -> dict[str, str]:
     baseline = config.get("monitoring_baseline", "pooled")
     if baseline not in ("pooled", "tod"):
         raise ValueError("monitoring_baseline must be exactly 'pooled' or 'tod'")
+    dns_enabled = config.get("monitoring_dns", False)
+    if type(dns_enabled) is not bool:
+        raise ValueError("monitoring_dns must be a boolean")
+    dns_min_queries = config.get("monitoring_dns_min_queries", 200)
+    if type(dns_min_queries) is not int or not 1 <= dns_min_queries <= 1_000_000:
+        raise ValueError("monitoring_dns_min_queries must be an integer in 1..1000000")
     ns, image, key = (config[k] for k in ("namespace", "image", "collector_key_id"))
     if not isinstance(ns, str) or not re.fullmatch(r"vigie_[a-z0-9_]{1,32}", ns):
         raise ValueError("a dedicated vigie_ namespace is required")
@@ -227,7 +235,11 @@ def render(config: dict) -> dict[str, str]:
             ]
         if role == "pipeline":
             lines += [f"Environment=VIGIE_MONITORING_LARGE_UPLOAD_BYTES={threshold}"]
-            lines += [f"Environment=VIGIE_MONITORING_BASELINE={baseline}"]
+            lines += [
+                f"Environment=VIGIE_MONITORING_BASELINE={baseline}",
+                f"Environment=VIGIE_MONITORING_DNS={int(dns_enabled)}",
+                f"Environment=VIGIE_MONITORING_DNS_MIN_QUERIES={dns_min_queries}",
+            ]
             if probe_addresses is not None:
                 lines += [f"Environment=VIGIE_PROBE_FILE=/probe/{_PROBE_STATE_NAME}"]
             lines += [

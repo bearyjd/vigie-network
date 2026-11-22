@@ -14,6 +14,7 @@ from datetime import datetime
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.activity import purge_activity, record_activity
 from vigie_pipeline.baselines import BaselineConfig
+from vigie_pipeline.baselines_dns import DnsBaselineConfig
 from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.characterization_store import (
     read_services,
@@ -26,7 +27,7 @@ from vigie_pipeline.config import (
     PipelineConfig,
 )
 from vigie_pipeline.delivery_wiring import run_delivery_stage
-from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
+from vigie_pipeline.detectors import DNS_DEVIATION, ESSENTIAL_ABSENCE
 from vigie_pipeline.essential_absence import (
     configure_recording,
     deferred_absence_notices,
@@ -35,6 +36,7 @@ from vigie_pipeline.essential_absence import (
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
+from vigie_pipeline.monitoring_dns import deferred_dns_notices
 from vigie_pipeline.monitoring_engine import analyze_monitoring, prune_monitoring
 from vigie_pipeline.new_device_notice import sweep_new_devices
 from vigie_pipeline.overrides import (
@@ -157,7 +159,8 @@ def _monitor_deliver_probe(
 ) -> None:
     """The stages after the prune; they need a readable overrides.db except the probes."""
     if usable:
-        analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
+        dns = dns_policy(config)
+        analyze_monitoring(inv, overrides, monitoring_policy(config), clock, dns_policy=dns)
         held_incidents = frozenset()
         if (
             config.essential_absence
@@ -170,6 +173,12 @@ def _monitor_deliver_probe(
                 held = frozenset({ESSENTIAL_ABSENCE})
             else:
                 held_incidents = deferred
+        if config.delivery.enabled and DNS_DEVIATION in config.delivery.detectors:
+            pending = deferred_dns_notices(inv, overrides, dns, clock) if dns else None
+            if pending is None:
+                held |= {DNS_DEVIATION}
+            else:
+                held_incidents |= pending
         run_delivery_stage(
             inv,
             overrides,
@@ -180,10 +189,13 @@ def _monitor_deliver_probe(
             held_incidents=held_incidents,
             # F6-b: its incidents are stamped with the pass start, so the first run's watermark
             # must not be later than that (else the first push is hidden for good)
-            watermark_at=clock if config.essential_absence else None,
+            watermark_at=clock
+            if config.essential_absence
+            or (config.monitoring_dns and DNS_DEVIATION in config.delivery.detectors)
+            else None,
         )
         refresh_characterization(inv, overrides, clock)
-    prune_monitoring(inv, clock)
+    prune_monitoring(inv, clock, dns_enabled=config.monitoring_dns)
     if config.probes.enabled:  # needs no overrides; contains its own errors
         fold_probes(inv, config.probes, live or (lambda: clock))
     else:  # a status stored while it was on must not keep saying ok (a read when none exists)
@@ -194,6 +206,12 @@ def monitoring_policy(config: PipelineConfig) -> BaselineConfig | TodConfig:
     "The baseline family is an explicit opt-in; the default stays pooled-median-v1."
     family = TodConfig if config.monitoring_baseline == "tod" else BaselineConfig
     return family(large_upload_bytes=config.monitoring_large_upload_bytes)
+
+
+def dns_policy(config: PipelineConfig) -> DnsBaselineConfig | None:
+    if config.monitoring_dns:
+        return DnsBaselineConfig(minimum_queries=config.monitoring_dns_min_queries)
+    return None
 
 
 def _overrides_readable(

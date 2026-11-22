@@ -14,6 +14,17 @@
             "title": "Device Id",
             "type": "string"
           },
+          "dns_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DnsBaselineView"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "DNS query-count reference for this collector and identity. Omitted when no DNS profile exists."
+          },
           "hours": {
             "items": {
               "$ref": "#/components/schemas/ActivityHour"
@@ -1182,6 +1193,211 @@
         "title": "DevicesResponse",
         "type": "object"
       },
+      "DnsBaselineView": {
+        "properties": {
+          "algorithm": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Algorithm"
+          },
+          "baseline_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Id"
+          },
+          "config_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Version"
+          },
+          "distinct_days": {
+            "title": "Distinct Days",
+            "type": "integer"
+          },
+          "median_queries": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Queries"
+          },
+          "sample_hours": {
+            "title": "Sample Hours",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "learning",
+              "mature",
+              "rebuilding",
+              "rebuilding_quality",
+              "lineage_unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "trained_until": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trained Until"
+          },
+          "training_since": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Training Since"
+          }
+        },
+        "required": [
+          "state",
+          "baseline_id",
+          "algorithm",
+          "config_version",
+          "sample_hours",
+          "distinct_days",
+          "training_since",
+          "trained_until",
+          "median_queries"
+        ],
+        "title": "DnsBaselineView",
+        "type": "object"
+      },
+      "DnsIncidentEvidence": {
+        "properties": {
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "baseline_id": {
+            "title": "Baseline Id",
+            "type": "string"
+          },
+          "baseline_median_queries": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Baseline Median Queries"
+          },
+          "config_version": {
+            "title": "Config Version",
+            "type": "string"
+          },
+          "coverage_required_seconds": {
+            "title": "Coverage Required Seconds",
+            "type": "integer"
+          },
+          "distinct_days": {
+            "title": "Distinct Days",
+            "type": "integer"
+          },
+          "hour": {
+            "title": "Hour",
+            "type": "integer"
+          },
+          "lineage": {
+            "title": "Lineage",
+            "type": "string"
+          },
+          "minimum_queries": {
+            "title": "Minimum Queries",
+            "type": "integer"
+          },
+          "multiplier": {
+            "title": "Multiplier",
+            "type": "integer"
+          },
+          "observed_bytes": {
+            "description": "Number of DNS queries in the observed UTC hour.",
+            "title": "Observed Bytes",
+            "type": "integer"
+          },
+          "reason_code": {
+            "const": "dns_deviation_threshold",
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "sample_hours": {
+            "title": "Sample Hours",
+            "type": "integer"
+          },
+          "threshold_bytes": {
+            "description": "DNS query-count threshold for the hour.",
+            "title": "Threshold Bytes",
+            "type": "integer"
+          },
+          "unit": {
+            "const": "queries",
+            "title": "Unit",
+            "type": "string"
+          },
+          "unusual_is_not_malicious": {
+            "const": true,
+            "title": "Unusual Is Not Malicious",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reason_code",
+          "unit",
+          "hour",
+          "observed_bytes",
+          "threshold_bytes",
+          "baseline_id",
+          "algorithm",
+          "config_version",
+          "coverage_required_seconds",
+          "lineage",
+          "unusual_is_not_malicious",
+          "baseline_median_queries",
+          "multiplier",
+          "minimum_queries",
+          "sample_hours",
+          "distinct_days"
+        ],
+        "title": "DnsIncidentEvidence",
+        "type": "object"
+      },
       "ErrorBody": {
         "properties": {
           "code": {
@@ -2134,7 +2350,8 @@
               "large_upload",
               "upload_deviation",
               "new_device",
-              "essential_absence"
+              "essential_absence",
+              "dns_deviation"
             ],
             "title": "Detector",
             "type": "string"
@@ -2157,6 +2374,9 @@
               },
               {
                 "$ref": "#/components/schemas/EssentialAbsenceEvidence"
+              },
+              {
+                "$ref": "#/components/schemas/DnsIncidentEvidence"
               }
             ],
             "title": "Evidence"
@@ -2174,6 +2394,7 @@
             "type": "string"
           },
           "observed_bytes": {
+            "description": "Observed upload bytes for upload detectors. Query count for dns_deviation. Zero for new_device and essential_absence.",
             "title": "Observed Bytes",
             "type": "integer"
           },
@@ -2198,6 +2419,7 @@
             "type": "string"
           },
           "threshold_bytes": {
+            "description": "Threshold in bytes for upload detectors. Query-count threshold for dns_deviation. Zero for new_device and essential_absence.",
             "title": "Threshold Bytes",
             "type": "integer"
           }

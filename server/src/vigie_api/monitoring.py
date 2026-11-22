@@ -13,6 +13,7 @@ from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
 from vigie_api.models import essential_absence_evidence, new_device_evidence
 from vigie_pipeline.detectors import ESSENTIAL_ABSENCE, NEW_DEVICE
+from vigie_pipeline.monitoring_dns import dns_baseline_view
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -300,6 +301,7 @@ def activity(inv, ov, device, collector, start, stop, hours):
         "lineage": lineage,
         "hours": out,
         "baseline": baseline_view(inv, collector, canonical, lineage),
+        "dns_baseline": dns_baseline_view(inv, collector, canonical, lineage),
     }
 
 

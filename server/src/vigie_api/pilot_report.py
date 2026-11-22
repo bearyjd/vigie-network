@@ -35,6 +35,7 @@ from vigie_pipeline.baselines import BaselineConfig
 from vigie_pipeline.baselines_tod import ALGORITHM as TOD_ALGORITHM
 from vigie_pipeline.baselines_tod import TodConfig
 from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS, DeliveryConfig
+from vigie_pipeline.detectors import DNS_DEVIATION
 from vigie_pipeline.monitoring_engine import AGGREGATE_DAYS
 
 SCHEMA = "vigie-pilot-report/1"
@@ -66,9 +67,9 @@ COVERAGE_NOTE = (
 # the engine stamps last_hour with the hour just completed: one hour before detection
 _INCIDENT_WINDOW = "last_hour>=? AND detected_at>=? AND detected_at<?"
 
-# F5 detectors are reported per detector only: they stay out of the upload totals and of the
-# delivery and unwanted-notification verdicts, which are pilot evidence about the upload detectors.
-_FOREIGN = ",".join(f"'{d}'" for d in OPEN_ONLY_DETECTORS)  # fixed internal constants
+# The upload pilot uses upload incidents, decisions, and deliveries for its verdicts.
+_NON_UPLOAD_DETECTORS = (*OPEN_ONLY_DETECTORS, DNS_DEVIATION)
+_FOREIGN = ",".join(f"'{d}'" for d in _NON_UPLOAD_DETECTORS)  # fixed internal constants
 
 Section = dict[str, Any]
 
@@ -196,18 +197,18 @@ def incidents_section(inv: sqlite3.Connection | None, lo: int, hi: int, gap: str
         f"WHERE {_INCIDENT_WINDOW} GROUP BY detector,day ORDER BY day,detector LIMIT ?",
         (*_incident_args(lo, hi), ROW_LIMIT + 1),
     ).fetchall()
-    if gap and all(r["detector"] in OPEN_ONLY_DETECTORS for r in rows[:ROW_LIMIT]):
+    if gap and all(r["detector"] in _NON_UPLOAD_DETECTORS for r in rows[:ROW_LIMIT]):
         return _unknown(f"no incidents: {gap}")  # no UPLOAD rows: the zero would not be real
     per_detector: dict[str, int] = defaultdict(int)
     per_day: dict[str, dict[str, int]] = defaultdict(dict)
     for row in rows[:ROW_LIMIT]:
         per_detector[row["detector"]] += row["n"]
-        if row["detector"] not in OPEN_ONLY_DETECTORS:
+        if row["detector"] not in _NON_UPLOAD_DETECTORS:
             per_day[row["day"]][row["detector"]] = row["n"]
     return {
         **_status(len(rows) > ROW_LIMIT),
         "truncated": len(rows) > ROW_LIMIT,
-        "total": sum(n for d, n in per_detector.items() if d not in OPEN_ONLY_DETECTORS),
+        "total": sum(n for d, n in per_detector.items() if d not in _NON_UPLOAD_DETECTORS),
         "per_detector": dict(sorted(per_detector.items())),
         "per_day": {d: per_day[d] for d in sorted(per_day)},
     }
@@ -291,7 +292,7 @@ def decisions_section(ov: sqlite3.Connection | None, lo: int, hi: int) -> Sectio
 
 
 def _not_foreign(inv: sqlite3.Connection | None) -> str:
-    """SQL (with a trailing space) leaving out deliveries of F5 incidents; needs the incidents."""
+    """Filter deliveries to the upload pilot when the incidents table is available."""
     if not _has_table(inv, "monitoring_incidents"):
         return ""
     return (

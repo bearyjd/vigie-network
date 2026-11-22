@@ -24,6 +24,7 @@ from typing import Protocol
 from urllib.parse import quote
 
 from vigie_pipeline.delivery_types import OPEN_ONLY_DETECTORS
+from vigie_pipeline.detectors import DNS_DEVIATION
 
 MAX_LABEL = 48
 MAX_DIGITS = 3
@@ -107,10 +108,14 @@ def incident_link(incident_id: object) -> str:
 DETECTOR_TITLES = {
     ("new_device", "open"): "New device on your network: {label}",
     ("essential_absence", "open"): "{label} has not been seen",
+    (DNS_DEVIATION, "open"): "Unusual DNS activity: {label}",
+    (DNS_DEVIATION, "recover"): "DNS activity is back to normal: {label}",
 }
 DETECTOR_BODIES = {
     ("new_device", "open"): "New device on your network: {label}. Review it: {link}",
     ("essential_absence", "open"): "{label} has not been seen for a while. Review it: {link}",
+    (DNS_DEVIATION, "open"): "{label} had unusual DNS activity. Review it: {link}",
+    (DNS_DEVIATION, "recover"): "{label}'s DNS activity is back to normal. Review it: {link}",
 }
 
 

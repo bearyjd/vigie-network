@@ -109,6 +109,29 @@ class RendererTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 render.render(config(**{key: invalid}))
 
+    def test_monitoring_dns_defaults_overrides_and_validation(self):
+        flag = "VIGIE_MONITORING_DNS"
+        floor = "VIGIE_MONITORING_DNS_MIN_QUERIES"
+        default = render.render(config())["vigie_test-pipeline.container"]
+        self.assertIn(f"Environment={flag}=0", default)
+        self.assertIn(f"Environment={floor}=200", default)
+        custom = render.render(config(monitoring_dns=True, monitoring_dns_min_queries=1))
+        pipeline = custom["vigie_test-pipeline.container"]
+        self.assertIn(f"Environment={flag}=1", pipeline)
+        self.assertIn(f"Environment={floor}=1", pipeline)
+        upper = render.render(config(monitoring_dns_min_queries=1_000_000))
+        self.assertIn(f"Environment={floor}=1000000", upper["vigie_test-pipeline.container"])
+        for role in ("ingest", "api"):
+            environment = custom[f"vigie_test-{role}.container"]
+            self.assertNotIn(f"Environment={flag}=", environment)
+            self.assertNotIn(f"Environment={floor}=", environment)
+        for invalid in (1, "true", None):
+            with self.subTest(flag=invalid), self.assertRaises(ValueError):
+                render.render(config(monitoring_dns=invalid))
+        for invalid in (0, -1, True, "200", None, 1_000_001):
+            with self.subTest(floor=invalid), self.assertRaises(ValueError):
+                render.render(config(monitoring_dns_min_queries=invalid))
+
     def test_invalid_or_injected_config_rejected(self):
         for updates in [
             {"namespace": "dev"},

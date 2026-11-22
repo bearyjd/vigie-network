@@ -23,6 +23,7 @@ class Lineage:
     key: str
     versioned: bool
     rule_attached: bool
+    aliases: tuple[str, ...] = ()
 
 
 def has_table(db, name):
@@ -97,4 +98,5 @@ def lineage(inv, ov, device):
         key,
         versioned,
         any(row["link_source"] == "rule" for row in rows),
+        tuple(sorted(members - {canonical})),
     )
