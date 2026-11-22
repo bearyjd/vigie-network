@@ -8,11 +8,19 @@ import re
 import sqlite3
 from datetime import UTC, datetime
 
+from pydantic import ValidationError
+
 from vigie_api.effective import decode_cursor, encode_cursor
 from vigie_api.errors import ApiError
 from vigie_api.incident_decisions import attention, review_view, reviews_for
-from vigie_api.models import essential_absence_evidence, new_device_evidence
-from vigie_pipeline.detectors import ESSENTIAL_ABSENCE, NEW_DEVICE
+from vigie_api.models import (
+    DnsIncidentEvidence,
+    dns_reference_id,
+    essential_absence_evidence,
+    new_device_evidence,
+)
+from vigie_pipeline.detectors import DNS_DEVIATION, ESSENTIAL_ABSENCE, NEW_DEVICE
+from vigie_pipeline.monitoring_dns import dns_baseline_view
 from vigie_pipeline.monitoring_identity import LineageUnavailable, lineage
 
 LOG = logging.getLogger("vigie_api")
@@ -300,6 +308,7 @@ def activity(inv, ov, device, collector, start, stop, hours):
         "lineage": lineage,
         "hours": out,
         "baseline": baseline_view(inv, collector, canonical, lineage),
+        "dns_baseline": dns_baseline_view(inv, collector, canonical, lineage),
     }
 
 
@@ -357,26 +366,52 @@ def _evidence(detector, stored):
     return _SANITISED[detector](parsed)
 
 
-def incident_row(inv, ov, row, review, now):
+def _dns_evidence(row, key, baseline_id):
+    """Select the DNS evidence model by detector before the response union sees stored data."""
     try:
-        current = device_macs(inv, ov, row["device_id"])[2] == row["lineage"]
+        evidence = DnsIncidentEvidence.model_validate_json(row["evidence"])
+    except ValidationError:
+        evidence = DnsIncidentEvidence(
+            reason_code="dns_deviation_threshold",
+            unit="queries",
+            hour=row["last_hour"],
+            observed_bytes=row["observed_bytes"],
+            threshold_bytes=row["threshold_bytes"],
+            baseline_id=baseline_id,
+            lineage=key or None,
+            unusual_is_not_malicious=True,
+        )
+    return evidence.model_dump()
+
+
+def incident_row(inv, ov, row, review, now):
+    detector = row["detector"]
+    key, baseline_id = row["lineage"], row["baseline_id"]
+    if detector == DNS_DEVIATION:
+        key = dns_reference_id(key) or ""
+        baseline_id = dns_reference_id(baseline_id)
+        evidence = _dns_evidence(row, key, baseline_id)
+    else:
+        evidence = _evidence(detector, row["evidence"])
+    try:
+        current = device_macs(inv, ov, row["device_id"])[2] == key
     except ApiError:
         current = False
     return {
         "id": row["id"],
         "collector_id": row["collector_id"],
         "device_id": row["device_id"],
-        "lineage": row["lineage"],
+        "lineage": key,
         "current_lineage": current,
-        "detector": row["detector"],
+        "detector": detector,
         "state": row["state"],
         "episode_start": row["episode_start"],
         "last_hour": row["last_hour"],
         "detected_at": row["detected_at"],
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
-        "baseline_id": row["baseline_id"],
-        "evidence": _evidence(row["detector"], row["evidence"]),
+        "baseline_id": baseline_id,
+        "evidence": evidence,
         "review": review_view(review),
         "decision_version": review["version"] if review else 0,
         "attention": attention(row["state"], review, now),

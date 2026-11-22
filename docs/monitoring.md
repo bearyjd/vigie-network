@@ -1501,3 +1501,40 @@ into another; the sweep above resolves each marked id to its current canonical d
 (following the identity links, as the effective view does), counts any member MAC seen as "seen",
 and does not require the stored id to stay canonical. Unmarking a merged alias is allowed so the
 owner can always free the slot.
+
+## DNS volume deviation (F7)
+
+Set `VIGIE_MONITORING_DNS=1` on the pipeline to enable the `dns_deviation` detector. It is off by
+default. It measures DNS query rows visible to the collector and attributed to the device. The
+evidence contains counts and baseline metadata. Caching, encrypted DNS and traffic that bypasses
+the observed resolver can reduce visibility. A surge is evidence of unusually high observed query
+volume. A query does not establish that a domain was contacted.
+
+The detector uses a chronological, frozen pooled median. Within a bounded 90-day history, the first
+cohort with at least 20 qualified hours spanning at least 14 distinct UTC dates forms the
+reference. Qualification requires at least 3,420 seconds of qualified observations and no coverage
+reasons. Hours with any saturated per-MAC query counter are skipped. Only a qualified closed hour
+after training can trigger, and its count must be **strictly greater than 4×** the median. The
+detector abstains while the reference is immature or its median is below
+`VIGIE_MONITORING_DNS_MIN_QUERIES`. The floor defaults to 200 observed queries per hour and accepts
+integers from 1 to 1,000,000. Existing upload baseline and incident settings continue to apply.
+
+Initial training can use retained qualified DNS measurements for an unchanged device lineage.
+A known identity merge or rule attachment, including one later undone, starts a fresh training
+window. Later lineage or DNS policy changes and a loss of qualification in the frozen cohort also
+start a fresh window. Each new window starts at the next UTC hour boundary and must meet the same
+20-hour and 14-date minimums.
+
+Consecutive triggering hours extend the same incident. A qualified hour below or equal to the
+trigger threshold resolves it. If another burst follows a gap, it starts a new incident and
+supersedes the previous one without a recovery notice. A policy, lineage, or training quality
+change can also supersede an incident. After 90 days without a triggering hour, a DNS incident can
+age out even if it is still open. While an incident has delivery records, the pipeline retains it
+so those records remain attributable to DNS in reports.
+
+External delivery requires `VIGIE_DELIVERY_ENABLED=1` and an explicit `dns_deviation` entry in
+`VIGIE_DELIVERY_DETECTORS`. The default delivery list excludes DNS. An opted-in DNS notice waits
+if its lineage or policy has changed or if relevant analysis is pending. Delivery uses the
+existing privacy settings for device labels and links.
+
+Field evaluation and tuning of the query floor are pending.

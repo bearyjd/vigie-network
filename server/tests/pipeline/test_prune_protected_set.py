@@ -59,6 +59,11 @@ LEFT_ALONE_INVENTORY = {
     ("monitoring_incidents", "lineage"): "same row as device_id, which is excluded",
     ("monitoring_profiles", "lineage"): "same row as device_id, which is excluded",
     ("monitoring_suspicious", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_dns_profiles", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_dns_suspicious", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_dns_retries", "lineage"): "same row as device_id, which is excluded",
+    ("monitoring_dns_baselines", "device_id"): "reached through DNS profiles and incidents",
+    ("monitoring_dns_baselines", "lineage"): "same row as device_id, reached through its reference",
     ("rule_attachments", "target"): "same row as mac, which is excluded",
 }
 

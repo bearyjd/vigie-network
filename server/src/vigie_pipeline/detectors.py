@@ -6,4 +6,5 @@ ENGINE = ("large_upload", "upload_deviation")
 NEW_DEVICE = "new_device"
 ESSENTIAL_ABSENCE = "essential_absence"
 OPEN_ONLY = (NEW_DEVICE, ESSENTIAL_ABSENCE)
-ALL = ENGINE + OPEN_ONLY
+DNS_DEVIATION = "dns_deviation"
+ALL = ENGINE + OPEN_ONLY + (DNS_DEVIATION,)
