@@ -20,6 +20,14 @@ see `docs/monitoring.md`).
   minimum, at most `promotion cap` per server hour (extra devices stay transient and one
   `promotion_rate_limited` event is emitted per hour). Unpromoted transients are retired after the
   window; a retired device seen again returns to transient (`device_reappeared`).
+- Essential-device absence (F6-b; code in `essential_absence.py`). OPT-IN: `VIGIE_ESSENTIAL_ABSENCE`
+  (`PipelineConfig.essential_absence`) is OFF by default; only 1/true/yes enable it and any other
+  value is a startup error that does not echo it. Off, the processor never calls the sweep and the
+  database is byte-identical to a build without it; the flag is in no policy dataclass, so the
+  monitoring policy version is unchanged. On, it opens one `essential_absence` incident per owner-
+  marked device (`PUT /devices/{id}/essential`) not seen for its own N hours while coverage
+  qualified, fail closed (see `docs/monitoring.md` "Essential-device absence (F6)"). Delivery is
+  separate: the detector must also be in `VIGIE_DELIVERY_DETECTORS`.
 - Retired-MAC prune (irreversible; code in `prune.py`). OPT-IN: `VIGIE_PRUNE_RETIRED_MACS`
   (`PipelineConfig.prune_retired_macs`) is OFF by default and only 1/true/yes turn it on; any
   other value, an unparsable one included, reads as off. Off, a pass deletes nothing, never touches

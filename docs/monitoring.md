@@ -1416,17 +1416,22 @@ wins; one incident per lineage). **Fixed-address devices only:** a lineage whose
 randomized abstains (a rotating private address looks absent), with an `essential_unjudged` event.
 
 *Anchor* = the newest hour of ACTIVE evidence of any member MAC: a `measurements_hourly` row (flows,
-DNS), never later than the next hour. `last_seen`, leases and neighbour entries do NOT count: they
+DNS) of an hour the collector has a coverage row for. The server clock takes no part (a clock step
+cannot move an episode). `last_seen`, leases and neighbour entries do NOT count: they
 are snapshots, and an agent restart re-emits every unexpired lease and stale neighbour entry stamped
 "now" (it would otherwise move a dead device's anchor forward, or keep it alive forever). The
 judging collector is the one that measured the lineage newest (never measured: abstain, event).
 
 *Q* = the number of ELIGIBLE `coverage_hourly` hours of that collector strictly after the anchor
 and before the current hour: qualified for at least 3420 s with no reasons (the upload engine's
-notion) AND no batch of that collector overlapping the hour reported dropped identity or DNS rows
-(`batches.truncated` keys `leases`, `neigh`, `sightings`, `sightings_dropped`, `dns`,
-`dns_out_of_window`, `truncated_other`; an unreadable map counts as dropped). Under a flood the
-collector drops those rows, so a missing device is not evidence of absence. The incident opens iff
+notion) AND no batch of that collector overlapping the hour reported ANY non-zero `batches.truncated`
+counter (fail closed: every key except the informational `ct_unmapped_bytes`, `ct_unmapped_flows`,
+`mcast_unmapped` and `mcast_dropped`, and except bit 8 of the `source_flags` bitmask; so the DNS
+drop keys, `ct_lan_unmapped_*` and any key a future collector adds count; an unreadable map counts
+too) AND the hour is inside the 7-day batch retention (older flood evidence is purged, so a
+threshold near 7 days fires only while its whole span is retained). More than 500 such batches
+make the device abstain. Under a flood the collector drops rows, so a missing device is not
+evidence of absence. The incident opens iff
 `Q * 3600 >= absent_after_s`. An hour the collector was blind (no row, short, degraded, flooded) is
 not counted: **a collector outage, a pipeline gap or a clock step pauses the clock and can never
 fire it**.
@@ -1434,8 +1439,9 @@ fire it**.
 *Clock domain.* Anchor and coverage both come from the same batch windows of ONE collector (hour keys
 of its clock), so a constant offset of that collector cancels and never fires early. With several
 collectors the "newest activity" comparison assumes their clocks agree within an hour. The server
-clock is only a clamp: an activity row stamped later than the next server hour cannot anchor (one
-far-future stamp neither suppresses nor disables judging) and the current hour is never counted. A
+clock only bounds the eligible hours (the current hour is never counted) and the retention window:
+activity in an hour with no coverage row cannot anchor (one far-future stamp neither suppresses nor
+disables judging), so stepping the clock back cannot manufacture an episode. A
 clock step on the collector can delay an alert, never cause one. Not receipt-bounded: the batch
 windows are collector-stamped; this is the one input the server does not independently anchor.
 
@@ -1449,7 +1455,10 @@ ever sent. Editing the threshold or re-marking while an incident is open leaves 
 in a later hour than `episode_start` (a late row inside the same hour is not a return), the owner
 marked it `acknowledged` or `expected`, the mark was cleared, the incident's device is no longer
 canonical (merged), or its lineage has no MAC left. A marks table that cannot be read (missing,
-locked, newer schema) closes nothing: that is not an unmark. With more than 32 active marks (only
+locked) closes nothing: that is not an unmark. A newer overrides.db schema than this build
+understands abstains entirely (one `essential_unjudged` event per day, nothing opened or closed).
+The mark is re-read inside the write transaction, so an unmark committed during a pass opens
+nothing. With the flag on, a pass whose shard read failed sends nothing. With more than 32 active marks (only
 possible by editing the database) the read is incomplete and nothing is closed as "unmarked". A mark
 that cannot be resolved (no known MAC, more than 64 MACs, an unusable identity graph) or has an
 out-of-range value protects only ITS OWN device from being closed as unmarked; other marks' closes
@@ -1484,6 +1493,9 @@ refers to them; open ones are kept. Pilot-report counts list it apart from the u
   is never alerted while that holds. Attach rules are not changed by F6.
 * Restarts are fixed (snapshots never count); floods are mitigated (a flooded hour is not counted),
   at the price of a delay while the flood lasts.
+* A device whose only evidence in an hour was in a window that crosses the hour boundary
+  (`cross_hour`: the writer measures neither hour) can read as absent for that hour; the usual 60 s
+  window loses at most one window per boundary.
 * The daily cap (8) can delay a real absence by up to a UTC day; a held device stays eligible.
 * A delivery outage longer than the delivery TTL (default 24 h) drops the notice; the incident
   stays in the inbox.
