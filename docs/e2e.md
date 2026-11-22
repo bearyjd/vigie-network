@@ -52,6 +52,33 @@ Devices: a stable laptop (`alice-laptop`), a camera (`cam-front`, a DNS query ev
 phone (`Pixel-8`, same opt55 and vendor class) that rolls through three locally administered MACs
 (`c2:11:22:33:44:01..03`, one per 10 s step, all on 192.168.1.50).
 
+## Synthetic monitoring acceptance
+
+Run from the checkout with the server development dependencies installed.
+
+```sh
+cd server
+uv run --frozen pytest -q -o addopts= tests/api/test_monitoring_mvp_acceptance.py
+```
+
+The server CI stage also runs these scenarios. They advance a fixture clock and use temporary
+databases, signed batches through the ingest app, real pipeline passes, and the authenticated
+API in process. The fixture uses one-hour collection windows so coverage is visible as soon as
+the missing hour closes. The test checks device discovery, 20 qualified hours over 14 UTC dates,
+the shift from learning to a frozen reference, and a missing hour with null measurements. A spike
+on either side of the gap produces no incident. Two adjacent eligible spike hours produce one
+incident with its reference and threshold. Batch retries preserve its ID and measured totals.
+The owner acknowledges the incident twice with one request ID and sees one decision and audit event.
+
+A separate scenario schedules the deployed probe runner at 60-second ticks and substitutes a
+timeout for the TCP adapter. Its state file reaches `GET /probes` through the pipeline on the third
+failed tick, 120 seconds after the first failed attempt. The event feed shows one outage after a
+repeat fold. The timing is measured on the fixture clock with a pipeline pass at each tick.
+
+These results cover the synthetic workflow. Field maturity, detector precision, live collection
+and scheduler latency, and the seven-day budget of at most one unwanted external notification
+per network per day require field data and owner review.
+
 ## Historical reference run (before stitching and human identity APIs)
 
 * ingest: 11 batches (seq 1..11, no gaps), `parse_failures` 0, 0 dropped.
