@@ -166,12 +166,34 @@ def test_a_purged_flood_does_not_turn_old_hours_into_absence(env):
     assert env.sweep(later) == 0 and env.rows() == []
 
 
-@pytest.mark.parametrize(("delta", "fires"), [(0, 0), (1, 0), (-1, 1)])
-def test_the_retention_edge_is_the_end_of_the_hour(env, delta, fires):
+@pytest.mark.parametrize(("delta", "fires"), [(0, 1), (1, 0), (-1, 1)])
+def test_the_retention_edge_keeps_the_clock_skew_margin(env, delta, fires):
+    """R2-2: an hour counts only while a batch of it received up to the skew early is retained."""
     env.device("d1")
     env.mark("d1", 3600)
     env.cover(1, 1)
-    assert env.sweep(H + 2 * HOUR + ea.BATCH_RETENTION_S + delta) == fires
+    assert env.sweep(H + HOUR + ea.BATCH_RETENTION_S - ea.CLOCK_SKEW_S + delta) == fires
+
+
+def test_the_purge_cannot_change_a_verdict(env):
+    """R2-2: the sweep reads the same answer before and after ingest purges the oldest batches."""
+    two_hours(env)
+    env.batch(H + HOUR + 60, H + HOUR + 900, {"dns_dropped": 1})
+    edge = H + 2 * HOUR + ea.BATCH_RETENTION_S - 1
+    before = env.sweep(edge)
+    purge_batches(env.inv, edge, 7)
+    assert before == 0 and env.sweep(edge) == 0
+
+
+def test_a_week_long_threshold_cannot_fire(env):
+    """R2-2: the whole 168 h span is never retained, before or after a purge."""
+    env.device("d1")
+    env.mark("d1", 604800)
+    env.cover(1, 170)
+    later = H + 9 * 86400
+    assert env.sweep(later) == 0
+    purge_batches(env.inv, later, 7)
+    assert env.sweep(later) == 0 and env.rows() == []
 
 
 # ---- R1-5: a clock step cannot move the anchor --------------------------------------------------

@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import uuid
 from dataclasses import dataclass, replace
@@ -77,6 +78,7 @@ ELIGIBLE_S = 3420  # an eligible hour: monitoring_engine's qualified-seconds flo
 HOURS_READ = 400  # eligible hours read per device (the longest threshold is 168)
 FLOOD_ROWS = 500  # flooded batches read per device; more than this and the device abstains
 BATCH_RETENTION_S = 7 * 86400  # ingest's default batch retention: older flood evidence is gone
+CLOCK_SKEW_S = 300  # ingest's max_clock_skew_s: a batch window may be received this much early
 # `batches.truncated` keys that say NOTHING about lost identity, DNS or flow rows. FAIL CLOSED: any
 # other key with a non-zero value (every dns_*/dhcp_*/tail_*/leases/neigh... counter, and any key a
 # future collector adds) marks the batch as flooded. `source_flags` is a bitmask: only bits other
@@ -219,16 +221,17 @@ def _flood_windows(
 
 def _eligible_hours(inv: sqlite3.Connection, collector: str, anchor: int, now: float) -> int:
     """Eligible hours after the anchor and before the current hour that no flooded batch overlaps
-    (read up to HOURS_READ). An hour whose batches may be purged (batch retention) is unreadable
-    and never counts; so a threshold near 7 days can only fire while its whole span is retained."""
+    (read up to HOURS_READ). An hour whose batches may already be purged (received before now minus
+    the retention) is unreadable and never counts: the hour must start no earlier than that cutoff
+    plus the clock skew. So a threshold of 168 h can never fire, and 167 h only early in an hour."""
     floor = int(now) // HOUR_S * HOUR_S
+    oldest = math.ceil(now - BATCH_RETENTION_S + CLOCK_SKEW_S)
     hours = [
         r[0]
         for r in inv.execute(
             "SELECT hour FROM coverage_hourly WHERE collector_id=? AND hour>? AND hour<?"
-            " AND hour>? AND qualified_seconds>=? AND reasons='[]' ORDER BY hour LIMIT ?",
-            (collector, anchor, floor, int(now) - BATCH_RETENTION_S - HOUR_S, ELIGIBLE_S,
-             HOURS_READ),
+            " AND hour>=? AND qualified_seconds>=? AND reasons='[]' ORDER BY hour LIMIT ?",
+            (collector, anchor, floor, oldest, ELIGIBLE_S, HOURS_READ),
         )
     ]  # fmt: skip
     if not hours:

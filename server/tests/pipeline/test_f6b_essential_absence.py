@@ -166,7 +166,8 @@ def test_policy_versions_unchanged():
     ("secs", "hours", "fires"),
     [(7200, 1, False), (7200, 2, True), (7200, 3, True),  # exactly N qualified hours fires
      (7201, 2, False), (7201, 3, True),  # one second over: a whole further hour is needed
-     (3600, 0, False), (3600, 1, True), (604800, 167, False), (604800, 168, True)],
+     (3600, 0, False), (3600, 1, True), (604800, 167, False), (604800, 168, False),  # 168 h: unreachable (R2-2)
+     (597600, 166, True)],
 )  # fmt: skip
 def test_threshold_boundaries(env, secs, hours, fires):
     env.device("d1")

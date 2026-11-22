@@ -1428,8 +1428,9 @@ notion) AND no batch of that collector overlapping the hour reported ANY non-zer
 counter (fail closed: every key except the informational `ct_unmapped_bytes`, `ct_unmapped_flows`,
 `mcast_unmapped` and `mcast_dropped`, and except bit 8 of the `source_flags` bitmask; so the DNS
 drop keys, `ct_lan_unmapped_*` and any key a future collector adds count; an unreadable map counts
-too) AND the hour is inside the 7-day batch retention (older flood evidence is purged, so a
-threshold near 7 days fires only while its whole span is retained). More than 500 such batches
+too) AND the hour starts no earlier than 7 days minus 300 s before the pass (the batch retention plus
+the collector clock-skew margin; older flood evidence may already be purged). A threshold of 168 h
+therefore never fires, and one of 167 h only early in an hour. More than 500 such batches
 make the device abstain. Under a flood the collector drops rows, so a missing device is not
 evidence of absence. The incident opens iff
 `Q * 3600 >= absent_after_s`. An hour the collector was blind (no row, short, degraded, flooded) is
