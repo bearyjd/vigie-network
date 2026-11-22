@@ -49,11 +49,10 @@ def run_delivery_stage(
     held: frozenset[str] = frozenset(),
 ) -> RunReport | None:
     """Disabled: do nothing at all. Enabled: any exception is contained and logged.
-    `watermark_at` stamps the first run's watermark instead of the delivery clock; `held`
-    detectors are left off the allowlist for this run only."""
+    `watermark_at` stamps the first run's watermark instead of the delivery clock.
+    `held` pauses delivery for the named configured detectors during this run."""
     settings = config.delivery
-    detectors = tuple(d for d in settings.detectors if d not in held)
-    if not settings.enabled or not detectors:  # nothing allowlisted left: nothing to run
+    if not settings.enabled or all(d in held for d in settings.detectors):
         return None
     try:
         since = _watermark(inv, clock() if watermark_at is None else watermark_at)
@@ -67,7 +66,8 @@ def run_delivery_stage(
             max_abandoned=settings.max_abandoned,
             drain_budget_seconds=settings.drain_budget_s,
             include_label=settings.include_label,
-            detectors=detectors,
+            detectors=settings.detectors,
+            held=held,
             should_stop=should_stop,
         )
     except Exception as exc:  # noqa: BLE001 - delivery must never fail the pipeline pass

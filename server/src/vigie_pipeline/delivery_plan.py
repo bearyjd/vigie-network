@@ -365,13 +365,16 @@ def plan(
     config: DeliveryConfig,
     frozen: frozenset[str] = frozenset(),
     open_only: frozenset[str] = frozenset(),
+    *,
+    held: frozenset[str] = frozenset(),
 ) -> tuple[Action, ...]:
     """Actions reconciling deliveries with incidents and reviews, sorted by (incident, kind).
 
     `frozen` ids are existing incidents that must not be delivered: their pending and lapsed rows
     expire, no open/recover is ever created, and their rows are deleted only once the incident is
     closed (or gone) and the retention rule says so. `open_only` ids get an open delivery like any
-    other but never a recover (a resolved incident is simply closed; the sent open stays sent)."""
+    other but never a recover (a resolved incident is simply closed; the sent open stays sent).
+    `held` ids are skipped for the pass and their existing rows are left untouched."""
     if not _num(now):
         raise ValueError("now must be a finite number of epoch seconds")
     grouped: dict[str, dict[str, DeliveryView]] = {}
@@ -386,7 +389,7 @@ def plan(
         ):
             by_incident.setdefault(incident.id, incident)
     actions: list[Action] = []
-    for iid in sorted(by_incident.keys() | grouped.keys()):
+    for iid in sorted((by_incident.keys() | grouped.keys()) - held):
         actions.extend(
             _plan_incident(
                 iid,

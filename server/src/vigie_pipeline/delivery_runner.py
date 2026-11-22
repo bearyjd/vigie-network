@@ -109,28 +109,35 @@ def _read_reviews(ro: sqlite3.Connection | None) -> dict[str, ReviewView]:
 
 
 def _plan_pass(
-    inv, ro, config: DeliveryConfig, clock: Callable[[], float], detectors: Iterable[str]
+    inv,
+    ro,
+    config: DeliveryConfig,
+    clock: Callable[[], float],
+    detectors: frozenset[str],
+    held: frozenset[str],
 ) -> tuple[int, float]:
     """Returns (actions applied, the pass's `now`); raises DecisionsUnavailable or PassError.
 
     Every incident is read, but one whose detector is not allowlisted is planned as FROZEN: no
     open/recover row is ever created for it, its pending and lapsed rows expire
     (`incident_missing`), and its rows are deleted only once it is closed (retention rule) or gone.
-    A sent open is therefore not followed by a recover while its detector stays off the list."""
-    allowed = frozenset(detectors)
+    A sent open is therefore not followed by a recover while its detector stays off the list.
+    A held detector's incidents and existing deliveries are skipped."""
     with immediate(inv):
         now = clock()  # after BEGIN IMMEDIATE: never older than the state it plans against
         rows = inv.execute(
             "SELECT id,state,detected_at,detector FROM monitoring_incidents"
         ).fetchall()
-        found = [(IncidentView(r[0], r[1], _epoch(r[2])), r[3] in allowed) for r in rows]
-        incidents = [v for v, _ in found]
-        frozen = frozenset(v.id for v, ok in found if not ok)
+        incidents = [IncidentView(r[0], r[1], _epoch(r[2])) for r in rows]
+        frozen = frozenset(r[0] for r in rows if r[3] not in detectors)
         open_only = frozenset(r[0] for r in rows if r[3] in OPEN_ONLY_DETECTORS)
+        held_ids = frozenset(r[0] for r in rows if r[3] in held)
         every = inv.execute(f"SELECT {_ROW} FROM incident_deliveries")  # noqa: S608
         deliveries = [_delivery(r) for r in every]
         reviews = _read_reviews(ro)
-        actions = plan(incidents, reviews, deliveries, now, config, frozen, open_only)
+        actions = plan(
+            incidents, reviews, deliveries, now, config, frozen, open_only, held=held_ids
+        )
         apply_actions(inv, actions, now)
     return len(actions), now
 
@@ -298,16 +305,27 @@ def _send_one(inv, ro, publisher, row: DeliveryView, config, clock, slot, labels
 
 
 def _due(
-    inv, now: float, config: DeliveryConfig, limit: int, busy: frozenset[str] = frozenset()
+    inv,
+    now: float,
+    config: DeliveryConfig,
+    limit: int,
+    busy: frozenset[str],
+    held: frozenset[str],
 ) -> list[DeliveryView]:
-    """Due pending rows, oldest first. Busy deliveries are excluded BEFORE the LIMIT, so a row
-    that owns a hung worker can never starve the others (the list is bounded by max_abandoned)."""
+    """Due pending rows, oldest first, excluding busy and held deliveries before the limit."""
     skip = ",".join("?" * len(busy))
+    hold_filter = ""
+    if held:
+        placeholders = ",".join("?" * len(held))
+        hold_filter = (
+            " AND EXISTS (SELECT 1 FROM monitoring_incidents AS i"  # noqa: S608
+            f" WHERE i.id=incident_deliveries.incident_id AND i.detector NOT IN ({placeholders}))"
+        )
     rows = inv.execute(
         f"SELECT {_ROW} FROM incident_deliveries WHERE state='pending' AND next_attempt_at<=?"  # noqa: S608
-        f" AND attempts<?{f' AND delivery_id NOT IN ({skip})' if busy else ''}"
+        f" AND attempts<?{f' AND delivery_id NOT IN ({skip})' if busy else ''}{hold_filter}"
         " ORDER BY next_attempt_at,row_id LIMIT ?",
-        (tick_floor(now), config.max_attempts, *sorted(busy), limit),
+        (tick_floor(now), config.max_attempts, *sorted(busy), *sorted(held), limit),
     )
     return [_delivery(r) for r in rows.fetchall()]
 
@@ -352,19 +370,22 @@ def run_delivery(
     include_label: bool = False,
     should_stop: Callable[[], bool] = lambda: False,
     detectors: Iterable[str] = DEFAULT_DETECTORS,
+    held: frozenset[str] = frozenset(),
 ) -> RunReport:
     """`overrides` is the READ-ONLY decision store connection (None: unavailable). `clock` stamps
-    the database; `monotonic` (never steps back) measures the drain budget."""
+    the database; `monotonic` (never steps back) measures the drain budget.
+    `held` pauses delivery for the named allowlisted detectors during this run."""
     if isinstance(detectors, str) or not (detectors := frozenset(detectors)):
         raise ValueError("detectors must be a non-empty collection of detector ids")
     if drain_budget_seconds < config.transmit_deadline_seconds:
         raise ValueError("drain_budget must be at least the transmit deadline")
+    held = detectors.intersection(held)
     try:
-        planned, now = _plan_pass(inv, overrides, config, clock, detectors)
+        planned, now = _plan_pass(inv, overrides, config, clock, detectors, held)
     except DecisionsUnavailable as exc:
         log(logger, logging.WARNING, "delivery_decisions_unavailable", error=str(exc))
         return RunReport(skipped="decisions_unavailable")
-    rows = _due(inv, now, config, max_per_run, busy_deliveries())
+    rows = _due(inv, now, config, max_per_run, busy_deliveries(), held)
     counts = _drain(
         inv,
         overrides,

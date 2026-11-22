@@ -16,6 +16,8 @@ from test_f6b_fix2 import two_hours
 
 from vigie_pipeline import processor
 from vigie_pipeline.config import DeliverySettings, PipelineConfig
+from vigie_pipeline.delivery_publish import FakePublisher
+from vigie_pipeline.delivery_runner import run_delivery
 from vigie_pipeline.delivery_types import DEFAULT_DETECTORS
 from vigie_pipeline.delivery_wiring import WATERMARK_KEY
 from vigie_pipeline.processor import run_once
@@ -123,11 +125,30 @@ def test_a_stale_pass_with_the_flag_on_still_delivers_other_detectors(env, monke
     env.sweep(now_after(2))
     old_watermark(env)
     cfg, out = deliver_cfg(env, essential_absence=True)
+    run_delivery(
+        env.inv,
+        env.ov,
+        FakePublisher(),
+        cfg.delivery.delivery_config(1),
+        lambda: now - 1,
+        detectors=cfg.delivery.detectors,
+        max_per_run=0,
+    )
+    iid = env.rows()[0]["id"]
+    queued = "SELECT * FROM incident_deliveries WHERE incident_id=?"
+    pending = tuple(env.inv.execute(queued, (iid,)).fetchone())
     stale_shard(monkeypatch)
     with pytest.raises(processor.ShardReadError):
         run_once(cfg, now=now)
     links = [json.loads(line)["link"] for line in out.read_text().splitlines()]
-    assert links == ["/ui/#incident=up1"]  # the upload notice, and no absence notice
+    assert links == ["/ui/#incident=up1"]
+    assert tuple(env.inv.execute(queued, (iid,)).fetchone()) == pending
+    monkeypatch.undo()
+    run_once(cfg, now=now + 60)
+    assert [json.loads(line)["link"] for line in out.read_text().splitlines()] == [
+        "/ui/#incident=up1",
+        f"/ui/#incident={iid}",
+    ]
 
 
 @pytest.mark.parametrize(("flag", "at_pass_start"), [(True, True), (False, False)])
