@@ -9,17 +9,20 @@ or a pipeline gap cannot leave state behind to go wrong.
 
 Rule (docs/monitoring.md "Essential-device absence (F6)"): for each marked device (at most
 MAX_MARKS, read-only overrides.db) resolved to its CURRENT canonical device and lineage:
-  anchor  = the newest hour (not later than the next hour: a clock running ahead cannot anchor) of
-            ACTIVE evidence of any lineage MAC: a `measurements_hourly` row (flows, DNS). A lease
+  anchor  = the newest hour of ACTIVE evidence of any lineage MAC that the collector has a
+            coverage row for (the server clock takes no part: a clock step cannot move an
+            episode): a `measurements_hourly` row (flows, DNS). A lease
             or neighbour entry is a SNAPSHOT: an agent restart re-emits every unexpired one stamped
             'now', so `last_seen` never takes part. The collector that measured it newest is the
             judging collector (none: abstain);
   Q = the ELIGIBLE `coverage_hourly` hours of that collector strictly after the anchor and before
       the current hour: qualified >= 3420 s, no reasons, AND no batch of that collector that
-      overlaps the hour reported dropped identity or DNS rows (`batches.truncated`: a flood makes
-      the collector drop leases/neighbours/sightings/DNS, so the device's rows may be missing, not
-      the device). A blind hour (no row, unqualified, flooded) is not counted: the clock pauses,
-      it never fires;
+      overlaps the hour reported ANY non-zero `batches.truncated` counter except the few
+      INFORMATIONAL_KEYS (fail closed: a drop makes the device's rows missing, not the device; an
+      unreadable map counts too), AND the hour is still inside batch retention (7 days: older
+      flood evidence is purged, so a threshold near 7 days fires only while its whole span is
+      retained). A blind hour (no row, unqualified, flooded, unreadable) is not counted: the clock
+      pauses, it never fires. More than FLOOD_ROWS flooded batches: the device abstains;
   fire iff Q * 3600 >= absent_after_s.
 Both sides come from the same batch windows (one collector clock, hour keys), so a constant
 offset of THAT collector cancels. Across several collectors the newest-activity comparison assumes
@@ -32,12 +35,15 @@ anchor): an absence is announced once, even after review, unmark/re-mark or a me
 later hour moves the anchor past the episode: the open incident resolves (no recover is ever sent,
 delivery_types.OPEN_ONLY_DETECTORS) and a later absence is a new episode. Also resolved: the owner
 reviewed it (acknowledged/expected), the mark was cleared, the incident's device is no longer
-canonical (merged) or has no MAC left. Unmark-closes are paused when the marks read was
-incomplete (more than MAX_MARKS); a mark that cannot be resolved or has an invalid value protects
-only ITS device. Merged alias marks are judged on the canonical device; several marks of one
-lineage use the smallest threshold. At most MAX_PER_DAY incidents open per UTC day (a held device
-stays eligible next pass, so the cap can delay a real absence by up to a day). The incident id is
-random, evidence is the fixed shape {reason_code, absent_for_hours, threshold_hours}. Devices that
+canonical (merged) or has no MAC left. The mark is re-read inside the write transaction: a mark
+cleared after the plan was made opens nothing. An overrides.db newer than this build abstains
+(one `essential_unjudged` event per day, nothing opened or closed). Unmark-closes are paused when
+the marks read was incomplete (more than MAX_MARKS); a mark that cannot be resolved or has an
+invalid value protects only ITS device. Merged alias marks are judged on the canonical device;
+several marks of one lineage use the smallest threshold. At most MAX_PER_DAY incidents open per UTC
+day (a held device stays eligible next pass, so the cap can delay a real absence by up to a day).
+The incident id is random,
+evidence is the fixed shape {reason_code, absent_for_hours, threshold_hours}. Devices that
 cannot be judged get an `essential_unjudged` event naming the device (never a MAC): once per mark
 version for never-measured/randomized/no-MAC, once per day for the rest.
 """
@@ -49,14 +55,14 @@ import json
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vigie_ingest.db import immediate, iso_utc
 from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
 from vigie_pipeline.logs import log
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
-from vigie_pipeline.overrides import QUIET_STATUSES, decided_incident_ids
-from vigie_pipeline.stitch_db import emit_once
+from vigie_pipeline.overrides import QUIET_STATUSES, SUPPORTED_USER_VERSION, decided_incident_ids
+from vigie_pipeline.stitch_db import emit_once, event_exists
 
 logger = logging.getLogger("vigie_pipeline")
 DETECTOR = ESSENTIAL_ABSENCE
@@ -69,24 +75,24 @@ MAX_PER_DAY = 8
 MAX_OPEN = 65  # open incidents examined per run (one more than MAX_MARKS x 2: strays are closed)
 ELIGIBLE_S = 3420  # an eligible hour: monitoring_engine's qualified-seconds floor
 HOURS_READ = 400  # eligible hours read per device (the longest threshold is 168)
-FLOOD_ROWS = 500  # flooded batches read per device
-# `batches.truncated` keys that mean identity or DNS rows were dropped before they reached us
-FLOOD_KEYS = (
-    "leases",
-    "neigh",
-    "sightings",
-    "sightings_dropped",
-    "dns",
-    "dns_out_of_window",
-    "truncated_other",  # a merged count of unknown keys: 'something else was lost'
-)
+FLOOD_ROWS = 500  # flooded batches read per device; more than this and the device abstains
+BATCH_RETENTION_S = 7 * 86400  # ingest's default batch retention: older flood evidence is gone
+# `batches.truncated` keys that say NOTHING about lost identity, DNS or flow rows. FAIL CLOSED: any
+# other key with a non-zero value (every dns_*/dhcp_*/tail_*/leases/neigh... counter, and any key a
+# future collector adds) marks the batch as flooded. `source_flags` is a bitmask: only bits other
+# than 8 (multicast socket) count, as in measurements.py. ct_lan_unmapped_* (traffic of a LAN
+# address with no MAC: a device may be invisible) is NOT informational here.
+INFORMATIONAL_KEYS = ("ct_unmapped_bytes", "ct_unmapped_flows", "mcast_unmapped", "mcast_dropped")
 SUMMARIES = {
     "never_measured": "no traffic has ever been measured for it",
     "randomized": "its address is randomized (only fixed-address devices can be judged)",
     "no_known_mac": "no address of it is known",
     "identity_unavailable": "its identity data is unavailable (too many addresses or a bad link)",
     "too_many_marks": "too many essential marks (over 32): unmark-closes are paused",
+    "overrides_schema": "overrides.db is newer than this build understands: nothing is judged",
 }
+UNJUDGED = "essential_unjudged"
+CAPPED = "essential_capped"
 PER_VERSION = ("never_measured", "randomized", "no_known_mac")  # one event per mark version
 
 
@@ -174,45 +180,62 @@ def _members(inv: sqlite3.Connection, identity: Lineage) -> tuple[str, ...]:
     return tuple(sorted({identity.device_id, *(row[0] or "").split(",")} - {""}))
 
 
-def _anchor(inv: sqlite3.Connection, macs: tuple[str, ...], now: float) -> tuple[str, int] | None:
+def _anchor(inv: sqlite3.Connection, macs: tuple[str, ...]) -> tuple[str, int] | None:
     """(collector, anchor hour): the newest hour of active evidence of any MAC, over collectors
-    (a seek per collector and MAC). An hour after the next one cannot anchor."""
-    cap = int(now) // HOUR_S * HOUR_S + HOUR_S
+    (a seek per collector and MAC). The server clock takes no part (a clock step must never move
+    an episode). Evidence in an hour the collector has no coverage row for (a measurement and its
+    coverage are written together, so that is forged or impossible) cannot anchor."""
     row = inv.execute(
         "SELECT c.id, (SELECT MAX(m.hour) FROM measurements_hourly m WHERE m.collector_id=c.id"  # noqa: S608
-        f" AND m.mac IN ({','.join('?' * len(macs))}) AND m.hour<=?) AS h FROM collectors c"
-        " ORDER BY h DESC, c.id LIMIT 1",
-        (*macs, cap),
+        f" AND m.mac IN ({','.join('?' * len(macs))}) AND m.hour<="
+        " (SELECT MAX(v.hour) FROM coverage_hourly v WHERE v.collector_id=c.id)) AS h"
+        " FROM collectors c ORDER BY h DESC, c.id LIMIT 1",
+        macs,
     ).fetchone()
     return (row[0], row[1]) if row and row[1] is not None else None
 
 
-def _flood_windows(inv: sqlite3.Connection, collector: str, anchor: int) -> list[tuple[int, int]]:
-    """Batch windows of the collector that reported dropped identity or DNS rows (or whose
-    truncation map is unreadable: unknown is not clean)."""
-    test = " OR ".join(f"COALESCE(json_extract(truncated,'$.{key}'),0)>0" for key in FLOOD_KEYS)
+def _flood_windows(
+    inv: sqlite3.Connection, collector: str, first: int, last: int
+) -> list[tuple[int, int]] | None:
+    """Batch windows of the collector, overlapping [first, last), that reported any dropped or
+    unattributed rows: every non-zero `truncated` key not on INFORMATIONAL_KEYS (fail closed), or
+    a truncation map that is not valid JSON (unknown is not clean). None when more than
+    FLOOD_ROWS: the caller abstains (a cap must never make a flooded hour look clean)."""
+    names = ",".join("?" * len(INFORMATIONAL_KEYS))
     rows = inv.execute(
-        "SELECT window_start, window_end FROM batches WHERE collector_id=? AND received_at>=?"  # noqa: S608
-        " AND window_start IS NOT NULL AND window_end IS NOT NULL AND truncated IS NOT NULL"
-        f" AND truncated<>'{{}}' AND CASE WHEN json_valid(truncated) THEN ({test}) ELSE 1 END"
+        "SELECT window_start, window_end FROM batches WHERE collector_id=?"  # noqa: S608
+        " AND window_start IS NOT NULL AND window_end IS NOT NULL AND window_end>?"
+        " AND window_start<? AND truncated IS NOT NULL AND truncated<>'{}'"
+        " AND CASE WHEN json_valid(truncated) THEN (json_type(truncated)<>'object' OR EXISTS ("
+        f"SELECT 1 FROM json_each(truncated) WHERE key NOT IN ({names}) AND CASE key"
+        " WHEN 'source_flags' THEN type<>'integer' OR (value & ~8)<>0"
+        " ELSE NOT (type='integer' AND value=0) END)) ELSE 1 END"
         " LIMIT ?",
-        (collector, iso_utc(anchor - 86400), FLOOD_ROWS),
+        (collector, first, last, *INFORMATIONAL_KEYS, FLOOD_ROWS + 1),
     ).fetchall()
-    return [(r[0], r[1]) for r in rows]
+    return None if len(rows) > FLOOD_ROWS else [(r[0], r[1]) for r in rows]
 
 
 def _eligible_hours(inv: sqlite3.Connection, collector: str, anchor: int, now: float) -> int:
     """Eligible hours after the anchor and before the current hour that no flooded batch overlaps
-    (read up to HOURS_READ)."""
+    (read up to HOURS_READ). An hour whose batches may be purged (batch retention) is unreadable
+    and never counts; so a threshold near 7 days can only fire while its whole span is retained."""
+    floor = int(now) // HOUR_S * HOUR_S
     hours = [
         r[0]
         for r in inv.execute(
             "SELECT hour FROM coverage_hourly WHERE collector_id=? AND hour>? AND hour<?"
-            " AND qualified_seconds>=? AND reasons='[]' ORDER BY hour LIMIT ?",
-            (collector, anchor, int(now) // HOUR_S * HOUR_S, ELIGIBLE_S, HOURS_READ),
+            " AND hour>? AND qualified_seconds>=? AND reasons='[]' ORDER BY hour LIMIT ?",
+            (collector, anchor, floor, int(now) - BATCH_RETENTION_S - HOUR_S, ELIGIBLE_S,
+             HOURS_READ),
         )
-    ]
-    flood = _flood_windows(inv, collector, anchor) if hours else []
+    ]  # fmt: skip
+    if not hours:
+        return 0
+    flood = _flood_windows(inv, collector, hours[0], hours[-1] + HOUR_S)
+    if flood is None:
+        return 0
     return sum(1 for h in hours if not any(s < h + HOUR_S and e > h for s, e in flood))
 
 
@@ -265,7 +288,6 @@ def _close_reason(
     row: sqlite3.Row,
     identity: Lineage,
     state: tuple[dict[str, Entry], set[str], bool],
-    now: float,
 ) -> str | None:
     entries, protected, complete = state
     if identity.device_id != row["device_id"]:
@@ -276,7 +298,7 @@ def _close_reason(
         return None
     if identity.device_id not in entries:
         return "unmarked" if complete else None
-    found = _anchor(inv, identity.macs, now)
+    found = _anchor(inv, identity.macs)
     return "returned" if found and found[1] > row["episode_start"] else None
 
 
@@ -285,7 +307,6 @@ def _closes(
     ov: sqlite3.Connection,
     rows: list[sqlite3.Row],
     state: tuple[dict[str, Entry], set[str], bool],
-    now: float,
 ) -> list[tuple[str, str]]:
     """Open incidents to resolve: reviewed, merged away or MAC-less, unmarked (never while the
     marks read is incomplete or the device's own mark is unusable), or seen again."""
@@ -299,7 +320,7 @@ def _closes(
             identity = lineage(inv, ov, row["device_id"])
         except LineageUnavailable:
             continue  # unknown is not closed
-        reason = _close_reason(inv, row, identity, state, now)
+        reason = _close_reason(inv, row, identity, state)
         if reason:
             closes.append((row["id"], reason))
     return closes
@@ -321,21 +342,21 @@ def _judge(inv: sqlite3.Connection, entry: Entry, now: float) -> tuple[str, str,
     members = _members(inv, entry.identity)
     if _randomized(inv, members):
         return "randomized", "", 0, 0
-    found = _anchor(inv, entry.identity.macs, now)
+    found = _anchor(inv, entry.identity.macs)
     if found is None:
         return "never_measured", "", 0, 0
     collector, hour = found
+    if _announced(inv, members, hour):  # a cheap seek first: no history scan for a known absence
+        return "wait", collector, hour, 0
     hours = _eligible_hours(inv, collector, hour, now)
-    if hours < -(-entry.secs // HOUR_S) or _announced(inv, members, hour):
-        return "wait", collector, hour, hours
-    return "fire", collector, hour, hours
+    return ("fire" if hours >= -(-entry.secs // HOUR_S) else "wait"), collector, hour, hours
 
 
 def _plan(inv: sqlite3.Connection, ov: sqlite3.Connection, now: float) -> Plan:
     marks = _read_marks(ov)
     entries, protected, unjudged = _resolve(inv, ov, marks)
     rows = _open_rows(inv)
-    closes = _closes(inv, ov, rows, (entries, protected, not marks.overflow), now)
+    closes = _closes(inv, ov, rows, (entries, protected, not marks.overflow))
     closing = {c[0] for c in closes}
     found: list[tuple[Lineage, str, int, int, int]] = []
     for canonical, entry in sorted(entries.items()):
@@ -347,7 +368,12 @@ def _plan(inv: sqlite3.Connection, ov: sqlite3.Connection, now: float) -> Plan:
         elif verdict != "wait":
             unjudged.append((canonical, verdict, entry.version))
     room = max(0, MAX_PER_DAY - _opened_today(inv, now)) if found else 0
-    return Plan(tuple(closes), tuple(found[:room]), tuple(unjudged), len(found[room:]))
+    day = iso_utc(now)[:10]
+    held = len(found[room:])
+    if held and event_exists(inv, CAPPED, day):
+        held = 0  # today's event is already on file: no write for it
+    unjudged = [u for u in unjudged if not event_exists(inv, UNJUDGED, _unjudged_token(u, day))]
+    return Plan(tuple(closes), tuple(found[:room]), tuple(unjudged), held)
 
 
 def _opened_today(inv: sqlite3.Connection, now: float) -> int:
@@ -380,23 +406,38 @@ def _device_exists(inv: sqlite3.Connection, device_id: str) -> bool:
     return inv.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone() is not None
 
 
+def _unjudged_token(item: tuple, day: str) -> str:
+    device_id, reason, version = item
+    when = f"v{version}" if reason in PER_VERSION and version is not None else day
+    return f"{device_id}:{reason}:{when}"
+
+
 def _emit_unjudged(inv: sqlite3.Connection, item: tuple, day: str, now: float) -> None:
     """One event naming the device (its id, never a MAC; none when the device is unknown)."""
-    device_id, reason, version = item
+    device_id, reason, _ = item
     known = device_id if device_id and _device_exists(inv, device_id) else None
-    when = f"v{version}" if reason in PER_VERSION and version is not None else day
-    emit_once(inv, known, "essential_unjudged", "warn",
+    emit_once(inv, known, UNJUDGED, "warn",
               f"an essential device cannot be judged: {SUMMARIES[reason]}",
-              f"{device_id}:{reason}:{when}", now)  # fmt: skip
+              _unjudged_token(item, day), now)  # fmt: skip
 
 
-def _apply(inv: sqlite3.Connection, plan: Plan, now: float) -> int:
+def _still_marked(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan) -> Plan:
+    """Inside the write transaction: drop the openings whose mark was cleared (or became unusable)
+    after the plan was made, so a committed unmark never opens an incident."""
+    if not plan.opens:
+        return plan
+    live = _resolve(inv, ov, _read_marks(ov))[0]
+    return replace(plan, opens=tuple(o for o in plan.opens if o[0].device_id in live))
+
+
+def _apply(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan, now: float) -> int:
     """One transaction: close first (the open-incident index is per lineage), then open, then the
     events. Nothing to do = no transaction at all."""
     if not (plan.closes or plan.opens or plan.unjudged or plan.held):
         return 0
     day = iso_utc(now)[:10]
     with immediate(inv):
+        plan = _still_marked(inv, ov, plan)
         for incident_id, _ in plan.closes:
             inv.execute(
                 "UPDATE monitoring_incidents SET state='resolved' WHERE id=? AND state='open'",
@@ -407,7 +448,7 @@ def _apply(inv: sqlite3.Connection, plan: Plan, now: float) -> int:
         for item in plan.unjudged:
             _emit_unjudged(inv, item, day, now)
         if plan.held:
-            emit_once(inv, None, "essential_capped", "warn",
+            emit_once(inv, None, CAPPED, "warn",
                       f"essential-absence cap {MAX_PER_DAY}/day reached; {plan.held} held",
                       day, now)  # fmt: skip
     for reason in sorted({r for _, r in plan.closes}):
@@ -432,6 +473,17 @@ def _report_failure(inv: sqlite3.Connection, exc: Exception, now: float) -> None
     log(logger, logging.ERROR if fresh else logging.DEBUG, "essential_absence_failed", error=name)
 
 
+def _abstain_schema(inv: sqlite3.Connection, now: float) -> None:
+    """One event per UTC day (and no write when it is on file) naming why nothing is judged."""
+    token = f"overrides_schema:{iso_utc(now)[:10]}"
+    if event_exists(inv, UNJUDGED, token):
+        return
+    with immediate(inv):
+        emit_once(inv, None, UNJUDGED, "warn",
+                  f"an essential device cannot be judged: {SUMMARIES['overrides_schema']}",
+                  token, now)  # fmt: skip
+
+
 def sweep_essential_absence(
     inv: sqlite3.Connection, ov: sqlite3.Connection | None, now: float
 ) -> int:
@@ -441,7 +493,10 @@ def sweep_essential_absence(
     if ov is None:
         return 0
     try:
-        return _apply(inv, _plan(inv, ov, now), now)
+        if ov.execute("PRAGMA user_version").fetchone()[0] > SUPPORTED_USER_VERSION:
+            _abstain_schema(inv, now)  # prune.py refuses such a file too: nothing is judged
+            return 0
+        return _apply(inv, ov, _plan(inv, ov, now), now)
     except Exception as exc:  # noqa: BLE001 - the sweep must never fail the pipeline pass
         _report_failure(inv, exc, now)
         return 0

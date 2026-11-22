@@ -49,7 +49,7 @@ class Env:
         """`active` = the hour offset of its newest measured activity; `last_seen` is the snapshot
         stamp (a lease or neighbour row), which must never matter."""
         self.n += 1
-        mac = f"00:1a:2b:00:00:{self.n:02x}"
+        mac = f"00:00:5e:00:53:{self.n:02x}"
         self.macs[did] = mac
         self.collector[did] = collector
         self.inv.execute(
@@ -393,8 +393,9 @@ def test_a_pipeline_gap_changes_nothing_and_a_late_pass_opens_exactly_once(env):
     env.device("d1")
     env.mark("d1", 3600)
     env.cover(1, 2)
-    assert env.sweep(now_after(2) + 7 * 86400) == 1  # first pass after a week of downtime
-    assert env.sweep(now_after(2) + 7 * 86400 + 30) == 0
+    gap = 5 * 86400  # inside batch retention: older hours' flood status is unreadable (fix 2)
+    assert env.sweep(now_after(2) + gap) == 1  # first pass after days of downtime
+    assert env.sweep(now_after(2) + gap + 30) == 0
 
 
 def test_far_future_activity_neither_suppresses_nor_disables_judging(env):
@@ -415,11 +416,11 @@ def test_a_constant_collector_offset_never_fires_early(env, skew):
         env.inv.execute(
             "INSERT INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')", (first + h * HOUR,)
         )
-    assert env.sweep(H + 200 * HOUR) == 0  # two qualified hours < 3: early would be a false page
+    assert env.sweep(H + 100 * HOUR) == 0  # two qualified hours < 3: early would be a false page
     env.inv.execute(
         "INSERT INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')", (first + 3 * HOUR,)
     )
-    assert env.sweep(H + 200 * HOUR) == 1
+    assert env.sweep(H + 100 * HOUR) == 1
 
 
 # ---- overrides.db problems ----------
