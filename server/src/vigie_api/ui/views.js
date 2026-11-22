@@ -258,6 +258,36 @@ export function incidentView(d, onActivity) {
   if (!d || !d.evidence || typeof d.id !== 'string') throw new Error('Malformed incident response'); const e = d.evidence;
   return node('aside', {class: 'detail-panel', 'aria-label': 'Incident evidence', tabindex: '-1'}, node('span', {class: 'eyebrow'}, 'EVIDENCE RECORD'), node('h2', {}, detector(d.detector)), badge(d.state, d.state === 'open' ? 'warn' : ''), node('div', {class: 'callout'}, 'Unusual does not mean malicious. This observation is evidence to review, not a safety verdict.'), (d.detector === 'new_device' ? facts([['Reason', text(e.reason_code)], ['Hours present when noticed', finite(e.dwell_hours) ? String(e.dwell_hours) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']]) : d.detector === 'essential_absence' ? facts([['Reason', text(e.reason_code)], ['Hours not seen (collector could see)', finite(e.absent_for_hours) ? String(e.absent_for_hours) : 'Unavailable'], ['Your threshold (hours)', finite(e.threshold_hours) ? String(e.threshold_hours) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']]) : facts([['Observed upload', bytes(e.observed_bytes)], ['Threshold', bytes(e.threshold_bytes)], ['Observed hour', utc(e.hour)], ['Previous hour', utc(e.previous_hour)], ['Quality required', finite(e.coverage_required_seconds) ? `${e.coverage_required_seconds}s per hour` : 'Unavailable'], ['Reason', text(e.reason_code)], ['Algorithm', text(e.algorithm)], ['Config version', text(e.config_version)], ['Baseline', e.baseline_id || 'No mature baseline'], ['Reference median', e.baseline_id ? bytes(e.baseline_median_upload_bytes) : 'Not used'], ['Qualified hours', finite(e.sample_hours) ? String(e.sample_hours) : 'Unavailable'], ['Distinct dates', finite(e.distinct_days) ? String(e.distinct_days) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']])), node('code', {class: 'identity-id'}, d.device_id), node('button', {type: 'button', 'data-focus-key': `activity:${d.device_id}`, onclick: () => onActivity(d.device_id)}, 'View activity'), node('details', {}, node('summary', {}, 'Provenance identifiers'), facts([['Incident ID', d.id], ['Baseline ID', text(e.baseline_id)], ['Lineage', text(e.lineage)]])));
 }
+export function incidentReviewControls(incident, enabled, message, onEnable, onStop, onSave) {
+  const status = node('p', {role: 'status', tabindex: '-1', 'data-focus-key': 'review-status'}, message);
+  const current = node('p', {}, 'Current decision · ', triage(incident, Date.now()).label);
+  if (!enabled) {
+    const token = node('input', {'data-review-writer-token': '', type: 'password', maxlength: '4096', autocomplete: 'off', spellcheck: 'false', required: ''});
+    const form = node('form', {class: 'review-form', 'data-focus-key': 'review-writer', onsubmit: event => {
+      event.preventDefault();
+      const value = token.value.trim();
+      token.value = '';
+      onEnable(value, status);
+    }}, node('label', {}, 'Writer token', token),
+    node('button', {type: 'submit'}, 'Enable editing'));
+    return [current, form, status];
+  }
+  const option = (value, label) => node('option', {value}, label);
+  const minutes = node('input', {type: 'number', min: '2', max: '10080', step: '1', disabled: ''});
+  const duration = node('label', {hidden: ''}, 'Minutes to snooze', minutes);
+  const action = node('select', {required: '', onchange: () => {
+    duration.hidden = minutes.disabled = action.value !== 'snooze';
+  }}, option('', 'Choose a decision'), option('acknowledge', 'Acknowledge'),
+  option('mark-expected', 'Mark expected'), incident.state === 'open' ? option('snooze', 'Snooze') : null,
+  incident.review !== null ? option('clear', 'Clear decision') : null);
+  const save = node('button', {type: 'submit'}, 'Apply decision');
+  const stop = node('button', {type: 'button', onclick: onStop}, 'Stop editing');
+  const form = node('form', {class: 'review-form', 'data-focus-key': 'review-action', onsubmit: event => {
+    event.preventDefault();
+    onSave(action.value, minutes.value, status, () => { save.disabled = stop.disabled = true; });
+  }}, node('label', {}, 'Decision', action), duration, node('div', {class: 'review-buttons'}, save, stop));
+  return [current, form, status];
+}
 /* Events: every API string is shown through text(); severity reaches `class` only via this allowlist. */
 export const EVENT_PAGE = 25; export const EVENT_TIMELINE = 10; export const EVENT_MAX_PAGES = 40;
 const SEVERITY_TONE = {info: '', warn: 'warn', warning: 'warn', error: 'bad', critical: 'bad'};
