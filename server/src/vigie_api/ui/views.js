@@ -123,6 +123,50 @@ export function coverageStatus(snapshot, now = Date.now()) {
     return {tone: 'ok', text: `OK · coverage current; ${plural(qualified, 'qualified hour')}${open ? `, ${open} accumulating` : ''}`};
   } catch { return UNAVAILABLE; }
 }
+const probeVerdicts = {
+  normal: 'No resolver outage indicated',
+  upstream_unreachable: 'Upstream unreachable',
+  router_resolver_down: 'Router resolver outage',
+  vigie_blind: 'Collector visibility unknown',
+  unknown: 'Probe verdict unknown',
+};
+const probeKinds = {dns_local: 'Router DNS', dns_upstream: 'Upstream DNS', tcp_lan: 'LAN TCP', unknown: 'Unknown'};
+const probeErrors = new Set(['malformed', 'bad_id', 'rcode', 'no_answer', 'timeout', 'oserror', 'refused', 'unreachable', 'other']);
+const probeNumber = (value, maximum = 1e11, integer = true) => value === null ||
+  (finite(value) && value <= maximum && (!integer || Number.isInteger(value)));
+function validProbes(data) {
+  if (!data || typeof data.enabled !== 'boolean' || typeof data.stale !== 'boolean' ||
+      !probeNumber(data.written_at) || typeof data.verdict !== 'string' || !Object.hasOwn(probeVerdicts, data.verdict) ||
+      !Array.isArray(data.targets) || data.targets.length > 10) return false;
+  if (!data.enabled) return !data.stale && data.written_at === null && data.targets.length === 0 && data.verdict === 'unknown';
+  if (data.stale) return data.verdict === 'unknown';
+  return data.written_at !== null;
+}
+function validProbeTarget(target) {
+  return target && typeof target.id === 'string' && /^[a-z0-9_-]{1,32}$/.test(target.id) &&
+    typeof target.kind === 'string' && Object.hasOwn(probeKinds, target.kind) &&
+    ['ok', 'outage', 'unknown'].includes(target.state) && probeNumber(target.last_ok_at, 1e11, false) &&
+    probeNumber(target.last_latency_ms, 5000) && probeNumber(target.episode_start) &&
+    (target.last_error_class === null || probeErrors.has(target.last_error_class));
+}
+export function probeStatusView(data) {
+  if (!validProbes(data) || !data.targets.every(validProbeTarget) ||
+      new Set(data.targets.map(target => target.id)).size !== data.targets.length) {
+    throw new Error('Malformed probe response');
+  }
+  const summary = !data.enabled ? 'Off' : data.stale ? 'Probe status stale · unknown' : probeVerdicts[data.verdict];
+  const status = node('p', {role: 'status'}, summary);
+  if (!data.enabled || data.stale) return status;
+  const rows = data.targets.map(target => {
+    const label = target.state === 'outage' ? 'Outage' : target.state === 'unknown' ? 'Unknown' :
+      target.episode_start === null ? 'OK' : 'Recovered';
+    return node('tr', {}, node('th', {scope: 'row'}, target.id), node('td', {}, probeKinds[target.kind]),
+      node('td', {}, badge(label, target.state === 'outage' ? 'bad' : '')), node('td', {}, utc(target.last_ok_at)));
+  });
+  return node('div', {}, status, node('p', {class: 'table-note'}, `Last probe report ${utc(data.written_at)}`),
+    rows.length ? table(['Target', 'Kind', 'State', 'Last success · UTC'], rows) : null);
+}
+
 export function coverageView(data) {
   validateHours(data); const c = data.collector; if (!c || typeof c !== 'object') throw new Error('Malformed coverage response');
   if (!data.hours.length) return empty('Coverage unavailable', 'No hourly coverage was returned. There is no basis for a quality conclusion.');
@@ -249,6 +293,36 @@ function trafficIncidentFacts(d, e) {
 export function incidentView(d, onActivity) {
   if (!d || !d.evidence || typeof d.id !== 'string') throw new Error('Malformed incident response'); const e = d.evidence;
   return node('aside', {class: 'detail-panel', 'aria-label': 'Incident evidence', tabindex: '-1'}, node('span', {class: 'eyebrow'}, 'EVIDENCE RECORD'), node('h2', {}, detector(d.detector)), badge(d.state, d.state === 'open' ? 'warn' : ''), node('div', {class: 'callout'}, 'Unusual does not mean malicious. This observation is evidence to review, not a safety verdict.'), (d.detector === 'new_device' ? facts([['Reason', text(e.reason_code)], ['Hours present when noticed', finite(e.dwell_hours) ? String(e.dwell_hours) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']]) : d.detector === 'essential_absence' ? facts([['Reason', text(e.reason_code)], ['Hours not seen (collector could see)', finite(e.absent_for_hours) ? String(e.absent_for_hours) : 'Unavailable'], ['Your threshold (hours)', finite(e.threshold_hours) ? String(e.threshold_hours) : 'Unavailable'], ['Current lineage', d.current_lineage ? 'Yes' : 'No · historical evidence']]) : trafficIncidentFacts(d, e)), node('code', {class: 'identity-id'}, d.device_id), node('button', {type: 'button', 'data-focus-key': `activity:${d.device_id}`, onclick: () => onActivity(d.device_id)}, 'View activity'), node('details', {}, node('summary', {}, 'Provenance identifiers'), facts([['Incident ID', d.id], ['Baseline ID', text(e.baseline_id)], ['Lineage', text(e.lineage)]])));
+}
+export function incidentReviewControls(incident, enabled, message, onEnable, onStop, onSave) {
+  const status = node('p', {role: 'status', tabindex: '-1', 'data-focus-key': 'review-status'}, message);
+  const current = node('p', {}, 'Current decision · ', triage(incident, Date.now()).label);
+  if (!enabled) {
+    const token = node('input', {'data-review-writer-token': '', type: 'password', maxlength: '4096', autocomplete: 'off', spellcheck: 'false', required: ''});
+    const form = node('form', {class: 'review-form', 'data-focus-key': 'review-writer', onsubmit: event => {
+      event.preventDefault();
+      const value = token.value.trim();
+      token.value = '';
+      onEnable(value, status);
+    }}, node('label', {}, 'Writer token', token),
+    node('button', {type: 'submit'}, 'Enable editing'));
+    return [current, form, status];
+  }
+  const option = (value, label) => node('option', {value}, label);
+  const minutes = node('input', {type: 'number', min: '2', max: '10080', step: '1', disabled: ''});
+  const duration = node('label', {hidden: ''}, 'Minutes to snooze', minutes);
+  const action = node('select', {required: '', onchange: () => {
+    duration.hidden = minutes.disabled = action.value !== 'snooze';
+  }}, option('', 'Choose a decision'), option('acknowledge', 'Acknowledge'),
+  option('mark-expected', 'Mark expected'), incident.state === 'open' ? option('snooze', 'Snooze') : null,
+  incident.review !== null ? option('clear', 'Clear decision') : null);
+  const save = node('button', {type: 'submit'}, 'Apply decision');
+  const stop = node('button', {type: 'button', onclick: onStop}, 'Stop editing');
+  const form = node('form', {class: 'review-form', 'data-focus-key': 'review-action', onsubmit: event => {
+    event.preventDefault();
+    onSave(action.value, minutes.value, status, () => { save.disabled = stop.disabled = true; });
+  }}, node('label', {}, 'Decision', action), duration, node('div', {class: 'review-buttons'}, save, stop));
+  return [current, form, status];
 }
 /* Events: every API string is shown through text(); severity reaches `class` only via this allowlist. */
 export const EVENT_PAGE = 25; export const EVENT_TIMELINE = 10; export const EVENT_MAX_PAGES = 40;

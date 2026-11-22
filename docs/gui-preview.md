@@ -1,4 +1,4 @@
-# Read-only GUI development preview
+# Monitoring GUI development preview
 
 The read-only GUI is merged to main (#17, #31, #65) and served by the API at `/ui/`. This page documents the synthetic development preview, written on 2026-10-25 from the isolated `feat/read-only-gui` worktree; the worktree wording below is historical. Whether the GUI is served by the running deployment is not recorded here; soak 4 was running on 2026-11-09. The browser preview uses 55 synthetic identities, documentation-only IPv4/IPv6 addresses, a deliberately suspicious HTML-like device name, unknown types, missing/partial hours, a learning baseline and one synthetic incident. It does not describe household devices or real network activity.
 
@@ -110,11 +110,29 @@ attention / Quiet filter changes only the view and is kept in the URL hash (`#fi
 never in browser storage. The API returns at most 25 incidents per page and a longer list is rejected as malformed rather
 than truncated; the pager counts the rows the filter leaves, and a filter that hides rows says
 `Showing X of N incidents on this page`. An empty list says
-absence of incidents is not proof of health. The GUI is intentionally read-only: it has no
-acknowledge, snooze or expected controls and issues only GET requests; decisions are made through
-the authenticated API.
+absence of incidents is not proof of health.
+
+### Incident review
+
+The ordinary connection uses GET requests and a dedicated read-only token. To record a decision,
+open an incident, enter a separate API writer token under **Incident review**, and select
+**Enable editing**. Choose **Acknowledge**, **Mark expected**, **Snooze** for an open incident, or
+**Clear decision** when a decision exists. **Apply decision** sends the action with the collector,
+incident, and decision version from the latest detail response. The server enforces the configured
+snooze limit.
+
+The page holds the writer token in memory for at most five minutes. Stopping editing, changing
+incident or collector, hiding the page, and disconnecting clear it. Writer authentication failures
+leave the read connection available. On a conflict, the page refreshes the incident and asks you
+to check the latest decision before applying another. A failed or unconfirmed write is never
+retried automatically. The synthetic preview supplies a read-only token.
 
 ## Coverage gauge
+
+The Overview also shows host-wide **Active probes** from the authenticated `GET /probes` endpoint.
+The panel distinguishes disabled probes, stale or unknown status, and target outages or recovery.
+Probe status and passive coverage load independently, so either can display when the other endpoint
+is unavailable.
 
 The Overview opens with a ring gauge that summarises the displayed coverage hours; the hour strip and
 legend below it remain the evidence. The inner ring splits the hours by state (qualified, partial,

@@ -161,7 +161,65 @@ try {
   // The server accepts these device_id values (it only bounds length), so the client sends them as query data instead of rejecting them.
   const sent = seen.length; for (const odd of ['..', 'a/b', 'a\\b', 'a\nb', '.']) { await c.events({deviceId: odd}); await c.deviceTimeline(odd); assert.equal(seen.at(-1).url.searchParams.get('device_id'), odd); assert.equal(seen.at(-2).url.searchParams.get('device_id'), odd); } assert.equal(seen.length, sent + 10);
   const out = new ApiClient(); await assert.rejects(out.events(), error => error.status === 401);
-  const source = (await import('node:fs')).readFileSync(new URL('../../server/src/vigie_api/ui/client.js', import.meta.url), 'utf8');
-  assert.ok(!/\b(POST|PUT|PATCH|DELETE)\b/.test(source), 'no write verb appears in the client');
 }
-console.log('PASS: fixed GET/generation/auth/backlog contracts; complete UTC grids with null gaps; bounded/cancelled bodies and deadlines; numeric/HTTP-date Retry-After.');
+// Mutations have an independent, explicitly enabled credential and a closed request shape.
+{
+  const c = new ApiClient();
+  c.setToken('synthetic-read');
+  const seen = [];
+  let status = 200; let version = 4;
+  globalThis.fetch = async (url, options) => {
+    seen.push({url: new URL(url), options});
+    return new Response(JSON.stringify({ok: true, page: null, data: {
+      incident_id: 'inc-1', status: 'acknowledged', version, snooze_until: null,
+      decided_by: 'app', decided_at: '2026-11-22T00:00:00Z',
+    }}), {status});
+  };
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.status === 401);
+  assert.equal(seen.length, 0);
+  c.enableWriter('synthetic-write');
+  for (const bad of [
+    ['inc-1', 'collector', 'delete', 3], ['../x', 'collector', 'acknowledge', 3],
+    ['inc-1', 'collector', 'clear', -1], ['inc-1', 'collector', 'acknowledge', '3'],
+    ['inc-1', 'collector', 'acknowledge', 3, '2026-11-22T00:00:00Z'],
+    ['inc-1', 'collector', 'snooze', 3, '<img src=x>'],
+  ]) await assert.rejects(c.decideIncident(...bad), e => e.code === 'invalid_input');
+  assert.equal(seen.length, 0);
+  await c.decideIncident('inc-1', 'collector', 'acknowledge', 3);
+  const [{url, options}] = seen;
+  assert.equal(url.origin, location.origin);
+  assert.equal(url.pathname, '/incidents/inc-1/acknowledge');
+  assert.deepEqual([...url.searchParams], [['collector_id', 'collector']]);
+  assert.equal(options.method, 'POST'); assert.equal(options.redirect, 'error');
+  assert.equal(options.credentials, 'omit'); assert.equal(options.mode, 'same-origin');
+  assert.equal(options.referrerPolicy, 'no-referrer');
+  assert.equal(options.headers.Authorization, 'Bearer synthetic-write');
+  assert.equal(options.headers['Content-Type'], 'application/json');
+  assert.deepEqual(JSON.parse(options.body), {expected_version: 3});
+  version = 3;
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.code === 'malformed_response');
+  status = 409;
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.status === 409);
+  assert.equal(seen.length, 3, 'POSTs are never replayed');
+  status = 403;
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.status === 403);
+  assert.equal(c.writerEnabled, false);
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.status === 401);
+  status = 200;
+  await c.devices();
+  assert.equal(seen.at(-1).options.headers.Authorization, 'Bearer synthetic-read');
+  c.enableWriter('synthetic-write');
+  status = 401;
+  await assert.rejects(c.decideIncident('inc-1', 'collector', 'acknowledge', 3), e => e.status === 401);
+  assert.equal(c.writerEnabled, false);
+  c.enableWriter('synthetic-write');
+  const now = Date.now;
+  try {
+    const expired = Date.now() + 300001; Date.now = () => expired;
+    assert.equal(c.writerEnabled, false);
+    await assert.rejects(c.decideIncident('inc-1', 'collector', 'clear', 4), e => e.status === 401);
+  } finally { Date.now = now; }
+  c.disconnect();
+}
+
+console.log('PASS: fixed GET and explicit incident POST/generation/auth contracts; complete UTC grids with null gaps; bounded/cancelled bodies and deadlines; numeric/HTTP-date Retry-After.');

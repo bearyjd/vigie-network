@@ -28,7 +28,7 @@ class FakeElement extends FakeNode {
 const violations = [];  // any write to an HTML-parsing sink, document.write or browser storage is a contract failure
 for (const sink of ['innerHTML', 'outerHTML']) Object.defineProperty(FakeElement.prototype, sink, {get() { return ''; }, set(value) { violations.push(`${sink}=${value}`); }});
 FakeElement.prototype.insertAdjacentHTML = function insertAdjacentHTML() { violations.push('insertAdjacentHTML'); };
-const ids = ['preview-banner', 'connect-collector', 'content', 'notice', 'connect-panel', 'workspace', 'disconnect', 'connection-state', 'view-title', 'scope-label', 'refresh', 'refresh-status', 'token', 'connect-form', 'collector', 'scope-form', 'range', 'coverage-banner'];
+const ids = ['preview-banner', 'connect-collector', 'content', 'notice', 'connect-panel', 'workspace', 'disconnect', 'connection-state', 'view-title', 'scope-label', 'refresh', 'refresh-status', 'token', 'connect-form', 'collector', 'scope-form', 'range', 'coverage-banner', 'overview-probes'];
 const elements = Object.fromEntries(ids.map(id => [id, new FakeElement('div')]));
 for (const id of ['content', 'notice']) elements[id].parent = null;
 elements.refresh.tag = 'button';
@@ -61,6 +61,8 @@ const refreshTimers = () => dueTimers().length;  // the 15 s request deadlines a
 const tick = async ms => { clock += ms; for (const [id, timer] of [...liveTimeouts]) if (timer.due <= clock) { liveTimeouts.delete(id); timer.callback(); } await flush(); };  // fire a timer only when the fake clock reaches it
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
+const probesOff = {enabled: false, written_at: null, stale: false, targets: [], verdict: 'unknown'};
+let probeData = probesOff; let probeFailure = 0; let holdProbes = null;
 let holdCoverage = null; let lastHourState = 'eligible'; let incidentPages = null; let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
 let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
@@ -70,20 +72,50 @@ function coverageBody(url) {
   const collector = {collector_id: 'c1', latest_observation_received_at: stamp, latest_window_end: now - (windowLag ?? lag), latest_dns_observation_received_at: stamp, latest_dns_observation_window_end: now - (windowLag ?? lag), backlog_batches: 0, backlog_capped: false, oldest_pending_received_at: null, source_flags_latest: 0, last_seq: 1, last_received_at: stamp, dropped_batches_in_retained_detail: 0, retained_detail_since: stamp, summary_capped: false, agent_rss_kb: 1, monitoring_unavailable: unavailable, monitoring_unavailable_capped: false, ...collectorOver};
   return {ok: true, page: {next_cursor: null}, data: {collector, hours}};
 }
+let reviewFixture = null;
 let eventsReply = null; let deviceReply = null; let inventoryRows = [];  // optional stubs for the events and identity routes
 let gate = null;  // when set, responses wait for it: a slow manual refresh
 const requests = [];  // every request the page makes, for the read-only contract
 globalThis.fetch = async (url, options) => {
   requests.push({url: String(url), options});
   if (gate) await gate;
-  if (new URL(String(url)).pathname === '/coverage' && holdCoverage) { const held = holdCoverage; holdCoverage = null; await held.promise; return new Response('{}', {status: 503}); }  // one slow, soon obsolete coverage response
+  if (new URL(String(url)).pathname === '/coverage' && holdCoverage) { const held = holdCoverage; holdCoverage = null; await held.promise; return new Response('{}', {status: held.status ?? 503}); }  // one slow, soon obsolete coverage response
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
+  if (target.pathname === '/probes') {
+    const data = probeData;
+    if (holdProbes) { const held = holdProbes; holdProbes = null; await held; }
+    return probeFailure ? new Response('{}', {status: probeFailure})
+      : new Response(JSON.stringify({ok: true, page: null, data}));
+  }
   if (target.pathname === '/coverage' && coverageDown) return new Response('{}', {status: 503});
   if (target.pathname === '/events' && eventsReply) { const reply = eventsReply(target); if (reply) return reply; }
   if (/^\/devices\/[^/]+$/.test(target.pathname) && deviceReply) return deviceReply(target);
   if (target.pathname === '/devices') return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: inventoryRows}));
+  if (reviewFixture && /^\/incidents\/inc-review(?:\/.*)?$/.test(target.pathname)) {
+    const fixture = reviewFixture;
+    if (options.method === 'POST') {
+      const action = target.pathname.split('/').at(-1); const body = JSON.parse(options.body);
+      if (fixture.hold) await fixture.hold;
+      if (fixture.fail) return new Response(JSON.stringify({error: {code: 'version_conflict', message: '<img src=x>'}}), {status: fixture.fail});
+      fixture.version++;
+      fixture.review = action === 'clear' ? null : {
+        status: {acknowledge: 'acknowledged', 'mark-expected': 'expected', snooze: 'snoozed'}[action],
+        snooze_until: body.until ?? null, version: fixture.version,
+      };
+      return new Response(JSON.stringify({ok: true, page: null, data: {
+        incident_id: 'inc-review', status: fixture.review?.status ?? null,
+        snooze_until: fixture.review?.snooze_until ?? null, version: fixture.version,
+        decided_by: 'app', decided_at: '2026-10-25T12:00:00Z',
+      }}));
+    }
+    if (fixture.detailDown) return new Response('{}', {status: 503});
+    return new Response(JSON.stringify({ok: true, page: null, data: {
+      id: 'inc-review', collector_id: 'c1', device_id: 'dev-1', detector: 'large_upload',
+      state: 'open', evidence: {}, review: fixture.review, decision_version: fixture.version,
+    }}));
+  }
   if (target.pathname.startsWith('/incidents/')) return new Response(JSON.stringify({ok: true, page: {next_cursor: null}, data: {id: target.pathname.slice(11), device_id: 'dev-1', detector: 'large_upload', state: 'open', current_lineage: true, evidence: {}}}));
   if (target.pathname === '/incidents' && incidentsDown) return new Response('{}', {status: 503});
   if (target.pathname === '/incidents' && incidentPages) { const at = Number((target.searchParams.get('cursor') || 'c0').slice(1)); return new Response(JSON.stringify({ok: true, page: {next_cursor: at + 25 < incidentPages.length ? `c${at + 25}` : null}, data: incidentPages.slice(at, at + 25)})); }
@@ -260,6 +292,45 @@ const bannerText = () => banner.textContent; const tone = () => banner.getAttrib
 const reload = async () => { refresh.fire('click'); await flush(); };
 mode = 'ok'; lag = 0; windowLag = null; await reload();
 assert.match(bannerText(), /^OK/); assert.equal(tone(), 'ok');
+// Host-wide probe status is separate from collector-scoped passive coverage.
+const probePanel = elements['overview-probes'];
+assert.equal(probePanel.hidden, false);
+assert.match(probePanel.textContent, /Active probes.*Off/);
+const probeTarget = {id: 'lan-dns', kind: 'dns_local', state: 'outage', last_ok_at: null, last_error_class: 'timeout', last_latency_ms: null, episode_start: clock / 1000 - 60};
+probeData = {enabled: true, written_at: clock / 1000, stale: false, targets: [probeTarget], verdict: 'router_resolver_down'};
+await reload(); assert.match(probePanel.textContent, /Router resolver outage/); assert.match(probePanel.textContent, /lan-dns.*Outage/); assert.equal(tone(), 'ok');
+probeData = {...probeData, verdict: 'normal', targets: [{...probeTarget, state: 'ok', last_ok_at: clock / 1000}]};
+await reload(); assert.match(probePanel.textContent, /lan-dns.*Recovered/);
+coverageDown = true;
+probeData = {...probeData, verdict: 'router_resolver_down', targets: [probeTarget]};
+await reload();
+assert.equal(tone(), 'error'); assert.match(content.textContent, /Coverage over time/, 'the previous passive snapshot remains');
+assert.match(probePanel.textContent, /Router resolver outage/, 'fresh probe outage replaces the previous normal despite coverage failure');
+assert.doesNotMatch(probePanel.textContent, /No resolver outage indicated/);
+navButtons.find(button => button.dataset.view === 'inventory').fire('click'); await flush();
+navButtons.find(button => button.dataset.view === 'overview').fire('click'); await flush();
+assert.match(content.textContent, /Data unavailable/); assert.match(probePanel.textContent, /Router resolver outage/, 'initial coverage failure still renders the probe response');
+coverageDown = false;
+probeData = {...probeData, stale: true, verdict: 'unknown', targets: [{...probeTarget, state: 'unknown'}]};
+await reload(); assert.match(probePanel.textContent, /Probe status stale/); assert.doesNotMatch(probePanel.textContent, /lan-dns/); assert.equal(tone(), 'ok');
+probeData = {...probeData, stale: false, targets: [{...probeTarget, id: '<img src=x>', state: 'unknown'}]};
+await reload(); assert.match(probePanel.textContent, /Probe status unavailable/); assert.doesNotMatch(probePanel.textContent, /<img/);
+probeData = probesOff; probeFailure = 503;
+await reload(); assert.match(probePanel.textContent, /Probe status unavailable/); assert.match(content.textContent, /Coverage over time/); assert.equal(tone(), 'ok'); assert.equal(notice.hidden, true);
+probeFailure = 0;
+let releaseProbes;
+holdProbes = new Promise(resolve => { releaseProbes = resolve; });
+await reload(); assert.match(probePanel.textContent, /Checking probe status/); assert.match(content.textContent, /Coverage over time/);
+navButtons.find(button => button.dataset.view === 'inventory').fire('click'); await flush();
+releaseProbes(); await flush(); assert.equal(probePanel.hidden, true); assert.equal(probePanel.textContent, '');
+navButtons.find(button => button.dataset.view === 'overview').fire('click'); await flush();
+assert.match(probePanel.textContent, /Active probes.*Off/);
+probeData = {enabled: true, written_at: clock / 1000, stale: false, targets: [], verdict: 'unknown'};
+await reload(); assert.match(probePanel.textContent, /Probe verdict unknown/);
+probeData = probesOff; probeFailure = 401;
+await reload(); assert.equal(elements.workspace.hidden, true); assert.equal(content.textContent, ''); assert.equal(probePanel.textContent, '');
+probeFailure = 0; elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
+elements['connect-form'].fire('submit'); await flush();
 elements.collector.value = 'c1'; elements.range.value = '24'; gate = new Promise(resolve => { release = resolve; });
 elements['scope-form'].fire('submit'); await flush();
 assert.match(bannerText(), /^Checking/); assert.equal(tone(), 'loading'); assert.doesNotMatch(bannerText(), /^OK/);
@@ -505,10 +576,11 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
 // Round 3: an obsolete coverage response must not overwrite a fresher banner.
 {
   collectorOver = {}; hourState = 'eligible'; lastHourState = 'eligible'; location.hash = ''; view('overview'); await flush(); await reload(); assert.equal(tone(), 'ok');
-  let releaseStale; holdCoverage = {promise: new Promise(resolve => { releaseStale = resolve; })};
+  let releaseStale; holdCoverage = {status: 401, promise: new Promise(resolve => { releaseStale = resolve; })};
   view('inventory'); await flush();  // its coverage request is held
   view('overview'); await flush(); assert.equal(tone(), 'ok', 'the fresh overview owns the banner');
   releaseStale(); await flush(); intervalTick(); assert.equal(tone(), 'ok', 'the obsolete response must not flip the banner'); assert.match(bannerText(), /^OK/);
+  assert.equal(elements.workspace.hidden, false, 'an obsolete 401 cannot disconnect the current view');
 }
 // Round 4: an automatic refresh that is still waiting on coverage must not replace content the user has since started using.
 {
@@ -599,7 +671,11 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   for (const el of content.querySelectorAll('*')) { for (const [k, v] of el.attrs) { assert.ok(!/[<>"]/.test(v), `attribute ${k} carries API markup`); assert.ok(!k.startsWith('on'), 'no inline handler attribute'); } assert.ok(!/[<>]/.test(el.getAttribute('class') || ''), 'API text never reaches a class'); }
   assert.deepEqual(content.querySelectorAll('span').filter(e => (e.getAttribute('class') || '').startsWith('badge')).map(e => e.getAttribute('class')), ['badge ', 'badge ', 'badge warn', 'badge ', 'badge '], 'severity maps through an allowlist, including prototype names');
   assert.ok(content.querySelectorAll('div').some(d => d.getAttribute('role') === 'region' && /Scrollable table/.test(d.getAttribute('aria-label'))), 'the table is a labelled, focusable region');
-  assert.deepEqual(violations, [], 'no HTML sink was touched');
+  for (const {url, options} of requests.filter(({url}) => new URL(url).pathname === '/probes')) {
+  assert.equal(new URL(url).search, '', 'probe status is host-wide');
+  assert.equal(options.headers.Authorization, 'Bearer synthetic-token');
+}
+assert.deepEqual(violations, [], 'no HTML sink was touched');
 
   // 2. Filters: a real <form> whose submit never navigates; values are encoded, bounded, and reset the pager.
   const form = content.querySelectorAll('form')[0]; assert.equal(form.getAttribute('aria-label'), 'Event filters');
@@ -669,6 +745,101 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   const walk = n => [n, ...n.children.filter(c => c instanceof FakeElement).flatMap(walk)];
   for (const el of walk(content)) { for (const v of el.attrs.values()) assert.ok(!v.includes('synthetic-token')); assert.ok(!el.textContent.includes('synthetic-token')); }
 }
+// Intentional incident review is the only write surface. The read connection stays independent.
+{
+  reviewFixture = {version: 3, review: null, fail: 0, hold: null};
+  incidents = [{id: 'inc-review', device_id: 'dev-1', detector: 'large_upload', state: 'open'}];
+  view('incidents'); await flush();
+  content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'incident:inc-review').fire('click'); await flush();
+  const writes = () => requests.filter(r => r.options.method === 'POST');
+  const form = key => content.querySelectorAll('form').find(n => n.getAttribute('data-focus-key') === key);
+  const button = label => content.querySelectorAll('button').find(b => b.textContent === label);
+  const enable = () => {
+    const setup = form('review-writer'); assert.ok(setup, 'writer activation is available on incident detail');
+    const input = setup.querySelector('input'); input.value = 'synthetic-writer';
+    setup.fire('submit'); assert.equal(input.value, '', 'writer bearer leaves the DOM at activation');
+  };
+  const intent = (action, minutes = '') => {
+    const edit = form('review-action'); edit.querySelector('select').value = action;
+    edit.querySelector('input').value = minutes; edit.fire('submit'); return edit;
+  };
+  assert.equal(writes().length, 0); assert.equal(form('review-action'), undefined);
+  const unsubmitted = form('review-writer').querySelector('input');
+  unsubmitted.value = 'synthetic-writer'; unsubmitted.focus();
+  const detailReads = () => requests.filter(r => r.options.method === 'GET' && new URL(r.url).pathname === '/incidents/inc-review').length;
+  const beforeHide = detailReads();
+  document.hidden = true; documentListeners.visibilitychange[0]();
+  assert.equal(unsubmitted.value, '', 'hiding clears the unsubmitted writer token');
+  document.hidden = false; documentListeners.visibilitychange[0](); await flush();
+  assert.equal(detailReads(), beforeHide + 1, 'the focused detail refreshes when shown again');
+  enable(); assert.equal(writes().length, 0); assert.match(elements['connection-state'].textContent, /incident editing/);
+  intent(''); intent('snooze', '<img src=x>'); assert.equal(writes().length, 0);
+  let releaseSave;
+  reviewFixture.hold = new Promise(resolve => { releaseSave = resolve; });
+  const oldForm = intent('acknowledge'); oldForm.fire('submit');
+  assert.equal(writes().length, 1, 'double submissions send one request');
+  assert.deepEqual(JSON.parse(writes()[0].options.body), {expected_version: 3});
+  assert.equal(writes()[0].options.headers.Authorization, 'Bearer synthetic-writer');
+  releaseSave(); reviewFixture.hold = null; await flush();
+  assert.match(content.textContent, /Decision saved/); oldForm.fire('submit');
+  assert.equal(writes().length, 1, 'a detached form cannot submit');
+  reviewFixture.version = 6; reviewFixture.review = {...reviewFixture.review, version: 6}; reviewFixture.fail = 409;
+  intent('mark-expected'); await flush();
+  assert.equal(writes().length, 2, 'conflicts reload the detail without replay');
+  assert.match(content.textContent, /Decision conflict/); assert.doesNotMatch(content.textContent, /<img/);
+  reviewFixture.fail = 0;
+  intent('mark-expected'); await flush();
+  assert.deepEqual(JSON.parse(writes().at(-1).options.body), {expected_version: 6});
+  intent('snooze', '10'); await flush();
+  assert.match(JSON.parse(writes().at(-1).options.body).until, /^\d{4}-\d{2}-\d{2}T/);
+  intent('clear'); await flush(); assert.match(new URL(writes().at(-1).url).pathname, /\/clear$/);
+  reviewFixture.fail = 403;
+  intent('acknowledge'); await flush();
+  assert.match(content.textContent, /Writer access refused/); assert.equal(elements.workspace.hidden, false);
+  assert.equal(form('review-action'), undefined);
+  reviewFixture.fail = 0; enable(); const detached = form('review-action');
+  reviewFixture.detailDown = true; await reload();
+  assert.equal(form('review-action'), detached, 'a failed detail refresh retains the read snapshot');
+  button('Stop editing').fire('click'); detached.fire('submit');
+  assert.match(elements['connection-state'].textContent, /read-only/, 'Stop editing revokes the writer on the stale form');
+  assert.equal(form('review-action'), undefined);
+  assert.equal(writes().length, 6, 'disabling writer does not send a write');
+  reviewFixture.detailDown = false; await reload();
+  enable();
+  let releaseObsolete;
+  reviewFixture.hold = new Promise(resolve => { releaseObsolete = resolve; });
+  const obsoleteForm = intent('acknowledge');
+  const obsolete = writes().at(-1);
+  view('overview'); await flush();
+  assert.equal(obsolete.options.signal.aborted, true);
+  obsoleteForm.fire('submit'); releaseObsolete(); await flush();
+  assert.equal(writes().length, 7, 'a late response or detached form sends nothing');
+  assert.equal(elements['view-title'].textContent, 'Overview');
+  assert.match(elements['connection-state'].textContent, /read-only/);
+  assert.doesNotMatch(content.textContent, /Decision saved/);
+  view('incidents'); await flush();
+  content.querySelectorAll('button').find(b => b.getAttribute('data-focus-key') === 'incident:inc-review').fire('click'); await flush();
+  assert.equal(form('review-action'), undefined, 'navigation clears the writer');
+  enable();
+  const activeWriterForm = form('review-action');
+  const readsBefore401 = detailReads();
+  let releaseUnauthorized;
+  holdCoverage = {status: 401, promise: new Promise(resolve => { releaseUnauthorized = resolve; })};
+  await reload();
+  assert.equal(detailReads(), readsBefore401 + 1, 'incident detail finishes before the background coverage 401');
+  assert.match(elements['connection-state'].textContent, /incident editing/);
+  releaseUnauthorized(); await flush();
+  assert.equal(elements.workspace.hidden, true, 'a background coverage 401 disconnects the read session');
+  assert.equal(content.textContent, '', 'observed incident data is cleared');
+  assert.equal(elements['overview-probes'].textContent, '');
+  assert.match(elements['connection-state'].textContent, /Disconnected/);
+  activeWriterForm.querySelector('select').value = 'acknowledge';
+  activeWriterForm.fire('submit');
+  assert.equal(writes().length, 7, 'the former writer form cannot send a write');
+  elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
+  elements['connect-form'].fire('submit'); await flush();
+  reviewFixture = null; incidents = [];
+}
 // Behavioural read-only (addendum B), sinks (C) and timers (D).
 await reload(); const doubleCheck = refreshTimers();
 for (const name of ['overview', 'inventory', 'activity', 'incidents', 'overview', 'incidents']) { view(name); await flush(); hashchange(); }
@@ -677,7 +848,19 @@ assert.equal(doubleCheck, 1); assert.equal(refreshTimers(), 1, 'exactly one refr
 assert.equal((windowListeners.hashchange || []).length, 1, 'exactly one hashchange listener'); assert.equal((documentListeners.visibilitychange || []).length, 1); assert.equal((windowListeners.pagehide || []).length, 1);
 elements.disconnect.fire('click'); assert.equal(refreshTimers(), 0, 'disconnect leaves no refresh timer behind');
 assert.ok(requests.length > 25, 'the suite drove real traffic');
-for (const {url, options} of requests) { assert.ok([undefined, 'GET'].includes(options?.method), `${url} uses ${options?.method}`); assert.equal(options?.body, undefined, `${url} sends no body`); assert.ok(/^\/(coverage|incidents(\/[^/]+)?|devices(\/[^/]+)?|events)$/.test(new URL(url).pathname), `unexpected endpoint ${url}`); }
+for (const {url, options} of requests) {
+  if (options.method === 'GET') {
+    assert.equal(options.body, undefined);
+    if (new URL(url).pathname === '/probes') assert.equal(new URL(url).search, '', 'probe status is host-wide');
+    assert.match(new URL(url).pathname, /^\/(coverage|incidents(\/[^/]+)?|devices(\/[^/]+)?|events|probes)$/);
+    assert.equal(options.headers.Authorization, 'Bearer synthetic-token');
+  } else {
+    assert.equal(options.method, 'POST');
+    assert.match(new URL(url).pathname, /^\/incidents\/inc-review\/(acknowledge|mark-expected|snooze|clear)$/);
+    assert.equal(options.headers.Authorization, 'Bearer synthetic-writer');
+  }
+  assert.doesNotMatch(url, /synthetic-(token|writer)/);
+}
 assert.deepEqual(violations, [], 'no HTML sink, document.write or storage access happened'); assert.equal(storageTouched, false);
 // Static guard on the shipped sources: a cheap tripwire (quote-agnostic), NOT a guarantee; the behavioural checks above are the contract.
 const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${name}`, import.meta.url), 'utf8');
@@ -686,8 +869,8 @@ const computed = /\b(?:globalThis|window|self|document|this)\s*\[|[\w)\]]\s*\[\s
 for (const name of ['views.js', 'app.js', 'client.js']) { const code = source(name); assert.doesNotMatch(code, banned, `${name} stays inert`); assert.doesNotMatch(code, computed, `${name} has no computed member access built from strings`); }
 for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /['"`]style['"`]\s*:|\bstyle\s*:|\.style\b|setAttribute\(\s*['"`]style/, `${name} sets no inline style (CSP style-src 'self')`);
 for (const name of ['views.js', 'app.js']) assert.doesNotMatch(source(name), /\bfetch\s*\(|XMLHttpRequest|sendBeacon|\bmethod\b/, `${name} never talks to the network itself`);
-const clientCode = source('client.js'); assert.deepEqual([...clientCode.matchAll(/\bmethod\s*:\s*(['"`])(\w+)\1/g)].map(m => m[2]), ['GET'], 'the only HTTP verb is GET'); assert.equal((clientCode.match(/\bmethod\b/g) || []).length, 1); assert.doesNotMatch(clientCode, /\bbody\s*:/);
+const clientCode = source('client.js'); assert.match(clientCode, /method: writer \? 'POST' : 'GET'/); assert.doesNotMatch(clientCode, /\b(PUT|PATCH|DELETE)\b/);
 const page = source('index.html'); assert.match(page, /<div id="coverage-banner"[^>]*role="status"[^>]*aria-live="polite"/); assert.doesNotMatch(page, /<form[^>]*method=|<textarea/i);
 
 Date.now = realNow;
-console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts; coverage banner states; read-only incident inbox ordering, decisions, filter and inert-text contracts; behavioural read-only, sink and timer contracts.');
+console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts; coverage banner and active probe states; incident inbox and explicit review contracts; constrained request, sink and timer contracts.');
