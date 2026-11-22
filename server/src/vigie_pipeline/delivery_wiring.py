@@ -52,7 +52,7 @@ def run_delivery_stage(
     `watermark_at` stamps the first run's watermark instead of the delivery clock; `held`
     detectors are left off the allowlist for this run only."""
     settings = config.delivery
-    detectors = [d for d in settings.detectors if d not in held]
+    detectors = tuple(d for d in settings.detectors if d not in held)
     if not settings.enabled or not detectors:  # nothing allowlisted left: nothing to run
         return None
     try:
