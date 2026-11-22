@@ -23,7 +23,10 @@ function setBanner() {
     try { box.setAttribute('data-tone', 'error'); } catch { /* the text above already says it */ }
   }
 }
-function interacting() { return state.updated !== null && byId('content').contains(document.activeElement); }
+function interacting() {
+  const focused = document.activeElement;
+  return (state.updated !== null && byId('content').contains(focused)) || byId('overview-probes').contains(focused);
+}
 // Which control inside #content holds focus. Controls carry a stable data-focus-key (kind + id);
 // text and rank are only the fallback for unkeyed controls, so a re-render that changes a label
 // ('Copy ID' -> 'Copied') or reorders identical-looking rows still hands focus to the same one.
@@ -60,6 +63,7 @@ function notice(message = '', retry = false) {
 }
 function chrome() {
   byId('connect-panel').hidden = state.connected; byId('workspace').hidden = !state.connected; byId('disconnect').hidden = !state.connected;
+  byId('overview-probes').hidden = !state.connected || state.view !== 'overview';
   byId('connection-state').textContent = state.connected ? 'Connected · read-only view' : 'Disconnected';
   document.querySelectorAll('nav button[data-view]').forEach(button => { button.disabled = !state.connected; if (button.dataset.view === state.view && state.connected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
   byId('view-title').textContent = titles[state.view]; setBanner();
@@ -73,7 +77,7 @@ function chrome() {
 function schedule() { clearTimeout(timer); if (state.connected && !document.hidden) timer = setTimeout(() => load(false, null, true), Math.min(2147483647, Math.max(30000, client.retryAt - Date.now()))); }
 function disconnected(message = '') {
   client.disconnect(); state.generation++; state.connected = false; state.loading = false; state.updated = null; state.coverage = {phase: 'loading'}; state.selectedDevice = null; state.selectedIncident = null; state.eventFilter = {deviceId: '', kind: ''}; resetPage(); clearTimeout(timer);
-  byId('token').value = ''; byId('content').replaceChildren(); byId('collector').value = ''; chrome(); notice(message); byId('token').focus();
+  byId('token').value = ''; byId('content').replaceChildren(); byId('overview-probes').replaceChildren(); byId('collector').value = ''; chrome(); notice(message); byId('token').focus();
 }
 function selectDevice(id) { state.selectedDevice = id; load(true, '[aria-label="Identity detail"]'); }
 function activity(id) { state.selectedDevice = id; navigate('activity'); }
@@ -107,7 +111,9 @@ function withTimeline(panel, events, id) { panel.append(timelineSection(events, 
 function overviewProbes(generation) {
   const message = text => node('p', {role: 'status'}, text);
   const status = node('div', {}, message('Checking probe status…'));
-  const panel = node('section', {class: 'section'}, heading('Active probes', 'Host-wide status'), status);
+  byId('overview-probes').replaceChildren(
+    node('section', {class: 'section'}, heading('Active probes', 'Host-wide status'), status),
+  );
   // The panel settles independently so an unavailable probe view cannot delay passive coverage.
   client.probes().then(result => {
     if (generation === state.generation) status.replaceChildren(probeStatusView(result.data));
@@ -116,14 +122,13 @@ function overviewProbes(generation) {
     if (error instanceof ApiError && error.status === 401) failure(error);
     else status.replaceChildren(message('Probe status unavailable'));
   });
-  return panel;
 }
 async function load(clear = false, focus = null, automatic = false) {
   if (!state.connected) return;
   if (!clear && document.hidden) return;
   if (!clear && automatic && interacting()) { chrome(); schedule(); return; }
   clearTimeout(timer); client.invalidate(); const generation = ++state.generation; state.loading = !document.hidden;
-  if (clear) { state.updated = null; byId('content').replaceChildren(node('p', {class: 'loading'}, 'Loading observations…')); notice(); }
+  if (clear) { state.updated = null; byId('overview-probes').replaceChildren(); byId('content').replaceChildren(node('p', {class: 'loading'}, 'Loading observations…')); notice(); }
   chrome();
   if (document.hidden) return;
   if (clear) (focus === '#view-title' ? byId('view-title') : byId('content')).focus({preventScroll: true});
@@ -135,9 +140,9 @@ async function load(clear = false, focus = null, automatic = false) {
     banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
     if (state.view === 'overview') {
       const observations = client.coverage(state.collector, range());
-      const probes = overviewProbes(generation);
+      overviewProbes(generation);
       const result = await observations;
-      content = node('div', {}, coverageView(result.data), probes);
+      content = coverageView(result.data);
       coverage = {phase: 'ready', data: result.data};
     }
     if (state.view === 'inventory') {
@@ -192,8 +197,10 @@ byId('scope-form').addEventListener('submit', event => {
 byId('disconnect').addEventListener('click', () => disconnected());
 byId('refresh').addEventListener('click', () => { if (!state.loading && Date.now() >= client.retryAt) load(false); });
 document.querySelectorAll('nav button[data-view]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.view)));
-byId('content').addEventListener('focusin', chrome);
-byId('content').addEventListener('focusout', () => queueMicrotask(chrome));
+for (const id of ['content', 'overview-probes']) {
+  byId(id).addEventListener('focusin', chrome);
+  byId(id).addEventListener('focusout', () => queueMicrotask(chrome));
+}
 document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (document.hidden) { client.invalidate(); state.generation++; state.loading = false; chrome(); } else if (state.connected) load(false, null, true); });
 window.addEventListener('hashchange', () => { if (state.connected && state.view === 'incidents') load(false); });
 window.addEventListener('pagehide', () => disconnected());
