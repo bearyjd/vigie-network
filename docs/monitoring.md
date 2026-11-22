@@ -1399,15 +1399,14 @@ long-duration learning. D1–D6 owner decisions remain unchanged.
 about 2026-11-28). `VIGIE_ESSENTIAL_ABSENCE=1` (only 1/true/yes enable; garbage is a startup error
 that does not echo the value) lets the pipeline open ONE incident of detector `essential_absence`
 when a device the OWNER marked essential has not been seen for the owner's own number of hours
-while Vigie could see the network. With the flag off nothing is read, written or swept and the
-database is byte-identical to a build without F6-b. The flag lives in `PipelineConfig`, never in a
-policy dataclass: the monitoring policy versions are unchanged. There is no migration.
+while Vigie could see the network. The flag defaults to off. The pipeline inventory upgrade adds
+storage for this detector, and the detector records observations while enabled. The flag lives in
+`PipelineConfig` and leaves monitoring policy versions unchanged.
 
 **Owner opt-in.** Nothing fires until the owner marks at least one device essential (F6-a:
 `PUT /devices/{id}/essential`, the `vigie-api essential` CLI; at most 32 devices;
-`absent_after_s` 3600 to 604800, no default). With the flag on and nothing marked the sweep
-reads the marks and the open `essential_absence` incidents and writes nothing. Docs suggest 24 h or
-more for battery devices. Only flows or DNS seen at the router count as presence: a device that
+`absent_after_s` 3600 to 604800, no default). While enabled, observation records can accumulate
+before a device is marked. Consider 24 h or more for battery devices. Only flows or DNS seen at the router count as presence: a device that
 only renews DHCP (idle or LAN-only) still reads as absent, so give it a longer threshold.
 
 **Rule.** Each pass (after the batches are processed; skipped when a shard could not be read) every
@@ -1416,36 +1415,23 @@ the canonical device; if the alias and the canonical device are both marked the 
 wins; one incident per lineage). **Fixed-address devices only:** a lineage whose first MAC is
 randomized abstains (a rotating private address looks absent), with an `essential_unjudged` event.
 
-*Anchor* = the newest hour of ACTIVE evidence of any member MAC: a `measurements_hourly` row (flows,
-DNS) of an hour no later than the collector's newest coverage row. The server clock takes no part (a clock step
-cannot move an episode). `last_seen`, leases and neighbour entries do NOT count: they
-are snapshots, and an agent restart re-emits every unexpired lease and stale neighbour entry stamped
-"now" (it would otherwise move a dead device's anchor forward, or keep it alive forever). The
-judging collector is the one that measured the lineage newest (never measured: abstain, event).
+*Anchor* = the newest hour of active flow or DNS evidence for any member MAC. The judging collector
+is the one that most recently observed the device. A device with no known active evidence is left
+unjudged. Lease and neighbour snapshots do not update the anchor.
 
-*Q* = the number of ELIGIBLE `coverage_hourly` hours of that collector strictly after the anchor
-and before the current hour: qualified for at least 3420 s with no reasons (the upload engine's
-notion) AND no batch of that collector overlapping the hour reported ANY non-zero `batches.truncated`
-counter (fail closed: every key except the informational `ct_unmapped_bytes`, `ct_unmapped_flows`,
-`mcast_unmapped` and `mcast_dropped`, and except bit 8 of the `source_flags` bitmask; so the DNS
-drop keys, `ct_lan_unmapped_*` and any key a future collector adds count; an unreadable map counts
-too) AND the hour starts no earlier than 7 days minus 300 s before the pass (the batch retention plus
-the collector clock-skew margin; older flood evidence may already be purged). A threshold of 168 h
-therefore never fires, and one of 167 h only early in an hour. More than 500 such batches
-make the device abstain. Under a flood the collector drops rows, so a missing device is not
-evidence of absence. The incident opens iff
-`Q * 3600 >= absent_after_s`. An hour the collector was blind (no row, short, degraded, flooded) is
-not counted: **a collector outage, a pipeline gap or a clock step pauses the clock and can never
-fire it**.
+*Q* = the number of completed hours of that collector after the anchor with both ordinary qualified
+coverage and durable essential-device observation evidence. The accepted batch windows must
+positively cover at least 3,420 seconds. An overlapping report of lost rows or unattributed LAN
+traffic disqualifies the hour. Unknown history, short or degraded coverage, and gaps pause the count.
+The incident opens when `Q * 3600 >= absent_after_s`. The maximum threshold remains 168 eligible
+hours. The observation evidence follows the 90-day monitoring retention period and survives the
+earlier expiry of raw shards and batch receipt records.
 
-*Clock domain.* Anchor and coverage both come from the same batch windows of ONE collector (hour keys
-of its clock), so a constant offset of that collector cancels and never fires early. With several
-collectors the "newest activity" comparison assumes their clocks agree within an hour. The server
-clock only bounds the eligible hours (the current hour is never counted) and the retention window:
-activity in an hour with no coverage row cannot anchor (one far-future stamp neither suppresses nor
-disables judging), so stepping the clock back cannot manufacture an episode. A
-clock step on the collector can delay an alert, never cause one. Not receipt-bounded: the batch
-windows are collector-stamped; this is the one input the server does not independently anchor.
+The observation records are specific to this detector. Shared coverage and monitoring policy use
+the existing rules. An accepted window that crosses an hour boundary can still establish device
+presence. The sweep judges from the observation evidence committed at the time of its decision.
+A later batch can disqualify an overlapping hour. If that leaves a queued absence notice without
+enough eligible hours, delivery holds that notice while preserving the original incident.
 
 **Episode and re-arm.** The anchor's hour is the incident's `episode_start`. An absence is announced
 once per lineage member and anchor, in any incident state: re-running, review, unmark then re-mark,
@@ -1460,8 +1446,10 @@ canonical (merged), or its lineage has no MAC left. A marks table that cannot be
 locked) closes nothing: that is not an unmark. A newer overrides.db schema than this build
 understands abstains entirely (one `essential_unjudged` event per day, nothing opened or closed).
 The mark is re-read inside the write transaction, so an unmark committed during a pass opens
-nothing. With the flag on, a pass whose shard read failed sends no absence notice (every other detector still delivers). With more than 32 active marks (only
-possible by editing the database) the read is incomplete and nothing is closed as "unmarked". A mark
+nothing. With the flag on, a pass whose shard read failed holds queued absence notices and skips new
+absence sends. Other detectors can still deliver. On a fresh pass, the usual retry and expiry rules
+apply. With more than 32 active marks (only possible by editing the database) the read is incomplete
+and nothing is closed as "unmarked". A mark
 that cannot be resolved (no known MAC, more than 64 MACs, an unusable identity graph) or has an
 out-of-range value protects only ITS OWN device from being closed as unmarked; other marks' closes
 are unaffected. Each such device gets an `essential_unjudged` event naming it (never a MAC): once per
@@ -1471,8 +1459,8 @@ mark version for never-measured, randomized and no-MAC, once per UTC day for the
 device stays eligible and one `essential_capped` event per day says so; at most 65 open incidents
 examined per pass (a candidate with an open incident is skipped by a direct query, so none is
 duplicated beyond that window); a failing sweep logs ERROR once per UTC day and class (an
-`essential_failed` event, class name only) and DEBUG after; no `pipeline_meta` key at all (the sweep is stateless). An error anywhere is logged
-by class name only and contained: it never fails the pass. The incident id is random (never derived
+`essential_failed` event, class name only) and DEBUG after. The sweep contains its own errors, so
+a failed sweep cannot open an incident or stop the pipeline pass. The incident id is random (never derived
 from the device); the evidence is exactly `{"reason_code":"essential_absent","absent_for_hours":Q,
 "threshold_hours":N}`; no MAC, hostname, vendor or IP.
 
@@ -1493,11 +1481,8 @@ refers to them; open ones are kept. Pilot-report counts list it apart from the u
   fresh randomized MAC can be attached into the lineage, and its activity hides the absence. More
   than 64 MACs in a lineage makes it unjudged (`identity_unavailable` event, daily) and the device
   is never alerted while that holds. Attach rules are not changed by F6.
-* Restarts are fixed (snapshots never count); floods are mitigated (a flooded hour is not counted),
-  at the price of a delay while the flood lasts.
-* A device whose only evidence in an hour was in a window that crosses the hour boundary
-  (`cross_hour`: the writer measures neither hour) can read as absent for that hour; the usual 60 s
-  window loses at most one window per boundary.
+* The detector needs to build enough observed history after activation before it can alert.
+  A collector outage or a period of degraded observations extends this wait.
 * The daily cap (8) can delay a real absence by up to a UTC day; a held device stays eligible.
 * A delivery outage longer than the delivery TTL (default 24 h) drops the notice; the incident
   stays in the inbox.

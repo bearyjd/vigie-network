@@ -367,6 +367,10 @@ def prune_monitoring(inv, now):
     detail = iso_utc(now - DETAIL_DAYS * 86400)
     cutoff = int(now) // 3600 * 3600 - AGGREGATE_DAYS * 86400
     with immediate(inv):
+        # Never re-certify a purged hour after a clock rollback and a late arrival.
+        inv.execute(
+            "UPDATE essential_recording SET since_hour=? WHERE since_hour<?", (cutoff, cutoff)
+        )
         inv.execute(
             "DELETE FROM measurement_batches WHERE rowid IN "
             "(SELECT m.rowid FROM measurement_batches m WHERE received_at<? AND NOT EXISTS "
@@ -375,7 +379,13 @@ def prune_monitoring(inv, now):
             "ORDER BY received_at LIMIT 1000)",
             (detail,),
         )
-        for table in ("measurements_hourly", "coverage_hourly", "monitoring_suspicious"):
+        for table in (
+            "measurements_hourly",
+            "coverage_hourly",
+            "monitoring_suspicious",
+            "essential_observation_hours",
+            "essential_activity",
+        ):
             inv.execute(  # table comes only from this fixed internal allowlist.
                 f"DELETE FROM {table} WHERE rowid IN "  # noqa: S608
                 f"(SELECT rowid FROM {table} WHERE hour<? ORDER BY hour LIMIT 1000)",

@@ -27,7 +27,11 @@ from vigie_pipeline.config import (
 )
 from vigie_pipeline.delivery_wiring import run_delivery_stage
 from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
-from vigie_pipeline.essential_absence import sweep_essential_absence
+from vigie_pipeline.essential_absence import (
+    configure_recording,
+    deferred_absence_notices,
+    sweep_essential_absence,
+)
 from vigie_pipeline.last_ip import save_last_ips
 from vigie_pipeline.logs import log
 from vigie_pipeline.measurements import apply_measurements, read_measurements
@@ -77,6 +81,12 @@ def run_once(
     overrides = open_overrides_ro(config.overrides_path)
     failures: list[ShardReadError] = []
     try:
+        recording_failed = False
+        try:
+            configure_recording(inv, config.essential_absence, clock)
+        except sqlite3.Error as exc:
+            recording_failed = True
+            log(logger, logging.ERROR, "essential_recording_failed", error=type(exc).__name__)
         # a malformed overrides.db gets the unreadable-file policy BEFORE any batch is touched:
         # no identity links for the batches, no stitching, cursor progress is kept
         usable = _overrides_readable(inv, overrides, config, clock)
@@ -93,7 +103,17 @@ def run_once(
             track_overrides_history(inv, config.overrides_path)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
-        _late_stages(inv, overrides, config, usable, clock, live, should_stop, bool(failures))
+        _late_stages(
+            inv,
+            overrides,
+            config,
+            usable,
+            clock,
+            live,
+            should_stop,
+            bool(failures),
+            recording_failed,
+        )
     finally:
         inv.close()
         if overrides is not None:
@@ -120,15 +140,17 @@ def _late_stages(
     live: Callable[[], float] | None,
     should_stop: Callable[[], bool],
     stale: bool,
+    recording_failed: bool = False,
 ) -> None:
     """F6-b (default off), the activity purge, then monitoring and delivery. `stale`: a shard could
     not be read, so the view may hold an "absent" device that is back in the unread batch: the
     sweep is skipped and, with F6-b on, no absence notice is sent this pass (others still are)."""
-    if config.essential_absence and usable and not stale:
+    hold_absence = (config.essential_absence and stale) or recording_failed
+    if config.essential_absence and usable and not hold_absence:
         sweep_essential_absence(inv, overrides, clock)
     purge_activity(inv, clock, config.activity_retention_s)
     # a stale pass holds back only the absence detector; every other detector still delivers
-    held = frozenset({ESSENTIAL_ABSENCE}) if config.essential_absence and stale else frozenset()
+    held = frozenset({ESSENTIAL_ABSENCE}) if hold_absence else frozenset()
     _monitor_deliver_probe(inv, overrides, config, usable, clock, live, should_stop, held)
 
 
@@ -145,6 +167,18 @@ def _monitor_deliver_probe(
     """The stages after the prune; they need a readable overrides.db except the probes."""
     if usable:
         analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
+        held_incidents = frozenset()
+        if (
+            config.essential_absence
+            and config.delivery.enabled
+            and not held
+            and ESSENTIAL_ABSENCE in config.delivery.detectors
+        ):
+            deferred = deferred_absence_notices(inv, overrides, clock)
+            if deferred is None:
+                held = frozenset({ESSENTIAL_ABSENCE})
+            else:
+                held_incidents = deferred
         run_delivery_stage(
             inv,
             overrides,
@@ -152,6 +186,7 @@ def _monitor_deliver_probe(
             live or (lambda: clock),
             should_stop=should_stop,
             held=held,
+            held_incidents=held_incidents,
             # F6-b: its incidents are stamped with the pass start, so the first run's watermark
             # must not be later than that (else the first push is hidden for good)
             watermark_at=clock if config.essential_absence else None,

@@ -1,34 +1,16 @@
 """F6-b: one `essential_absence` incident when a device the OWNER marked essential is not seen for
 its own N hours (`essential_devices.absent_after_s`, 3600..604800) while Vigie could see.
 
-DEFAULT OFF (`PipelineConfig.essential_absence`): with the flag off the processor never calls this
-module. With the flag on and nothing marked the sweep reads two small things and writes nothing.
-It is STATELESS: no `pipeline_meta` key, watermark, cursor or last-run stamp; every verdict is a
-pure function of the stored activity, the stored coverage and the stored incidents, so a clock step
-or a pipeline gap cannot leave state behind to go wrong.
+The pipeline opt-in enables recording at ingest. Each accepted observation records the latest
+active flow/DNS hour for each MAC and the union of clean window seconds per hour. A degraded window
+vetoes each hour it touches. A writer without this evidence protocol advances a durable fence
+past its possible activity. Evidence from before activation or the fence cannot authorize an
+opening. Lease and neighbour snapshots do not count as active observations.
 
-Rule (docs/monitoring.md "Essential-device absence (F6)"): for each marked device (at most
-MAX_MARKS, read-only overrides.db) resolved to its CURRENT canonical device and lineage:
-  anchor  = the newest hour of ACTIVE evidence of any lineage MAC that the collector has a
-            coverage row for (the server clock takes no part: a clock step cannot move an
-            episode): a `measurements_hourly` row (flows, DNS). A lease
-            or neighbour entry is a SNAPSHOT: an agent restart re-emits every unexpired one stamped
-            'now', so `last_seen` never takes part. The collector that measured it newest is the
-            judging collector (none: abstain);
-  Q = the ELIGIBLE `coverage_hourly` hours of that collector strictly after the anchor and before
-      the current hour: qualified >= 3420 s, no reasons, AND no batch of that collector that
-      overlaps the hour reported ANY non-zero `batches.truncated` counter except the few
-      INFORMATIONAL_KEYS (fail closed: a drop makes the device's rows missing, not the device; an
-      unreadable map counts too), AND the hour is still inside batch retention (7 days: older
-      flood evidence is purged, so a threshold near 7 days fires only while its whole span is
-      retained). A blind hour (no row, unqualified, flooded, unreadable) is not counted: the clock
-      pauses, it never fires. More than FLOOD_ROWS flooded batches: the device abstains;
-  fire iff Q * 3600 >= absent_after_s.
-Both sides come from the same batch windows (one collector clock, hour keys), so a constant
-offset of THAT collector cancels. Across several collectors the newest-activity comparison assumes
-their clocks agree within an hour. The server clock is only a clamp. A lineage whose first MAC is
-randomized abstains (a rotating address looks absent): only fixed-address devices are suitable.
-`run_once` runs this after the batches are processed and skips it when a shard could not be read.
+A fixed-address lineage is absent when the collector that most recently saw it has enough
+completed hours strictly after its anchor, with at least 3420 positively observed seconds and
+clean ordinary monitoring coverage. Both aggregates expire after 90 days. An unreadable shard
+skips the sweep. The server clock only bounds the observation period.
 
 Episode: the anchor hour is the incident's `episode_start`. One incident per (lineage member,
 anchor): an absence is announced once, even after review, unmark/re-mark or a merge. Activity in a
@@ -53,14 +35,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import sqlite3
 import uuid
 from dataclasses import dataclass, replace
 
+from vigie_ingest.config import Settings
 from vigie_ingest.db import immediate, iso_utc
+from vigie_ingest.models import FUTURE_WINDOW_SLACK
 from vigie_pipeline.detectors import ESSENTIAL_ABSENCE
 from vigie_pipeline.logs import log
+from vigie_pipeline.monitoring_engine import AGGREGATE_DAYS
 from vigie_pipeline.monitoring_identity import Lineage, LineageUnavailable, lineage
 from vigie_pipeline.overrides import QUIET_STATUSES, SUPPORTED_USER_VERSION, decided_incident_ids
 from vigie_pipeline.stitch_db import emit_once, event_exists
@@ -75,16 +59,6 @@ MAX_MARKS = 32
 MAX_PER_DAY = 8
 MAX_OPEN = 65  # open incidents examined per run (one more than MAX_MARKS x 2: strays are closed)
 ELIGIBLE_S = 3420  # an eligible hour: monitoring_engine's qualified-seconds floor
-HOURS_READ = 400  # eligible hours read per device (the longest threshold is 168)
-FLOOD_ROWS = 500  # flooded batches read per device; more than this and the device abstains
-BATCH_RETENTION_S = 7 * 86400  # ingest's default batch retention: older flood evidence is gone
-CLOCK_SKEW_S = 300  # ingest's max_clock_skew_s: a batch window may be received this much early
-# `batches.truncated` keys that say NOTHING about lost identity, DNS or flow rows. FAIL CLOSED: any
-# other key with a non-zero value (every dns_*/dhcp_*/tail_*/leases/neigh... counter, and any key a
-# future collector adds) marks the batch as flooded. `source_flags` is a bitmask: only bits other
-# than 8 (multicast socket) count, as in measurements.py. ct_lan_unmapped_* (traffic of a LAN
-# address with no MAC: a device may be invisible) is NOT informational here.
-INFORMATIONAL_KEYS = ("ct_unmapped_bytes", "ct_unmapped_flows", "mcast_unmapped", "mcast_dropped")
 SUMMARIES = {
     "never_measured": "no traffic has ever been measured for it",
     "randomized": "its address is randomized (only fixed-address devices can be judged)",
@@ -182,64 +156,64 @@ def _members(inv: sqlite3.Connection, identity: Lineage) -> tuple[str, ...]:
     return tuple(sorted({identity.device_id, *(row[0] or "").split(",")} - {""}))
 
 
+def configure_recording(inv: sqlite3.Connection, enabled: bool, now: float) -> None:
+    """Start a fresh evidence period on enable. Never reuse history across an off interval."""
+    row = inv.execute("SELECT enabled FROM essential_recording").fetchone()
+    if bool(row and row[0]) == enabled:
+        return
+    with immediate(inv):
+        row = inv.execute("SELECT enabled FROM essential_recording").fetchone()
+        if bool(row and row[0]) == enabled:
+            return
+        if not enabled:
+            inv.execute("UPDATE essential_recording SET enabled=0")
+            inv.execute("DELETE FROM essential_pending")
+            return
+        # Receiver time and the collector's accepted send high-water bound pre-activation data.
+        # Preserve the previous fence on clock rollback and exclude any earlier recording period.
+        boundary = inv.execute(
+            "SELECT MAX(?,COALESCE((SELECT MAX(last_sent_ts) FROM collectors),0)+?,"
+            " COALESCE((SELECT MAX(window_end) FROM batches),0),"
+            " COALESCE((SELECT MAX(hour) FROM coverage_hourly),0),"
+            " COALESCE((SELECT MAX(window_end) FROM measurement_batches),0),"
+            " COALESCE((SELECT MAX(hour) FROM essential_activity),0),"
+            " COALESCE((SELECT MAX(hour) FROM essential_observation_hours),0))",
+            (int(now) + Settings.max_clock_skew_s + FUTURE_WINDOW_SLACK, FUTURE_WINDOW_SLACK),
+        ).fetchone()[0]
+        inv.execute(
+            "INSERT INTO essential_recording VALUES (1,1,?) ON CONFLICT(singleton) DO UPDATE SET"
+            " enabled=1,since_hour=MAX(since_hour,excluded.since_hour)",
+            ((boundary // HOUR_S + 1) * HOUR_S,),
+        )
+        inv.execute(
+            "INSERT OR IGNORE INTO essential_pending SELECT b.collector_id,b.batch_id"
+            " FROM batches b WHERE b.observation_kind IS NOT 'probe' AND NOT EXISTS (SELECT 1 FROM"
+            " measurement_batches m WHERE m.collector_id=b.collector_id AND m.batch_id=b.batch_id)"
+        )
+
+
 def _anchor(inv: sqlite3.Connection, macs: tuple[str, ...]) -> tuple[str, int] | None:
-    """(collector, anchor hour): the newest hour of active evidence of any MAC, over collectors
-    (a seek per collector and MAC). The server clock takes no part (a clock step must never move
-    an episode). Evidence later than the collector's newest coverage hour (a measurement and its
-    coverage are written together, so that is forged or impossible) cannot anchor."""
+    """Newest accepted flow/DNS hour of any lineage MAC across collectors."""
     row = inv.execute(
-        "SELECT c.id, (SELECT MAX(m.hour) FROM measurements_hourly m WHERE m.collector_id=c.id"  # noqa: S608
-        f" AND m.mac IN ({','.join('?' * len(macs))}) AND m.hour<="
-        " (SELECT MAX(v.hour) FROM coverage_hourly v WHERE v.collector_id=c.id)) AS h"
-        " FROM collectors c ORDER BY h DESC, c.id LIMIT 1",
+        "SELECT c.id,(SELECT MAX(a.hour) FROM essential_activity a WHERE a.collector_id=c.id"  # noqa: S608
+        f" AND a.mac IN ({','.join('?' * len(macs))}) AND a.hour>=r.since_hour) AS h"
+        " FROM collectors c, essential_recording r WHERE r.enabled=1 ORDER BY h DESC,c.id LIMIT 1",
         macs,
     ).fetchone()
     return (row[0], row[1]) if row and row[1] is not None else None
 
 
-def _flood_windows(
-    inv: sqlite3.Connection, collector: str, first: int, last: int
-) -> list[tuple[int, int]] | None:
-    """Batch windows of the collector, overlapping [first, last), that reported any dropped or
-    unattributed rows: every non-zero `truncated` key not on INFORMATIONAL_KEYS (fail closed), or
-    a truncation map that is not valid JSON (unknown is not clean). None when more than
-    FLOOD_ROWS: the caller abstains (a cap must never make a flooded hour look clean)."""
-    names = ",".join("?" * len(INFORMATIONAL_KEYS))
-    rows = inv.execute(
-        "SELECT window_start, window_end FROM batches WHERE collector_id=?"  # noqa: S608
-        " AND window_start IS NOT NULL AND window_end IS NOT NULL AND window_end>?"
-        " AND window_start<? AND truncated IS NOT NULL AND truncated<>'{}'"
-        " AND CASE WHEN json_valid(truncated) THEN (json_type(truncated)<>'object' OR EXISTS ("
-        f"SELECT 1 FROM json_each(truncated) WHERE key NOT IN ({names}) AND CASE key"
-        " WHEN 'source_flags' THEN type<>'integer' OR (value & ~8)<>0"
-        " ELSE NOT (type='integer' AND value=0) END)) ELSE 1 END"
-        " LIMIT ?",
-        (collector, first, last, *INFORMATIONAL_KEYS, FLOOD_ROWS + 1),
-    ).fetchall()
-    return None if len(rows) > FLOOD_ROWS else [(r[0], r[1]) for r in rows]
-
-
 def _eligible_hours(inv: sqlite3.Connection, collector: str, anchor: int, now: float) -> int:
-    """Eligible hours after the anchor and before the current hour that no flooded batch overlaps
-    (read up to HOURS_READ). An hour whose batches may already be purged (received before now minus
-    the retention) is unreadable and never counts: the hour must start no earlier than that cutoff
-    plus the clock skew. So a threshold of 168 h can never fire, and 167 h only early in an hour."""
     floor = int(now) // HOUR_S * HOUR_S
-    oldest = math.ceil(now - BATCH_RETENTION_S + CLOCK_SKEW_S)
-    hours = [
-        r[0]
-        for r in inv.execute(
-            "SELECT hour FROM coverage_hourly WHERE collector_id=? AND hour>? AND hour<?"
-            " AND hour>=? AND qualified_seconds>=? AND reasons='[]' ORDER BY hour LIMIT ?",
-            (collector, anchor, floor, oldest, ELIGIBLE_S, HOURS_READ),
-        )
-    ]  # fmt: skip
-    if not hours:
+    if anchor < floor - AGGREGATE_DAYS * 86400:
         return 0
-    flood = _flood_windows(inv, collector, hours[0], hours[-1] + HOUR_S)
-    if flood is None:
-        return 0
-    return sum(1 for h in hours if not any(s < h + HOUR_S and e > h for s, e in flood))
+    return inv.execute(
+        "SELECT COUNT(*) FROM essential_recording r JOIN essential_observation_hours e"
+        " ON r.enabled=1 AND e.hour>=r.since_hour JOIN coverage_hourly c USING (collector_id,hour)"
+        " WHERE e.collector_id=? AND e.hour>? AND e.hour>=? AND e.hour<? AND e.qualified_seconds>=?"
+        " AND c.qualified_seconds>=? AND c.reasons='[]'",
+        (collector, anchor, floor - AGGREGATE_DAYS * 86400, floor, ELIGIBLE_S, ELIGIBLE_S),
+    ).fetchone()[0]
 
 
 def _announced(inv: sqlite3.Connection, members: tuple[str, ...], anchor_hour: int) -> bool:
@@ -424,13 +398,81 @@ def _emit_unjudged(inv: sqlite3.Connection, item: tuple, day: str, now: float) -
               _unjudged_token(item, day), now)  # fmt: skip
 
 
-def _still_marked(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan) -> Plan:
-    """Inside the write transaction: drop the openings whose mark was cleared (or became unusable)
-    after the plan was made, so a committed unmark never opens an incident."""
+def pending_observations(inv: sqlite3.Connection) -> bool:
+    """Any accepted observation whose ordinary coverage or identity work is still outstanding."""
+    return inv.execute("SELECT 1 FROM essential_pending LIMIT 1").fetchone() is not None
+
+
+def deferred_absence_notices(
+    inv: sqlite3.Connection, ov: sqlite3.Connection | None, now: float
+) -> frozenset[str] | None:
+    """Hold queued opens whose historical verdict no longer qualifies. None holds the detector."""
+    try:
+        if ov is None:
+            return None
+        with inv, ov:
+            inv.execute("BEGIN")
+            ov.execute("BEGIN")
+            if ov.execute("PRAGMA user_version").fetchone()[0] > SUPPORTED_USER_VERSION:
+                return None
+            if pending_observations(inv):
+                return None
+            rows = inv.execute(
+                "SELECT i.id,i.device_id,i.collector_id,i.lineage,i.episode_start,i.evidence"
+                " FROM monitoring_incidents i LEFT JOIN incident_deliveries d"
+                " ON d.incident_id=i.id AND d.kind='open' WHERE i.detector=? AND i.state='open'"
+                " AND (d.state IS NULL OR d.state IN ('pending','sending','suppressed')) LIMIT ?",
+                (DETECTOR, MAX_OPEN + 1),
+            ).fetchall()
+            if len(rows) > MAX_OPEN:
+                return None
+            held = set()
+            for row in rows:
+                try:
+                    identity = lineage(inv, ov, row["device_id"])
+                    threshold = json.loads(row["evidence"])["threshold_hours"]
+                    anchor = _anchor(inv, identity.macs) if identity.macs else None
+                    valid = (
+                        type(threshold) is int
+                        and 1 <= threshold <= MAX_S // HOUR_S
+                        and identity.key == row["lineage"]
+                        and anchor == (row["collector_id"], row["episode_start"])
+                        and _eligible_hours(inv, row["collector_id"], row["episode_start"], now)
+                        >= threshold
+                    )
+                except (LineageUnavailable, KeyError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    held.add(row["id"])
+            return frozenset(held)
+    except Exception as exc:  # noqa: BLE001 - hold absence so other delivery and probes can run
+        log(logger, logging.ERROR, "essential_delivery_check_failed", error=type(exc).__name__)
+        return None
+
+
+def _current_opens(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan, now: float) -> Plan:
+    """Recheck the mark, anchor and positive hours with the inventory write lock held."""
     if not plan.opens:
         return plan
+    if (
+        pending_observations(inv)
+        or ov.execute("PRAGMA user_version").fetchone()[0] > SUPPORTED_USER_VERSION
+    ):
+        return replace(plan, opens=())
     live = _resolve(inv, ov, _read_marks(ov))[0]
-    return replace(plan, opens=tuple(o for o in plan.opens if o[0].device_id in live))
+    current = []
+    for identity, collector, anchor, _, _ in plan.opens:
+        entry = live.get(identity.device_id)
+        if (
+            not entry
+            or entry.identity != identity
+            or _anchor(inv, identity.macs) != (collector, anchor)
+        ):
+            continue
+        hours = _eligible_hours(inv, collector, anchor, now)
+        if hours * HOUR_S >= entry.secs:
+            current.append((identity, collector, anchor, hours, entry.secs))
+    return replace(plan, opens=tuple(current))
 
 
 def _apply(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan, now: float) -> int:
@@ -440,7 +482,7 @@ def _apply(inv: sqlite3.Connection, ov: sqlite3.Connection, plan: Plan, now: flo
         return 0
     day = iso_utc(now)[:10]
     with immediate(inv):
-        plan = _still_marked(inv, ov, plan)
+        plan = _current_opens(inv, ov, plan, now)
         for incident_id, _ in plan.closes:
             inv.execute(
                 "UPDATE monitoring_incidents SET state='resolved' WHERE id=? AND state='open'",

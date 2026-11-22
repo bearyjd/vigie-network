@@ -113,12 +113,12 @@ def test_real_activity_in_a_later_hour_is_a_return(env):
     assert [r["state"] for r in env.rows()] == ["resolved"]
 
 
-def test_activity_ahead_of_the_clock_cannot_anchor(env):
+def test_accepted_later_activity_survives_a_clock_rollback(env):
     env.device("d1")
     env.mark("d1", 2 * 3600)
     env.cover(1, 2)
-    env.active("d1", 5)  # stamped after 'now': ignored
-    assert env.sweep(now_after(2)) == 1
+    env.active("d1", 5)
+    assert env.sweep(now_after(2)) == 0
 
 
 # ---- 6: randomized MACs ------------------------------------------------------------------------

@@ -47,10 +47,12 @@ def run_delivery_stage(
     should_stop: Callable[[], bool] = lambda: False,
     watermark_at: float | None = None,
     held: frozenset[str] = frozenset(),
+    *,
+    held_incidents: frozenset[str] = frozenset(),
 ) -> RunReport | None:
     """Disabled: do nothing at all. Enabled: any exception is contained and logged.
     `watermark_at` stamps the first run's watermark instead of the delivery clock.
-    `held` pauses delivery for the named configured detectors during this run."""
+    `held` and `held_incidents` pause delivery for configured detectors and incidents this run."""
     settings = config.delivery
     if not settings.enabled or all(d in held for d in settings.detectors):
         return None
@@ -69,6 +71,7 @@ def run_delivery_stage(
             detectors=settings.detectors,
             held=held,
             should_stop=should_stop,
+            **({"held_incidents": held_incidents} if held_incidents else {}),
         )
     except Exception as exc:  # noqa: BLE001 - delivery must never fail the pipeline pass
         _report_failure(exc)

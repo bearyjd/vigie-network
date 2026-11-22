@@ -20,7 +20,9 @@ from probe_helpers import build_fixture, digest, dump, run_fixture
 from test_probe_freeze import GOLDEN_TABLES, POOLED_VERSION, TOD_VERSION, tables
 
 from vigie_api.schema import open_overrides
-from vigie_ingest.db import iso_utc
+from vigie_ingest.db import immediate, iso_utc
+from vigie_ingest.models import Batch
+from vigie_ingest.store import _commit_inventory
 from vigie_pipeline import essential_absence as ea
 from vigie_pipeline import processor
 from vigie_pipeline.config import PipelineConfig
@@ -32,6 +34,36 @@ H = T0 // HOUR * HOUR  # the anchor hour of a device last seen at H + 600
 OPAQUE = re.compile(r"[0-9a-f]{64}")
 
 
+BATCH_ID = "018ce870-0000-7000-8000-000000000000"
+
+
+def accept_batch(env, start, end, *, collector="c1", **fields):
+    last_seq, key_id = env.inv.execute(
+        "SELECT last_seq,key_id FROM collectors WHERE id=?", (collector,)
+    ).fetchone()
+    seq = last_seq + 1
+    doc = dict(
+        collector_id=collector,
+        key_id=key_id,
+        boot_id="boot",
+        seq=seq,
+        batch_id=BATCH_ID[:-8] + f"{seq:08x}",
+        window_start=start,
+        window_end=end,
+        sent_ts=end,
+        observation_kind="observation",
+        truncated={},
+        dns=[],
+        conntrack=[],
+        dropped_batches=0,
+        health={"dns_log_quiet": False},
+    )
+    batch = Batch.model_validate({k: v for k, v in (doc | fields).items() if v is not Ellipsis})
+    with immediate(env.inv):
+        assert _commit_inventory(env.inv, batch, end, 300) == "applied"
+    return batch
+
+
 class Env:
     def __init__(self, root) -> None:
         self.root = root
@@ -39,6 +71,7 @@ class Env:
         self.ovw = open_overrides(root / "overrides.db")
         self.ov = open_overrides_ro(root / "overrides.db")
         self.inv.execute("INSERT INTO collectors(id,key_id) VALUES ('c1','k1')")
+        ea.configure_recording(self.inv, True, H - 200 * HOUR)
         self.n = 0
         self.macs: dict[str, str] = {}
         self.collector: dict[str, str] = {}
@@ -66,6 +99,9 @@ class Env:
                 "INSERT INTO measurements_hourly VALUES (?,?,?,1,1,1,0)",
                 (collector, mac, H + active * HOUR),
             )
+            self.inv.execute(
+                "INSERT INTO essential_activity VALUES (?,?,?)", (collector, mac, H + active * HOUR)
+            )
         return mac
 
     def active(self, did, hours) -> None:
@@ -75,13 +111,29 @@ class Env:
             (self.collector[did], self.macs[did], H + hours * HOUR),
         )
 
-    def batch(self, start, end, truncated=None, collector="c1") -> None:
-        """A recorded batch window with its `truncated` map (the collector's drop counters)."""
-        self.n += 1
         self.inv.execute(
-            "INSERT INTO batches(collector_id,batch_id,received_at,truncated,dropped_batches,"
-            "window_start,window_end,observation_kind) VALUES (?,?,?,?,0,?,?,'observation')",
-            (collector, f"b{self.n}", iso_utc(end), json.dumps(truncated or {}), start, end),
+            "INSERT OR REPLACE INTO essential_activity VALUES (?,?,?)",
+            (self.collector[did], self.macs[did], H + hours * HOUR),
+        )
+
+    def processed(self, batch) -> None:
+        self.inv.execute(
+            "INSERT INTO measurement_batches VALUES (?,?,?,?,?,?,?)",
+            (
+                batch.collector_id,
+                batch.batch_id,
+                batch.window_start,
+                batch.window_end,
+                iso_utc(batch.window_end),
+                (batch.window_end - 1) // HOUR * HOUR,
+                "[]",
+            ),
+        )
+
+    def batch(self, start, end, truncated=None, collector="c1") -> None:
+        """An accepted, processed batch window with its collector drop counters."""
+        self.processed(
+            accept_batch(self, start, end, collector=collector, truncated=truncated or {})
         )
 
     def seen(self, did, at) -> None:
@@ -97,6 +149,12 @@ class Env:
             self.inv.execute(
                 "INSERT OR REPLACE INTO coverage_hourly VALUES (?,?,?,?,?)",
                 (collector, H + h * HOUR, qualified, qualified, reasons),
+            )
+
+            mask = ((1 << qualified) - 1).to_bytes(450, "little")
+            self.inv.execute(
+                "INSERT OR REPLACE INTO essential_observation_hours VALUES (?,?,?,?)",
+                (collector, H + h * HOUR, mask, qualified),
             )
 
     def mark(self, did, secs) -> None:
@@ -166,8 +224,8 @@ def test_policy_versions_unchanged():
     ("secs", "hours", "fires"),
     [(7200, 1, False), (7200, 2, True), (7200, 3, True),  # exactly N qualified hours fires
      (7201, 2, False), (7201, 3, True),  # one second over: a whole further hour is needed
-     (3600, 0, False), (3600, 1, True), (604800, 167, False), (604800, 168, False),
-     (597600, 166, True)],  # 168 h is unreachable (R2-2)
+     (3600, 0, False), (3600, 1, True), (604800, 167, False), (604800, 168, True),
+     (597600, 166, True)],  # full one-week threshold
 )  # fmt: skip
 def test_threshold_boundaries(env, secs, hours, fires):
     env.device("d1")
@@ -394,7 +452,7 @@ def test_a_pipeline_gap_changes_nothing_and_a_late_pass_opens_exactly_once(env):
     env.device("d1")
     env.mark("d1", 3600)
     env.cover(1, 2)
-    gap = 5 * 86400  # inside batch retention: older hours' flood status is unreadable (fix 2)
+    gap = 5 * 86400
     assert env.sweep(now_after(2) + gap) == 1  # first pass after days of downtime
     assert env.sweep(now_after(2) + gap + 30) == 0
 
@@ -402,7 +460,10 @@ def test_a_pipeline_gap_changes_nothing_and_a_late_pass_opens_exactly_once(env):
 def test_far_future_activity_neither_suppresses_nor_disables_judging(env):
     env.device("d1")
     env.mark("d1", 3600)
-    env.active("d1", 24 * 365 * 30)  # one forged far-future window: ignored, not an anchor
+    env.inv.execute(
+        "INSERT INTO measurements_hourly VALUES (?,?,?,1,1,1,0)",
+        ("c1", env.macs["d1"], H + 24 * 365 * 30 * HOUR),
+    )
     env.cover(1, 2)
     assert env.sweep(now_after(2)) == 1  # M4: it is still judged, on the real anchor
     assert env.rows()[0]["episode_start"] == H
@@ -412,15 +473,9 @@ def test_far_future_activity_neither_suppresses_nor_disables_judging(env):
 def test_a_constant_collector_offset_never_fires_early(env, skew):
     env.device("d1", active=skew // HOUR)
     env.mark("d1", 3 * 3600)
-    first = H + skew // HOUR * HOUR  # coverage is stamped by the same clock
-    for h in range(1, 3):
-        env.inv.execute(
-            "INSERT INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')", (first + h * HOUR,)
-        )
-    assert env.sweep(H + 100 * HOUR) == 0  # two qualified hours < 3: early would be a false page
-    env.inv.execute(
-        "INSERT INTO coverage_hourly VALUES ('c1',?,3600,3600,'[]')", (first + 3 * HOUR,)
-    )
+    env.cover(skew // HOUR + 1, 2)
+    assert env.sweep(H + 100 * HOUR) == 0
+    env.cover(skew // HOUR + 3, 1)
     assert env.sweep(H + 100 * HOUR) == 1
 
 

@@ -169,6 +169,31 @@ def test_held_notice_uses_normal_ttl_after_release(world):
     assert world.states() == {"open": "expired"} and pub.attempted == []
 
 
+def test_incident_hold_keeps_other_notices_eligible_and_honors_allowlist_removal(world):
+    detector = "essential_absence"
+    allow = ("large_upload", detector)
+    pub, clock = FakePublisher(), Clock(T0)
+    world.incident("held", detector=detector)
+    world.incident("removed", detector="new_device")
+    go(world, pub, clock, detectors=(*allow, "new_device"), max_per_run=0)
+    before = world.rows()[0]
+    world.incident("unaffected", detector=detector)
+    world.incident("upload")
+    held_incidents = frozenset({"held", "removed"})
+
+    go(world, pub, clock, detectors=allow, held_incidents=held_incidents, max_per_run=2)
+    assert world.rows()[0] == before
+    assert world.rows()[1]["state"] == "expired"
+    assert [m.link for m in pub.sent] == ["/ui/#incident=unaffected", "/ui/#incident=upload"]
+
+    clock.t += dconf().pending_ttl_seconds
+    go(world, pub, clock, detectors=allow, held_incidents=held_incidents)
+    assert world.rows()[0] == before
+    go(world, pub, clock, detectors=allow)
+    assert world.rows()[0]["state"] == "expired"
+    assert len(pub.attempted) == 2
+
+
 def test_dropping_a_detector_after_send_never_sends_recover(world):
     world.incident("f", detector="new_device")
     allow = ("large_upload", "new_device")

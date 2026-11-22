@@ -33,6 +33,7 @@ from vigie_ingest.db import (
     shard_name,
     utc_day,
 )
+from vigie_ingest.essential_evidence import record_accepted, recording_since
 from vigie_ingest.keeper import hold_active
 from vigie_ingest.models import Batch
 
@@ -355,6 +356,7 @@ def _commit_inventory(
     rejection = _evaluate(conn, batch, now, max_skew_s)
     if rejection:
         return rejection
+    since = recording_since(conn)
     conn.execute(
         "INSERT INTO batches (collector_id,batch_id,received_at,truncated,dropped_batches,"
         "window_start,window_end,observation_kind,health,dns_queries) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -366,4 +368,6 @@ def _commit_inventory(
         "UPDATE collectors SET last_seq=?, boot_id=?, last_sent_ts=MAX(last_sent_ts, ?) WHERE id=?",
         (batch.seq, batch.boot_id, batch.sent_ts, batch.collector_id),
     )
+    if since is not None:
+        record_accepted(conn, batch, since)
     return "applied"

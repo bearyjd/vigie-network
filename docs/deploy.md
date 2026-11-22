@@ -278,7 +278,17 @@ Set in `deploy/.env` (read at container start, so recreate the service after edi
 Retention shortens how long raw data sits on disk; it is not a substitute for encrypting the volume.
 Put the data directory on an encrypted filesystem (PRP section 9).
 
-**Essential-device absence (off by default).** `VIGIE_ESSENTIAL_ABSENCE=1` (only 1/true/yes enable; garbage is a startup error) turns on the pipeline sweep that opens one incident when a device the owner marked essential is unseen past its own threshold. It needs no migration and nothing fires until a device is marked. Compose forwards it with `${VIGIE_ESSENTIAL_ABSENCE-0}`; notifications additionally need delivery enabled and `essential_absence` in `VIGIE_DELIVERY_DETECTORS`. See "Essential-device absence (F6)" in `docs/monitoring.md`.
+**Essential-device absence (off by default).** `VIGIE_ESSENTIAL_ABSENCE=1` enables observation
+recording and alerts for marked devices after enough observed hours. Values `1`, `true`, and `yes`
+enable it. Compose forwards the setting with `${VIGIE_ESSENTIAL_ABSENCE-0}`. Phone notices also
+require delivery to be enabled and `essential_absence` in `VIGIE_DELIVERY_DETECTORS`.
+
+The pipeline applies an additive inventory migration at startup. Verify a pre-upgrade inventory
+snapshot with the current image and keep it for rollback. An older pipeline refuses the newer
+pipeline schema.
+Run ingest and pipeline from the same build before enabling observation recording. An older ingest
+build cannot certify observations, so the detector must build fresh history from new batches.
+See “Essential-device absence (F6)” in `docs/monitoring.md`.
 
 ## Upgrades and migrations
 
