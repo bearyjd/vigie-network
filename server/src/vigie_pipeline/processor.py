@@ -96,7 +96,12 @@ def run_once(
         if config.essential_absence and usable and not failures:
             sweep_essential_absence(inv, overrides, clock)
         purge_activity(inv, clock, config.activity_retention_s)
-        _monitor_deliver_probe(inv, overrides, config, usable, clock, live, should_stop)
+        # F6-b on and a shard unreadable: the stale view may hold an "absent" device that is back
+        # in the unread batch, so nothing is sent this pass (rows are still planned)
+        stale = config.essential_absence and bool(failures)
+        _monitor_deliver_probe(
+            inv, overrides, config, usable, clock, live, (lambda: True) if stale else should_stop
+        )
     finally:
         inv.close()
         if overrides is not None:
@@ -126,7 +131,16 @@ def _monitor_deliver_probe(
     """The stages after the prune; they need a readable overrides.db except the probes."""
     if usable:
         analyze_monitoring(inv, overrides, monitoring_policy(config), clock)
-        run_delivery_stage(inv, overrides, config, live or (lambda: clock), should_stop=should_stop)
+        run_delivery_stage(
+            inv,
+            overrides,
+            config,
+            live or (lambda: clock),
+            should_stop=should_stop,
+            # F6-b: its incidents are stamped with the pass start, so the first run's watermark
+            # must not be later than that (else the first push is hidden for good)
+            watermark_at=clock if config.essential_absence else None,
+        )
         refresh_characterization(inv, overrides, clock)
     prune_monitoring(inv, clock)
     if config.probes.enabled:  # needs no overrides; contains its own errors

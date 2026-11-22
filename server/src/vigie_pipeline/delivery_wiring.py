@@ -45,13 +45,15 @@ def run_delivery_stage(
     clock: Callable[[], float],
     publisher: Publisher | None = None,
     should_stop: Callable[[], bool] = lambda: False,
+    watermark_at: float | None = None,
 ) -> RunReport | None:
-    """Disabled: do nothing at all. Enabled: any exception is contained and logged."""
+    """Disabled: do nothing at all. Enabled: any exception is contained and logged.
+    `watermark_at` stamps the first run's watermark instead of the delivery clock."""
     settings = config.delivery
     if not settings.enabled:
         return None
     try:
-        since = _watermark(inv, clock())
+        since = _watermark(inv, clock() if watermark_at is None else watermark_at)
         return run_delivery(
             inv,
             overrides,
