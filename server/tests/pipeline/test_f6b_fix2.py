@@ -317,3 +317,36 @@ def test_an_unmark_committed_between_plan_and_apply_opens_nothing(env, monkeypat
 
     monkeypatch.setattr(ea, "_plan", plan_then_unmark)
     assert env.sweep(now_after(2)) == 0 and env.rows() == []
+
+
+# ---- R2-5: the flood-window and midnight-cap boundaries are pinned -------------------------------
+def three_hours(env) -> None:
+    env.device("d1")
+    env.mark("d1", 2 * 3600)
+    env.cover(1, 3)
+
+
+def test_a_batch_ending_exactly_at_an_hour_start_does_not_blind_that_hour(env):
+    three_hours(env)
+    env.batch(H + HOUR + 60, H + 2 * HOUR, {"dns_dropped": 1})  # hour 1 only
+    assert env.sweep(now_after(3)) == 1  # hours 2 and 3 are clean
+
+
+def test_a_batch_starting_exactly_at_an_hour_end_does_not_blind_that_hour(env):
+    three_hours(env)
+    env.batch(H + 3 * HOUR, H + 3 * HOUR + 600, {"dns_dropped": 1})  # hour 3 only
+    assert env.sweep(now_after(3)) == 1  # hours 1 and 2 are clean
+
+
+def test_an_incident_detected_at_midnight_counts_toward_the_daily_cap(env, monkeypatch):
+    monkeypatch.setattr(ea, "MAX_PER_DAY", 1)
+    two_hours(env)
+    now = now_after(2)
+    midnight = int(now) // 86400 * 86400
+    env.inv.execute(
+        "INSERT INTO monitoring_incidents(id,collector_id,device_id,lineage,detector,state,"
+        "episode_start,last_hour,detected_at,baseline_id,observed_bytes,threshold_bytes,evidence)"
+        " VALUES ('old','c1','other','old','essential_absence','resolved',?,?,?,NULL,0,0,'{}')",
+        (H - HOUR, H - HOUR, iso_utc(midnight)),
+    )
+    assert env.sweep(now) == 0

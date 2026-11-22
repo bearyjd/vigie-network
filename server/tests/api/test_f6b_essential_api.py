@@ -14,7 +14,7 @@ from test_pilot_report import HOUR0, report, seeded, set_detected  # noqa: F401
 GOOD = {"reason_code": "essential_absent", "absent_for_hours": 30, "threshold_hours": 24}
 NULLS = {"reason_code": "essential_absent", "absent_for_hours": None, "threshold_hours": None}
 HOSTILE = [
-    {**GOOD, "mac": "aa:bb:cc:00:00:01", "hostname": "evil\n", "vendor": "x", "ip": "10.0.0.9"},
+    {**GOOD, "mac": "aa:bb:cc:00:00:01", "hostname": "evil\n", "vendor": "x", "ip": "192.0.2.9"},
     {**GOOD, "absent_for_hours": "3; DROP TABLE x"},
     {**GOOD, "absent_for_hours": True},
     {**GOOD, "absent_for_hours": -1},

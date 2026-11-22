@@ -1407,7 +1407,8 @@ policy dataclass: the monitoring policy versions are unchanged. There is no migr
 `PUT /devices/{id}/essential`, the `vigie-api essential` CLI; at most 32 devices;
 `absent_after_s` 3600 to 604800, no default). With the flag on and nothing marked the sweep
 reads the marks and the open `essential_absence` incidents and writes nothing. Docs suggest 24 h or
-more for battery devices: a sleeping device that renews DHCP is not absent.
+more for battery devices. Only flows or DNS seen at the router count as presence: a device that
+only renews DHCP (idle or LAN-only) still reads as absent, so give it a longer threshold.
 
 **Rule.** Each pass (after the batches are processed; skipped when a shard could not be read) every
 marked device is resolved to its CURRENT canonical device (a mark on a since-merged alias is judged on
@@ -1416,7 +1417,7 @@ wins; one incident per lineage). **Fixed-address devices only:** a lineage whose
 randomized abstains (a rotating private address looks absent), with an `essential_unjudged` event.
 
 *Anchor* = the newest hour of ACTIVE evidence of any member MAC: a `measurements_hourly` row (flows,
-DNS) of an hour the collector has a coverage row for. The server clock takes no part (a clock step
+DNS) of an hour no later than the collector's newest coverage row. The server clock takes no part (a clock step
 cannot move an episode). `last_seen`, leases and neighbour entries do NOT count: they
 are snapshots, and an agent restart re-emits every unexpired lease and stale neighbour entry stamped
 "now" (it would otherwise move a dead device's anchor forward, or keep it alive forever). The

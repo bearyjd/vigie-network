@@ -132,6 +132,7 @@ def _read_marks(ov: sqlite3.Connection) -> Marks:
     for row in rows[:MAX_MARKS]:
         if not isinstance(row[0], str):
             continue
+        # the overrides CHECK constraint is the first guard; MAX_S backs it for a hand-edited row
         if type(row[1]) is int and MIN_S <= row[1] <= MAX_S and type(row[2]) is int:
             valid.append((row[0], row[1], row[2]))
         else:
@@ -163,7 +164,6 @@ def _resolve(
             unjudged.append((device_id, "identity_unavailable", None))
             continue
         if not identity.macs:
-            protected.add(identity.device_id)
             unjudged.append((device_id, "no_known_mac", version))
             continue
         old = entries.get(identity.device_id)
@@ -185,7 +185,7 @@ def _members(inv: sqlite3.Connection, identity: Lineage) -> tuple[str, ...]:
 def _anchor(inv: sqlite3.Connection, macs: tuple[str, ...]) -> tuple[str, int] | None:
     """(collector, anchor hour): the newest hour of active evidence of any MAC, over collectors
     (a seek per collector and MAC). The server clock takes no part (a clock step must never move
-    an episode). Evidence in an hour the collector has no coverage row for (a measurement and its
+    an episode). Evidence later than the collector's newest coverage hour (a measurement and its
     coverage are written together, so that is forged or impossible) cannot anchor."""
     row = inv.execute(
         "SELECT c.id, (SELECT MAX(m.hour) FROM measurements_hourly m WHERE m.collector_id=c.id"  # noqa: S608
