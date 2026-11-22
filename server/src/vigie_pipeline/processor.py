@@ -92,16 +92,7 @@ def run_once(
             track_overrides_history(inv, config.overrides_path)
         if config.new_device_notice and usable:  # F5, default off: nothing else touches it
             sweep_new_devices(inv, overrides, config, clock)
-        # F6-b, default off. Not after a failed shard read: a stale view must not page "absent"
-        if config.essential_absence and usable and not failures:
-            sweep_essential_absence(inv, overrides, clock)
-        purge_activity(inv, clock, config.activity_retention_s)
-        # F6-b on and a shard unreadable: the stale view may hold an "absent" device that is back
-        # in the unread batch, so nothing is sent this pass (rows are still planned)
-        stale = config.essential_absence and bool(failures)
-        _monitor_deliver_probe(
-            inv, overrides, config, usable, clock, live, (lambda: True) if stale else should_stop
-        )
+        _late_stages(inv, overrides, config, usable, clock, live, should_stop, bool(failures))
     finally:
         inv.close()
         if overrides is not None:
@@ -117,6 +108,28 @@ def run_once(
     if failures:
         raise failures[0]
     return stats
+
+
+def _late_stages(
+    inv: sqlite3.Connection,
+    overrides: sqlite3.Connection | None,
+    config: PipelineConfig,
+    usable: bool,
+    clock: float,
+    live: Callable[[], float] | None,
+    should_stop: Callable[[], bool],
+    stale: bool,
+) -> None:
+    """F6-b (default off), the activity purge, then monitoring and delivery. `stale`: a shard could
+    not be read, so the view may hold an "absent" device that is back in the unread batch: the
+    sweep is skipped and, with F6-b on, nothing is sent this pass (rows are still planned)."""
+    if config.essential_absence and usable and not stale:
+        sweep_essential_absence(inv, overrides, clock)
+    purge_activity(inv, clock, config.activity_retention_s)
+    quiet = config.essential_absence and stale
+    _monitor_deliver_probe(
+        inv, overrides, config, usable, clock, live, (lambda: True) if quiet else should_stop
+    )
 
 
 def _monitor_deliver_probe(
