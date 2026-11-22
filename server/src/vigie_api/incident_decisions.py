@@ -3,8 +3,8 @@
 Two independent axes: the pipeline owns the incident `state`; humans own the review status.
 Nothing here writes inventory.db. The pipeline reads this table read-only, through
 `vigie_pipeline.overrides.decided_incident_ids` and the delivery runner: it never writes it, and for
-new_device it closes the incident (state) once a QUIET_STATUSES review exists. The pipeline's copy
-of QUIET_STATUSES is pinned equal to this one by a test.
+new_device and essential_absence it closes the incident (state) once a QUIET_STATUSES review
+exists. The pipeline's copy of QUIET_STATUSES is pinned equal to this one by a test.
 """
 
 from __future__ import annotations

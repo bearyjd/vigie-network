@@ -24,8 +24,13 @@ from vigie_api.evidence_types import (
     sensitive,
     when,
 )
-from vigie_api.models import TOD_BUCKET_HOURS, new_device_evidence, tod_cohort_bucket_valid
-from vigie_pipeline.detectors import ALL, NEW_DEVICE
+from vigie_api.models import (
+    TOD_BUCKET_HOURS,
+    essential_absence_evidence,
+    new_device_evidence,
+    tod_cohort_bucket_valid,
+)
+from vigie_pipeline.detectors import ALL, ESSENTIAL_ABSENCE, NEW_DEVICE
 
 DETERMINISTIC = "deterministic-services"
 REASON_CODES = (
@@ -107,6 +112,14 @@ def _review(review: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _evidence_for(row: dict[str, Any]) -> dict[str, Any]:
+    if row["detector"] == NEW_DEVICE:
+        return new_device_evidence(row["evidence"])
+    if row["detector"] == ESSENTIAL_ABSENCE:
+        return essential_absence_evidence(row["evidence"])
+    return allowlisted_evidence(row["evidence"])
+
+
 def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": sensitive("incident_id", row["id"]),
@@ -121,11 +134,7 @@ def _incident_item(row: dict[str, Any]) -> dict[str, Any]:
         "observed_bytes": row["observed_bytes"],
         "threshold_bytes": row["threshold_bytes"],
         "baseline_id": sensitive("baseline_id", row["baseline_id"]),
-        "evidence": (
-            new_device_evidence(row["evidence"])
-            if row["detector"] == NEW_DEVICE
-            else allowlisted_evidence(row["evidence"])
-        ),
+        "evidence": _evidence_for(row),
         "review": _review(row["review"]),
         "decision_version": row["decision_version"],
         "attention": bool(row["attention"]),

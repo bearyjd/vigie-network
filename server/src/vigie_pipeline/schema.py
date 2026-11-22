@@ -285,6 +285,40 @@ PIPELINE_MIGRATIONS: Sequence[Sequence[str]] = (
         "UNIQUE(incident_id,kind))",
         "CREATE INDEX idx_incident_deliveries_due ON incident_deliveries(state,next_attempt_at)",
     ),
+    (
+        "CREATE TABLE essential_recording (singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+        " enabled INTEGER NOT NULL, since_hour INTEGER NOT NULL)",
+        "CREATE TABLE essential_pending (collector_id TEXT NOT NULL,batch_id TEXT NOT NULL,"
+        "PRIMARY KEY(collector_id,batch_id)) WITHOUT ROWID",
+        "CREATE TABLE essential_observation_hours (collector_id TEXT NOT NULL,hour INTEGER"
+        " NOT NULL,observed BLOB,qualified_seconds INTEGER NOT NULL,"
+        "PRIMARY KEY(collector_id,hour))",
+        "CREATE INDEX idx_essential_observation_expiry ON essential_observation_hours(hour)",
+        "CREATE TABLE essential_activity (collector_id TEXT NOT NULL,mac TEXT NOT NULL,"
+        " hour INTEGER NOT NULL,PRIMARY KEY(collector_id,mac))",
+        "CREATE INDEX idx_essential_activity_expiry ON essential_activity(hour)",
+        # A writer that cannot certify its payload invalidates observations through its newest
+        # possible event hour, even if its receipt is purged before the pipeline next runs.
+        # A compatible writer restores the previous fence inside this same transaction.
+        """CREATE TRIGGER essential_unverified AFTER INSERT ON batches
+        WHEN NEW.observation_kind IS NOT 'probe' BEGIN
+          UPDATE essential_recording SET since_hour=MAX(since_hour,
+            COALESCE((NEW.window_end / 3600 + 1) * 3600, 4398046511104));
+          INSERT OR IGNORE INTO essential_pending SELECT NEW.collector_id,NEW.batch_id
+            WHERE EXISTS (SELECT 1 FROM essential_recording WHERE enabled=1) AND NOT EXISTS
+            (SELECT 1 FROM measurement_batches WHERE collector_id=NEW.collector_id
+            AND batch_id=NEW.batch_id); END""",
+        """CREATE TRIGGER essential_processed AFTER INSERT ON measurement_batches BEGIN
+          DELETE FROM essential_pending WHERE collector_id=NEW.collector_id
+            AND batch_id=NEW.batch_id; END""",
+        """CREATE TRIGGER essential_purged BEFORE DELETE ON batches
+        WHEN EXISTS (SELECT 1 FROM essential_pending WHERE collector_id=OLD.collector_id
+        AND batch_id=OLD.batch_id) BEGIN
+          UPDATE essential_recording SET since_hour=MAX(since_hour,
+            COALESCE((OLD.window_end / 3600 + 1) * 3600,4398046511104));
+          DELETE FROM essential_pending WHERE collector_id=OLD.collector_id
+            AND batch_id=OLD.batch_id; END""",
+    ),
 )
 
 PIPELINE_TABLES = (

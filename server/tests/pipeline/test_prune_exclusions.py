@@ -142,6 +142,7 @@ INVENTORY_SOURCES = {
         "INSERT INTO measurements_hourly (collector_id, mac, hour, bytes_up, bytes_down, flows,"
         " dns_queries) VALUES ('rtr-1', '{mac}', 0, 0, 0, 0, 0)"
     ),
+    "essential_activity": "INSERT INTO essential_activity VALUES ('rtr-1', '{mac}', 0)",
     "monitoring_dirty": (
         "INSERT INTO monitoring_dirty (collector_id, mac, queued_at) VALUES ('rtr-1', '{mac}', 0)"
     ),

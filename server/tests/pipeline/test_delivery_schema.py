@@ -185,6 +185,7 @@ def _v10(path, monkeypatch):
 def test_upgrade_from_v10_keeps_rows_and_adds_the_table(tmp_path, monkeypatch):
     path = tmp_path / "inventory.db"
     _v10(path, monkeypatch)
+    monkeypatch.setattr(schema, "PIPELINE_MIGRATIONS", schema.PIPELINE_MIGRATIONS[:11])
     conn = open_pipeline_inventory(path)
     assert conn.execute("SELECT MAX(version) FROM pipeline_schema").fetchone()[0] == 11
     assert conn.execute("SELECT id FROM devices").fetchone()[0] == "d"
@@ -201,15 +202,18 @@ def test_upgrade_from_v10_keeps_rows_and_adds_the_table(tmp_path, monkeypatch):
 def test_rerunning_the_migration_is_idempotent_and_keeps_deliveries(tmp_path):
     conn = _fresh(tmp_path)
     conn.execute(INSERT, (A, "inc", "open", "sent"))
-    assert apply_pipeline_migrations(conn) == 11
-    assert apply_pipeline_migrations(conn) == 11
-    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == 11
+    latest = len(schema.PIPELINE_MIGRATIONS)
+    assert apply_pipeline_migrations(conn) == latest
+    assert apply_pipeline_migrations(conn) == latest
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_schema").fetchone()[0] == latest
     assert conn.execute("SELECT state FROM incident_deliveries").fetchone()[0] == "sent"
 
 
 def test_a_newer_schema_is_still_refused(tmp_path):
     conn = _fresh(tmp_path)
-    conn.execute("INSERT INTO pipeline_schema (version) VALUES (12)")
+    conn.execute(
+        "INSERT INTO pipeline_schema (version) VALUES (?)", (len(schema.PIPELINE_MIGRATIONS) + 1,)
+    )
     with pytest.raises(RuntimeError, match="newer"):
         apply_pipeline_migrations(conn)
 

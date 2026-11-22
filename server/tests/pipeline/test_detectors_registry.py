@@ -6,8 +6,8 @@ from typing import get_args
 
 from vigie_api import evidence_determinations
 from vigie_api.models import IncidentOut
-from vigie_pipeline import delivery_types, monitoring_engine, new_device_notice
-from vigie_pipeline.detectors import ALL, ENGINE, NEW_DEVICE, OPEN_ONLY
+from vigie_pipeline import delivery_types, essential_absence, monitoring_engine, new_device_notice
+from vigie_pipeline.detectors import ALL, ENGINE, ESSENTIAL_ABSENCE, NEW_DEVICE, OPEN_ONLY
 
 
 def test_registry_sets_are_consistent():
@@ -30,8 +30,13 @@ def test_incident_literal_matches_registry():
 
 def test_new_device_constant_is_registered():
     assert NEW_DEVICE == "new_device"
-    assert OPEN_ONLY == (NEW_DEVICE,)
+    assert OPEN_ONLY == (NEW_DEVICE, ESSENTIAL_ABSENCE)
     assert new_device_notice.DETECTOR is NEW_DEVICE
+
+
+def test_essential_absence_constant_is_registered():
+    assert ESSENTIAL_ABSENCE == "essential_absence"
+    assert essential_absence.DETECTOR is ESSENTIAL_ABSENCE
 
 
 def test_no_new_device_literal_in_consumers():
@@ -43,6 +48,14 @@ def test_no_new_device_literal_in_consumers():
     ):
         assert '"new_device"' not in (root / rel).read_text(), (
             f"{rel} re-lists the literal; use detectors.NEW_DEVICE"
+        )
+    for rel in (
+        "vigie_pipeline/essential_absence.py",
+        "vigie_api/monitoring.py",
+        "vigie_api/evidence_determinations.py",
+    ):
+        assert '"essential_absence"' not in (root / rel).read_text(), (
+            f"{rel} re-lists the literal; use detectors.ESSENTIAL_ABSENCE"
         )
 
 

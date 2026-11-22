@@ -4,5 +4,6 @@
 ENGINE = ("large_upload", "upload_deviation")
 # Announced once on open; never a "back to normal" send.
 NEW_DEVICE = "new_device"
-OPEN_ONLY = (NEW_DEVICE,)
+ESSENTIAL_ABSENCE = "essential_absence"
+OPEN_ONLY = (NEW_DEVICE, ESSENTIAL_ABSENCE)
 ALL = ENGINE + OPEN_ONLY

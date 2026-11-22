@@ -216,13 +216,16 @@ covers it. `acknowledged` and `expected` cover it indefinitely; `snoozed` covers
 A snooze on an incident that later resolves stays as history with `attention` false. `GET /incidents`
 also accepts `state=open|resolved|superseded`. There is no filter on review or attention.
 
-`detector` is `large_upload`, `upload_deviation` or (additive, F5) `new_device`. A `new_device` incident
+`detector` is `large_upload`, `upload_deviation`, (additive, F5) `new_device` or (additive, F6-b)
+`essential_absence`. An `essential_absence` incident also has bytes of 0 and its `evidence` is exactly
+`{"reason_code":"essential_absent","absent_for_hours":Q,"threshold_hours":N}` (a count null if implausible);
+no MAC, hostname, vendor or IP, any other key is dropped. A `new_device` incident
 has `observed_bytes` and `threshold_bytes` of 0 and its `evidence` is exactly
 `{"reason_code":"new_device_first_seen","randomized":false,"dwell_hours":N}` (`dwell_hours` null if the
 stored value is implausible): never a MAC, hostname, vendor or IP; any other stored key is dropped. The
 same shape appears in the evidence pack. Upload evidence is unchanged.
 In `api/openapi.yaml` `evidence` is a union (`anyOf` of the upload evidence and the new-device
-evidence) with no discriminator: a typed client sees the union, so branch on the incident's `detector`
+evidence, and the essential-absence evidence) with no discriminator: a typed client sees the union, so branch on the incident's `detector`
 (`new_device` means the new-device shape) rather than on the shape.
 
 The incident `evidence` object also carries the time-of-day (tod) keys when the stored evidence has them:
