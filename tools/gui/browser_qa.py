@@ -69,7 +69,7 @@ class Audit:
         url = urlsplit(request.url)
         allowed = (url.scheme, url.netloc) == ("http", "127.0.0.1:18745")
         allowed_path = url.path.startswith("/ui/") or re.fullmatch(
-            r"/(healthz|coverage|devices(?:/[^/]+(?:/activity)?)?|incidents(?:/[^/]+)?)",
+            r"/(healthz|coverage|probes|devices(?:/[^/]+(?:/activity)?)?|incidents(?:/[^/]+)?)",
             url.path,
         )
         query = parse_qs(url.query)

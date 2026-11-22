@@ -61,6 +61,8 @@ const refreshTimers = () => dueTimers().length;  // the 15 s request deadlines a
 const tick = async ms => { clock += ms; for (const [id, timer] of [...liveTimeouts]) if (timer.due <= clock) { liveTimeouts.delete(id); timer.callback(); } await flush(); };  // fire a timer only when the fake clock reaches it
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
+const probesOff = {enabled: false, written_at: null, stale: false, targets: [], verdict: 'unknown'};
+let probeData = probesOff; let probeFailure = 0; let holdProbes = null;
 let holdCoverage = null; let lastHourState = 'eligible'; let incidentPages = null; let collectorOver = {}; let incidentsDown = false; let coverageDown = false; let hourState = 'eligible'; let unavailable = []; let incidents = [];  // knobs for the banner and inbox contracts
 let mode = 'ok'; let retryAfter = '60'; let windowLag = null; let lag = 0;  // seconds between the observation and the fetch
 function coverageBody(url) {
@@ -80,6 +82,12 @@ globalThis.fetch = async (url, options) => {
   const target = new URL(String(url));
   if (mode === '429') return new Response('{}', {status: 429, headers: {'Retry-After': retryAfter}});
   if (mode === '503') return new Response('{}', {status: 503});
+  if (target.pathname === '/probes') {
+    const data = probeData;
+    if (holdProbes) { const held = holdProbes; holdProbes = null; await held; }
+    return probeFailure ? new Response('{}', {status: probeFailure})
+      : new Response(JSON.stringify({ok: true, page: null, data}));
+  }
   if (target.pathname === '/coverage' && coverageDown) return new Response('{}', {status: 503});
   if (target.pathname === '/events' && eventsReply) { const reply = eventsReply(target); if (reply) return reply; }
   if (/^\/devices\/[^/]+$/.test(target.pathname) && deviceReply) return deviceReply(target);
@@ -260,6 +268,33 @@ const bannerText = () => banner.textContent; const tone = () => banner.getAttrib
 const reload = async () => { refresh.fire('click'); await flush(); };
 mode = 'ok'; lag = 0; windowLag = null; await reload();
 assert.match(bannerText(), /^OK/); assert.equal(tone(), 'ok');
+// Host-wide probe status is separate from collector-scoped passive coverage.
+assert.match(content.textContent, /Active probes.*Off/);
+const probeTarget = {id: 'lan-dns', kind: 'dns_local', state: 'outage', last_ok_at: null, last_error_class: 'timeout', last_latency_ms: null, episode_start: clock / 1000 - 60};
+probeData = {enabled: true, written_at: clock / 1000, stale: false, targets: [probeTarget], verdict: 'router_resolver_down'};
+await reload(); assert.match(content.textContent, /Router resolver outage/); assert.match(content.textContent, /lan-dns.*Outage/); assert.equal(tone(), 'ok');
+probeData = {...probeData, verdict: 'normal', targets: [{...probeTarget, state: 'ok', last_ok_at: clock / 1000}]};
+await reload(); assert.match(content.textContent, /lan-dns.*Recovered/);
+probeData = {...probeData, stale: true, verdict: 'unknown', targets: [{...probeTarget, state: 'unknown'}]};
+await reload(); assert.match(content.textContent, /Probe status stale/); assert.doesNotMatch(content.textContent, /lan-dns/); assert.equal(tone(), 'ok');
+probeData = {...probeData, stale: false, targets: [{...probeTarget, id: '<img src=x>', state: 'unknown'}]};
+await reload(); assert.match(content.textContent, /Probe status unavailable/); assert.doesNotMatch(content.textContent, /<img/);
+probeData = probesOff; probeFailure = 503;
+await reload(); assert.match(content.textContent, /Probe status unavailable/); assert.match(content.textContent, /Coverage over time/); assert.equal(tone(), 'ok'); assert.equal(notice.hidden, true);
+probeFailure = 0;
+let releaseProbes;
+holdProbes = new Promise(resolve => { releaseProbes = resolve; });
+await reload(); assert.match(content.textContent, /Checking probe status/); assert.match(content.textContent, /Coverage over time/);
+navButtons.find(button => button.dataset.view === 'inventory').fire('click'); await flush();
+releaseProbes(); await flush(); assert.doesNotMatch(content.textContent, /Active probes/);
+navButtons.find(button => button.dataset.view === 'overview').fire('click'); await flush();
+assert.match(content.textContent, /Active probes.*Off/);
+probeData = {enabled: true, written_at: clock / 1000, stale: false, targets: [], verdict: 'unknown'};
+await reload(); assert.match(content.textContent, /Probe verdict unknown/);
+probeData = probesOff; probeFailure = 401;
+await reload(); assert.equal(elements.workspace.hidden, true); assert.equal(content.textContent, '');
+probeFailure = 0; elements.token.value = 'synthetic-token'; elements['connect-collector'].value = 'c1';
+elements['connect-form'].fire('submit'); await flush();
 elements.collector.value = 'c1'; elements.range.value = '24'; gate = new Promise(resolve => { release = resolve; });
 elements['scope-form'].fire('submit'); await flush();
 assert.match(bannerText(), /^Checking/); assert.equal(tone(), 'loading'); assert.doesNotMatch(bannerText(), /^OK/);
@@ -587,7 +622,11 @@ for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'v
   for (const el of content.querySelectorAll('*')) { for (const [k, v] of el.attrs) { assert.ok(!/[<>"]/.test(v), `attribute ${k} carries API markup`); assert.ok(!k.startsWith('on'), 'no inline handler attribute'); } assert.ok(!/[<>]/.test(el.getAttribute('class') || ''), 'API text never reaches a class'); }
   assert.deepEqual(content.querySelectorAll('span').filter(e => (e.getAttribute('class') || '').startsWith('badge')).map(e => e.getAttribute('class')), ['badge ', 'badge ', 'badge warn', 'badge ', 'badge '], 'severity maps through an allowlist, including prototype names');
   assert.ok(content.querySelectorAll('div').some(d => d.getAttribute('role') === 'region' && /Scrollable table/.test(d.getAttribute('aria-label'))), 'the table is a labelled, focusable region');
-  assert.deepEqual(violations, [], 'no HTML sink was touched');
+  for (const {url, options} of requests.filter(({url}) => new URL(url).pathname === '/probes')) {
+  assert.equal(new URL(url).search, '', 'probe status is host-wide');
+  assert.equal(options.headers.Authorization, 'Bearer synthetic-token');
+}
+assert.deepEqual(violations, [], 'no HTML sink was touched');
 
   // 2. Filters: a real <form> whose submit never navigates; values are encoded, bounded, and reset the pager.
   const form = content.querySelectorAll('form')[0]; assert.equal(form.getAttribute('aria-label'), 'Event filters');
@@ -665,7 +704,11 @@ assert.equal(doubleCheck, 1); assert.equal(refreshTimers(), 1, 'exactly one refr
 assert.equal((windowListeners.hashchange || []).length, 1, 'exactly one hashchange listener'); assert.equal((documentListeners.visibilitychange || []).length, 1); assert.equal((windowListeners.pagehide || []).length, 1);
 elements.disconnect.fire('click'); assert.equal(refreshTimers(), 0, 'disconnect leaves no refresh timer behind');
 assert.ok(requests.length > 25, 'the suite drove real traffic');
-for (const {url, options} of requests) { assert.ok([undefined, 'GET'].includes(options?.method), `${url} uses ${options?.method}`); assert.equal(options?.body, undefined, `${url} sends no body`); assert.ok(/^\/(coverage|incidents(\/[^/]+)?|devices(\/[^/]+)?|events)$/.test(new URL(url).pathname), `unexpected endpoint ${url}`); }
+for (const {url, options} of requests) { assert.ok([undefined, 'GET'].includes(options?.method), `${url} uses ${options?.method}`); assert.equal(options?.body, undefined, `${url} sends no body`); assert.ok(/^\/(coverage|incidents(\/[^/]+)?|devices(\/[^/]+)?|events|probes)$/.test(new URL(url).pathname), `unexpected endpoint ${url}`); }
+for (const {url, options} of requests.filter(({url}) => new URL(url).pathname === '/probes')) {
+  assert.equal(new URL(url).search, '', 'probe status is host-wide');
+  assert.equal(options.headers.Authorization, 'Bearer synthetic-token');
+}
 assert.deepEqual(violations, [], 'no HTML sink, document.write or storage access happened'); assert.equal(storageTouched, false);
 // Static guard on the shipped sources: a cheap tripwire (quote-agnostic), NOT a guarantee; the behavioural checks above are the contract.
 const source = name => readFileSync(new URL(`../../server/src/vigie_api/ui/${name}`, import.meta.url), 'utf8');
@@ -678,4 +721,4 @@ const clientCode = source('client.js'); assert.deepEqual([...clientCode.matchAll
 const page = source('index.html'); assert.match(page, /<div id="coverage-banner"[^>]*role="status"[^>]*aria-live="polite"/); assert.doesNotMatch(page, /<form[^>]*method=|<textarea/i);
 
 Date.now = realNow;
-console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts; coverage banner states; read-only incident inbox ordering, decisions, filter and inert-text contracts; behavioural read-only, sink and timer contracts.');
+console.log('PASS: live Current badge, pause/stale recompute timer, aria-disabled and Retry focus/state contracts; coverage banner and active probe states; read-only incident inbox ordering, decisions, filter and inert-text contracts; behavioural read-only, sink and timer contracts.');

@@ -61,6 +61,11 @@ export class ApiClient {
   devices(cursor = null) { if (cursor !== null) bounded(cursor, 256); return this.#get('/devices', {limit: 25, cursor}); }
   device(id) { return this.#get(`/devices/${segment(id)}`); }
   coverage(collector, range) { const requested = this.#range(range); return this.#get('/coverage', {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
+  async probes() {
+    const result = await this.#get('/probes');
+    if (result.page !== null) throw new ApiError(0, 'malformed_response');
+    return result;
+  }
   activity(id, collector, range) { const requested = this.#range(range); return this.#get(`/devices/${segment(id)}/activity`, {collector_id: this.#scope(collector), ...requested}).then(result => this.#monitoring(result, requested)); }
   incidents(collector, cursor = null) { if (cursor !== null) bounded(cursor, 1024); return this.#get('/incidents', {collector_id: this.#scope(collector), limit: 25, cursor}); }
   // Newest first, fixed page size. since/kind/device_id are bounded here to the server's own limits; limit is never caller-chosen.

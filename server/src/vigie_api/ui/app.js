@@ -1,5 +1,5 @@
 import {ApiClient, ApiError, StaleResult} from './client.js';
-import {node, empty, refreshLiveLabels, heading, pager, coverageView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc, eventsView, eventFilterForm, timelineSection, EVENT_PAGE, EVENT_MAX_PAGES} from './views.js';
+import {node, empty, refreshLiveLabels, heading, pager, coverageView, probeStatusView, inventoryView, deviceView, activityView, incidentsView, incidentView, coverageStatus, inboxRows, utc, eventsView, eventFilterForm, timelineSection, EVENT_PAGE, EVENT_MAX_PAGES} from './views.js';
 
 const byId = id => document.getElementById(id);
 const client = new ApiClient();
@@ -104,6 +104,20 @@ async function timelineFor(id) {
   catch (error) { if (!(error instanceof ApiError) || error.status === 401) throw error; return null; }
 }
 function withTimeline(panel, events, id) { panel.append(timelineSection(events, id, eventsFor)); return panel; }
+function overviewProbes(generation) {
+  const message = text => node('p', {role: 'status'}, text);
+  const status = node('div', {}, message('Checking probe status…'));
+  const panel = node('section', {class: 'section'}, heading('Active probes', 'Host-wide status'), status);
+  // The panel settles independently so an unavailable probe view cannot delay passive coverage.
+  client.probes().then(result => {
+    if (generation === state.generation) status.replaceChildren(probeStatusView(result.data));
+  }).catch(error => {
+    if (generation !== state.generation) return;
+    if (error instanceof ApiError && error.status === 401) failure(error);
+    else status.replaceChildren(message('Probe status unavailable'));
+  });
+  return panel;
+}
 async function load(clear = false, focus = null, automatic = false) {
   if (!state.connected) return;
   if (!clear && document.hidden) return;
@@ -119,7 +133,13 @@ async function load(clear = false, focus = null, automatic = false) {
     const cursor = state.cursors[state.page]; let content; let next = null; let coverage = null;
     // Other views still fetch coverage (same endpoint) so the banner is never absent; its failure never fails the view.
     banner = state.view === 'overview' ? null : client.coverage(state.collector, range()).then(result => ({phase: 'ready', data: result.data}), () => ({phase: 'error'}));
-    if (state.view === 'overview') { const result = await client.coverage(state.collector, range()); content = coverageView(result.data); coverage = {phase: 'ready', data: result.data}; if (result.page?.next_cursor) throw new ApiError(0, 'incomplete_range'); }
+    if (state.view === 'overview') {
+      const observations = client.coverage(state.collector, range());
+      const probes = overviewProbes(generation);
+      const result = await observations;
+      content = node('div', {}, coverageView(result.data), probes);
+      coverage = {phase: 'ready', data: result.data};
+    }
     if (state.view === 'inventory') {
       const [list, detail, timeline] = await Promise.all([client.devices(cursor), state.selectedDevice ? client.device(state.selectedDevice) : Promise.resolve(null), state.selectedDevice ? timelineFor(state.selectedDevice) : Promise.resolve(null)]);
       next = list.page?.next_cursor || null;

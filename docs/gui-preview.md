@@ -116,6 +116,10 @@ the authenticated API.
 
 ## Coverage gauge
 
+The Overview also shows host-wide **Active probes** from the authenticated `GET /probes` endpoint.
+The panel distinguishes disabled probes, stale or unknown status, and target outages or recovery.
+The passive coverage view continues to load if the probe endpoint is unavailable.
+
 The Overview opens with a ring gauge that summarises the displayed coverage hours; the hour strip and
 legend below it remain the evidence. The inner ring splits the hours by state (qualified, partial,
 missing, open) in a fixed order, and an hour is never drawn as qualified unless the API said so. The
