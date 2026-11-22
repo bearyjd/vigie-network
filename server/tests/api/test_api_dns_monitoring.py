@@ -6,7 +6,7 @@ import json
 
 import pytest
 from api_helpers import NOW, Env, env  # noqa: F401
-from incident_helpers import HOUR, incident, seed_collector
+from incident_helpers import EVIDENCE, HOUR, incident, seed_collector
 from test_api_evidence_pack import export
 from test_evidence_assemble import section
 from test_pilot_report import HOUR0, decide, delivery, report, seeded, set_detected  # noqa: F401
@@ -183,6 +183,42 @@ def test_dns_incident_rejects_malformed_provenance_without_hiding_query_counts(e
     assert row.get("baseline_id") is None
     assert row["evidence"]["unit"] == "queries"
     assert all(row["evidence"].get(key) is None for key in compromised)
+
+
+@pytest.mark.parametrize("path", ["/incidents", "/incidents/dns1"])
+@pytest.mark.parametrize("stored", ["upload_shape", "invalid_json"])
+def test_dns_incident_uses_dns_shape_even_when_stored_evidence_is_invalid(env: Env, path, stored):
+    seed_collector(env)
+    key = device_macs(env.inv, env.ov, "d1")[2]
+    baseline_id = "b" * 64
+    incident(env, "dns1", detector="dns_deviation", lineage=key)
+    private = {
+        "algorithm": "other-algorithm.private.example",
+        "config_version": "198.51.100.77",
+        "baseline_id": "other-baseline.private.example",
+        "lineage": "other-lineage.private.example",
+    }
+    payload = json.dumps({**EVIDENCE, **private}) if stored == "upload_shape" else "{"
+    env.inv.execute(
+        "UPDATE monitoring_incidents SET evidence=?, baseline_id=?, observed_bytes=1301, "
+        "threshold_bytes=1202 WHERE id='dns1'",
+        (payload, baseline_id),
+    )
+    response = env.get(path, collector_id="c1")
+    assert response.status_code == 200, response.text
+    assert all(value not in response.text for value in private.values())
+    data = response.json()["data"]
+    if path == "/incidents":
+        (data,) = data
+    assert data["detector"] == "dns_deviation" and data["current_lineage"]
+    evidence = data["evidence"]
+    assert (evidence["unit"], evidence["reason_code"]) == ("queries", "dns_deviation_threshold")
+    assert (evidence["observed_bytes"], evidence["threshold_bytes"]) == (1301, 1202)
+    assert evidence["hour"] == HOUR
+    assert evidence["baseline_id"] == baseline_id and evidence["lineage"] == key
+    assert evidence["algorithm"] is None and evidence["config_version"] is None
+    assert evidence["baseline_median_queries"] is None
+    assert "previous_hour" not in evidence
 
 
 def test_dns_incidents_stay_out_of_upload_pilot_totals(seeded, capsys, monkeypatch):

@@ -241,6 +241,8 @@ its evidence. DNS evidence includes `reason_code: "dns_deviation_threshold"`,
 no DNS names or answers. DNS provenance accepts the known algorithm and 64-character lowercase
 hexadecimal digests. Invalid provenance inside the evidence is null in the incident response and
 omitted from the pack's evidence. An invalid top-level incident lineage is an empty string in the API.
+If stored DNS evidence is unreadable or has another detector's shape, the API serves the incident's
+hour and counts as DNS evidence, with unavailable baseline statistics set to null.
 The evidence pack carries the same unit and counts.
 In OpenAPI, `evidence` is a union of the four evidence shapes. Use the incident's `detector`
 to choose the corresponding shape.

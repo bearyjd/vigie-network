@@ -627,6 +627,8 @@ def essential_absence_evidence(raw: Any) -> dict[str, Any]:
 
 
 class DnsIncidentEvidence(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     reason_code: Literal["dns_deviation_threshold"]
     unit: Literal["queries"]
     hour: int
@@ -635,14 +637,14 @@ class DnsIncidentEvidence(BaseModel):
     baseline_id: _DnsReferenceId = None
     algorithm: _DnsAlgorithm = None
     config_version: _DnsReferenceId = None
-    coverage_required_seconds: int
+    coverage_required_seconds: int | None = None
     lineage: _DnsReferenceId = None
     unusual_is_not_malicious: Literal[True]
-    baseline_median_queries: int | float
-    multiplier: int
-    minimum_queries: int
-    sample_hours: int
-    distinct_days: int
+    baseline_median_queries: int | float | None = None
+    multiplier: int | None = None
+    minimum_queries: int | None = None
+    sample_hours: int | None = None
+    distinct_days: int | None = None
 
 
 class IncidentOut(BaseModel):

@@ -1334,6 +1334,9 @@
               },
               {
                 "type": "number"
+              },
+              {
+                "type": "null"
               }
             ],
             "title": "Baseline Median Queries"
@@ -1351,12 +1354,26 @@
             "title": "Config Version"
           },
           "coverage_required_seconds": {
-            "title": "Coverage Required Seconds",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Required Seconds"
           },
           "distinct_days": {
-            "title": "Distinct Days",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Distinct Days"
           },
           "hour": {
             "title": "Hour",
@@ -1375,12 +1392,26 @@
             "title": "Lineage"
           },
           "minimum_queries": {
-            "title": "Minimum Queries",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Queries"
           },
           "multiplier": {
-            "title": "Multiplier",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Multiplier"
           },
           "observed_bytes": {
             "description": "Number of DNS queries in the observed UTC hour.",
@@ -1393,8 +1424,15 @@
             "type": "string"
           },
           "sample_hours": {
-            "title": "Sample Hours",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Hours"
           },
           "threshold_bytes": {
             "description": "DNS query-count threshold for the hour.",
@@ -1418,13 +1456,7 @@
           "hour",
           "observed_bytes",
           "threshold_bytes",
-          "coverage_required_seconds",
-          "unusual_is_not_malicious",
-          "baseline_median_queries",
-          "multiplier",
-          "minimum_queries",
-          "sample_hours",
-          "distinct_days"
+          "unusual_is_not_malicious"
         ],
         "title": "DnsIncidentEvidence",
         "type": "object"
