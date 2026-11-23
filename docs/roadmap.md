@@ -280,8 +280,9 @@ acceptance waits. UI framework, external sensor placement, final alert budget an
 policy remain proposed choices to settle in each milestone's design review.
 
 The [NextDNS operator report](nextdns.md) is the first M2 provider context adapter. It reports explicit provider
-and time scope and withholds context when the same query has competing candidates. Cloud history stays out of
-router-local baseline training and device identity.
+and time scope and withholds context when the same query has competing candidates. Provider context adapters
+have no enforcement, notification, or severity authority. Keep cloud history out of router-local baseline training
+and automatic identity merging.
 The local GUI is implemented, including the read-only M1b foundations in #17, #31 and #65.
 
 M1c field hardening includes a transport-gap/sequence-reset quality latch: when a helper restarts

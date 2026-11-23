@@ -12,7 +12,7 @@ from pathlib import Path
 
 from vigie_ingest.db import shard_name, utc_day
 from vigie_ingest.models import FUTURE_WINDOW_SLACK, MAX_WINDOW_SECONDS
-from vigie_pipeline.nextdns import LocalQuery, ReportError, canonical_name
+from vigie_pipeline.nextdns import LocalQuery, ReadLimitError, ReportError, canonical_name
 from vigie_pipeline.sources import normalize_mac
 
 MAX_BATCHES = 512
@@ -40,9 +40,7 @@ NON_DNS_LOSS_COUNTERS = frozenset(
 
 class CoverageError(ReportError):
     def __init__(self) -> None:
-        super().__init__(
-            "accepted router DNS coverage is missing, degraded, or exceeds read limits"
-        )
+        super().__init__("accepted router DNS coverage is missing or degraded")
 
 
 def _open_ro(path: Path) -> sqlite3.Connection:
@@ -176,7 +174,7 @@ def _read_local(
             (collector, coverage_end, coverage_start, MAX_BATCHES + 1),
         ).fetchall()
         if len(batches) > MAX_BATCHES:
-            raise CoverageError()
+            raise ReadLimitError()
         # A missing day inside the coverage interval cannot establish retained raw coverage.
         first_day, last_day = utc_day(coverage_start), utc_day(coverage_end - 1)
         for offset in range((last_day - first_day).days + 1):
@@ -204,7 +202,7 @@ def _read_local(
             rows = _batch_rows(dbs, resources, raw_dir, batch, collector)
             raw_rows_read += len(rows)
             if raw_rows_read > MAX_RAW_DNS:
-                raise CoverageError()
+                raise ReadLimitError()
             result.extend(row for row in rows if row.boundary or start <= row.ts < end)
         if covered_until < coverage_end:
             raise CoverageError()

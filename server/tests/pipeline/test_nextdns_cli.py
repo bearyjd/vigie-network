@@ -6,7 +6,9 @@ import json
 import os
 import signal
 import sqlite3
+import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +24,7 @@ from vigie_ingest.config import Settings
 from vigie_ingest.db import connect, ensure_shard, iso_utc, open_inventory, shard_name, utc_day
 from vigie_ingest.models import Health
 from vigie_ingest.store import provision_collector
-from vigie_pipeline import nextdns_cli
+from vigie_pipeline import nextdns, nextdns_cli, nextdns_raw
 from vigie_pipeline.essential_absence import configure_recording
 from vigie_pipeline.measurements import read_measurements
 from vigie_pipeline.schema import open_pipeline_inventory
@@ -38,6 +40,12 @@ KEY = "synthetic-operator-key"
 MAC = "02:00:00:00:00:01"
 QNAME = "sample.example"
 REASON = "threat-intelligence-feeds"
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix"
+    or not all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "setitimer")),
+    reason="NextDNS report integration requires POSIX interval timers",
+)
 
 
 def provider_row(ts=START + 15, *, status="blocked", reason=REASON, device=DEVICE):
@@ -113,6 +121,10 @@ class Sources:
     def https(self, host, *, timeout, context):
         assert host == "api.nextdns.io"
         assert timeout > 0
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname
+        assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+        assert context.keylog_filename is None
 
         class Connection:
             def request(connection, method, resource, *, headers):
@@ -164,7 +176,9 @@ def sources(tmp_path, monkeypatch):
     return result
 
 
-def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsys):
+def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, monkeypatch, capsys):
+    keylog_path = sources.root / "transport-keylog"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keylog_path))
     sources.batch("a", [(START + 15, MAC, QNAME, "A")])
     sources.batch("other", [(START + 15, "02:00:00:00:00:99", QNAME, "A")], collector_id="other")
     with closing(sqlite3.connect(sources.shard)) as db, db:
@@ -181,6 +195,7 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsy
     assert sources.run() == 0
     result = capsys.readouterr()
     assert not result.err
+    assert not keylog_path.exists()
     assert json.loads(result.out) == {
         "source": "nextdns",
         "provider_coverage": "unverified",
@@ -387,17 +402,12 @@ def test_rereads_raw_after_provider_to_include_late_accepted_competitor(
     assert json.loads(capsys.readouterr().out)["devices"] == []
 
 
-@pytest.mark.parametrize("failure", ["body", "pages", "duplicate", "short"])
+@pytest.mark.parametrize("failure", ["body", "duplicate", "short"])
 def test_provider_response_bounds_and_json_framing(sources, monkeypatch, capsys, failure):
-    from vigie_pipeline import nextdns
-
     sources.batch("a", [(START + 15, MAC, QNAME, "A")])
     if failure == "body":
         monkeypatch.setattr(nextdns, "MAX_PAGE_BYTES", 3)
         sources.pages = [page([provider_row()])]
-    elif failure == "pages":
-        monkeypatch.setattr(nextdns, "MAX_PAGES", 1)
-        sources.pages = [page([provider_row()], cursor="another")]
     elif failure == "duplicate":
         raw = json.dumps(page([provider_row()]))
         sources.pages = [Response((raw[:-1] + ', "data": []}').encode())]
@@ -762,3 +772,62 @@ def test_old_unknown_window_blocks_only_the_selected_collector(
         assert json.loads(result.out)["devices"] == [
             {"mac": MAC, "threat_intelligence_blocks": 1},
         ]
+
+
+@pytest.mark.parametrize("cursor", [None, "next-page"])
+def test_provider_page_limit_abstains_only_if_pagination_is_unfinished(
+    sources,
+    monkeypatch,
+    capsys,
+    cursor,
+):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    monkeypatch.setattr(nextdns, "MAX_PAGES", 1)
+    sources.pages = [page([provider_row()], cursor=cursor)]
+    status = sources.run()
+    result = capsys.readouterr()
+    assert len(sources.requests) == 1
+    if cursor is None:
+        assert status == 0 and not result.err
+        assert json.loads(result.out)["devices"] == [
+            {"mac": MAC, "threat_intelligence_blocks": 1},
+        ]
+    else:
+        assert status == 1
+        assert not result.out
+        assert result.err == (
+            "vigie-nextdns: window exceeds report read limits. Choose a shorter interval\n"
+        )
+
+
+@pytest.mark.parametrize("limit", ["MAX_BATCHES", "MAX_RAW_DNS"])
+def test_local_read_limit_fails_before_provider_request(sources, monkeypatch, capsys, limit):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.batch("b", [(START + 30, MAC, QNAME, "A")])
+    monkeypatch.setattr(nextdns_raw, limit, 1)
+    assert sources.run() == 1
+    assert not sources.requests
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == (
+        "vigie-nextdns: window exceeds report read limits. Choose a shorter interval\n"
+    )
+
+
+@pytest.mark.parametrize("failure", ["missing-timer", "worker-thread"])
+def test_unsupported_runtime_fails_before_reading_key(sources, monkeypatch, capsys, failure):
+    sources.key.unlink()
+    if failure == "missing-timer":
+        with monkeypatch.context() as patch:
+            patch.delattr(signal, "ITIMER_REAL")
+            status = sources.run()
+    else:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            status = workers.submit(sources.run).result()
+    assert status == 1
+    assert not sources.requests
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == (
+        "vigie-nextdns: report requires POSIX interval timers and the main thread\n"
+    )

@@ -12,6 +12,7 @@ import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from threading import current_thread, main_thread
 from time import time
 
 from vigie_ingest.config import BATCH_RETENTION_DAYS, SHARD_RETENTION_DEFAULT_DAYS
@@ -133,6 +134,12 @@ def _report_deadline() -> Iterator[None]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if (
+            os.name != "posix"
+            or current_thread() is not main_thread()
+            or not all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "setitimer"))
+        ):
+            raise nextdns.ReportError("report requires POSIX interval timers and the main thread")
         with _report_deadline():
             start, end, mac = _validate(args)
             key = _key_file(args.key_file)

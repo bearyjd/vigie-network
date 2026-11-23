@@ -1,8 +1,8 @@
 # NextDNS operator report
 
 Vigie can add third-party threat-feed context to a recent router DNS observation. Run the report
-manually for an investigation from an operator environment with read access to the ingest inventory
-database and raw DNS shards. Select the Vigie router collector that produced those records. The
+manually as a standalone command on a POSIX system with read access to the ingest inventory database
+and raw DNS shards. Select the Vigie router collector that produced those records. The
 pipeline and API services make no provider requests in normal operation.
 
 Before running the report, verify that the NextDNS log device ID was used exclusively for queries
@@ -29,12 +29,15 @@ seven days. Leave at least five minutes and four seconds after the retention bou
 at least ten minutes and four seconds before running the report. Verify that NextDNS logged the
 requested interval, including the four-second margins. The API can return only the records it
 still has. The command checks accepted batches and retained DNS rows, and exits without a report
-if it detects missing
-or degraded local data or cannot finish reading the provider pages. It needs ingest records
-that distinguish explicitly supplied DNS health and loss evidence from default values. Batches
-without window timestamps can prevent the report from establishing coverage until those records
-expire. An empty device list means the command found no attributable threat-feed matches among
-the available observations.
+if it detects missing or degraded local data or cannot finish reading the provider pages. It needs
+continuous coverage from ingest records that distinguish explicitly supplied DNS health and loss
+evidence from default values. Collector backlog or clock gaps can prevent coverage. Batches without
+window timestamps can prevent coverage until those records expire. An empty device list means the
+command found no attributable threat-feed matches among the available observations.
+
+The report reads up to 10,000 provider log entries, 512 local batches, and 30,000 local DNS rows,
+including the records needed to check nearby competing queries. Choose a shorter interval if the
+report reaches a read limit.
 
 The report requests raw logs across the selected profile for the time window, including entries
 for other device IDs. Local DNS names are used only in memory for matching. A match requires

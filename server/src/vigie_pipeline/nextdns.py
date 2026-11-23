@@ -34,6 +34,11 @@ class ReportError(RuntimeError):
     """Fixed operator-facing message. Source data and credentials never enter exceptions."""
 
 
+class ReadLimitError(ReportError):
+    def __init__(self) -> None:
+        super().__init__("window exceeds report read limits. Choose a shorter interval")
+
+
 class ProviderError(ReportError):
     def __init__(self) -> None:
         super().__init__("NextDNS logs unavailable, invalid, or incomplete")
@@ -190,7 +195,7 @@ def read_logs(profile: str, device: str, key: str, start: int, end: int) -> list
             raise ProviderError()
         cursors.add(cursor)
         query["cursor"] = cursor
-    raise ProviderError()
+    raise ReadLimitError()
 
 
 def _nearby_count(stamps: list[int], center: int, delta: int) -> int:
