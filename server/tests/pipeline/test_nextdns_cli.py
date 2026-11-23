@@ -171,6 +171,8 @@ class Sources:
 @pytest.fixture
 def sources(tmp_path, monkeypatch):
     result = Sources(tmp_path)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     monkeypatch.setattr(nextdns_cli, "time", lambda: END + 700)
     monkeypatch.setattr("http.client.HTTPSConnection", result.https)
     return result
@@ -929,3 +931,52 @@ def test_unordered_local_rows_still_compete(sources, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["ambiguity_withheld"] is True
     assert report["devices"] == [{"mac": MAC, "threat_intelligence_blocks": 1}]
+
+
+@pytest.mark.parametrize("edge", ["start", "end"])
+def test_later_accepted_batch_only_contributes_start_boundary_competition(sources, capsys, edge):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    low, high = END + 305, END + 330
+    ts = low if edge == "start" else high
+    sources.batch("later", [(ts, MAC, QNAME, "AAAA")], low=low, high=high)
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ambiguity_withheld"] is (edge == "start")
+    assert report["devices"] == (
+        [] if edge == "start" else [{"mac": MAC, "threat_intelligence_blocks": 1}]
+    )
+
+
+@pytest.mark.parametrize("eligible", [False, True])
+def test_later_batch_scan_requires_eligible_provider_evidence(sources, capsys, eligible):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.batch("later", [], low=END + 305, high=END + 330, dropped_batches=1)
+    sources.pages = [page([provider_row()] if eligible else [])]
+    status = sources.run()
+    report = capsys.readouterr()
+    assert len(sources.requests) == 1
+    if eligible:
+        assert status == 1 and not report.out and "coverage" in report.err
+    else:
+        assert status == 0 and not report.err
+        assert json.loads(report.out)["devices"] == []
+
+
+def test_later_batch_scan_limit_recommends_more_recent_or_shorter_interval(
+    sources,
+    monkeypatch,
+    capsys,
+):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.batch("later", [], low=END + 305, high=END + 330)
+    sources.pages = [page([provider_row()])]
+    monkeypatch.setattr(nextdns_raw, "MAX_BATCHES", 1)
+    assert sources.run() == 1
+    assert len(sources.requests) == 1
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == (
+        "vigie-nextdns: local evidence exceeds report read limits. "
+        "Choose a more recent or shorter interval\n"
+    )

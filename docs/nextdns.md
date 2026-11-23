@@ -38,7 +38,9 @@ command found no attributable threat-feed matches among the available observatio
 
 The report accepts up to 10,000 provider log entries and, per local snapshot, 512 batches and
 30,000 DNS rows. These limits include the records needed to check nearby competing queries.
-Choose a shorter interval if the report reaches a read limit.
+An eligible provider verdict also requires checking later accepted batches for start-edge rows
+that could represent an earlier query. Choose a shorter or more recent interval if the report
+reaches a read limit.
 
 The report requests raw logs across the selected profile for the time window, including entries
 for other device IDs. Local DNS names are used only in memory for matching. A match requires

@@ -134,9 +134,11 @@ def read_local(
     collector: str,
     start: int,
     end: int,
+    *,
+    include_later: bool = False,
 ) -> list[LocalQuery]:
     try:
-        return _read_local(inventory, raw_dir, collector, start, end)
+        return _read_local(inventory, raw_dir, collector, start, end, include_later=include_later)
     except (OSError, sqlite3.Error, ValueError, OverflowError, RecursionError) as exc:
         raise CoverageError() from exc
 
@@ -147,6 +149,8 @@ def _read_local(
     collector: str,
     start: int,
     end: int,
+    *,
+    include_later: bool,
 ) -> list[LocalQuery]:
     result: list[LocalQuery] = []
     # Ingest can clamp an input timestamp to a batch boundary. The surrounding accepted
@@ -171,12 +175,12 @@ def _read_local(
         batches = inv.execute(
             "SELECT batch_id,window_start,window_end,observation_kind,health,truncated,"
             "dropped_batches,dns_queries FROM batches WHERE collector_id=? "
-            "AND window_start <= ? AND window_end >= ? "
+            "AND window_end >= ? AND (? OR window_start <= ?) "
             "ORDER BY window_start,window_end LIMIT ?",
-            (collector, coverage_end, coverage_start, MAX_BATCHES + 1),
+            (collector, coverage_start, include_later, coverage_end, MAX_BATCHES + 1),
         ).fetchall()
         if len(batches) > MAX_BATCHES:
-            raise ReadLimitError()
+            raise ReadLimitError(later_scan=include_later)
         # A missing day inside the coverage interval cannot establish retained raw coverage.
         first_day, last_day = utc_day(coverage_start), utc_day(coverage_end - 1)
         for offset in range((last_day - first_day).days + 1):
@@ -198,14 +202,20 @@ def _read_local(
                 _batch_rows(dbs, resources, raw_dir, batch, collector)
                 continue
             _check_quality(batch)
-            if low > covered_until:
-                raise CoverageError()
-            covered_until = max(covered_until, high)
+            later = low > coverage_end
+            if not later:
+                if low > covered_until:
+                    raise CoverageError()
+                covered_until = max(covered_until, high)
             rows = _batch_rows(dbs, resources, raw_dir, batch, collector)
             raw_rows_read += len(rows)
             if raw_rows_read > MAX_RAW_DNS:
-                raise ReadLimitError()
-            result.extend(row for row in rows if row.boundary or start <= row.ts < end)
+                raise ReadLimitError(later_scan=include_later)
+            if later:
+                # Native clock deferral can raise an older query beyond the padded guard.
+                result.extend(row for row in rows if row.start_boundary)
+            else:
+                result.extend(row for row in rows if row.boundary or start <= row.ts < end)
         if covered_until < coverage_end:
             raise CoverageError()
     return result

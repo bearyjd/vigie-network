@@ -151,7 +151,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             # accepted during the fetch still compete for attribution.
             nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
             provider = nextdns.read_logs(args.profile, args.device, key, low, high)
-            local = nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
+            include_later = any(
+                row.eligible_verdict
+                and start * nextdns.MICROSECONDS <= row.stamp_us < end * nextdns.MICROSECONDS
+                for row in provider
+            )
+            local = nextdns_raw.read_local(
+                args.inventory, args.raw_dir, args.collector, low, high, include_later=include_later
+            )
             count, ambiguity_withheld = nextdns.summarize_matches(local, provider, mac, start, end)
             report = {
                 "source": "nextdns",
