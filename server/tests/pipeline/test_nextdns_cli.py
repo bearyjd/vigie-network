@@ -951,7 +951,7 @@ def test_later_accepted_batch_only_contributes_start_boundary_competition(source
 @pytest.mark.parametrize("eligible", [False, True])
 def test_later_batch_scan_requires_eligible_provider_evidence(sources, capsys, eligible):
     sources.batch("a", [(START + 15, MAC, QNAME, "A")])
-    sources.batch("later", [], low=END + 305, high=END + 330, dropped_batches=1)
+    sources.batch("later", [], low=END + 305, high=END + 330, truncated='{"dns":1}')
     sources.pages = [page([provider_row()] if eligible else [])]
     status = sources.run()
     report = capsys.readouterr()
@@ -963,20 +963,74 @@ def test_later_batch_scan_requires_eligible_provider_evidence(sources, capsys, e
         assert json.loads(report.out)["devices"] == []
 
 
-def test_later_batch_scan_limit_recommends_more_recent_or_shorter_interval(
+@pytest.mark.parametrize("late_edge", [False, True])
+def test_native_minute_windows_beyond_guard_do_not_consume_report_caps(
     sources,
     monkeypatch,
     capsys,
+    late_edge,
 ):
     sources.batch("a", [(START + 15, MAC, QNAME, "A")])
-    sources.batch("later", [], low=END + 305, high=END + 330)
+    by_day = {}
+    accepted = []
+    count = 520
+    first = END + 305
+    for index in range(count):
+        low = first + 60 * index
+        high = low + 60
+        batch_id = f"later-{index}"
+        health = (
+            '{"dns_log_quiet":false,"dns_evidence_reported":true,"spool_batches":0,"uptime_s":600}'
+        )
+        accepted.append((COLLECTOR, batch_id, iso_utc(high + 1), low, high, 60, health))
+        for position in range(60):
+            ts = (
+                low
+                if late_edge and index == count - 1 and position == 0
+                else low + 1 + position % 59
+            )
+            by_day.setdefault(utc_day(ts), []).append((COLLECTOR, batch_id, ts, MAC, QNAME, "A"))
+    with closing(sqlite3.connect(sources.inventory)) as inv, inv:
+        inv.executemany(
+            "INSERT INTO batches (collector_id,batch_id,received_at,window_start,window_end,"
+            "dns_queries,observation_kind,truncated,dropped_batches,health) VALUES"
+            " (?,?,?,?,?,?,'observation','{}',0,?)",
+            accepted,
+        )
+    for day, rows in by_day.items():
+        ensure_shard(sources.root, day)
+        with closing(sqlite3.connect(sources.root / shard_name(day))) as db, db:
+            db.executemany(
+                "INSERT INTO raw_dns(collector_id,batch_id,ts,device_mac,qname,qtype)"
+                " VALUES(?,?,?,?,?,?)",
+                rows,
+            )
+    monkeypatch.setattr(nextdns_cli, "time", lambda: first + 60 * count + 60)
     sources.pages = [page([provider_row()])]
-    monkeypatch.setattr(nextdns_raw, "MAX_BATCHES", 1)
-    assert sources.run() == 1
-    assert len(sources.requests) == 1
-    result = capsys.readouterr()
-    assert not result.out
-    assert result.err == (
-        "vigie-nextdns: local evidence exceeds report read limits. "
-        "Choose a more recent or shorter interval\n"
+    assert sources.run() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ambiguity_withheld"] is late_edge
+    assert result["devices"] == (
+        [] if late_edge else [{"mac": MAC, "threat_intelligence_blocks": 1}]
     )
+
+
+@pytest.mark.parametrize("missing_row", [False, True])
+def test_later_midnight_batch_reconciles_rows_in_both_shards(sources, capsys, missing_row):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    midnight = (START // 86400 + 1) * 86400
+    sources.batch(
+        "rollover",
+        [(midnight + 1, MAC, QNAME, "A")],
+        low=midnight - 30,
+        high=midnight + 30,
+        dns_queries=2 if missing_row else 1,
+    )
+    sources.pages = [page([provider_row()])]
+    status = sources.run()
+    result = capsys.readouterr()
+    if missing_row:
+        assert status == 1 and not result.out and "coverage" in result.err
+    else:
+        assert status == 0 and not result.err
+        assert json.loads(result.out)["devices"] == [{"mac": MAC, "threat_intelligence_blocks": 1}]

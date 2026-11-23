@@ -36,11 +36,12 @@ evidence from default values. Collector backlog or clock gaps can prevent covera
 window timestamps can prevent coverage until those records expire. An empty device list means the
 command found no attributable threat-feed matches among the available observations.
 
-The report accepts up to 10,000 provider log entries and, per local snapshot, 512 batches and
-30,000 DNS rows. These limits include the records needed to check nearby competing queries.
-An eligible provider verdict also requires checking later accepted batches for start-edge rows
-that could represent an earlier query. Choose a shorter or more recent interval if the report
-reaches a read limit.
+The report accepts up to 10,000 provider log entries. Each local coverage check can read up to
+512 batches and 30,000 DNS rows in the guarded interval. An eligible provider verdict also triggers
+a separate scan of later retained batches. The scan checks accepted row counts and reads only
+start-edge queries that could represent an earlier observation. Missing records or reported DNS
+loss in those batches can prevent attribution. The command exits without a report if the read
+limits or overall deadline prevent it from finishing.
 
 The report requests raw logs across the selected profile for the time window, including entries
 for other device IDs. Local DNS names are used only in memory for matching. A match requires

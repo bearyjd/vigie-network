@@ -7,7 +7,7 @@ import os
 import sqlite3
 import stat
 from contextlib import ExitStack, closing
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 from vigie_ingest.db import shard_name, utc_day
@@ -18,6 +18,8 @@ from vigie_pipeline.sources import normalize_mac
 MAX_BATCHES = 512
 MAX_BATCH_DNS = 5000  # ingest Batch.dns maximum
 MAX_RAW_DNS = 30_000
+EPOCH_DAY = date(1970, 1, 1)
+DAY_SECONDS = 86400
 # The known source flags and these counters concern conntrack or multicast, not dnsmasq.
 # Future flags and counters can signal DNS loss and must fail closed.
 NON_DNS_SOURCE_FLAGS = 0b1111
@@ -83,17 +85,28 @@ def _check_quality(batch: sqlite3.Row) -> None:
         raise CoverageError()
 
 
+def _window_bounds(batch: sqlite3.Row) -> tuple[int, int]:
+    low, high = batch["window_start"], batch["window_end"]
+    if type(low) is not int or type(high) is not int or not 0 <= high - low <= MAX_WINDOW_SECONDS:
+        raise CoverageError()
+    return low, high
+
+
 def _batch_rows(
     dbs: dict[Path, sqlite3.Connection],
     resources: ExitStack,
     raw_dir: Path,
     batch: sqlite3.Row,
     collector: str,
+    *,
+    starts_only: bool = False,
 ) -> list[LocalQuery]:
-    low, high = batch["window_start"], batch["window_end"]
-    day, last_day = utc_day(low), utc_day(high)
+    low, high = _window_bounds(batch)
+    first_day, last_day = utc_day(low), utc_day(high)
     result = []
-    while day <= last_day:
+    counted = 0
+    for offset in range((last_day - first_day).days + 1):
+        day = first_day + timedelta(days=offset)
         path = raw_dir / shard_name(day)
         # No DNS rows on a day is possible. The accepted full-row count below verifies that
         # skipping an absent shard did not remove a row from this batch.
@@ -101,11 +114,40 @@ def _batch_rows(
             if path not in dbs:
                 dbs[path] = resources.enter_context(closing(_open_ro(path)))
                 dbs[path].execute("BEGIN")
-            rows = dbs[path].execute(
-                "SELECT ts,device_mac,qname FROM raw_dns "
-                "WHERE collector_id=? AND batch_id=? LIMIT ?",
-                (collector, batch["batch_id"], MAX_BATCH_DNS + 1),
-            )
+            if starts_only:
+                # Reconcile all accepted rows by batch index without loading interior DNS names.
+                shard_start = (day - EPOCH_DAY).days * DAY_SECONDS
+                total, in_window = (
+                    dbs[path]
+                    .execute(
+                        "SELECT COUNT(*), COUNT(CASE WHEN typeof(ts) = 'integer' "
+                        "AND ts BETWEEN ? AND ? THEN 1 END) FROM raw_dns "
+                        "WHERE collector_id=? AND batch_id=?",
+                        (
+                            max(low, shard_start),
+                            min(high, shard_start + DAY_SECONDS - 1),
+                            collector,
+                            batch["batch_id"],
+                        ),
+                    )
+                    .fetchone()
+                )
+                counted += total
+                if total != in_window or counted > batch["dns_queries"]:
+                    raise CoverageError()
+                if offset or not total:
+                    continue
+                rows = dbs[path].execute(
+                    "SELECT ts,device_mac,qname FROM raw_dns "
+                    "WHERE collector_id=? AND batch_id=? AND ts=? LIMIT ?",
+                    (collector, batch["batch_id"], low, MAX_BATCH_DNS + 1),
+                )
+            else:
+                rows = dbs[path].execute(
+                    "SELECT ts,device_mac,qname FROM raw_dns "
+                    "WHERE collector_id=? AND batch_id=? LIMIT ?",
+                    (collector, batch["batch_id"], MAX_BATCH_DNS + 1),
+                )
             for row in rows:
                 ts = row["ts"]
                 name = canonical_name(row["qname"])
@@ -122,8 +164,7 @@ def _batch_rows(
                 result.append(
                     LocalQuery(ts, name, mac, start_boundary=ts == low, end_boundary=ts == high)
                 )
-        day += timedelta(days=1)
-    if len(result) != batch["dns_queries"]:
+    if (counted if starts_only else len(result)) != batch["dns_queries"]:
         raise CoverageError()
     return result
 
@@ -135,10 +176,10 @@ def read_local(
     start: int,
     end: int,
     *,
-    include_later: bool = False,
+    later_names: set[str] | None = None,
 ) -> list[LocalQuery]:
     try:
-        return _read_local(inventory, raw_dir, collector, start, end, include_later=include_later)
+        return _read_local(inventory, raw_dir, collector, start, end, later_names=later_names)
     except (OSError, sqlite3.Error, ValueError, OverflowError, RecursionError) as exc:
         raise CoverageError() from exc
 
@@ -150,7 +191,7 @@ def _read_local(
     start: int,
     end: int,
     *,
-    include_later: bool,
+    later_names: set[str] | None,
 ) -> list[LocalQuery]:
     result: list[LocalQuery] = []
     # Ingest can clamp an input timestamp to a batch boundary. The surrounding accepted
@@ -175,12 +216,12 @@ def _read_local(
         batches = inv.execute(
             "SELECT batch_id,window_start,window_end,observation_kind,health,truncated,"
             "dropped_batches,dns_queries FROM batches WHERE collector_id=? "
-            "AND window_end >= ? AND (? OR window_start <= ?) "
+            "AND window_start <= ? AND window_end >= ? "
             "ORDER BY window_start,window_end LIMIT ?",
-            (collector, coverage_start, include_later, coverage_end, MAX_BATCHES + 1),
+            (collector, coverage_end, coverage_start, MAX_BATCHES + 1),
         ).fetchall()
         if len(batches) > MAX_BATCHES:
-            raise ReadLimitError(later_scan=include_later)
+            raise ReadLimitError()
         # A missing day inside the coverage interval cannot establish retained raw coverage.
         first_day, last_day = utc_day(coverage_start), utc_day(coverage_end - 1)
         for offset in range((last_day - first_day).days + 1):
@@ -190,32 +231,41 @@ def _read_local(
         covered_until = coverage_start
         raw_rows_read = 0
         for batch in batches:
-            low, high = batch["window_start"], batch["window_end"]
-            if (
-                type(low) is not int
-                or type(high) is not int
-                or not 0 <= high - low <= MAX_WINDOW_SECONDS
-            ):
-                raise CoverageError()
+            low, high = _window_bounds(batch)
             # Signed transport probes carry no observations and provide no coverage.
             if batch["observation_kind"] == "probe" and batch["dns_queries"] == 0:
                 _batch_rows(dbs, resources, raw_dir, batch, collector)
                 continue
             _check_quality(batch)
-            later = low > coverage_end
-            if not later:
-                if low > covered_until:
-                    raise CoverageError()
-                covered_until = max(covered_until, high)
+            if low > covered_until:
+                raise CoverageError()
+            covered_until = max(covered_until, high)
             rows = _batch_rows(dbs, resources, raw_dir, batch, collector)
             raw_rows_read += len(rows)
             if raw_rows_read > MAX_RAW_DNS:
-                raise ReadLimitError(later_scan=include_later)
-            if later:
-                # Native clock deferral can raise an older query beyond the padded guard.
-                result.extend(row for row in rows if row.start_boundary)
-            else:
-                result.extend(row for row in rows if row.boundary or start <= row.ts < end)
+                raise ReadLimitError()
+            result.extend(row for row in rows if row.boundary or start <= row.ts < end)
         if covered_until < coverage_end:
             raise CoverageError()
+        if later_names:
+            # Clock deferral can raise a query to a start boundary beyond the guarded interval.
+            # Stream the rest of the retained batches, retaining at most one edge per eligible
+            # name. The latest edge subsumes every earlier edge's directional veto.
+            latest: dict[str, LocalQuery] = {}
+            later_batches = inv.execute(
+                "SELECT batch_id,window_start,window_end,observation_kind,health,truncated,"
+                "dropped_batches,dns_queries FROM batches WHERE collector_id=? "
+                "AND window_start > ?",
+                (collector, coverage_end),
+            )
+            for batch in later_batches:
+                if batch["observation_kind"] != "probe" or batch["dns_queries"] != 0:
+                    # A later loss flag can hide a query that was raised to this batch's start.
+                    _check_quality(batch)
+                for row in _batch_rows(dbs, resources, raw_dir, batch, collector, starts_only=True):
+                    if row.name in later_names and (
+                        row.name not in latest or row.ts > latest[row.name].ts
+                    ):
+                        latest[row.name] = row
+            result.extend(latest.values())
     return result

@@ -36,14 +36,8 @@ class ReportError(RuntimeError):
 
 
 class ReadLimitError(ReportError):
-    def __init__(self, *, later_scan: bool = False) -> None:
-        if later_scan:
-            super().__init__(
-                "local evidence exceeds report read limits. "
-                "Choose a more recent or shorter interval"
-            )
-        else:
-            super().__init__("window exceeds report read limits. Choose a shorter interval")
+    def __init__(self) -> None:
+        super().__init__("window exceeds report read limits. Choose a shorter interval")
 
 
 class ProviderError(ReportError):
