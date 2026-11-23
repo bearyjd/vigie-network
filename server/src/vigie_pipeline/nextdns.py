@@ -10,6 +10,7 @@ from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from urllib.parse import urlencode
 
 from vigie_ingest.db import iso_utc
@@ -192,51 +193,56 @@ def read_logs(profile: str, device: str, key: str, start: int, end: int) -> list
     raise ProviderError()
 
 
-def count_matches(
+def _nearby_count(stamps: list[int], center: int, delta: int) -> int:
+    return bisect_right(stamps, center + delta) - bisect_left(stamps, center - delta)
+
+
+def summarize_matches(
     local: list[LocalQuery],
     provider: list[ProviderQuery],
     mac: str,
     start: int,
     end: int,
-) -> int:
-    """Require mutual uniqueness while retaining rows ineligible for a positive match."""
+) -> tuple[int, bool]:
+    """Return the positive match count and whether any scoped candidate was ambiguous."""
     clamped_names: set[str] = set()
-    by_name: dict[str, list[int]] = defaultdict(list)
+    local_stamps: dict[str, list[int]] = defaultdict(list)
     for row in local:
         if row.boundary:
             # A deferred collector clock can place an older query at the start of its batch.
             clamped_names.add(row.name)
         else:
-            by_name[row.name].append(row.ts * MICROSECONDS)
-    remote: dict[str, list[ProviderQuery]] = defaultdict(list)
+            local_stamps[row.name].append(row.ts * MICROSECONDS)
+
+    provider_stamps: dict[str, list[int]] = defaultdict(list)
+    eligible_stamps: dict[str, list[int]] = defaultdict(list)
+    start_us, end_us = start * MICROSECONDS, end * MICROSECONDS
     for event in provider:
-        remote[event.name].append(event)
-    for stamps in by_name.values():
+        provider_stamps[event.name].append(event.stamp_us)
+        if event.eligible_verdict and start_us <= event.stamp_us < end_us:
+            eligible_stamps[event.name].append(event.stamp_us)
+    for stamps in chain(local_stamps.values(), provider_stamps.values(), eligible_stamps.values()):
         stamps.sort()
-    for events in remote.values():
-        events.sort(key=lambda row: row.stamp_us)
 
     count = 0
+    ambiguity_withheld = False
     delta = TOLERANCE_S * MICROSECONDS
-    interval_start_us = start * MICROSECONDS
-    interval_end_us = end * MICROSECONDS
     for row in local:
-        if row.boundary or row.mac != mac or not start <= row.ts < end or row.name in clamped_names:
+        if row.mac != mac or not start <= row.ts < end:
             continue
-        events = remote.get(row.name)
-        if not events:
+        eligible = eligible_stamps.get(row.name)
+        if not eligible:
             continue
         stamp = row.ts * MICROSECONDS
-        low = bisect_left(events, stamp - delta, key=lambda event: event.stamp_us)
-        high = bisect_right(events, stamp + delta, key=lambda event: event.stamp_us)
-        if high - low != 1:
+        index = bisect_left(eligible, stamp - delta)
+        if index == len(eligible) or eligible[index] > stamp + delta:
             continue
-        event = events[low]
-        if not event.eligible_verdict or not interval_start_us <= event.stamp_us < interval_end_us:
-            continue
-        stamps = by_name[row.name]
-        low = bisect_left(stamps, event.stamp_us - delta)
-        high = bisect_right(stamps, event.stamp_us + delta)
-        if high - low == 1:
+        if (
+            row.name in clamped_names
+            or _nearby_count(provider_stamps[row.name], stamp, delta) != 1
+            or _nearby_count(local_stamps[row.name], eligible[index], delta) != 1
+        ):
+            ambiguity_withheld = True
+        else:
             count += 1
-    return count
+    return count, ambiguity_withheld

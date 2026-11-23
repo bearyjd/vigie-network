@@ -143,10 +143,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
             provider = nextdns.read_logs(args.profile, args.device, key, low, high)
             local = nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
-            count = nextdns.count_matches(local, provider, mac, start, end)
+            count, ambiguity_withheld = nextdns.summarize_matches(local, provider, mac, start, end)
             report = {
                 "source": "nextdns",
                 "provider_coverage": "unverified",
+                "ambiguity_withheld": ambiguity_withheld,
                 "window": {"from": args.start, "to": args.end},
                 "devices": [{"mac": mac, "threat_intelligence_blocks": count}] if count else [],
             }

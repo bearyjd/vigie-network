@@ -184,6 +184,7 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsy
     assert json.loads(result.out) == {
         "source": "nextdns",
         "provider_coverage": "unverified",
+        "ambiguity_withheld": False,
         "window": {"from": iso_utc(START), "to": iso_utc(END)},
         "devices": [{"mac": MAC, "threat_intelligence_blocks": 1}],
     }
@@ -207,21 +208,28 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsy
 
 
 @pytest.mark.parametrize(
-    ("local", "provider"),
+    ("local", "provider", "ambiguity_withheld"),
     [
-        ([(START + 15, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "AAAA")], [provider_row()]),
-        ([(START + 15, MAC, QNAME, "A")] * 2, [provider_row()]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row()] * 2),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(), provider_row(status="future")]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(), provider_row(device=None)]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(device=None)]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(reason="blocklist:oisd")]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(reason="security:" + REASON)]),
-        ([(START + 15, MAC, QNAME, "A")], [provider_row(status="allowed")]),
-        ([(START + 15, MAC, "other.sample.example", "A")], [provider_row()]),
-        ([(START + 13, MAC, QNAME, "A")], [provider_row()]),
-        ([(COVERAGE_LOW, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "A")], [provider_row()]),
-        ([(COVERAGE_LOW, MAC, QNAME, "A")], [provider_row()]),
+        ([], [], False),
+        ([], [provider_row()], False),
+        (
+            [(START + 15, MAC, QNAME, "A")],
+            [provider_row(device=None), provider_row(device=None)],
+            False,
+        ),
+        ([(START + 15, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "AAAA")], [provider_row()], True),
+        ([(START + 15, MAC, QNAME, "A")] * 2, [provider_row()], True),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row()] * 2, True),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(), provider_row(status="future")], True),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(), provider_row(device=None)], True),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(device=None)], False),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(reason="blocklist:oisd")], False),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(reason="security:" + REASON)], False),
+        ([(START + 15, MAC, QNAME, "A")], [provider_row(status="allowed")], False),
+        ([(START + 15, MAC, "other.sample.example", "A")], [provider_row()], False),
+        ([(START + 13, MAC, QNAME, "A")], [provider_row()], False),
+        ([(COVERAGE_LOW, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "A")], [provider_row()], True),
+        ([(COVERAGE_LOW, MAC, QNAME, "A")], [provider_row()], False),
     ],
 )
 def test_excludes_non_unique_unbound_non_threat_and_imprecise_candidates(
@@ -229,11 +237,14 @@ def test_excludes_non_unique_unbound_non_threat_and_imprecise_candidates(
     capsys,
     local,
     provider,
+    ambiguity_withheld,
 ):
     sources.batch("a", local)
     sources.pages = [page(provider)]
     assert sources.run() == 0
-    assert json.loads(capsys.readouterr().out)["devices"] == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["devices"] == []
+    assert result["ambiguity_withheld"] is ambiguity_withheld
 
 
 def test_mutual_uniqueness_includes_both_padded_margins(sources, capsys):
@@ -579,14 +590,18 @@ def test_positive_provider_timestamp_must_be_inside_requested_window(
     # Exact whole-second provider timestamp exercises the end-exclusive boundary.
     sources.pages = [page([{**provider_row(), "timestamp": iso_utc(provider_ts)}])]
     assert sources.run() == 0
-    assert bool(json.loads(capsys.readouterr().out)["devices"]) is expected
+    result = json.loads(capsys.readouterr().out)
+    assert bool(result["devices"]) is expected
+    assert result["ambiguity_withheld"] is False
 
 
 def test_outside_provider_event_remains_an_ambiguity_competitor(sources, capsys):
     sources.batch("a", [(START, MAC, QNAME, "A")])
     sources.pages = [page([provider_row(START - 1, status="default"), provider_row(START)])]
     assert sources.run() == 0
-    assert json.loads(capsys.readouterr().out)["devices"] == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["devices"] == []
+    assert result["ambiguity_withheld"] is True
 
 
 def test_dns_root_can_coexist_with_a_match_without_becoming_a_verdict(sources, capsys):
@@ -706,3 +721,44 @@ def test_alarm_delivered_while_cancelling_stays_sanitized_and_restores_handler(
     result = capsys.readouterr()
     assert not result.out
     assert result.err == "vigie-nextdns: report time limit exceeded\n"
+
+
+def test_selected_mac_boundary_inside_interval_withholds_attribution(sources, capsys):
+    sources.batch("a", [])
+    sources.batch("clamped", [(START + 15, MAC, QNAME, "A")], low=START + 15)
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["devices"] == []
+    assert result["ambiguity_withheld"] is True
+
+
+@pytest.mark.parametrize("legacy_collector", [COLLECTOR, "another-collector"])
+def test_old_unknown_window_blocks_only_the_selected_collector(
+    sources,
+    capsys,
+    legacy_collector,
+):
+    old_received = iso_utc(START - 6 * 86400)
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.batch(
+        "synthetic-legacy-row",
+        [],
+        collector_id=legacy_collector,
+        received_at=old_received,
+        window_start=None,
+        window_end=None,
+    )
+    sources.pages = [page([provider_row()])]
+    code = sources.run()
+    result = capsys.readouterr()
+    if legacy_collector == COLLECTOR:
+        assert code == 1 and not sources.requests and not result.out
+        assert "legacy batches without observation timestamps" in result.err
+        assert "age out" in result.err
+        assert all(secret not in result.err for secret in (legacy_collector, old_received, KEY))
+    else:
+        assert code == 0 and not result.err
+        assert json.loads(result.out)["devices"] == [
+            {"mac": MAC, "threat_intelligence_blocks": 1},
+        ]

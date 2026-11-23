@@ -156,11 +156,22 @@ def _read_local(
     with ExitStack() as resources:
         inv = resources.enter_context(closing(_open_ro(inventory)))
         inv.execute("BEGIN")
+        # Accepted receipts without event bounds can overlap any window because spool age is
+        # configurable. The original receipt time cannot prove that they are irrelevant.
+        legacy = inv.execute(
+            "SELECT 1 FROM batches WHERE collector_id=? "
+            "AND (window_start IS NULL OR window_end IS NULL) LIMIT 1",
+            (collector,),
+        ).fetchone()
+        if legacy is not None:
+            raise ReportError(
+                "accepted router DNS coverage includes legacy batches without observation "
+                "timestamps. Retry after they age out"
+            )
         batches = inv.execute(
             "SELECT batch_id,window_start,window_end,observation_kind,health,truncated,"
-            "dropped_batches,dns_queries FROM batches WHERE collector_id=? AND "
-            "((window_start <= ? AND window_end >= ?) OR "
-            "window_start IS NULL OR window_end IS NULL) "
+            "dropped_batches,dns_queries FROM batches WHERE collector_id=? "
+            "AND window_start <= ? AND window_end >= ? "
             "ORDER BY window_start,window_end LIMIT ?",
             (collector, coverage_end, coverage_start, MAX_BATCHES + 1),
         ).fetchall()
