@@ -140,6 +140,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             or not all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "setitimer"))
         ):
             raise nextdns.ReportError("report requires POSIX interval timers and the main thread")
+        if "SSL_CERT_FILE" in os.environ or "SSL_CERT_DIR" in os.environ:
+            raise nextdns.ReportError("custom TLS trust environment is unsupported")
         with _report_deadline():
             start, end, mac = _validate(args)
             key = _key_file(args.key_file)

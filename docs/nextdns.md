@@ -14,6 +14,7 @@ Store the NextDNS API key in a private file readable only by its owner. NextDNS 
 API key that can also authenticate API operations that change settings or delete logs. Run the
 command as the database file owner because SQLite can create WAL companion files beside a database
 on a writable mount. Use a consistent local copy or a read-only mount where available.
+The HTTPS connection uses the system trust store. Run with `SSL_CERT_FILE` and `SSL_CERT_DIR` unset.
 [NextDNS API documentation](https://nextdns.github.io/api/)
 
 ```bash
@@ -35,9 +36,9 @@ evidence from default values. Collector backlog or clock gaps can prevent covera
 window timestamps can prevent coverage until those records expire. An empty device list means the
 command found no attributable threat-feed matches among the available observations.
 
-The report reads up to 10,000 provider log entries, 512 local batches, and 30,000 local DNS rows,
-including the records needed to check nearby competing queries. Choose a shorter interval if the
-report reaches a read limit.
+The report accepts up to 10,000 provider log entries and, per local snapshot, 512 batches and
+30,000 DNS rows. These limits include the records needed to check nearby competing queries.
+Choose a shorter interval if the report reaches a read limit.
 
 The report requests raw logs across the selected profile for the time window, including entries
 for other device IDs. Local DNS names are used only in memory for matching. A match requires
@@ -46,13 +47,17 @@ normalized name, timestamps within two seconds and the exact configured local MA
 device ID. Both timestamps must be inside the requested window. Other events with the same
 name and a nearby timestamp can make the match ambiguous, including non-security events and
 simultaneous A and AAAA queries. The router timestamps queries when it reads the dnsmasq log.
+Rows on a stored window edge cannot establish a match. A window-end row can compete with nearby
+provider events within the ingest timestamp allowance. A window-start row can represent an earlier
+query if the collector corrected its timestamp after a clock deferral.
 Poll lag and clock skew can put related events outside the two-second match window. Treat the
 result as context for an observed query and the DNS decision reported by NextDNS.
 
 The report accepts a blocked verdict with the exact `threat-intelligence-feeds` reason ID. NextDNS
 documents structured reason IDs, and this ID appears in a public example of a NextDNS log CSV.
 The public Logs API example does not enumerate security IDs. JSON support for this reason has
-been tested with synthetic transport. [NextDNS Logs API](https://nextdns.github.io/api/#logs)
+been tested with synthetic transport. NextDNS documents an inclusive `from` and exclusive `to`
+for the requested provider interval. [NextDNS Logs API](https://nextdns.github.io/api/#logs)
 · [Public log excerpt](https://help.nextdns.io/t/h7yz86r/threat-intelligence-block)
 
 Output is local JSON with observed MAC addresses and third-party reason counts for the selected

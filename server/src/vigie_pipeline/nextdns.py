@@ -14,6 +14,7 @@ from itertools import chain
 from urllib.parse import urlencode
 
 from vigie_ingest.db import iso_utc
+from vigie_ingest.models import FUTURE_WINDOW_SLACK
 
 HOST = "api.nextdns.io"
 PAGE_SIZE = 1000
@@ -49,7 +50,12 @@ class LocalQuery:
     ts: int
     name: str
     mac: str | None
-    boundary: bool
+    start_boundary: bool
+    end_boundary: bool
+
+    @property
+    def boundary(self) -> bool:
+        return self.start_boundary or self.end_boundary
 
 
 @dataclass(frozen=True)
@@ -210,14 +216,17 @@ def summarize_matches(
     end: int,
 ) -> tuple[int, bool]:
     """Return the positive match count and whether any scoped candidate was ambiguous."""
-    clamped_names: set[str] = set()
+    latest_start_boundary: dict[str, int] = {}
+    end_boundaries: dict[str, list[int]] = defaultdict(list)
     local_stamps: dict[str, list[int]] = defaultdict(list)
     for row in local:
-        if row.boundary:
-            # A deferred collector clock can place an older query at the start of its batch.
-            clamped_names.add(row.name)
-        else:
-            local_stamps[row.name].append(row.ts * MICROSECONDS)
+        stamp = row.ts * MICROSECONDS
+        if row.start_boundary:
+            latest_start_boundary[row.name] = max(stamp, latest_start_boundary.get(row.name, stamp))
+        if row.end_boundary:
+            end_boundaries[row.name].append(stamp)
+        if not row.boundary:
+            local_stamps[row.name].append(stamp)
 
     provider_stamps: dict[str, list[int]] = defaultdict(list)
     eligible_stamps: dict[str, list[int]] = defaultdict(list)
@@ -226,12 +235,18 @@ def summarize_matches(
         provider_stamps[event.name].append(event.stamp_us)
         if event.eligible_verdict and start_us <= event.stamp_us < end_us:
             eligible_stamps[event.name].append(event.stamp_us)
-    for stamps in chain(local_stamps.values(), provider_stamps.values(), eligible_stamps.values()):
+    for stamps in chain(
+        local_stamps.values(),
+        end_boundaries.values(),
+        provider_stamps.values(),
+        eligible_stamps.values(),
+    ):
         stamps.sort()
 
     count = 0
     ambiguity_withheld = False
     delta = TOLERANCE_S * MICROSECONDS
+    slack = FUTURE_WINDOW_SLACK * MICROSECONDS
     for row in local:
         if row.mac != mac or not start <= row.ts < end:
             continue
@@ -242,10 +257,18 @@ def summarize_matches(
         index = bisect_left(eligible, stamp - delta)
         if index == len(eligible) or eligible[index] > stamp + delta:
             continue
+        event = eligible[index]
+        latest_start = latest_start_boundary.get(row.name)
+        ends = end_boundaries.get(row.name, [])
+        end_index = bisect_left(ends, event - slack - delta)
+        # Native clock deferral can move an older query arbitrarily far forward to a window
+        # start. Ingest can only move newer queries backward to the end within its input slack.
         if (
-            row.name in clamped_names
+            row.boundary
+            or (latest_start is not None and event <= latest_start + delta)
+            or (end_index < len(ends) and ends[end_index] <= event + delta)
             or _nearby_count(provider_stamps[row.name], stamp, delta) != 1
-            or _nearby_count(local_stamps[row.name], eligible[index], delta) != 1
+            or _nearby_count(local_stamps[row.name], event, delta) != 1
         ):
             ambiguity_withheld = True
         else:

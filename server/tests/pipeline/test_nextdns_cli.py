@@ -243,7 +243,6 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, monke
         ([(START + 15, MAC, QNAME, "A")], [provider_row(status="allowed")], False),
         ([(START + 15, MAC, "other.sample.example", "A")], [provider_row()], False),
         ([(START + 13, MAC, QNAME, "A")], [provider_row()], False),
-        ([(COVERAGE_LOW, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "A")], [provider_row()], True),
         ([(COVERAGE_LOW, MAC, QNAME, "A")], [provider_row()], False),
     ],
 )
@@ -831,3 +830,102 @@ def test_unsupported_runtime_fails_before_reading_key(sources, monkeypatch, caps
     assert result.err == (
         "vigie-nextdns: report requires POSIX interval timers and the main thread\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("edge", "boundary_ts", "withheld"),
+    [
+        ("start", START - 10, False),
+        ("start", END + 302, True),
+        ("end", START - 289, False),
+        ("end", START - 286, True),
+        ("end", START + 17, True),
+        ("end", START + 18, False),
+    ],
+)
+def test_clamp_candidates_veto_only_in_possible_time_direction(
+    sources, capsys, edge, boundary_ts, withheld
+):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    other_mac = "02:00:00:00:00:99"
+    bounds = {"low": boundary_ts} if edge == "start" else {"high": boundary_ts}
+    sources.batch("boundary", [(boundary_ts, other_mac, QNAME, "AAAA")], **bounds)
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ambiguity_withheld"] is withheld
+    assert report["devices"] == (
+        [] if withheld else [{"mac": MAC, "threat_intelligence_blocks": 1}]
+    )
+
+
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_custom_tls_trust_environment_fails_before_key_or_provider(
+    sources, monkeypatch, capsys, variable
+):
+    sources.key.unlink()
+    monkeypatch.setenv(variable, "/example/synthetic-custom-ca")
+    assert sources.run() == 1
+    assert not sources.requests
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == "vigie-nextdns: custom TLS trust environment is unsupported\n"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "encoding",
+        "oversized-page",
+        "long-cursor",
+        "invalid-cursor",
+        "to",
+        "unordered",
+        "unordered-pages",
+    ],
+)
+def test_invalid_provider_page_evidence_fails_closed(sources, capsys, failure):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+
+    class EncodedResponse(Response):
+        def getheader(self, header):
+            return "gzip" if header == "Content-Encoding" else None
+
+    if failure == "encoding":
+        sources.pages = [EncodedResponse(json.dumps(page([provider_row()])).encode())]
+    elif failure == "oversized-page":
+        sources.pages = [page([provider_row()] * (nextdns.PAGE_SIZE + 1))]
+    elif failure == "long-cursor":
+        sources.pages = [page([provider_row()], cursor="x" * 1025)]
+    elif failure == "invalid-cursor":
+        sources.pages = [page([provider_row()], cursor=["cursor"])]
+    elif failure == "to":
+        exact_exclusive_end = iso_utc(END + 4)
+        sources.pages = [page([{**provider_row(), "timestamp": exact_exclusive_end}])]
+    elif failure == "unordered":
+        sources.pages = [page([provider_row(), provider_row(START + 14, status="default")])]
+    else:
+        sources.pages = [
+            page([provider_row()], cursor="next-page"),
+            page([provider_row(START + 14, status="default")]),
+        ]
+    assert sources.run() == 1
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == "vigie-nextdns: NextDNS logs unavailable, invalid, or incomplete\n"
+
+
+def test_unordered_local_rows_still_compete(sources, capsys):
+    sources.batch(
+        "a",
+        [
+            (START + 40, MAC, QNAME, "AAAA"),
+            (START + 15, MAC, QNAME, "A"),
+            (START + 14, MAC, QNAME, "AAAA"),
+        ],
+    )
+    sources.pages = [page([provider_row(), provider_row(START + 40)])]
+    assert sources.run() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ambiguity_withheld"] is True
+    assert report["devices"] == [{"mac": MAC, "threat_intelligence_blocks": 1}]

@@ -119,7 +119,9 @@ def _batch_rows(
                     raise CoverageError()
                 raw_mac = row["device_mac"]
                 mac = normalize_mac(raw_mac) if isinstance(raw_mac, str) else None
-                result.append(LocalQuery(ts, name, mac, ts in (low, high)))
+                result.append(
+                    LocalQuery(ts, name, mac, start_boundary=ts == low, end_boundary=ts == high)
+                )
         day += timedelta(days=1)
     if len(result) != batch["dns_queries"]:
         raise CoverageError()
