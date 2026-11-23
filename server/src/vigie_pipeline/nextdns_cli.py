@@ -9,7 +9,8 @@ import re
 import signal
 import stat
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from time import time
 
@@ -114,27 +115,41 @@ def _deadline(signum: int, frame: object) -> None:
     raise nextdns.ReportError("report time limit exceeded")
 
 
+@contextmanager
+def _report_deadline() -> Iterator[None]:
+    previous = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _deadline)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, RUN_TIMEOUT_S)
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    finally:
+        # An alarm delivered while cancelling must still leave the previous handler installed.
+        signal.signal(signal.SIGALRM, previous)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    previous = signal.signal(signal.SIGALRM, _deadline)
-    signal.setitimer(signal.ITIMER_REAL, RUN_TIMEOUT_S)
     try:
-        start, end, mac = _validate(args)
-        key = _key_file(args.key_file)
-        low = start - nextdns.PADDING_S
-        high = end + nextdns.PADDING_S
-        # Check coverage before contacting NextDNS, then use a fresh local snapshot so batches
-        # accepted during the fetch still compete for attribution.
-        nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
-        provider = nextdns.read_logs(args.profile, args.device, key, low, high)
-        local = nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
-        count = nextdns.count_matches(local, provider, mac, start, end)
-        report = {
-            "source": "nextdns",
-            "provider_coverage": "unverified",
-            "window": {"from": args.start, "to": args.end},
-            "devices": [{"mac": mac, "threat_intelligence_blocks": count}] if count else [],
-        }
+        with _report_deadline():
+            start, end, mac = _validate(args)
+            key = _key_file(args.key_file)
+            low = start - nextdns.PADDING_S
+            high = end + nextdns.PADDING_S
+            # Check coverage before contacting NextDNS, then use a fresh local snapshot so batches
+            # accepted during the fetch still compete for attribution.
+            nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
+            provider = nextdns.read_logs(args.profile, args.device, key, low, high)
+            local = nextdns_raw.read_local(args.inventory, args.raw_dir, args.collector, low, high)
+            count = nextdns.count_matches(local, provider, mac, start, end)
+            report = {
+                "source": "nextdns",
+                "provider_coverage": "unverified",
+                "window": {"from": args.start, "to": args.end},
+                "devices": [{"mac": mac, "threat_intelligence_blocks": count}] if count else [],
+            }
     except nextdns.ReportError as exc:
         print(f"{PROGRAM}: {exc}", file=sys.stderr)
         return 1
@@ -144,9 +159,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:  # noqa: BLE001 - suppress exception data from database, TLS, or provider
         print(f"{PROGRAM}: report unavailable", file=sys.stderr)
         return 1
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
     print(json.dumps(report, indent=2))
     return 0
 

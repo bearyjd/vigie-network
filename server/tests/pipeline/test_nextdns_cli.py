@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import signal
 import sqlite3
 import time
 from contextlib import closing
@@ -15,12 +16,16 @@ import pytest
 from conftest import KEY as INGEST_KEY
 from conftest import encode, make_batch, signed_headers
 
+from vigie_api.monitoring import collector_summary
 from vigie_ingest.app import _parse_envelope, process_batch
 from vigie_ingest.config import Settings
-from vigie_ingest.db import ensure_shard, iso_utc, open_inventory, shard_name, utc_day
+from vigie_ingest.db import connect, ensure_shard, iso_utc, open_inventory, shard_name, utc_day
 from vigie_ingest.models import Health
 from vigie_ingest.store import provision_collector
 from vigie_pipeline import nextdns_cli
+from vigie_pipeline.essential_absence import configure_recording
+from vigie_pipeline.measurements import read_measurements
+from vigie_pipeline.schema import open_pipeline_inventory
 
 START = 1_780_000_000
 END = START + 60
@@ -499,10 +504,11 @@ def test_signed_ingest_retains_dns_evidence_provenance(sources, capsys, omitted)
     secrets.mkdir()
     (secrets / f"collector_key_{ingest_key_id}").write_text(INGEST_KEY.hex())
     settings = Settings(data_dir=sources.root, secrets_dir=secrets)
-    with closing(open_inventory(sources.inventory)) as inv:
+    with closing(open_pipeline_inventory(sources.inventory)) as inv:
         provision_collector(inv, COLLECTOR, ingest_key_id)
+        configure_recording(inv, enabled=True, now=COVERAGE_LOW - 7200)
     sent = COVERAGE_HIGH
-    health = {"spool_batches": 0, "uptime_s": 600}
+    health = {"spool_batches": 0, "uptime_s": 600, "rss_kb": 256}
     if omitted != "dns_log_quiet":
         health["dns_log_quiet"] = False
     batch = make_batch(
@@ -522,10 +528,23 @@ def test_signed_ingest_retains_dns_evidence_provenance(sources, capsys, omitted)
     envelope = _parse_envelope({key.lower(): value for key, value in headers.items()})
     assert envelope is not None
     assert process_batch(settings, envelope, body, sent + 1) == (200, {"duplicate": False})
-    with closing(sqlite3.connect(sources.inventory)) as db:
+    with closing(connect(sources.inventory)) as db:
         accepted = json.loads(db.execute("SELECT health FROM batches").fetchone()[0])
+        summary = collector_summary(db, COLLECTOR)
+        measurements = read_measurements(db, sources.root, COLLECTOR, batch["batch_id"])
+        essential_seconds = db.execute(
+            "SELECT qualified_seconds FROM essential_observation_hours WHERE collector_id=?",
+            (COLLECTOR,),
+        ).fetchone()[0]
     assert accepted["dns_log_quiet"] is False
     assert accepted["dns_evidence_reported"] is (omitted is None)
+    assert summary["dns_log_quiet"] is False
+    assert summary["agent_uptime_s"] == 600
+    assert summary["agent_rss_kb"] == 256
+    assert "dns_evidence_reported" not in summary
+    assert measurements.reasons == ()
+    assert measurements.counters.get(MAC, (0, 0, 0, 0))[3] == int(omitted != "dns")
+    assert essential_seconds == (COVERAGE_HIGH - COVERAGE_LOW if omitted is None else 0)
 
     sources.pages = [page([provider_row()])]
     result = sources.run()
@@ -650,3 +669,40 @@ def test_stalled_provider_reaches_total_deadline(sources, monkeypatch, capsys):
     result = capsys.readouterr()
     assert not result.out and "report time limit exceeded" in result.err
     assert len(sources.requests) == 1
+
+
+@pytest.mark.parametrize("invalid_key", [False, True])
+def test_alarm_delivered_while_cancelling_stays_sanitized_and_restores_handler(
+    sources,
+    monkeypatch,
+    capsys,
+    invalid_key,
+):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.pages = [page([provider_row()])]
+    if invalid_key:
+        sources.key.chmod(0o644)
+
+    previous = signal.getsignal(signal.SIGALRM)
+    original_setitimer = signal.setitimer
+    late_alarm_fired = False
+
+    def deliver_during_cancel(which, seconds, interval=0):
+        nonlocal late_alarm_fired
+        timer = original_setitimer(which, seconds, interval)
+        if seconds == 0 and not late_alarm_fired:
+            late_alarm_fired = True
+            signal.raise_signal(signal.SIGALRM)
+        return timer
+
+    monkeypatch.setattr(signal, "setitimer", deliver_during_cancel)
+    try:
+        assert sources.run() == 1
+        assert signal.getsignal(signal.SIGALRM) == previous
+    finally:
+        # On a regression, keep the leaked handler from affecting the remainder of pytest.
+        signal.signal(signal.SIGALRM, previous)
+    assert late_alarm_fired
+    result = capsys.readouterr()
+    assert not result.out
+    assert result.err == "vigie-nextdns: report time limit exceeded\n"
