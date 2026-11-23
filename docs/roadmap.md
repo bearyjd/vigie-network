@@ -1,6 +1,6 @@
 # Vigie roadmap — discovery, baselines and unusual behavior
 
-Execution status updated 2026-11-22 against main at 4a2493d (M1a-M2 rows in the table below); later stages remain proposals. This roadmap extends the identity MVP.
+Execution status updated 2026-11-23. Source is on main at `7811822` (#131). The standby field readout comes from the deployed `b1d385c` baseline. This roadmap extends the identity MVP.
 Initial deterministic characterization and upload-incident source is merged; field efficacy remains
 unmeasured. The user wants an app that discovers and characterizes devices AND the
 network, learns normal activity, and makes strange behavior understandable. Implementation beyond the
@@ -16,11 +16,11 @@ features remain unimplemented until their own acceptance evidence exists.
 | Stage | Scope | State / prerequisite |
 |---|---|---|
 | M0 | Inventory, reversible identity decisions and rules, API, bounded real-router pilot | Foundation merged; ten-minute field evidence recorded separately from production readiness |
-| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Real-router 48-hour soaks 1-4 have run (soak 4 passed on 2026-11-14) and the pilot runs on the standby VM. Natural rotation/boot gates, credential approval, real 48-hour acceptance and field baseline maturity remain pending. Coverage-qualification, LAN-unmapped threshold and collector window/attribution fixes (#86-#88) are merged; the router collector carrying #88 was redeployed on 2026-11-22 (T0, operator-run), and the monitoring policy version is unchanged, so the profiles keep accumulating (a pilot-report on 2026-11-22 showed 9 distinct dates of samples per profile); whether samples before and after the redeploy are comparable for the learned-detector evaluation is an operator decision (counting only from 2026-11-22 would put the earliest evaluation at about 2026-12-06). Batch windows overlapped 8 to 14 times per hour before the swap and 0 times in the 11 full hours after it (one overlap in a single hour), so the overlap is fixed at the source; coverage hours were already qualifying before the swap (observed seconds per hour about 3541 before, 3550 after), and the conntrack-unmapped flags are still set on every batch. Retired-device MAC observations can be pruned after 90 days, opt-in only (`VIGIE_PRUNE_RETIRED_MACS`, default off; #114, #125). The [2026-10-25 field status](monitoring-field-status-2026-10-25.md) is historical |
+| M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Real-router 48-hour soaks 1-4 have run (soak 4 passed on 2026-11-14) and the pilot runs on the standby VM. Natural rotation/boot gates, credential approval, real 48-hour acceptance and field baseline maturity remain pending. Coverage-qualification, LAN-unmapped threshold and collector window/attribution fixes (#86-#88) are merged; the router collector carrying #88 was redeployed on 2026-11-22 (T0, operator-run), and the monitoring policy stayed unchanged. Through 12:00 UTC on November 23, DNS observations were present every hour, with 23/24 hours and 166/168 qualifying for baseline training. Upload and DNS each reached maxima of 212 eligible hours and 10 of 14 required UTC dates, with zero mature references. Window overlap fell from 8–14/hour before the swap to zero in the first 11 complete hours after it. A later check found three overlaps (36–60 seconds) and no gaps in 820 post-swap windows. Conntrack-unmapped flags still appeared in the checked batches. Retired-device MAC observations can be pruned after 90 days, opt-in only (`VIGIE_PRUNE_RETIRED_MACS`, default off; #114, #125). The [2026-10-25 field status](monitoring-field-status-2026-10-25.md) is historical |
 | M1b | Local overview, device charts/history, coverage panel and incident inbox | The local GUI at `/ui/` includes passive coverage, active probe status, device history, an incident inbox, events and a device timeline. Field acceptance against a mature baseline is pending |
-| M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Per-incident acknowledgment, snooze, mark-expected and clear are available through the [API](api.md#incidents-and-review-lifecycle) and the [opt-in incident controls](gui-preview.md) in the local GUI. Opt-in delivery, a per-detector delivery allowlist (`VIGIE_DELIVERY_DETECTORS`, #109) and standalone ntfy and Home Assistant webhook senders are merged (off by default; #49, #71). Scoped exceptions are deferred. The synthetic [MVP acceptance tests](e2e.md#synthetic-monitoring-mvp-acceptance) cover the incident workflow. No labeled seven-day pilot is recorded, external delivery needs a configured owner-controlled destination, and phone alerts (ntfy) have been enabled on the pilot VM since 2026-11-21 (the delivery allowlist keeps `new_device` notices out of the phone path until it is added) |
-| M2 | Time-of-day patterns, destination/port novelty, essential-device absence, DNS-volume deviation, network-wide shifts, incident correlation and calibrated characterization | Opt-in time-of-day baseline (`tod-median-v1`, `VIGIE_MONITORING_BASELINE=tod`, #37) is merged; `pooled` stays the default; its evidence keys are exposed in the read API (#105). A new-device notice (`new_device`, incident detector, open-only, `VIGIE_NEW_DEVICE_NOTICE`, off by default; #108-#112) and the owner-marking half of essential-device absence (API plus overrides migration v10, #110) are merged. The absence sweep (`VIGIE_ESSENTIAL_ABSENCE`, #113) is merged. The opt-in DNS-volume detector (`VIGIE_MONITORING_DNS`) is implemented with a separate baseline and field evaluation pending. Destination/port novelty, network-wide shifts and correlation remain queued |
-| M2b | Exposure and suspicious-traffic evidence: device-type known-issue notes from imported CVE data, local blocklist/reputation DNS matches, read-only provider DNS verdicts | Proposal only. Starts with device-identity quality and an offline blocklist match; every external dataset needs the source, license and false-positive review below |
+| M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Per-incident acknowledgment, snooze, mark-expected and clear are available through the [API](api.md#incidents-and-review-lifecycle) and the [opt-in incident controls](gui-preview.md) in the local GUI. Opt-in delivery, a per-detector delivery allowlist (`VIGIE_DELIVERY_DETECTORS`, #109) and standalone ntfy and Home Assistant webhook senders are merged (off by default; #49, #71). Scoped exceptions are deferred. The synthetic [MVP acceptance tests](e2e.md#synthetic-monitoring-mvp-acceptance) cover the incident workflow. No labeled seven-day pilot is recorded, external delivery needs a configured owner-controlled destination, and phone alerts (ntfy) have been enabled on the pilot VM since 2026-11-21 (the standby allowlist covers only `large_upload` and `upload_deviation`) |
+| M2 | Time-of-day patterns, destination/port novelty, essential-device absence, DNS-volume deviation, network-wide shifts, incident correlation and calibrated characterization | Opt-in time-of-day baseline (`tod-median-v1`, `VIGIE_MONITORING_BASELINE=tod`, #37) is merged; `pooled` stays the default; its evidence keys are exposed in the read API (#105). A new-device notice (`new_device`, incident detector, open-only, `VIGIE_NEW_DEVICE_NOTICE`, off by default; #108-#112) and the owner-marking half of essential-device absence (API plus overrides migration v10, #110) are merged. The absence sweep (`VIGIE_ESSENTIAL_ABSENCE`, #113) is merged. The opt-in DNS-volume detector (`VIGIE_MONITORING_DNS`) has a separate baseline and runs on standby with a 200-query floor. Learned DNS field evaluation is pending. F8 destination/port novelty is a locally reviewed, opt-in, count-only upload-incident detail slice. Adversarial review found its hour-boundary filter suppresses context on normal collector cadence. Resolve that source gate before seeking owner approval and a separate field exercise. Network-wide shifts and correlation remain queued |
+| M2b | Exposure and suspicious-traffic evidence: device-type known-issue notes from imported CVE data, local blocklist/reputation DNS matches, read-only provider DNS verdicts | The dataset-free evidence pack and the manual NextDNS report (#131) are merged. The report passed dedicated live lab cases and awaits a separate decision for standby or household use. [Offline dataset staging and decisions](datasets.md) are merged. Scheduled fetching, dataset readers, reputation matching and known-issue notes remain proposed |
 | M2c — endpoint connection events (design proposal) | Observe-only evidence from an endpoint firewall (Snitchwatch/OpenSnitch) compared with router conntrack | Design doc only: [docs/prp/003-endpoint-events.md](prp/003-endpoint-events.md); nothing built; K1-K4 confirmed; E0 feasibility measurement next |
 | M3 | Multiple network/VLAN scopes and optional external Zeek/Suricata metadata adapters | Queued after approved sensor placement and measured traffic visibility |
 | M4 | Drift models and optional AI explanations/classifiers | Conditional on demonstrated benefit over deterministic rules and an explicit privacy/resource review |
@@ -28,6 +28,21 @@ features remain unimplemented until their own acceptance evidence exists.
 M1a uses local authenticated APIs as its initial review surface. The local GUI reads the same APIs and can submit deliberate incident decisions in an explicit editing session. M1a does not
 claim full-MVP completion, or make a48h observation satisfy fourteen-day baseline eligibility.
 The real soak must reach its endpoint; synthetic clock tests verify the runner, not elapsed field time.
+
+### Next field decisions
+
+1. Record the owner's choice on combining observations before and after the November 22 redeploy.
+   The early estimates were about November 28 for the combined cohort and December 6 for a
+   post-redeploy-only cohort. The selected device's actual frozen reference and coverage determine
+   readiness. Follow the [learned-detector field acceptance design](monitoring-pilot-acceptance.md)
+   to verify the reference, a benign control, a positive case and coverage abstention.
+2. Use the labeled learned trial and seven-day review to judge the monitoring MVP before expanding
+   detector scope. For F8, first establish an explainable learned upload incident. The owner can
+   then decide whether to send the optional context slice through its separate PR and field gates.
+   A source merge and a field activation are separate decisions.
+3. While history accumulates, continue fixture-driven design for bounded evidence sources and
+   endpoint measurement. Keep NextDNS manual and limited to explicitly approved report scope.
+   Use the dedicated lab evidence when reviewing a future standby or household trial.
 
 ## Intended daily experience
 
@@ -51,14 +66,14 @@ proposed acceptance targets to calibrate with owner-labeled data, not demonstrat
 | Milestone | Deliverable / dependency | Proposed exit evidence | Effort |
 |---|---|---|---|
 | M0 — identity foundation | Inventory, reversible human identity decisions/rules, bounded stitching, API workflow, CI and honest deployment docs | Foundation merged after independent review and CI. Real deployment acceptance remains explicitly separate. | M, completed foundation |
-| M1 — monitoring MVP, next | Real collection validation; coverage panel; hourly device/network aggregates; cold-start baseline status; fixed large-upload and qualified upload-deviation alerts; bounded DNS/reachability probes (runner, pipeline fold, `GET /probes` and overview panel, off by default and pending live activation). An offline replay and evaluation harness (#104) and a pilot-report CLI (#94) are merged; minimal local UI/inbox and notification lifecycle | Deterministic replay without duplicate counts/alerts; injected collection failure visible within two configured collection windows; injected sustained upload and probe outage visible within two detector windows. Seven-day normal-LAN pilot reports alert volume and owner judgments, target ≤1 unwanted external notification/network/day. | L |
+| M1 — monitoring MVP, next | Real collection validation; coverage panel; hourly device/network aggregates; cold-start baseline status; fixed large-upload and qualified upload-deviation alerts; bounded DNS/reachability probes (runner, pipeline fold, `GET /probes` and overview panel, off by default and pending live activation). An offline replay and evaluation harness (#104) and a pilot-report CLI (#94) are merged; minimal local UI/inbox and notification lifecycle | Deterministic replay without duplicate counts/alerts; injected collection failure visible within two configured collection windows; injected sustained upload and probe outage visible within two detector windows. Seven-day normal-LAN pilot reports alert volume and owner judgments, target ≤1 unwanted open notification per network per UTC day in the pilot report. | L |
 | M2 — richer behavior/context | Read-only provider DNS context with provenance and explicit attribution; day/time patterns, destination/port novelty, network-wide shifts, measured type rules, incident correlation and feedback | ≥14 valid observation days before evaluating initial learned deviations; chronological held-out replay includes backups/updates, sleeping devices, restarts, IPv6 and gaps. Report precision/recall per detector, abstentions and coverage, never a single unsupported accuracy score. | L |
 | M3 — richer optional visibility | Approved multi-network adapters and external Zeek/Suricata metadata sensor on a capable host, with suitable TAP/SPAN placement | Fixture/replay contracts; malformed/flooded inputs bounded; missing sensor flagged; duplicate overlapping observations do not inflate totals. Demonstrate exactly which traffic is observable before enabling scan/beacon claims. | L |
 | M4 — measured learning | Robust per-device drift first; optional classifier/AI explanations only if rules leave a useful residual | Compare against deterministic baseline on owner-labeled chronological holdout; predeclare false-alert budget; no regression in explainability, privacy or resource bounds. Cancel models that add no measurable value. | M–L, conditional |
 
 *Dated note, 2026-11-09: the paragraph below is the 2026-10-25 snapshot. Soaks 1-3 have run since; soak 4 was running on 2026-11-09 (no outcome claimed). The read-only GUI and the opt-in senders are now merged.*
 
-The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. This historical result motivated the merged coverage/characterization source. The [current field status](monitoring-field-status-2026-10-25.md) records actual parsed-DNS delivery and corrected LAN scope while retaining the earlier flagged windows and pending recovery, long-duration and accuracy gates; M1a source delivery does not complete the UI/feedback stages or the full monitoring MVP.
+The [bounded real-router field pilot](router-validation-2026-10-24.md) found inventory identities still typed `unknown`, no DNS rows or DHCP option 55/60 observations, and conntrack attribution gaps. This historical result motivated the merged coverage/characterization source. The [October 25 field snapshot](monitoring-field-status-2026-10-25.md) records actual parsed-DNS delivery and corrected LAN scope while retaining the earlier flagged windows and pending recovery, long-duration and accuracy gates; M1a source delivery does not complete the UI/feedback stages or the full monitoring MVP.
 
 M1 includes network health, not only identity. Passive DNS error-rate/latency analysis is outside M1's existing
 batch contract; start with explicitly labeled probes, or approve a separate response-telemetry extension.
@@ -120,8 +135,9 @@ ntfy delivery and topic ownership remain gated by D5; the local inbox works with
 
 Goal: help the owner see which devices may be exposed to known vulnerabilities and which traffic looks like it
 could be malicious, as **evidence with confidence labels**. Nothing here is a verdict. A match never blocks
-traffic, never changes a group or trust, and never merges identities; enforcement stays with Couvre-feu. This is
-a proposal: apart from the dataset-free device evidence pack below (phase 1, implemented), no dataset import, provider call or notification exists for it, and the rest is gated by per-dataset source, license and false-positive review (D7, D8 and D9 are decided).
+traffic, never changes a group or trust, and never merges identities; enforcement stays with Couvre-feu. The
+dataset-free evidence pack, manual dataset staging and acceptance, and bounded NextDNS report are implemented.
+The remaining reader, scheduling, reputation and known-issue proposals retain their per-dataset source, license and false-positive review gates (D7, D8 and D9 are decided).
 
 Phases, each shippable and reviewed on its own:
 1. **Identity quality first.** CVE-style matching needs vendor/product (ideally version). Measure how many
@@ -137,8 +153,8 @@ Phases, each shippable and reviewed on its own:
    source, date, license and checksum. Map a device's vendor/product signal to candidate advisories and show them as
    "device type may be affected" notes with a confidence level, never as "vulnerable". Prefer exploited-in-the-wild
    entries first to keep noise low. A human can mark a note expected or not applicable, with an audit entry.
-4. **Provider verdict context.** A read-only adapter for resolver logs (see NextDNS below) that adds the provider's
-   block/category verdict and roaming-device visibility as separately labelled context.
+4. **Provider verdict context.** The manual [NextDNS report](nextdns.md) counts attributable threat-feed blocks in a bounded
+   query window. Separate roaming visibility remains a proposal and needs an explicit owner decision.
 5. **Sensor evidence (M3).** Zeek/Suricata EVE metadata for protocol-level indicators, only after sensor placement is approved.
 
 Constraints that apply to every phase:
@@ -213,14 +229,14 @@ sits upstream (NextDNS, AdGuard Home, another) only answers. Keep these roles se
   the NextDNS CLI) that sends LAN device names to the provider: that is a cloud disclosure and a dnsmasq/router change
   gated by D2 and D8, not a default. Even then there is no automatic identity merge and no training of the router-local
   baseline on cloud history (existing rule).
-- **Recommendation to settle in D8:** keep NextDNS for roaming and threat-category filtering, keep the router's
+- **D8 resolver strategy:** keep NextDNS for roaming and threat-category filtering, keep the router's
   dnsmasq as the single home DNS entry point so Vigie attributes queries per device, and add AdGuard Home only if the
   owner wants provider-independent local logs or a self-hosted filter. A hybrid (AdGuard Home at home, a NextDNS
   profile on roaming devices) avoids a hard choice only if those profiles are disabled on the home network: a phone
   or laptop with a NextDNS profile or Android Private DNS sends encrypted DNS straight to the provider even at home,
   bypasses dnsmasq, and must then show as DNS-coverage `degraded`, never as quiet. This changes no Vigie code; it
   changes which context sources exist. The owner has a paid NextDNS plan, so query limits are not a factor; log
-  retention, storage region and the API key's scope are inputs to D8.
+  retention, storage region and the API key's scope are inputs to any separate activation decision.
 
 ## Privacy, coverage and operating budgets
 
@@ -279,8 +295,10 @@ rather than promising identical coverage. Safe fixture-driven development can pr
 acceptance waits. UI framework, external sensor placement, final alert budget and retention beyond current
 policy remain proposed choices to settle in each milestone's design review.
 
-The [NextDNS operator report](nextdns.md) is the first M2 provider context adapter. It reports explicit provider
-and time scope and withholds context when the same query has competing candidates. Provider context adapters
+The [NextDNS operator report](nextdns.md) is the first M2 provider context adapter (#131). On November 23 the
+dedicated Atlas lab verified live attribution for one threat-feed block and zero matches for the allowed control.
+The report also withheld attribution for a simultaneous A/AAAA pair and a batch-end observation. It labels
+provider coverage as unverified. Standby and household use remain separate approval decisions. Provider context adapters
 have no enforcement, notification, or severity authority. Keep cloud history out of router-local baseline training
 and automatic identity merging.
 The local GUI is implemented, including the read-only M1b foundations in #17, #31 and #65.
