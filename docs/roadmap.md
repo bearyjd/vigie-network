@@ -19,7 +19,7 @@ features remain unimplemented until their own acceptance evidence exists.
 | M1a — current build | Device fingerprinting; real DNS/source coverage; persistent router/Tower deployment; durable48h testing; hourly baselines and explainable upload incidents | All five source foundations merged; live parsed DNS, privilege, corrected LAN scope, drain and stop/restart proofs passed. Real-router 48-hour soaks 1-4 have run (soak 4 passed on 2026-11-14) and the pilot runs on the standby VM. Natural rotation/boot gates, credential approval, real 48-hour acceptance and field baseline maturity remain pending. Coverage-qualification, LAN-unmapped threshold and collector window/attribution fixes (#86-#88) are merged; the router collector carrying #88 was redeployed at 03:31:43 UTC on 2026-11-22 (T0, operator-run), and the monitoring policy stayed unchanged. See the [November 23 standby readout](#2026-11-23-standby-readout). Retired-device MAC observations can be pruned after 90 days, opt-in only (`VIGIE_PRUNE_RETIRED_MACS`, default off; #114, #125). The [2026-10-25 field status](monitoring-field-status-2026-10-25.md) is historical |
 | M1b | Local overview, device charts/history, coverage panel and incident inbox | The local GUI at `/ui/` includes passive coverage, active probe status, device history, an incident inbox, events and a device timeline. Field acceptance against a mature baseline is pending |
 | M1c | Incident feedback, acknowledgment/snooze/expected lifecycle, optional deduplicated notifications and labeled seven-day field pilot | Per-incident acknowledgment, snooze, mark-expected and clear are available through the [API](api.md#incidents-and-review-lifecycle) and the [opt-in incident controls](gui-preview.md) in the local GUI. Opt-in delivery, a per-detector delivery allowlist (`VIGIE_DELIVERY_DETECTORS`, #109) and standalone ntfy and Home Assistant webhook senders are merged (off by default; #49, #71). Scoped exceptions are deferred. The synthetic [MVP acceptance tests](e2e.md#synthetic-monitoring-mvp-acceptance) cover the incident workflow. No labeled seven-day pilot is recorded, external delivery needs a configured owner-controlled destination, and phone alerts (ntfy) have been enabled on the pilot VM since 2026-11-21 (the recorded standby allowlist covers only `large_upload` and `upload_deviation`) |
-| M2 | Time-of-day patterns, destination/port novelty, essential-device absence, DNS-volume deviation, network-wide shifts, incident correlation and calibrated characterization | Opt-in time-of-day baseline (`tod-median-v1`, `VIGIE_MONITORING_BASELINE=tod`, #37) is merged; `pooled` stays the default; its evidence keys are exposed in the read API (#105). A new-device notice (`new_device`, incident detector, open-only, `VIGIE_NEW_DEVICE_NOTICE`, off by default; #108-#112) and the owner-marking half of essential-device absence (API plus overrides migration v10, #110) are merged. The absence sweep (`VIGIE_ESSENTIAL_ABSENCE`, #113) is merged. The opt-in DNS-volume detector (`VIGIE_MONITORING_DNS`) has a separate baseline and runs on standby with a 200-query floor. Learned DNS field evaluation is pending. Opt-in F8 destination/port novelty remains behind the [source gate](#f8-source-gate). Network-wide shifts and correlation remain queued |
+| M2 | Time-of-day patterns, destination/port novelty, essential-device absence, DNS-volume deviation, network-wide shifts, incident correlation and calibrated characterization | Opt-in time-of-day baseline (`tod-median-v1`, `VIGIE_MONITORING_BASELINE=tod`, #37) is merged; `pooled` stays the default; its evidence keys are exposed in the read API (#105). A new-device notice (`new_device`, incident detector, open-only, `VIGIE_NEW_DEVICE_NOTICE`, off by default; #108-#112) and the owner-marking half of essential-device absence (API plus overrides migration v10, #110) are merged. The absence sweep (`VIGIE_ESSENTIAL_ABSENCE`, #113) is merged. The opt-in DNS-volume detector (`VIGIE_MONITORING_DNS`) has a separate baseline and runs on standby with a 200-query floor. Learned DNS field evaluation is pending. The local opt-in F8 destination/port novelty candidate awaits [source delivery and field activation](#f8-source-gate). Network-wide shifts and correlation remain queued |
 | M2b | Exposure and suspicious-traffic evidence: device-type known-issue notes from imported CVE data, local blocklist/reputation DNS matches, read-only provider DNS verdicts | The dataset-free evidence pack and the manual NextDNS report (#131) are merged. The report passed dedicated live lab cases and awaits a separate decision for standby or household use. [Offline dataset staging and decisions](datasets.md) are merged. Scheduled fetching, dataset readers, reputation matching and known-issue notes remain proposed |
 | M2c — endpoint connection events (design proposal) | Observe-only evidence from an endpoint firewall (Snitchwatch/OpenSnitch) compared with router conntrack | Design doc only: [docs/prp/003-endpoint-events.md](prp/003-endpoint-events.md); nothing built; K1-K4 confirmed; E0 feasibility measurement next |
 | M3 | Multiple network/VLAN scopes and optional external Zeek/Suricata metadata adapters | Queued after approved sensor placement and measured traffic visibility |
@@ -46,6 +46,11 @@ The real soak must reach its endpoint; synthetic clock tests verify the runner, 
 1. Record the owner's choice on combining observations before and after the November 22 redeploy.
    The unchanged policy freezes each profile automatically when its earliest eligible cohort meets
    both floors. Make the choice before that freeze if the first reference must be post-redeploy-only.
+   The November 23 snapshot showed at most 10 of the required 14 UTC dates. A leading profile
+   already at the hour floor would need four new qualified UTC dates. With a new qualified date
+   each day, the earliest freeze would be around November 26 if November 23 can still add a date,
+   or November 27 if it already counted. Actual timing depends on the selected profile's
+   qualification and engine processing.
    Verify every training hour starts at or after 2026-11-22 04:00 UTC for that choice. Profiles with
    earlier eligible hours need a separately approved policy or lineage reset to start fresh. Each
    affected profile restarts at the next UTC hour boundary and must earn 20 eligible hours on 14
@@ -55,15 +60,17 @@ The real soak must reach its endpoint; synthetic clock tests verify the runner, 
    observed above-threshold count and engine abstention evidence.
 2. Judge the monitoring MVP using the controlled learned-detector trial and a subsequent seven-day
    normal-LAN review. Start the seven-day window after controlled incidents and associated delivery
-   work have finished.
+   work have finished. Record a quiet window with zero sent opens and hold the delivery component
+   until natural activity provides a verdict.
 3. While history accumulates, continue fixture-driven design for bounded evidence sources and
    endpoint measurement. Keep NextDNS manual and limited to explicitly approved report scope.
    Use the dedicated lab evidence when reviewing a future standby or household trial.
 
 #### F8 source gate
 
-F8 is a locally reviewed, opt-in, count-only upload-incident detail slice. The local adversarial
-review reported that the hour-boundary filter suppresses context on normal collector cadence.
+F8 is a local, opt-in, count-only upload-incident detail candidate awaiting delivery to main and
+any field activation. The local adversarial review reported that the hour-boundary filter
+suppresses context on normal collector cadence.
 Resolve that source defect and establish an explainable learned upload incident before seeking
 an owner decision on the separate F8 field exercise.
 
@@ -320,10 +327,11 @@ policy remain proposed choices to settle in each milestone's design review.
 
 The [NextDNS operator report](nextdns.md) is the first M2 provider context adapter (#131). On November 23 the
 dedicated Atlas lab verified live attribution for one threat-feed block and zero matches for the allowed control.
-A November 23 live lab follow-up recorded withheld attribution for a simultaneous A/AAAA pair and a batch-end observation. It labels
-provider coverage as unverified. Standby and household use remain separate approval decisions. Provider context adapters
-have no enforcement, notification, or severity authority. Keep cloud history out of router-local baseline training
-and automatic identity merging.
+A November 23 live lab follow-up recorded withheld attribution for a simultaneous A/AAAA pair and
+a batch-end observation. The operator report labels provider coverage as unverified. Standby and
+household use remain separate approval decisions. Provider context adapters have no enforcement,
+notification, or severity authority. Keep cloud history out of router-local baseline training and
+automatic identity merging.
 The local GUI is implemented, including the read-only M1b foundations in #17, #31 and #65.
 
 M1c field hardening includes a transport-gap/sequence-reset quality latch: when a helper restarts

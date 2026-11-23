@@ -16,8 +16,8 @@ Record the choice before the selected profile reaches both floors if a reset mus
 freeze. If the owner accepts combining both periods, verify and use the current policy's frozen
 reference after it matures. For a post-redeploy-only choice, require every training hour in the
 reference to start at or after 2026-11-22 04:00 UTC. When exposed metadata cannot establish the
-cohort, use a bounded read-only inventory query to look up `training_hours` by reference ID in
-`monitoring_baselines` for upload or `monitoring_dns_baselines` for DNS.
+cohort, open the inventory database read-only and use a bounded query to look up `training_hours` by
+reference ID in `monitoring_baselines` for upload or `monitoring_dns_baselines` for DNS.
 
 If the existing lineage includes eligible pre-redeploy hours, its first reference can freeze with
 a mixed cohort. Filtering a report to post-redeploy hours leaves the reference intact. If the
@@ -56,7 +56,7 @@ behavior or configuration cannot be confirmed on the deployed build.
 | Benign control | Observe owner-labeled routine activity on the selected device during a qualified closed hour. For upload, include a consecutive eligible post-reference predecessor so the detector can judge the pair. Predeclare the expected volume and outcome. | The reference applies, and no learned incident opens for the declared control. |
 | Learned upload positive | Use an owner-approved transfer to an endpoint the owner controls. Plan two consecutive qualified closed hours strictly above the greater of 50 MiB and four times the frozen median. Keep each below the configured fixed large-upload threshold so the learned rule can be judged on its own. Check both hours' recorded bytes and window overlap evidence. | One `upload_deviation` episode opens after the second qualifying hour. A follow-up qualified hour below or at the learned threshold should resolve it. |
 | Learned DNS positive | With DNS monitoring enabled and the selected device's median at or above the configured floor, use owner-approved DNS activity through the observed local resolver. Record one qualified closed hour strictly above four times the reference median. | One `dns_deviation` episode is visible in the inbox with observed and reference counts. Success is based on the incident, independent of external delivery. |
-| Coverage guard | For upload, find two otherwise triggering qualified hours separated by a degraded or missing hour, or use the upload replay command to demonstrate that case. For DNS, find an observed above-threshold count in an unqualified hour. If the counter or evaluation evidence is unavailable, record the coverage loss and hold the DNS guard judgment. | The coverage reason remains visible in field evidence. The upload gap prevents a two-hour trigger and the DNS hour cannot trigger. |
+| Coverage guard | For upload, find two otherwise triggering qualified hours separated by a degraded or missing hour, or use the offline upload replay (`python -m vigie_pipeline.replay --series SERIES.json --labels LABELS.json`) to demonstrate that case. For DNS, find an observed above-threshold count in an unqualified hour. If the counter or evaluation evidence is unavailable, record the coverage loss and hold the DNS guard judgment. | The coverage reason remains visible in field evidence. The upload gap prevents a two-hour trigger and the DNS hour cannot trigger. |
 
 Use only the cases for the detector that is ready. For a stronger upload control, if approved
 traffic and ordinary activity can produce it, record two consecutive eligible post-reference
@@ -80,9 +80,12 @@ for the trial. See [detector rules and coverage](monitoring.md).
 
 Every scoring hour, including both upload hours, must be strictly after `trained_until`. Check
 for an existing open episode and choose a fresh case if the expectation is a new incident. The
-engine normally evaluates the latest closed hour. Verify that it processed each test hour for
-the selected collector and device while the hour was current. Correlate the profile's `updated_hour`
-in `monitoring_profiles` or `monitoring_dns_profiles` with the relevant activity evidence and
+upload engine evaluates the latest closed hour. For an upload pair, verify that it evaluated the
+second hour for the selected collector and device while that hour was the latest closed hour.
+Confirm that the eligible, consecutive first hour was present in the recorded series available to
+that evaluation. For DNS, verify evaluation of the scoring hour, either on the normal latest
+closed hour pass or on a recorded retry of that hour. Correlate the profile's `updated_hour` in
+`monitoring_profiles` or `monitoring_dns_profiles` with the relevant activity evidence and
 reference. Hold a missing incident if evaluation timing or scope cannot be established.
 
 Recheck scoring-hour coverage, batch overlaps and the current reference after the pipeline processes
@@ -135,17 +138,26 @@ includes external delivery.
   a fair test. A hold records the missing fact and the next readout that can resolve it.
 
 Run the seven-day normal-LAN labeling and delivery review before claiming full monitoring MVP
-field acceptance. Label trial incidents privately as deliberate controlled activity and record the
-actual owner judgment. Start the normal-LAN window after the controlled activity, its incident
-episodes and any associated delivery work have finished. If a controlled open is delivered in
-the designated window, choose a clean seven-day window. The report counts sent opens marked
-`expected` as unwanted and returns `unknown` for sent opens with no decision. Compare evaluated
-upload deliveries with the proposed budget of at most one
-unwanted open per network per UTC day, grouped by completion day. Use `within_target` only when
-the report section status is `ok`. A window with zero sent opens has an unknown verdict. The report
-uses the incident's current `expected` decision, so retain the predeclared labels and phone receipt
-evidence separately from later edits. Keep the active collection, detector policy and delivery allowlist fixed during
-the trial. New activation or profile choices require a separate decision.
+field acceptance. Keep the controlled incidents' predeclared labels and actual owner judgments in
+the private trial record. Start the normal-LAN window after the controlled activity, its incident
+episodes and all associated delivery work have finished. If a controlled open is delivered in the
+designated window, choose a clean seven-day window.
+
+For each sent open during normal activity, record the owner's judgment. When the owner confirms
+that a naturally occurring alert was unwanted because the underlying activity was routine, apply
+the incident inbox's **Mark expected** action (`mark-expected` in the API). The report counts
+sent opens with the current `expected` decision as unwanted. Acknowledging or snoozing those
+opens leaves them out of the unwanted count, and a sent open with no decision makes the verdict
+`unknown`. Preserve the owner's judgment and any phone receipt evidence separately from later
+decision edits.
+
+Compare sent opens with the proposed budget of at most one unwanted open per network per UTC day,
+grouped by delivery completion day. Use `within_target` only when the report section status is
+`ok`. A quiet week with complete evidence and zero sent opens is a valid observation. Record it
+and mark the delivery component **Hold** because the report has no unwanted-notification verdict.
+Keep observing normal activity without producing alerts for the report. Keep active collection,
+detector policy and the delivery allowlist fixed during the trial. New activation or profile
+choices require a separate decision.
 
 [NextDNS](nextdns.md) has independent live lab evidence for its manual report. Provider verdicts
 do not train local baselines or establish a learned incident. Destination/port novelty (F8) is
