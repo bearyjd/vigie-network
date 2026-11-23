@@ -206,9 +206,10 @@ sits upstream (NextDNS, AdGuard Home, another) only answers. Keep these roles se
   Vigie has guaranteed per-device DNS only for devices whose DNS is forced through the router; adult devices that use
   NextDNS directly or DoH are invisible to the dnsmasq log and must show as DNS-coverage `degraded`. Couvre-feu's own
   decision list (its D1-D6 build decisions) is unrelated to Vigie's owner gates D1-D6; do not conflate them.
-- **Provider logs as optional context.** Provider history is imported only by the read-only M2 adapter: raw events,
-  explicit provider/time coverage, pagination, deduplication and timestamped attribution. If every home device queries
-  through the router, the provider sees one client. Per-device names at the provider require a forwarder (for example
+- **Provider logs as optional context.** The [NextDNS operator report](nextdns.md) reads a bounded window of raw
+  provider logs and correlates them with local queries when the owner can verify a dedicated provider device ID
+  for queries forwarded from one LAN device. A shared router identifier cannot establish a device binding.
+  Per-device names at the provider require a forwarder (for example
   the NextDNS CLI) that sends LAN device names to the provider: that is a cloud disclosure and a dnsmasq/router change
   gated by D2 and D8, not a default. Even then there is no automatic identity merge and no training of the router-local
   baseline on cloud history (existing rule).
@@ -278,9 +279,9 @@ rather than promising identical coverage. Safe fixture-driven development can pr
 acceptance waits. UI framework, external sensor placement, final alert budget and retention beyond current
 policy remain proposed choices to settle in each milestone's design review.
 
-Provider DNS logs, including NextDNS, are proposed M2 context adapters. Use raw events with explicit
-provider/time coverage, pagination and deduplication. Do not import cloud history into router-local
-baseline training, automatically merge identities, or give an observation adapter enforcement authority.
+The [NextDNS operator report](nextdns.md) is the first M2 provider context adapter. It reports explicit provider
+and time scope and withholds context when the same query has competing candidates. Cloud history stays out of
+router-local baseline training and device identity.
 The local GUI is implemented, including the read-only M1b foundations in #17, #31 and #65.
 
 M1c field hardening includes a transport-gap/sequence-reset quality latch: when a helper restarts
