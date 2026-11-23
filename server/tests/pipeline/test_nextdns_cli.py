@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
 import sqlite3
+import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from conftest import KEY as INGEST_KEY
+from conftest import encode, make_batch, signed_headers
 
+from vigie_ingest.app import _parse_envelope, process_batch
+from vigie_ingest.config import Settings
 from vigie_ingest.db import ensure_shard, iso_utc, open_inventory, shard_name, utc_day
 from vigie_ingest.models import Health
+from vigie_ingest.store import provision_collector
 from vigie_pipeline import nextdns_cli
 
 START = 1_780_000_000
 END = START + 60
+COVERAGE_LOW = START - 304
+COVERAGE_HIGH = END + 304
 PROFILE = "a123bc"
 DEVICE = "ROUTER42"
 COLLECTOR = "test-router"
@@ -60,7 +70,7 @@ class Sources:
         self.requests = []
         self.pages = []
 
-    def batch(self, batch_id, rows, *, low=START - 10, high=END + 10, **changes):
+    def batch(self, batch_id, rows, *, low=COVERAGE_LOW, high=COVERAGE_HIGH, **changes):
         meta = {
             "collector_id": COLLECTOR,
             "batch_id": batch_id,
@@ -68,13 +78,16 @@ class Sources:
             "window_start": low,
             "window_end": high,
             "observation_kind": "observation",
-            "health": '{"dns_log_quiet":false,"spool_batches":0,"uptime_s":600}',
+            "health": (
+                '{"dns_log_quiet":false,"dns_evidence_reported":true,'
+                '"spool_batches":0,"uptime_s":600}'
+            ),
             "dropped_batches": 0,
             "truncated": "{}",
             "dns_queries": len(rows),
         }
         meta.update(changes)
-        with sqlite3.connect(self.inventory) as inv:
+        with closing(sqlite3.connect(self.inventory)) as inv, inv:
             inv.execute(
                 "INSERT INTO batches (collector_id,batch_id,received_at,truncated,dropped_batches,"
                 "window_start,window_end,observation_kind,health,dns_queries)"
@@ -85,7 +98,7 @@ class Sources:
         for row in rows:
             day = utc_day(row[0])
             ensure_shard(self.root, day)
-            with sqlite3.connect(self.root / shard_name(day)) as db:
+            with closing(sqlite3.connect(self.root / shard_name(day))) as db, db:
                 db.execute(
                     "INSERT INTO raw_dns(collector_id,batch_id,ts,device_mac,qname,qtype)"
                     " VALUES(?,?,?,?,?,?)",
@@ -102,7 +115,7 @@ class Sources:
 
             def getresponse(connection):
                 response = self.pages.pop(0)
-                if isinstance(response, Response):
+                if isinstance(response, Response | http.client.HTTPResponse):
                     return response
                 return Response(json.dumps(response).encode())
 
@@ -141,7 +154,7 @@ class Sources:
 @pytest.fixture
 def sources(tmp_path, monkeypatch):
     result = Sources(tmp_path)
-    monkeypatch.setattr(nextdns_cli, "time", lambda: END + 600)
+    monkeypatch.setattr(nextdns_cli, "time", lambda: END + 700)
     monkeypatch.setattr("http.client.HTTPSConnection", result.https)
     return result
 
@@ -149,7 +162,7 @@ def sources(tmp_path, monkeypatch):
 def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsys):
     sources.batch("a", [(START + 15, MAC, QNAME, "A")])
     sources.batch("other", [(START + 15, "02:00:00:00:00:99", QNAME, "A")], collector_id="other")
-    with sqlite3.connect(sources.shard) as db:
+    with closing(sqlite3.connect(sources.shard)) as db, db:
         db.execute(
             "INSERT INTO raw_dns(collector_id,batch_id,ts,device_mac,qname,qtype)"
             " VALUES(?,?,?,?,?,?)",
@@ -165,6 +178,7 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsy
     assert not result.err
     assert json.loads(result.out) == {
         "source": "nextdns",
+        "provider_coverage": "unverified",
         "window": {"from": iso_utc(START), "to": iso_utc(END)},
         "devices": [{"mac": MAC, "threat_intelligence_blocks": 1}],
     }
@@ -201,8 +215,8 @@ def test_read_only_scoped_fixed_paged_request_and_redacted_report(sources, capsy
         ([(START + 15, MAC, QNAME, "A")], [provider_row(status="allowed")]),
         ([(START + 15, MAC, "other.sample.example", "A")], [provider_row()]),
         ([(START + 13, MAC, QNAME, "A")], [provider_row()]),
-        ([(START - 10, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "A")], [provider_row()]),
-        ([(START - 10, MAC, QNAME, "A")], [provider_row()]),
+        ([(COVERAGE_LOW, MAC, QNAME, "A"), (START + 15, MAC, QNAME, "A")], [provider_row()]),
+        ([(COVERAGE_LOW, MAC, QNAME, "A")], [provider_row()]),
     ],
 )
 def test_excludes_non_unique_unbound_non_threat_and_imprecise_candidates(
@@ -218,8 +232,8 @@ def test_excludes_non_unique_unbound_non_threat_and_imprecise_candidates(
 
 
 def test_mutual_uniqueness_includes_both_padded_margins(sources, capsys):
-    sources.batch("a", [(START, MAC, QNAME, "A"), (START - 3, MAC, QNAME, "A")])
-    sources.pages = [page([provider_row(START - 2)])]
+    sources.batch("a", [(START + 1, MAC, QNAME, "A"), (START - 1, MAC, QNAME, "A")])
+    sources.pages = [page([provider_row(START)])]
     assert sources.run() == 0
     assert json.loads(capsys.readouterr().out)["devices"] == []
 
@@ -236,6 +250,11 @@ def test_mutual_uniqueness_includes_both_padded_margins(sources, capsys):
         {"health": '{"dns_log_quiet":true,"spool_batches":0,"uptime_s":600}'},
         {"health": None},
         {"health": Health().model_dump_json()},
+        {"health": '{"dns_log_quiet":false,"spool_batches":0,"uptime_s":600}'},
+        {
+            "health": '{"dns_log_quiet":false,"dns_evidence_reported":1,'
+            '"spool_batches":0,"uptime_s":600}'
+        },
         {"health": '{"dns_log_quiet":false,"spool_batches":1,"uptime_s":600}'},
         {"health": '{"dns_log_quiet":false,"spool_batches":0,"uptime_s":-1}'},
         {"truncated": '{"tail_open_failed":1}'},
@@ -390,12 +409,12 @@ def test_shard_rollover_reconciles_full_accepted_batch(sources, monkeypatch, cap
     sources.batch(
         "a",
         [(midnight - 5, MAC, QNAME, "A"), (midnight + 5, MAC, QNAME, "AAAA")],
-        low=midnight - 20,
-        high=midnight + 20,
+        low=midnight - 320,
+        high=midnight + 320,
         truncated='{"ct_unmapped_bytes":42,"source_flags":4}',
     )
     sources.pages = [page([provider_row(midnight - 5), provider_row(midnight + 5)])]
-    monkeypatch.setattr(nextdns_cli, "time", lambda: midnight + 600)
+    monkeypatch.setattr(nextdns_cli, "time", lambda: midnight + 710)
     assert nextdns_cli.main(argv) == 0
     assert json.loads(capsys.readouterr().out)["devices"] == [
         {"mac": MAC, "threat_intelligence_blocks": 2},
@@ -404,11 +423,11 @@ def test_shard_rollover_reconciles_full_accepted_batch(sources, monkeypatch, cap
 
 @pytest.mark.parametrize("edge", ["before", "after"])
 def test_boundary_row_in_adjacent_accepted_batch_vetoes_match(sources, capsys, edge):
-    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
-    low = START - 40 if edge == "before" else END + 20
-    high = low + 20
-    boundary = high if edge == "before" else low
-    sources.batch("adjacent", [(boundary, "02:00:00:00:00:99", QNAME, "AAAA")], low=low, high=high)
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")], low=START - 10, high=END + 10)
+    before = [(START - 10, "02:00:00:00:00:99", QNAME, "AAAA")] if edge == "before" else []
+    after = [(END + 10, "02:00:00:00:00:99", QNAME, "AAAA")] if edge == "after" else []
+    sources.batch("early", before, low=COVERAGE_LOW, high=START - 10)
+    sources.batch("late", after, low=END + 10, high=COVERAGE_HIGH)
     sources.pages = [page([provider_row()])]
     assert sources.run() == 0
     assert json.loads(capsys.readouterr().out)["devices"] == []
@@ -471,3 +490,163 @@ def test_foreign_owned_database_is_rejected_before_sqlite_open(
     assert "coverage" in result.err
     assert not sources.requests
     assert not any(uri.startswith(foreign.as_uri()) for uri in opened)
+
+
+@pytest.mark.parametrize("omitted", [None, "dns_log_quiet", "dns", "truncated", "dropped_batches"])
+def test_signed_ingest_retains_dns_evidence_provenance(sources, capsys, omitted):
+    ingest_key_id = "router-test-key"
+    secrets = sources.root / "ingest-secrets"
+    secrets.mkdir()
+    (secrets / f"collector_key_{ingest_key_id}").write_text(INGEST_KEY.hex())
+    settings = Settings(data_dir=sources.root, secrets_dir=secrets)
+    with closing(open_inventory(sources.inventory)) as inv:
+        provision_collector(inv, COLLECTOR, ingest_key_id)
+    sent = COVERAGE_HIGH
+    health = {"spool_batches": 0, "uptime_s": 600}
+    if omitted != "dns_log_quiet":
+        health["dns_log_quiet"] = False
+    batch = make_batch(
+        collector_id=COLLECTOR,
+        key_id=ingest_key_id,
+        observation_kind="observation",
+        window_start=COVERAGE_LOW,
+        window_end=sent,
+        sent_ts=sent,
+        health=health,
+        dns=[{"ts": START + 15, "mac": MAC, "qname": QNAME, "qtype": "A"}],
+    )
+    if omitted in ("dns", "truncated", "dropped_batches"):
+        del batch[omitted]
+    body = encode(batch)
+    headers = signed_headers(body, batch)
+    envelope = _parse_envelope({key.lower(): value for key, value in headers.items()})
+    assert envelope is not None
+    assert process_batch(settings, envelope, body, sent + 1) == (200, {"duplicate": False})
+    with closing(sqlite3.connect(sources.inventory)) as db:
+        accepted = json.loads(db.execute("SELECT health FROM batches").fetchone()[0])
+    assert accepted["dns_log_quiet"] is False
+    assert accepted["dns_evidence_reported"] is (omitted is None)
+
+    sources.pages = [page([provider_row()])]
+    result = sources.run()
+    output = capsys.readouterr()
+    if omitted is None:
+        assert result == 0 and len(sources.requests) == 1
+        assert json.loads(output.out)["devices"] == [
+            {"mac": MAC, "threat_intelligence_blocks": 1},
+        ]
+    else:
+        assert result == 1 and not sources.requests
+        assert "coverage" in output.err and not output.out
+
+
+@pytest.mark.parametrize(
+    ("local_ts", "provider_ts", "expected"),
+    [
+        (START, START - 1, False),
+        (START, START, True),
+        (END - 1, END - 1, True),
+        (END - 1, END, False),
+    ],
+)
+def test_positive_provider_timestamp_must_be_inside_requested_window(
+    sources,
+    capsys,
+    local_ts,
+    provider_ts,
+    expected,
+):
+    sources.batch("a", [(local_ts, MAC, QNAME, "A")])
+    # Exact whole-second provider timestamp exercises the end-exclusive boundary.
+    sources.pages = [page([{**provider_row(), "timestamp": iso_utc(provider_ts)}])]
+    assert sources.run() == 0
+    assert bool(json.loads(capsys.readouterr().out)["devices"]) is expected
+
+
+def test_outside_provider_event_remains_an_ambiguity_competitor(sources, capsys):
+    sources.batch("a", [(START, MAC, QNAME, "A")])
+    sources.pages = [page([provider_row(START - 1, status="default"), provider_row(START)])]
+    assert sources.run() == 0
+    assert json.loads(capsys.readouterr().out)["devices"] == []
+
+
+def test_dns_root_can_coexist_with_a_match_without_becoming_a_verdict(sources, capsys):
+    sources.batch("a", [(START + 5, MAC, ".", "DNSKEY"), (START + 15, MAC, QNAME, "A")])
+    sources.pages = [page([{**provider_row(START + 5), "domain": "."}, provider_row()])]
+    assert sources.run() == 0
+    assert json.loads(capsys.readouterr().out)["devices"] == [
+        {"mac": MAC, "threat_intelligence_blocks": 1},
+    ]
+
+
+@pytest.mark.parametrize(("low", "high"), [(START - 20, COVERAGE_HIGH), (COVERAGE_LOW, END + 20)])
+def test_missing_outer_local_coverage_prevents_report(sources, capsys, low, high):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")], low=low, high=high)
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 1
+    result = capsys.readouterr()
+    assert not result.out and "coverage" in result.err
+    assert not sources.requests
+
+
+def test_outer_local_coverage_must_be_settled(sources, monkeypatch, capsys):
+    monkeypatch.setattr(nextdns_cli, "time", lambda: END + 500)
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 1
+    assert "settled" in capsys.readouterr().err
+    assert not sources.requests
+
+
+@pytest.mark.parametrize("kind", ["probe", "unknown-window"])
+def test_non_observation_cannot_establish_coverage(sources, capsys, kind):
+    if kind == "probe":
+        sources.batch("probe", [], observation_kind="probe")
+    else:
+        sources.batch("unknown", [], window_start=None)
+        sources.batch("observation", [])
+    assert sources.run() == 1
+    assert "coverage" in capsys.readouterr().err
+    assert not sources.requests
+
+
+def test_unattributable_local_mac_still_competes(sources, capsys):
+    sources.batch(
+        "a", [(START + 15, MAC, QNAME, "A"), (START + 15, "00:00:00:00:00:00", QNAME, "AAAA")]
+    )
+    sources.pages = [page([provider_row()])]
+    assert sources.run() == 0
+    assert json.loads(capsys.readouterr().out)["devices"] == []
+
+
+def test_incomplete_chunked_provider_response_never_emits_report(sources, capsys):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+    body = json.dumps(page([provider_row()])).encode()
+    raw = (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n"
+    )
+    response = http.client.HTTPResponse(SimpleNamespace(makefile=lambda _mode: io.BytesIO(raw)))
+    response.begin()
+    sources.pages = [response]
+    assert sources.run() == 1
+    result = capsys.readouterr()
+    assert not result.out and "NextDNS" in result.err
+
+
+def test_stalled_provider_reaches_total_deadline(sources, monkeypatch, capsys):
+    sources.batch("a", [(START + 15, MAC, QNAME, "A")])
+
+    class StalledPage(Response):
+        def read(self, *_args):
+            time.sleep(5)
+            raise AssertionError("deadline did not interrupt this read")
+
+    sources.pages = [StalledPage()]
+    monkeypatch.setattr(nextdns_cli, "RUN_TIMEOUT_S", 1)
+    assert sources.run() == 1
+    result = capsys.readouterr()
+    assert not result.out and "report time limit exceeded" in result.err
+    assert len(sources.requests) == 1

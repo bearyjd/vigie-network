@@ -68,6 +68,7 @@ def _check_quality(batch: sqlite3.Row) -> None:
     if (
         not isinstance(health, dict)
         or health.get("dns_log_quiet") is not False
+        or health.get("dns_evidence_reported") is not True
         or type(health.get("spool_batches")) is not int
         or health["spool_batches"] != 0
         or type(health.get("uptime_s")) is not int
@@ -148,6 +149,10 @@ def _read_local(
     end: int,
 ) -> list[LocalQuery]:
     result: list[LocalQuery] = []
+    # Ingest can clamp an input timestamp to a batch boundary. The surrounding accepted
+    # windows must be complete even though only their boundary rows compete for matches.
+    coverage_start = start - FUTURE_WINDOW_SLACK
+    coverage_end = end + FUTURE_WINDOW_SLACK
     with ExitStack() as resources:
         inv = resources.enter_context(closing(_open_ro(inventory)))
         inv.execute("BEGIN")
@@ -157,17 +162,17 @@ def _read_local(
             "((window_start <= ? AND window_end >= ?) OR "
             "window_start IS NULL OR window_end IS NULL) "
             "ORDER BY window_start,window_end LIMIT ?",
-            (collector, end + FUTURE_WINDOW_SLACK, start - FUTURE_WINDOW_SLACK, MAX_BATCHES + 1),
+            (collector, coverage_end, coverage_start, MAX_BATCHES + 1),
         ).fetchall()
         if len(batches) > MAX_BATCHES:
             raise CoverageError()
-        # A missing day inside the reporting interval cannot establish retained raw coverage.
-        first_day, last_day = utc_day(start), utc_day(end - 1)
+        # A missing day inside the coverage interval cannot establish retained raw coverage.
+        first_day, last_day = utc_day(coverage_start), utc_day(coverage_end - 1)
         for offset in range((last_day - first_day).days + 1):
             if not (raw_dir / shard_name(first_day + timedelta(days=offset))).is_file():
                 raise CoverageError()
         dbs: dict[Path, sqlite3.Connection] = {}
-        covered_until = start
+        covered_until = coverage_start
         raw_rows_read = 0
         for batch in batches:
             low, high = batch["window_start"], batch["window_end"]
@@ -182,17 +187,14 @@ def _read_local(
                 _batch_rows(dbs, resources, raw_dir, batch, collector)
                 continue
             _check_quality(batch)
-            # Adjacent accepted batches can hold a query whose reported timestamp was clamped
-            # outside the matching interval. Only overlapping windows establish its coverage.
-            if low < end and high > start:
-                if low > covered_until:
-                    raise CoverageError()
-                covered_until = max(covered_until, high)
+            if low > covered_until:
+                raise CoverageError()
+            covered_until = max(covered_until, high)
             rows = _batch_rows(dbs, resources, raw_dir, batch, collector)
             raw_rows_read += len(rows)
             if raw_rows_read > MAX_RAW_DNS:
                 raise CoverageError()
             result.extend(row for row in rows if row.boundary or start <= row.ts < end)
-        if covered_until < end:
+        if covered_until < coverage_end:
             raise CoverageError()
     return result

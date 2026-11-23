@@ -57,6 +57,8 @@ def canonical_name(raw: object) -> str | None:
     """Match ASCII DNS labels exactly, apart from case and the optional final root dot."""
     if not isinstance(raw, str) or len(raw) > 254 or not raw.isascii():
         return None
+    if raw == ".":
+        return raw  # The DNS root can appear in raw logs.
     name = raw.removesuffix(".").lower()
     if len(name) <= 253 and all(_LABEL.fullmatch(label) for label in name.split(".")):
         return name
@@ -145,7 +147,8 @@ def _parse_query(row: object, device: str) -> ProviderQuery:
     identity = row.get("device")
     reasons = row.get("reasons")
     eligible = (
-        isinstance(identity, dict)
+        name != "."
+        and isinstance(identity, dict)
         and identity.get("id") == device
         and row.get("status") == "blocked"
         and isinstance(reasons, list)
@@ -215,6 +218,8 @@ def count_matches(
 
     count = 0
     delta = TOLERANCE_S * MICROSECONDS
+    interval_start_us = start * MICROSECONDS
+    interval_end_us = end * MICROSECONDS
     for row in local:
         if row.boundary or row.mac != mac or not start <= row.ts < end or row.name in clamped_names:
             continue
@@ -224,9 +229,11 @@ def count_matches(
         stamp = row.ts * MICROSECONDS
         low = bisect_left(events, stamp - delta, key=lambda event: event.stamp_us)
         high = bisect_right(events, stamp + delta, key=lambda event: event.stamp_us)
-        if high - low != 1 or not events[low].eligible_verdict:
+        if high - low != 1:
             continue
         event = events[low]
+        if not event.eligible_verdict or not interval_start_us <= event.stamp_us < interval_end_us:
+            continue
         stamps = by_name[row.name]
         low = bisect_left(stamps, event.stamp_us - delta)
         high = bisect_right(stamps, event.stamp_us + delta)

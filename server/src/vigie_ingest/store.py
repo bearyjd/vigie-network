@@ -357,12 +357,21 @@ def _commit_inventory(
     if rejection:
         return rejection
     since = recording_since(conn)
+    health_json = None
+    if batch.health is not None:
+        health = batch.health.model_dump(mode="json")
+        # Preserve signed DNS evidence provenance without changing the wire defaults.
+        health["dns_evidence_reported"] = (
+            "dns_log_quiet" in batch.health.model_fields_set
+            and {"dns", "truncated", "dropped_batches"} <= batch.model_fields_set
+        )
+        health_json = json.dumps(health, separators=(",", ":"))
     conn.execute(
         "INSERT INTO batches (collector_id,batch_id,received_at,truncated,dropped_batches,"
         "window_start,window_end,observation_kind,health,dns_queries) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (batch.collector_id, batch.batch_id, iso_utc(now), json.dumps(batch.truncated),
          batch.dropped_batches, batch.window_start, batch.window_end, batch.observation_kind,
-         batch.health.model_dump_json() if batch.health is not None else None, len(batch.dns)),
+         health_json, len(batch.dns)),
     )  # fmt: skip
     conn.execute(
         "UPDATE collectors SET last_seq=?, boot_id=?, last_sent_ts=MAX(last_sent_ts, ?) WHERE id=?",

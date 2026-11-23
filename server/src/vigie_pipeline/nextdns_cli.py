@@ -104,7 +104,7 @@ def _validate(args: argparse.Namespace) -> tuple[int, int, str]:
         or args.end != iso_utc(end)
         or not 0 < end - start <= MAX_WINDOW_S
         or start - nextdns.PADDING_S - FUTURE_WINDOW_SLACK < now - MAX_AGE_S
-        or end + nextdns.PADDING_S > now - MIN_SETTLING_S
+        or end + nextdns.PADDING_S + FUTURE_WINDOW_SLACK > now - MIN_SETTLING_S
     ):
         raise nextdns.ReportError("report interval is too long or outside settled raw retention")
     return start, end, mac
@@ -131,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         count = nextdns.count_matches(local, provider, mac, start, end)
         report = {
             "source": "nextdns",
+            "provider_coverage": "unverified",
             "window": {"from": args.start, "to": args.end},
             "devices": [{"mac": mac, "threat_intelligence_blocks": count}] if count else [],
         }
