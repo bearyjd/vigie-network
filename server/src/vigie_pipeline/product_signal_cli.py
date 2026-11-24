@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from vigie_pipeline import product_signal_input as psi
-from vigie_pipeline.product_signal import build_report, render
+from vigie_pipeline.product_signal import build_report, parse_threshold, render
 
 PROGRAM = "vigie-product-signal"
 
@@ -48,6 +48,11 @@ def _read(path: Path) -> bytes:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.threshold is not None:
+        try:
+            parse_threshold(args.threshold)
+        except ValueError:
+            return _fail(2, "invalid threshold")
     try:
         data = _read(args.inventory)
     except OSError:
@@ -56,11 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         inventory = psi.load_inventory(data)
     except psi.InventoryError as exc:
         return _fail(4, f"invalid inventory: {exc}")
-    try:
-        report = build_report(inventory, args.threshold)
-    except ValueError:
-        return _fail(2, "invalid threshold")
-    sys.stdout.buffer.write(render(report))
+    sys.stdout.buffer.write(render(build_report(inventory, args.threshold)))
     sys.stdout.buffer.flush()
     return 0
 

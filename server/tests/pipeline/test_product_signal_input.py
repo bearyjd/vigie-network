@@ -87,6 +87,30 @@ def test_revoked_links_may_repeat_and_are_ignored():
     assert inv.active_links == {"x1": "x3"}
 
 
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        ("dhcp", "service"),
+        ("dhcp", "ua"),
+        ("dhcp", "model"),
+        ("mdns", "opt60"),
+        ("mdns", "ua"),
+        ("ssdp", "opt55"),
+        ("ssdp", "service"),
+    ],  # fmt: skip
+)
+def test_fields_are_restricted_to_the_kind_that_produces_them(kind, field):
+    obs = {"mac": "00:00:5e:00:54:01", "kind": kind, "observed_at": 1, field: "x"}
+    rejects(minimal(observations=[obs]))
+
+
+def test_a_chain_of_exactly_max_depth_links_is_accepted():
+    n = psi.MAX_LINK_DEPTH + 1
+    devices = [device(i) for i in range(n)]
+    links = [{"from": f"x{i}", "into": f"x{i + 1}", "revoked": False} for i in range(n - 1)]
+    assert len(parse_inventory(minimal(devices=devices, links=links)).active_links) == n - 1
+
+
 def test_link_depth_is_bounded():
     n = psi.MAX_LINK_DEPTH + 2
     devices = [device(i) for i in range(n)]

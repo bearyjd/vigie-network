@@ -29,7 +29,7 @@ The document has these fields:
 - `ttl_seconds`: the freshness window. Optional; the default is 86400, the same as characterization.
 - `devices`: a list of `{id, status, macs: [{mac, oui_vendor}]}`. `status` is `active`, `transient` or `retired`. `oui_vendor` is an optional lookup supplied by the owner; Vigie bundles no OUI dataset.
 - `links`: a list of `{from, into, revoked}`. Merges are active links, and an undo is a revoked link.
-- `observations`: a list of `{mac, kind, observed_at, ...}`. `kind` is `mdns`, `ssdp` or `dhcp`. The optional fields are `service`, `ua`, `opt55`, `opt60`, `hostname`, `manufacturer` and `model`. `manufacturer` and `model` are structured device-description fields and are accepted only on `mdns` and `ssdp` observations.
+- `observations`: a list of `{mac, kind, observed_at, ...}`. `kind` is `mdns`, `ssdp` or `dhcp`. Each kind accepts only the fields its source produces: `mdns` accepts `service`, `hostname`, `manufacturer` and `model`; `ssdp` accepts `ua`, `hostname`, `manufacturer` and `model`; `dhcp` accepts `hostname`, `opt55` and `opt60`. `manufacturer` and `model` are structured device-description fields.
 
 MACs use the pipeline's normalizer, so multicast, broadcast and all-zero MACs are rejected. The following are also rejected: a MAC on two devices, a duplicate device ID, a link to an unknown device, a self link, two active links from one device, link cycles, chains deeper than 32 links, and future timestamps.
 

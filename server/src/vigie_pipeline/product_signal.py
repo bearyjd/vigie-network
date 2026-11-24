@@ -138,9 +138,10 @@ def build_report(inv: Inventory, threshold: str | None) -> dict[str, Any]:
     """Coverage report; `threshold` is the owner's value or None (then not evaluated)."""
     limit = None if threshold is None else parse_threshold(threshold)
     by_id = {d.id: d for d in inv.devices}
+    links = dict(inv.active_links)
     groups: dict[str, list[Device]] = {}
     for device in sorted(inv.devices, key=lambda d: d.id):
-        groups.setdefault(resolve(dict(inv.active_links), device.id), []).append(device)
+        groups.setdefault(resolve(links, device.id), []).append(device)
     mac_owner = {m.mac: canonical for canonical, ds in groups.items() for d in ds for m in d.macs}
     obs_by_group: dict[str, list[Obs]] = {}
     for o in sorted(inv.observations, key=lambda o: (o.mac, o.observed_at, repr(o))):

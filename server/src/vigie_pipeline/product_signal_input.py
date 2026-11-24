@@ -30,8 +30,13 @@ KINDS = ("mdns", "ssdp", "dhcp")
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
 _ENVELOPE = {"format", "version", "now", "ttl_seconds", "devices", "links", "observations"}
 _TEXT_FIELDS = ("service", "ua", "opt55", "opt60", "hostname", "manufacturer", "model")
-# Structured device-description fields; only these kinds can carry them.
-_MODEL_KINDS = ("mdns", "ssdp")
+# Fields each kind may carry (mirrors what sources.py fills; manufacturer/model are the
+# structured device-description fields a future reader would supply).
+_KIND_FIELDS = {
+    "mdns": frozenset({"service", "hostname", "manufacturer", "model"}),
+    "ssdp": frozenset({"ua", "hostname", "manufacturer", "model"}),
+    "dhcp": frozenset({"hostname", "opt55", "opt60"}),
+}
 
 
 class InventoryError(ValueError):
@@ -170,7 +175,7 @@ def _observation(value: object, now: float) -> Obs:
     if not _number(stamp) or not 0 <= stamp <= now:
         raise _fail("invalid observation time")
     texts = {field: _text(item.get(field), field) for field in _TEXT_FIELDS}
-    if item["kind"] not in _MODEL_KINDS and (texts["manufacturer"] or texts["model"]):
+    if any(v is not None and f not in _KIND_FIELDS[item["kind"]] for f, v in texts.items()):
         raise _fail("invalid observation fields")
     return Obs(_mac(item["mac"]), item["kind"], float(stamp), **texts)
 

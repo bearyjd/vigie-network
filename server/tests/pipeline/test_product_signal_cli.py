@@ -40,6 +40,11 @@ def test_invalid_threshold_exits_2(capsysbinary):
     assert err == b"vigie-product-signal: invalid threshold\n"
 
 
+def test_threshold_is_checked_before_reading_the_inventory(capsysbinary, tmp_path):
+    code, _, err = run(capsysbinary, "--inventory", str(tmp_path / "absent"), "--threshold", "0")
+    assert (code, err) == (2, b"vigie-product-signal: invalid threshold\n")
+
+
 def test_missing_arguments_exit_2_with_fixed_message(capsysbinary):
     with pytest.raises(SystemExit) as info:
         main([])
