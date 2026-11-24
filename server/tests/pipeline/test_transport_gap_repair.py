@@ -107,3 +107,41 @@ def test_placeholder_rows_are_not_coverage_evidence(tmp_path):
         assert pilot_report.liveness(inv)[1] == HOUR, "a real receipt is evidence again"
     finally:
         inv.close()
+
+
+def test_an_unrelated_label_on_a_nested_receipt_does_not_requeue_the_hour(tmp_path):
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    try:
+        apply_measurements(inv, _big())
+        apply_measurements(inv, measured("n1", HOUR + 100, HOUR + 160, ()))
+        inv.execute("DELETE FROM monitoring_quality_work")  # the repair drained
+        apply_measurements(inv, measured("n2", HOUR + 200, HOUR + 260, ("health_missing",)))
+        assert queued(inv) == []
+        assert coverage(inv, HOUR)[2] == ["overlapping_window"]
+    finally:
+        inv.close()
+
+
+def _api_states(inv):
+    import sqlite3
+
+    from vigie_api.monitoring import coverage as api_coverage
+
+    inv.row_factory = sqlite3.Row
+    hours = api_coverage(inv, "c1", HOUR - 3600, HOUR + 7200, HOUR + 86400)
+    return {h["hour"]: (h["state"], h["observed_seconds"], h["reasons"]) for h in hours}
+
+
+def test_the_api_reports_a_zero_second_placeholder_hour_as_missing(tmp_path):
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    try:
+        apply_measurements(
+            inv, measured("span", HOUR - 30, HOUR + 30, ("cross_hour", "flow_degraded"))
+        )
+        apply_measurements(inv, measured("good", HOUR + 3600, HOUR + 3660, (), {MAC: (5, 0, 1, 0)}))
+        states = _api_states(inv)
+        assert states[HOUR - 3600] == ("missing", 0, ["flow_degraded"]), "reason kept"
+        assert states[HOUR] == ("missing", 0, ["flow_degraded"])
+        assert states[HOUR + 3600] == ("partial", 60, []), "rows with seconds are unchanged"
+    finally:
+        inv.close()

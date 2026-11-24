@@ -305,10 +305,11 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
             (m.collector, hour),
         ).fetchone()
         if prior is not None:
-            # Intentionally merges this receipt's own reasons (e.g. flow_degraded) as well as
-            # overlapping_window, so a nested degraded receipt is order-independent.
+            # Intentionally merges this receipt's flow_degraded as well as overlapping_window,
+            # so a nested degraded receipt is order-independent. Other labels of a nested
+            # receipt (health_missing, raw_missing, ...) stay off the hour, as before.
             before = set(json.loads(prior[1]))
-            degraded = before | set(reasons)
+            degraded = before | ({"overlapping_window", FLOW_DEGRADED} & set(reasons))
             if degraded != before or prior[0] != 0:  # repair only on a real transition
                 inv.execute(
                     "UPDATE coverage_hourly SET qualified_seconds=0,reasons=? "

@@ -217,7 +217,8 @@ impl CtConfig {
     }
 }
 
-/// State shared with the main loop. All plain atomics: the main loop never waits on the reader.
+/// State shared with the main loop. Atomics, plus `gate`: the main loop takes it only briefly at
+/// the window cut, and the reader holds it only for a few stores or one non-blocking enqueue.
 #[derive(Debug, Default)]
 pub struct CtShared {
     pub connected: AtomicBool,
@@ -229,8 +230,8 @@ pub struct CtShared {
     pub attempts: AtomicU64,
     /// Snapshots received over the connection's lifetime.
     pub received: AtomicU64,
-    /// Helper data may be missing although the window can look clean: a connect failed, or a
-    /// connect followed an earlier connection or attempt. A socket still down at the flush is
+    /// Helper data may be missing although the window can look clean: a connect followed an
+    /// earlier connection or attempt (while failing, `connected` is false). A socket still down at the flush is
     /// `connected` = false; a drop is `dropped`; a broken sequence is on the frame
     /// (`Snapshot::transport_gap`). Never counted in `errors`.
     pub interrupted: AtomicBool,
@@ -325,7 +326,6 @@ fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBo
                 let _cut = sh.gate();
                 sh.errors.fetch_add(1, Ordering::Relaxed);
                 sh.attempts.fetch_add(1, Ordering::Relaxed);
-                sh.interrupted.store(true, Ordering::Relaxed);
             }
         }
         first = false;

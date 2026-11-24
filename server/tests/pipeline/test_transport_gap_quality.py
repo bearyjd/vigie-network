@@ -226,3 +226,16 @@ def test_a_second_degraded_receipt_for_an_already_degraded_hour_queues_nothing(
     finally:
         inv.close()
         ov.close()
+
+
+def test_a_cross_hour_window_ending_on_the_hour_touches_only_its_own_hours(tmp_path):
+    inv = open_pipeline_inventory(tmp_path / "inventory.db", migrate=True)
+    try:
+        apply_measurements(
+            inv, measured("edge", HOUR - 30, HOUR + 3600, ("cross_hour", "flow_degraded"))
+        )
+        assert coverage(inv, HOUR - 3600) == (0, 0, ["flow_degraded"])
+        assert coverage(inv, HOUR) == (0, 0, ["flow_degraded"])
+        assert coverage(inv, HOUR + 3600) is None, "the end is exclusive"
+    finally:
+        inv.close()

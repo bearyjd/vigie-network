@@ -19,10 +19,13 @@ use vigie_agent::window::Window;
 use vigie_agent::wiring::{flag, Sources};
 
 const A: &str = "aa:bb:cc:00:00:01";
-const RETRY_MS: u64 = 400;
+const RETRY_MS: u64 = 20;
 
 struct Helper {
-    listener: UnixListener,
+    /// None while the fake helper is down: its socket file is gone, so the reader cannot
+    /// reconnect until the test binds it again (no wall-clock race with the retry delay).
+    listener: Option<UnixListener>,
+    path: PathBuf,
     shared: Arc<CtShared>,
     sources: Sources,
     table: HashMap<String, String>,
@@ -38,22 +41,27 @@ fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
-/// A listening fake helper and a reader that retries after `RETRY_MS`: long enough that a test
-/// sees the socket down and flushes before the reader reconnects into the listen backlog.
+fn bind(p: &PathBuf) -> UnixListener {
+    let listener = UnixListener::bind(p).unwrap();
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    listener
+}
+
+/// A listening fake helper and a reader that retries quickly.
 fn helper(tag: &str) -> Helper {
     let p = tmpdir(tag).join("c.sock");
-    let listener = UnixListener::bind(&p).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = Some(bind(&p));
     let me = std::fs::metadata("/proc/self").unwrap().uid();
     let cfg = CtConfig {
         backoff_base_ms: RETRY_MS,
         backoff_cap_ms: RETRY_MS,
-        ..CtConfig::new(p, vec![0, me])
+        ..CtConfig::new(p.clone(), vec![0, me])
     };
     let ct = CtReader::spawn(cfg).unwrap();
     let shared = ct.shared.clone();
     Helper {
         listener,
+        path: p,
         shared,
         sources: Sources::from_readers(Some(ct), None, 0),
         table: [("192.168.8.10".to_string(), A.to_string())].into(),
@@ -79,8 +87,11 @@ fn wait(what: &str, cond: impl Fn() -> bool) {
 }
 
 impl Helper {
-    fn accept(&self) -> UnixStream {
-        let (conn, _) = self.listener.accept().unwrap();
+    /// Binds the socket again if the helper is down, then accepts the reader.
+    fn accept(&mut self) -> UnixStream {
+        let path = self.path.clone();
+        let listener = self.listener.get_or_insert_with(|| bind(&path));
+        let (conn, _) = listener.accept().unwrap();
         wait("connected", || {
             self.shared.connected.load(Ordering::Relaxed)
         });
@@ -99,8 +110,11 @@ impl Helper {
         });
     }
 
-    /// Closes the connection and waits until the reader has noticed.
-    fn hang_up(&self, conn: UnixStream) {
+    /// Takes the helper down (socket file removed, connection closed) and waits until the
+    /// reader has noticed; it stays down until the next `accept`.
+    fn hang_up(&mut self, conn: UnixStream) {
+        self.listener = None;
+        std::fs::remove_file(&self.path).unwrap();
         drop(conn);
         wait("disconnected", || {
             !self.shared.connected.load(Ordering::Relaxed)
@@ -183,13 +197,16 @@ fn a_reconnect_with_a_reprimed_sequence_before_the_flush_still_marks_the_window(
     let mut h = helper("reprime");
     let mut c1 = h.accept();
     h.send(&mut c1, &[Some(1)]);
+    let before = h.shared.attempts.load(Ordering::Relaxed);
     h.hang_up(c1);
     let mut c2 = h.accept();
+    let refused = h.shared.attempts.load(Ordering::Relaxed) - before;
     h.send(&mut c2, &[Some(1)]);
     let t = h.window(2, true, "interrupted window looks healthy at flush time");
-    assert!(
-        t.get("ct_errors").is_none(),
-        "a clean EOF stays out of the error counter: {t}"
+    assert_eq!(
+        t["ct_errors"].as_u64().unwrap_or(0),
+        refused,
+        "only the refused reconnects count; a clean EOF stays out: {t}"
     );
     h.send(&mut c2, &[Some(2)]);
     h.window(1, false, "the next genuinely clean window clears it");
@@ -204,7 +221,7 @@ fn a_reconnect_in_the_next_window_marks_that_window_too() {
     h.window(1, true, "down at flush time");
     assert!(
         !h.shared.connected.load(Ordering::Relaxed),
-        "precondition: the reconnect falls in the next window"
+        "the helper is still down: the reconnect falls in the next window"
     );
     let mut c2 = h.accept();
     h.send(&mut c2, &[Some(1)]);
