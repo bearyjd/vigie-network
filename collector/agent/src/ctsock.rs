@@ -228,6 +228,11 @@ pub struct CtShared {
     pub attempts: AtomicU64,
     /// Snapshots received over the connection's lifetime.
     pub received: AtomicU64,
+    /// Helper data may be missing although the counters can look clean: a connection ended, a
+    /// connect failed, a reconnect followed an earlier attempt, a snapshot was dropped from the
+    /// queue, or the sequence broke on one connection. Set by the reader, taken once per window
+    /// by the main loop (independently of the snapshot queue). Never counted in `errors`.
+    pub interrupted: AtomicBool,
 }
 
 pub struct CtReader {
@@ -281,13 +286,23 @@ fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
 
 fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBool) {
     let mut attempt = 0u32;
+    let mut first = true;
     while !stop.load(Ordering::Relaxed) {
         let got = connect(cfg);
         match got {
             Ok(stream) => {
+                // Only a successful first attempt starts without a gap behind it.
+                if !first {
+                    sh.interrupted.store(true, Ordering::Relaxed);
+                }
                 sh.connected.store(true, Ordering::Relaxed);
                 let before = sh.received.load(Ordering::Relaxed);
                 serve(stream, cfg, tx, sh, stop);
+                // Latched before `connected` drops, so a flush that sees the socket down
+                // cannot also miss the latch and leave it for a later window alone.
+                if !stop.load(Ordering::Relaxed) {
+                    sh.interrupted.store(true, Ordering::Relaxed);
+                }
                 sh.connected.store(false, Ordering::Relaxed);
                 if sh.received.load(Ordering::Relaxed) > before {
                     attempt = 0;
@@ -297,8 +312,10 @@ fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBo
                 eprintln!("conntrack socket {}: {e}", cfg.path.display());
                 sh.errors.fetch_add(1, Ordering::Relaxed);
                 sh.attempts.fetch_add(1, Ordering::Relaxed);
+                sh.interrupted.store(true, Ordering::Relaxed);
             }
         }
+        first = false;
         let wait = backoff_ms(attempt, cfg.backoff_base_ms, cfg.backoff_cap_ms);
         attempt = attempt.saturating_add(1);
         sleep_unless_stopped(Duration::from_millis(wait), stop);
@@ -328,6 +345,7 @@ fn serve(
     let mut lines = LineBuf::default();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut line_started: Option<Instant> = None;
+    let mut last_seq: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
         match s.read(&mut buf) {
             Ok(0) => {
@@ -341,7 +359,10 @@ fn serve(
                     match ev {
                         LineEvent::Oversized => return bump(sh, "oversized line; dropping peer"),
                         LineEvent::Line(l) => match parse_snapshot(&l) {
-                            Ok(snap) => deliver(snap, tx, sh),
+                            Ok(snap) => {
+                                last_seq = track_seq(last_seq, snap.seq, sh);
+                                deliver(snap, tx, sh);
+                            }
                             Err(e) => return bump(sh, &format!("bad snapshot: {e}")),
                         },
                     }
@@ -363,12 +384,33 @@ fn serve(
     }
 }
 
+/// Whether `seq` continues `last` on one connection. The first numbered frame of a connection is
+/// its baseline (a restarted helper re-primes at 1); `seq` 0 is an old helper's frame without
+/// sequence metadata and is never judged. A gap, duplicate, reorder, reset or wrap breaks it.
+pub fn seq_continues(last: Option<u64>, seq: u64) -> bool {
+    seq == 0 || last.is_none_or(|l| l.checked_add(1) == Some(seq))
+}
+
+/// Latches a broken sequence; returns the connection's new last sequence.
+fn track_seq(last: Option<u64>, seq: u64, sh: &CtShared) -> Option<u64> {
+    if !seq_continues(last, seq) {
+        eprintln!("conntrack socket: sequence {seq} does not follow {last:?}");
+        sh.interrupted.store(true, Ordering::Relaxed);
+    }
+    if seq == 0 {
+        last
+    } else {
+        Some(seq)
+    }
+}
+
 fn deliver(snap: Snapshot, tx: &SyncSender<Snapshot>, sh: &CtShared) {
     sh.received.fetch_add(1, Ordering::Relaxed);
     match tx.try_send(snap) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             sh.dropped.fetch_add(1, Ordering::Relaxed);
+            sh.interrupted.store(true, Ordering::Relaxed);
         }
         Err(TrySendError::Disconnected(_)) => {}
     }

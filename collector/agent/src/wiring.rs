@@ -34,7 +34,8 @@ pub mod flag {
     pub const CT_TABLE_PRESSURE: u64 = 1;
     /// The helper saw conntrack lines without byte counters (`nf_conntrack_acct` is off).
     pub const CT_ACCT_OFF: u64 = 2;
-    /// The helper socket is down, refused, or has been silent for `CT_STALE_S`.
+    /// The helper socket is down, refused, or has been silent for `CT_STALE_S`; or the window
+    /// had a transport gap (see `CtShared::interrupted`), even if the helper recovered since.
     pub const CT_SOCKET_DOWN: u64 = 4;
     /// A multicast socket could not be bound or joined.
     pub const MULTICAST_BIND_FAILED: u64 = 8;
@@ -106,6 +107,8 @@ pub struct Sources {
     /// `flag::CT_TABLE_PRESSURE`/`CT_ACCT_OFF` seen in this window.
     window_flags: u64,
     ct_last_mono: u64,
+    /// The reader reported a transport gap in this window (`CtShared::interrupted`).
+    ct_interrupted: bool,
     /// Monotonic second of the last neighbor-table read (by the agent or by `pump_refreshing`).
     last_refresh: Option<u64>,
     ct_errors: u64,
@@ -248,6 +251,7 @@ impl Sources {
             let sh = ct.shared();
             let lost = sh.errors.swap(0, Ordering::Relaxed) + sh.dropped.swap(0, Ordering::Relaxed);
             self.ct_errors = self.ct_errors.saturating_add(lost);
+            self.ct_interrupted |= sh.interrupted.swap(false, Ordering::Relaxed);
         }
         let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
         if let Some(mc) = &self.mc {
@@ -299,7 +303,8 @@ impl Sources {
             w.add_conntrack(r);
         }
         let mut bits = std::mem::take(&mut self.window_flags);
-        if self.ct_down(mono_s) {
+        let interrupted = std::mem::take(&mut self.ct_interrupted);
+        if interrupted || self.ct_down(mono_s) {
             bits |= flag::CT_SOCKET_DOWN;
         }
         if self.mc_failed() {
