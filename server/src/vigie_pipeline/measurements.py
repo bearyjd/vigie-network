@@ -299,13 +299,14 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
             reasons.append("overlapping_window")
         else:
             already_covered = shared
-    if "overlapping_window" in reasons and "probe" not in reasons:
+    if "overlapping_window" in reasons and "probe" not in reasons and hour is not None:
         prior = inv.execute(
             "SELECT qualified_seconds,reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
             (m.collector, hour),
         ).fetchone()
         if prior is not None:
-            # The batch's own reasons too, so a nested degraded receipt is order-independent.
+            # Intentionally merges this receipt's own reasons (e.g. flow_degraded) as well as
+            # overlapping_window, so a nested degraded receipt is order-independent.
             before = set(json.loads(prior[1]))
             degraded = before | set(reasons)
             if degraded != before or prior[0] != 0:  # repair only on a real transition
