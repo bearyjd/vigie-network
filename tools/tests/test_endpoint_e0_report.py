@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from e0_synth import DAY, MAC, MAC_B, T0, batch, e0, event, flow, lines, scope
+import json
+
+import pytest
+from e0_synth import DAY, MAC, MAC_B, T0, batch, e0, event, flow, lines, scope, scope_dict
 
 inputs = e0.inputs
 report = e0.report
@@ -203,3 +206,125 @@ def test_report_never_carries_process_paths_or_hostnames() -> None:
 
 def codes(out: dict) -> list[str]:
     return [item["code"] for item in out["explanations"]]
+
+
+def hourly(n: int, first_event_hour: int, sc=None):
+    """n hourly keys with distinct destinations; events only from `first_event_hour` on."""
+    batches = [win(f"h{i}", T0 + i * 3600) for i in range(n)]
+    rows = [flow(f"h{i}", T0 + i * 3600 + 60, dst=f"192.0.2.{i + 1}") for i in range(n)]
+    events = [event(T0 + i * 3600 + 5, dst=f"192.0.2.{i + 1}") for i in range(first_event_hour, n)]
+    return run(batches, rows, events, sc=sc)
+
+
+def test_guard_silent_at_export_start_fails_the_gate_through_the_warm_up_bucket() -> None:
+    out = hourly(48, 12)
+    assert out["match"]["gated"]["combined"] == {"matched": 24, "denominator": 24}
+    assert out["match"]["warm_up"]["combined"] == {"matched": 12, "denominator": 24}
+    assert out["gate"]["verdict"] == "no_go"
+    assert out["gate"]["reasons"] == ["warm_up_match_ratio_below_90pct"]
+
+
+def test_warm_up_bucket_at_ninety_percent_passes() -> None:
+    sc = scope(export_start=T0, period_end=T0 + 3 * DAY)
+    out = hourly(30, 0, sc=sc)  # hours 0..23 warm-up, all matched
+    assert out["gate"]["verdict"] == "go"
+
+
+def test_scope_without_export_start_is_rejected_not_inferred_from_events() -> None:
+    raw = scope_dict()
+    del raw["export_start"]
+    with pytest.raises(inputs.InputError):
+        inputs.parse_scope(json.dumps(raw))
+
+
+def test_match_key_needs_the_same_port_and_protocol() -> None:
+    b = win("b1", LATE)
+    rows = [flow("b1", LATE + 60)]
+    port = run([b], rows, [event(LATE + 5, port=8443)])["match"]["gated"]["combined"]
+    assert port == {"matched": 0, "denominator": 1}
+    proto = run([b], rows, [event(LATE + 5, proto="udp")])["match"]["gated"]["combined"]
+    assert proto == {"matched": 0, "denominator": 1}
+
+
+def test_unsorted_event_input_still_matches() -> None:
+    b = win("b1", LATE)
+    events = [event(LATE + 10, src_port=40001), event(LATE - 2 * DAY + 4000, src_port=40002)]
+    out = run([b], [flow("b1", LATE + 60)], events)
+    assert out["match"]["gated"]["direct"] == {"matched": 1, "denominator": 1}
+
+
+def test_gate_ratio_eight_of_nine_fails() -> None:
+    batches = [win(f"b{i}", LATE + i * 60) for i in range(9)]
+    rows = [flow(f"b{i}", LATE + i * 60 + 60, dst=f"192.0.2.{i + 10}") for i in range(9)]
+    events = [event(LATE + i * 60 + 5, dst=f"192.0.2.{i + 10}") for i in range(8)]
+    out = run(batches, rows, events)
+    assert out["match"]["gated"]["combined"] == {"matched": 8, "denominator": 9}
+    assert out["gate"]["reasons"] == ["match_ratio_below_90pct"]
+
+
+@pytest.mark.parametrize(
+    ("offset", "want"),
+    [(-DAY, (0, 1)), (-DAY - 1, (0, 0)), (-121, (0, 1)), (-120, (1, 0))],
+)
+def test_carryover_and_direct_window_seams(offset: int, want: tuple[int, int]) -> None:
+    b = win("b1", LATE)
+    gated = run([b], [flow("b1", LATE + 60)], [event(LATE + offset)])["match"]["gated"]
+    assert (gated["direct"]["matched"], gated["carryover_only"]["matched"]) == want
+
+
+@pytest.mark.parametrize(("start", "bucket"), [(T0 + DAY, "gated"), (T0 + DAY - 1, "warm_up")])
+def test_warm_up_cut_is_a_full_24h_lookback_from_export_start(start: int, bucket: str) -> None:
+    out = run([batch("b1", start, start + 60)], [flow("b1", start + 60)], [event(start + 5)])
+    assert out["match"][bucket]["combined"] == {"matched": 1, "denominator": 1}
+
+
+@pytest.mark.parametrize(
+    ("ts", "attributed"), [(LATE - 1, False), (LATE, True), (LATE + 99, True), (LATE + 100, False)]
+)
+def test_mac_span_since_is_inclusive_and_until_exclusive(ts: int, attributed: bool) -> None:
+    span = model.MacSpan(MAC, LATE, LATE + 100)
+    assert span.covers(MAC, ts) is attributed
+    assert span.covers(MAC_B, LATE + 10) is False
+
+
+def test_attributed_orphan_rows_count_in_the_other_share() -> None:
+    b = win("b1", LATE)
+    rows = [
+        flow("b1", LATE + 60, up=5000, down=5000),
+        flow("ghost", LATE + 60, None, None, up=600, down=600),
+        flow("ghost", LATE + 60, None, None, mac="02:00:00:00:00:99", up=9, down=9),
+    ]
+    out = run([b], rows, [event(LATE + 5)])
+    share = out["other_share"]
+    assert share["other_bytes"] == 1200 and share["mapped_bytes"] == 11200
+    assert share["orphan_bytes"] == 1200
+    assert out["flows"]["orphan_rows"] == 1 and out["flows"]["unattributed_rows"] == 1
+    assert out["gate"]["reasons"] == ["other_share_at_or_above_10pct"]
+
+
+def test_explanations_cover_rejects_duplicates_nat_flows_shards_and_defaults() -> None:
+    b = win("b1", LATE)
+    rows = [flow("b1", LATE + 60), flow("b1", LATE + 60)]
+    events = [event(LATE), event(LATE), event(LATE, src_ip="10.88.0.5"), event("bad")]
+    out = run([b], rows, events, missing_shards=("raw-20231115.db",))
+    assert {
+        "key_level_match",
+        "skew_assumed_zero",
+        "events_rejected",
+        "duplicate_events",
+        "nat_or_off_lan_sources",
+        "duplicate_flow_rows",
+        "raw_shard_missing",
+    } <= set(codes(out))
+    clean = run([b], [flow("b1", LATE + 60)], [event(LATE)])
+    assert codes(clean) == ["key_level_match", "skew_assumed_zero"]
+    assert "zero_denominator" in codes(run([], [], []))
+
+
+def test_out_of_span_row_alone_flags_attribution_change() -> None:
+    sc = scope(export_start=T0, macs=[{"mac": MAC, "until": LATE + 100}])
+    b1, b2 = win("b1", LATE), win("b2", LATE + 120)
+    rows = [flow("b1", LATE + 60), flow("b2", LATE + 180, dst="192.0.2.11")]
+    out = run([b1, b2], rows, [event(LATE)], sc=sc)
+    assert out["flows"]["out_of_span_rows"] == 1
+    assert "attribution_changed" in codes(out)

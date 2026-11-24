@@ -1,8 +1,9 @@
 """E0 report: `other` byte share, key match ratio (direct and 24 h carryover) and the gate.
 
 Gate (PRP-003 section 10): `other` bytes < 10% of mapped bytes and matched keys >= 90%,
-in integer arithmetic. A zero denominator never passes. Output holds counts and class labels
-only: no process path, hostname, user id or rule leaves this module.
+in integer arithmetic, both after the 24 h warm-up and within it. A zero denominator never
+passes. Output holds counts and class labels only: no process path, hostname, user id or rule
+leaves this module.
 """
 
 from __future__ import annotations
@@ -35,9 +36,12 @@ def _row_exclusion(sc: Scope, flow: Flow) -> str | None:
     return netutil.dst_exclusion(flow.dst_ip, sc.lan_prefixes, sc.router_ips)
 
 
-def _join(sc: Scope, router: RouterData) -> tuple[list[tuple[Flow, Batch]], dict[str, int]]:
+def _join(
+    sc: Scope, router: RouterData
+) -> tuple[list[tuple[Flow, Batch]], list[Flow], dict[str, int]]:
+    """Attributed rows joined to their batch, attributed rows with no batch, and counts."""
     seen: set[Flow] = set()
-    joined, counts = [], Counter()
+    joined, orphans, counts = [], [], Counter()
     macs = {span.mac for span in sc.macs}
     for flow in router.flows:
         if flow in seen:
@@ -45,27 +49,32 @@ def _join(sc: Scope, router: RouterData) -> tuple[list[tuple[Flow, Batch]], dict
             continue
         seen.add(flow)
         batch = router.batches.get((flow.collector_id, flow.batch_id))
-        if batch is None:
-            counts["orphan_rows"] += 1
-        elif not _attributed(sc, flow):
+        if not _attributed(sc, flow):
             counts["unattributed_rows"] += 1
             counts["out_of_span_rows"] += flow.mac in macs
+        elif batch is None:
+            counts["orphan_rows"] += 1
+            orphans.append(flow)
         else:
             joined.append((flow, batch))
     names = ("duplicate_rows", "orphan_rows", "unattributed_rows", "out_of_span_rows")
-    return joined, {"rows": len(router.flows), **{n: counts[n] for n in names}}
+    return joined, orphans, {"rows": len(router.flows), **{n: counts[n] for n in names}}
 
 
-def _other_share(joined: list[tuple[Flow, Batch]]) -> dict:
-    total = other = flows = other_flows = degraded = 0
-    for flow, batch in joined:
+def _other_share(joined: list[tuple[Flow, Batch]], orphans: list[Flow]) -> dict:
+    """Byte share over every attributed row; orphans have no window but are still the device's."""
+    total = other = flows = other_flows = degraded = orphan = 0
+    rows: list[tuple[Flow, Batch | None]] = [*joined, *((flow, None) for flow in orphans)]
+    for flow, batch in rows:
         size = flow.bytes_up + flow.bytes_down
         total += size
         flows += flow.flows
         if flow.dst_ip is None:
             other += size
             other_flows += flow.flows
-        if batch.reasons:
+        if batch is None:
+            orphan += size
+        elif batch.reasons:
             degraded += size
     return {
         "other_bytes": other,
@@ -73,6 +82,7 @@ def _other_share(joined: list[tuple[Flow, Batch]]) -> dict:
         "other_flows": other_flows,
         "mapped_flows": flows,
         "degraded_bytes": degraded,
+        "orphan_bytes": orphan,
         "share_ppm": other * 1_000_000 // total if total else None,
     }
 
@@ -110,10 +120,7 @@ def _bucket() -> dict[str, dict[str, int]]:
 
 def _match(sc: Scope, keys: set[_Key], log: EventLog) -> dict:
     index = _index(log)
-    if sc.export_start is not None:
-        export_start = sc.export_start
-    else:
-        export_start = log.events[0].t if log.events else sc.period_start
+    export_start = sc.export_start
     buckets = {"gated": _bucket(), "warm_up": _bucket()}
     unmatched: Counter[str] = Counter()
     for dst, proto, port, start, end in sorted(keys):
@@ -170,18 +177,24 @@ def _batches(router: RouterData) -> dict:
     }
 
 
-def _gate(share: dict, gated: dict) -> dict:
+def _ratio_reason(bucket: dict, name: str) -> str | None:
+    matched, keys = bucket["combined"]["matched"], bucket["combined"]["denominator"]
+    return f"{name}match_ratio_below_90pct" if keys and matched * 10 < 9 * keys else None
+
+
+def _gate(share: dict, match: dict) -> dict:
     reasons = []
     other, mapped = share["other_bytes"], share["mapped_bytes"]
     if mapped == 0:
         reasons.append("zero_mapped_bytes")
     elif other * 10 >= mapped:
         reasons.append("other_share_at_or_above_10pct")
-    matched, keys = gated["combined"]["matched"], gated["combined"]["denominator"]
-    if keys == 0:
+    if match["gated"]["combined"]["denominator"] == 0:
         reasons.append("zero_gated_keys")
-    elif matched * 10 < 9 * keys:
-        reasons.append("match_ratio_below_90pct")
+    for name, prefix in (("gated", ""), ("warm_up", "warm_up_")):
+        reason = _ratio_reason(match[name], prefix)
+        if reason:
+            reasons.append(reason)
     if any(r.startswith("zero_") for r in reasons):
         verdict = "no_result"
     else:
@@ -189,13 +202,13 @@ def _gate(share: dict, gated: dict) -> dict:
     return {
         "verdict": verdict,
         "reasons": reasons,
-        "match_rule": "direct_or_carryover_post_warm_up",
+        "match_rule": "direct_or_carryover_post_warm_up_and_within_warm_up",
     }
 
 
 def build_report(sc: Scope, router: RouterData, log: EventLog) -> dict:
-    joined, flow_counts = _join(sc, router)
-    share = _other_share(joined)
+    joined, orphans, flow_counts = _join(sc, router)
+    share = _other_share(joined, orphans)
     keys, excluded = _keys(sc, joined)
     match = {**_match(sc, keys, log), "excluded_keys": excluded}
     out = {
@@ -214,7 +227,7 @@ def build_report(sc: Scope, router: RouterData, log: EventLog) -> dict:
         "events": _events(log, share["mapped_bytes"]),
         "batches": _batches(router),
         "attribution": {"mac_spans": len(sc.macs), "distinct_macs": len({m.mac for m in sc.macs})},
-        "gate": _gate(share, match["gated"]),
+        "gate": _gate(share, match),
     }
     return {**out, "explanations": explain.explanations(sc, out)}
 

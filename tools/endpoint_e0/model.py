@@ -32,9 +32,9 @@ class Scope:
     router_ips: frozenset[str]
     period_start: int
     period_end: int
+    export_start: int
     skew_s: int = 0
     skew_supplied: bool = False
-    export_start: int | None = None
 
 
 @dataclass(frozen=True)

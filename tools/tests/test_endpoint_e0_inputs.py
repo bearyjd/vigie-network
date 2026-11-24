@@ -7,6 +7,10 @@ import json
 import pytest
 from e0_synth import HOST, T0, e0, event, lines, scope, scope_dict
 
+report = e0.report
+router = e0.router
+DT_MAX = 253_402_300_799  # 9999-12-31T23:59:59Z
+
 inputs = e0.inputs
 net = e0.netutil
 
@@ -74,6 +78,10 @@ def test_scope_parses_and_is_immutable() -> None:
         {"skew_s": 10**9},
         {"extra": 1},
         {"macs": [{"mac": "02:00:00:00:00:01"}] * 65},
+        {"router_ips": 5},
+        {"router_ips": None},
+        {"router_ips": "192.168.8.1"},
+        {"router_ips": ["192.168.8.1"] * 65},
     ],
 )
 def test_scope_rejects_invalid_values(over: dict) -> None:
@@ -160,3 +168,70 @@ def test_events_file_size_cap_is_fatal(tmp_path, monkeypatch: pytest.MonkeyPatch
 def test_missing_events_file_is_an_input_error(tmp_path) -> None:
     with pytest.raises(inputs.InputError):
         inputs.read_events(tmp_path / "absent.jsonl", scope())
+
+
+@pytest.mark.parametrize(
+    ("time", "skew"),
+    [
+        ("0001-01-01T00:00:00+14:00", 0),
+        ("9999-12-31T23:59:59-14:00", 0),
+        ("9999-12-31T23:59:59+00:00", -1),  # in range until the skew shift
+        (0, 1),
+    ],
+)
+def test_out_of_range_event_times_are_rejected_not_fatal(time: object, skew: int) -> None:
+    sc = scope(skew_s=skew)
+    log = inputs.parse_events(lines(event(time), event(T0)), sc)
+    assert log.accepted == 1 and log.rejected == {"bad_value": 1}
+    empty = e0.model.RouterData(batches={}, flows=())
+    report.build_report(sc, empty, log)
+
+
+def test_event_times_at_the_representable_edges_are_accepted() -> None:
+    top = "9999-12-31T23:59:59+00:00"
+    log = inputs.parse_events(lines(event(0), event(top), event(9_999_999_999)), scope())
+    assert [ev.t for ev in log.events] == [0, 9_999_999_999, DT_MAX]
+
+
+def test_input_caps_are_pinned() -> None:
+    assert inputs.MAX_LINE_BYTES == 8192
+    assert inputs.MAX_EVENTS == 500_000
+    assert inputs.MAX_SCOPE_BYTES == 1 << 20
+    assert inputs.MAX_EVENTS_FILE_BYTES == 256 << 20
+    assert router.MAX_BATCHES == 20_000
+    assert router.MAX_FLOW_ROWS == 1_000_000
+    assert router.MAX_COUNTER == 1 << 62
+
+
+def padded(size: int, **over) -> bytes:
+    """A valid event line of exactly `size` bytes (inner JSON whitespace)."""
+    body = json.dumps(event(T0, **over)).encode()
+    return b"{" + b" " * (size - len(body)) + body[1:]
+
+
+def test_bounded_reader_frames_oversize_lines_and_keeps_the_next_line(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    exact = padded(inputs.MAX_LINE_BYTES)
+    over = padded(inputs.MAX_LINE_BYTES + 1, src_port=40001)
+    huge = b"x" * (3 * inputs.MAX_LINE_BYTES + 7)
+    last = json.dumps(event(T0, src_port=40002)).encode()  # no trailing newline
+    path.write_bytes(b"\n".join([exact, over, huge, b"", last]))
+    log = inputs.read_events(path, scope())
+    assert log.accepted == 2 and log.read == 4
+    assert log.rejected == {"frame_bad": 2}
+
+
+def test_event_count_cap_allows_exactly_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inputs, "MAX_EVENTS", 2)
+    assert inputs.parse_events(lines(event(T0), event(T0 + 1)), scope()).accepted == 2
+
+
+def test_scope_size_cap_is_fatal(tmp_path) -> None:
+    text = json.dumps(scope_dict())
+    big = text[:-1] + " " * (inputs.MAX_SCOPE_BYTES + 1 - len(text)) + "}"
+    with pytest.raises(inputs.InputError, match="size"):
+        inputs.parse_scope(big)
+    path = tmp_path / "scope.json"
+    path.write_text(big)
+    with pytest.raises(inputs.InputError, match="size"):
+        inputs.read_scope(path)

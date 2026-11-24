@@ -27,6 +27,7 @@ MAX_LIST = 64
 MAX_PERIOD_S = 7 * 86400
 MAX_SKEW_S = 86400
 MAX_TS = 1 << 40
+MAX_EVENT_TS = 253_402_300_799  # 9999-12-31T23:59:59Z, the last second datetime can render
 EVENT_KEYS = frozenset(
     {
         "time", "protocol", "src_ip", "src_port", "dst_ip", "dst_port", "dst_host",
@@ -34,9 +35,12 @@ EVENT_KEYS = frozenset(
     }
 )  # fmt: skip
 SCOPE_REQUIRED = frozenset(
-    {"host_id", "device_id", "macs", "lan_prefixes", "router_ips", "period_start", "period_end"}
-)
-SCOPE_OPTIONAL = frozenset({"skew_s", "export_start"})
+    {
+        "host_id", "device_id", "macs", "lan_prefixes", "router_ips", "period_start",
+        "period_end", "export_start",
+    }
+)  # fmt: skip
+SCOPE_OPTIONAL = frozenset({"skew_s"})
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _BAD_CHARS = re.compile("[\x00-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩]")
 
@@ -132,14 +136,13 @@ def parse_scope(text: str) -> Scope:
     for key in ("host_id", "device_id"):
         if not _text(raw[key], 128) or not raw[key]:
             raise InputError(f"scope {key} must be a short printable string")
-    routers = [netutil.norm_ip(ip) if isinstance(ip, str) else None for ip in raw["router_ips"]]
-    if None in routers or len(routers) > MAX_LIST:
+    ips = _bounded_list(raw, "router_ips", True)
+    routers = [netutil.norm_ip(ip) if isinstance(ip, str) else None for ip in ips]
+    if None in routers:
         raise InputError("scope router_ips must be IP strings")
     start = _scope_int(raw, "period_start", 0, MAX_TS)
     end = _scope_int(raw, "period_end", start + 1, start + MAX_PERIOD_S)
-    export = raw.get("export_start")
-    if export is not None and not _is_int(export, 0, MAX_TS):
-        raise InputError("scope export_start must be an epoch integer")
+    export = _scope_int(raw, "export_start", 0, MAX_TS)
     skew_supplied = "skew_s" in raw
     skew = _scope_int(raw, "skew_s", -MAX_SKEW_S, MAX_SKEW_S) if skew_supplied else 0
     return Scope(
@@ -216,6 +219,8 @@ def _classify(line: bytes, sc: Scope) -> tuple[str, object]:
     if obj["host_id"] != sc.host_id:
         return "host_id_mismatch", None
     t, proto, src, dst = values
+    if not 0 <= t - sc.skew_s <= MAX_EVENT_TS:
+        return "bad_value", None  # a corrected time datetime cannot render
     if not netutil.in_lan(src, sc.lan_prefixes):
         return "src_off_lan", None
     key = (t, proto, src, obj["src_port"], dst, obj["dst_port"])

@@ -13,7 +13,7 @@ TEXTS = {
     "legacy_windows": "Some batches have no window bounds (legacy). Their keys cannot be placed "
     "in time and are excluded; their bytes stay in the share.",
     "warm_up": "Keys whose 24 h carryover lookback starts before the export began are reported "
-    "under `warm_up` and kept out of the gated denominator.",
+    "under `warm_up`, apart from the gated denominator, and must also reach the 90% ratio.",
     "attribution_changed": "The device's attribution changed in the period (several scoped MACs, "
     "rows from a scoped MAC outside its validity span, or several endpoint source IPs).",
     "zero_denominator": "A gate denominator is zero, so the gate gives no result, never a pass.",
@@ -31,7 +31,7 @@ TEXTS = {
     "without a name); they still count as reported.",
     "ipv6_keys": "IPv6 keys are included; addresses are compared in canonical form.",
     "orphan_flow_rows": "Some raw_flow rows had no accepted batch with the same collector and "
-    "batch ID; they are left out of every number.",
+    "batch ID; their bytes count in the share (`orphan_bytes`), but they give no match keys.",
     "duplicate_flow_rows": "Exact duplicate raw_flow rows were collapsed before counting bytes.",
     "raw_shard_missing": "One or more raw shard days of the period were missing.",
 }

@@ -2,8 +2,8 @@
 """PRP-003 phase E0 feasibility report for one device (docs/prp/003-endpoint-events.md).
 
 Offline and read-only: an exported endpoint JSONL log (one opensnitch remote-logger event per
-line), the owner's scope JSON (host, device MAC spans, LAN prefixes, router IPs, period, optional
-skew_s and export_start), the inventory database (`batches`) and the raw shard directory.
+line), the owner's scope JSON (host, device MAC spans, LAN prefixes, router IPs, period,
+export_start, optional skew_s), the inventory database (`batches`) and the raw shard directory.
 Prints a sorted-key JSON report with the `other` byte share, the key match ratio (direct
 +-120 s and 24 h carryover, explicit denominators), explanations and the go/no-go gate.
 

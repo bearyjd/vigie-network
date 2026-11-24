@@ -38,6 +38,7 @@ def scope_dict(**over: object) -> dict:
         "router_ips": ["192.168.8.1"],
         "period_start": T0,
         "period_end": T0 + 2 * DAY,
+        "export_start": T0,
     }
     base.update(over)
     return base

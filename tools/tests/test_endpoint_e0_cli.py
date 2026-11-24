@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from e0_synth import (
     DAY,
     HEALTH,
     MAC,
+    MAC_B,
     T0,
     TOOLS,
     WINDOW,
@@ -126,7 +128,8 @@ def test_48h_single_device_report_end_to_end(tmp_path: Path) -> None:
     out = json.loads(proc.stdout)
     assert out["gate"]["verdict"] == "go"
     share = out["other_share"]
-    assert share["mapped_bytes"] == 2880 * (1900 + 30 + 10) + 2 * 2
+    assert share["mapped_bytes"] == 2880 * (1900 + 30 + 10) + 3 * 2  # hurt, legacy, ghost orphan
+    assert share["orphan_bytes"] == 2
     assert share["other_bytes"] == 2880 * 30
     m = out["match"]
     assert m["eligible_keys"] == 2880
@@ -210,3 +213,45 @@ def test_loader_fetches_only_batches_referenced_by_loaded_rows(tmp_path: Path) -
     )
     data = router.load_router(tmp_path / "inv.db", raw, scope())
     assert set(data.batches) == {(COLLECTOR, "b1")}
+
+
+def test_loader_reads_every_scoped_mac_and_normalizes_ip_and_proto(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0)])
+    rows = [
+        (COLLECTOR, T0 + 60, MAC, "192.0.2.1", 443, "tcp", 1, 1, 1, "b1"),
+        (COLLECTOR, T0 + 60, MAC_B, "2001:DB8:0:0::30", 443, "tcp6", 1, 1, 1, "b1"),
+        (COLLECTOR, T0 + 60, "02:00:00:00:0f:01", "192.0.2.2", 443, "tcp", 1, 1, 1, "b1"),
+    ]
+    write_shard(raw, "20231115", rows)
+    sc = scope(macs=[{"mac": MAC}, {"mac": MAC_B.upper()}])
+    data = router.load_router(tmp_path / "inv.db", raw, sc)
+    got = sorted((f.mac, f.dst_ip, f.proto) for f in data.flows)
+    assert got == [(MAC, "192.0.2.1", "tcp"), (MAC_B, "2001:db8::30", "tcp")]
+
+
+def test_loader_counter_cap_is_inclusive(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0)])
+    cap = router.MAX_COUNTER
+    write_shard(raw, "20231115", [(COLLECTOR, T0 + 60, MAC, None, None, "other", cap, 1, 1, "b1")])
+    assert router.load_router(tmp_path / "inv.db", raw, scope()).flows[0].bytes_up == cap
+    write_shard(
+        raw, "20231115", [(COLLECTOR, T0 + 60, MAC, None, None, "other", cap + 1, 1, 1, "b1")]
+    )
+    with pytest.raises(inputs.InputError, match="counter"):
+        router.load_router(tmp_path / "inv.db", raw, scope())
+
+
+def test_sqlite_connections_are_read_only_twice_over(tmp_path: Path) -> None:
+    write_inventory(tmp_path / "inv.db", [])
+    db = router._open_ro(tmp_path / "inv.db")
+    try:
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+        db.execute("PRAGMA query_only=OFF")
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            db.execute("CREATE TABLE t (a)")
+    finally:
+        db.close()
