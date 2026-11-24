@@ -27,6 +27,7 @@ struct Helper {
     sources: Sources,
     table: HashMap<String, String>,
     mono: u64,
+    w: Window,
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -57,6 +58,7 @@ fn helper(tag: &str) -> Helper {
         sources: Sources::from_readers(Some(ct), None, 0),
         table: [("192.168.8.10".to_string(), A.to_string())].into(),
         mono: 0,
+        w: Window::default(),
     }
 }
 
@@ -105,13 +107,14 @@ impl Helper {
         });
     }
 
-    /// Pumps and flushes one window; returns its `truncated` map and A's uploaded bytes.
-    fn flush(&mut self) -> (serde_json::Value, u64) {
+    /// Flushes one window; returns its `truncated` map and A's uploaded bytes. `pump` false is the agent's Hold path: `finish_window` alone, queued frames stay queued.
+    fn flush_with(&mut self, pump: bool) -> (serde_json::Value, u64) {
         self.mono += 60;
-        let mut w = Window::default();
-        self.sources.pump(&mut w, &self.table, self.mono);
-        self.sources.finish_window(&mut w, self.mono);
-        let (sections, drops) = w.take_with_drops();
+        if pump {
+            self.pump_only();
+        }
+        self.sources.finish_window(&mut self.w, self.mono);
+        let (sections, drops) = self.w.take_with_drops();
         let meta = Meta {
             collector_id: "c1".into(),
             key_id: "k1".into(),
@@ -136,9 +139,24 @@ impl Helper {
         (j["truncated"].clone(), up)
     }
 
+    /// A pump of the open window between flushes (the agent's main loop does this).
+    fn pump_only(&mut self) {
+        self.sources.pump(&mut self.w, &self.table, self.mono);
+    }
+
     /// Flushes and checks the window holds exactly `frames` frames' bytes and the given verdict.
     fn window(&mut self, frames: u64, degraded: bool, why: &str) -> serde_json::Value {
-        let (t, up) = self.flush();
+        self.window_with(true, frames, degraded, why)
+    }
+
+    fn window_with(
+        &mut self,
+        pump: bool,
+        frames: u64,
+        degraded: bool,
+        why: &str,
+    ) -> serde_json::Value {
+        let (t, up) = self.flush_with(pump);
         assert_eq!(
             up,
             FRAME_UP * frames,
@@ -214,7 +232,76 @@ fn a_snapshot_lost_from_a_full_queue_marks_the_window() {
     let t = h.window(QUEUE as u64, true, "queue loss");
     assert_eq!(t["ct_errors"], 1, "the drop counter keeps its meaning: {t}");
     h.send(&mut c, &[Some(QUEUE as u64 + 2)]);
-    h.window(1, false, "cleared after the lossy window");
+    h.window(
+        1,
+        true,
+        "the next delivered frame carries the drop (errs toward degrading)",
+    );
+    h.send(&mut c, &[Some(QUEUE as u64 + 3)]);
+    h.window(1, false, "cleared after it");
+}
+
+#[test]
+fn the_first_frame_after_a_reconnect_marks_the_window_that_counts_it() {
+    let mut h = helper("firstafter");
+    let mut c1 = h.accept();
+    h.send(&mut c1, &[Some(1)]);
+    h.window(1, false, "baseline");
+    h.hang_up(c1);
+    let mut c2 = h.accept();
+    h.send(&mut c2, &[Some(1)]);
+    h.window_with(
+        false,
+        0,
+        true,
+        "the reconnect is cut before its first frame drains",
+    );
+    h.window(1, true, "the first frame's counters may hold the gap");
+    h.send(&mut c2, &[Some(2)]);
+    h.window(1, false, "continuous after it");
+}
+
+#[test]
+fn a_queue_drop_on_the_hold_path_marks_the_window_of_the_next_frame() {
+    let mut h = helper("dropheld");
+    let mut c = h.accept();
+    let seqs: Vec<Option<u64>> = (1..=QUEUE as u64 + 1).map(Some).collect();
+    h.send(&mut c, &seqs);
+    h.window_with(false, 0, true, "held window: the drop's own window");
+    h.pump_only();
+    h.send(&mut c, &[Some(QUEUE as u64 + 2)]);
+    let t = h.window(
+        QUEUE as u64 + 1,
+        true,
+        "the frame after the drop carries it",
+    );
+    assert!(
+        t.get("ct_errors").is_none(),
+        "the drop was counted once: {t}"
+    );
+    h.send(&mut c, &[Some(QUEUE as u64 + 3)]);
+    h.window(1, false, "then clean");
+}
+
+#[test]
+fn a_queue_overflow_between_the_final_pump_and_the_cut_marks_the_next_frame_too() {
+    let mut h = helper("dropcut");
+    let mut c = h.accept();
+    h.send(&mut c, &[Some(1)]);
+    h.window(1, false, "baseline");
+    h.pump_only();
+    let seqs: Vec<Option<u64>> = (2..=QUEUE as u64 + 2).map(Some).collect();
+    h.send(&mut c, &seqs);
+    h.window_with(false, 0, true, "overflow after the final pump");
+    h.pump_only();
+    h.send(&mut c, &[Some(QUEUE as u64 + 3)]);
+    h.window(
+        QUEUE as u64 + 1,
+        true,
+        "queued frames plus the frame after the drop",
+    );
+    h.send(&mut c, &[Some(QUEUE as u64 + 4)]);
+    h.window(1, false, "then clean");
 }
 
 /// One connection: a baseline window, the window with `second` (degraded or not), then a

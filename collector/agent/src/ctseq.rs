@@ -9,6 +9,11 @@
 //! - at most `MAX_REORDER` behind it is a duplicate or a late frame: marked, mark kept;
 //! - further behind is a reset or a wrap: marked, and the frame becomes the new baseline.
 //!
+//! Assumption: a helper never resets its sequence without dropping the connection (a restart
+//! closes the socket, and the reconnect is flagged on its own). A reset that lands within
+//! `MAX_REORDER` of the mark is read as late frames and flags up to that many frames before
+//! the sequence catches up again: it errs toward degrading.
+//!
 //! Limit: an old helper advances `seq` only on successful samples, so a failed scan leaves no
 //! hole to see.
 

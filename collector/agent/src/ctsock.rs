@@ -348,7 +348,8 @@ fn bump(sh: &CtShared, what: &str) {
 }
 
 /// Reads until the peer misbehaves or goes away. Returns on any error (already counted).
-/// After a reconnect the first frame is marked: the gap behind it may sit in its counters.
+/// After a reconnect or a queue drop the next delivered frame is marked: the gap behind it may
+/// sit in its counters.
 fn serve(
     mut s: UnixStream,
     cfg: &CtConfig,
@@ -380,14 +381,14 @@ fn serve(
                                 }
                                 seq = next;
                                 let transport_gap = broken || std::mem::take(&mut gap_next);
-                                deliver(
-                                    Snapshot {
-                                        transport_gap,
-                                        ..snap
-                                    },
-                                    tx,
-                                    sh,
-                                );
+                                let snap = Snapshot {
+                                    transport_gap,
+                                    ..snap
+                                };
+                                // A dropped frame's loss rides on the next delivered one,
+                                // whichever window drains it (the Hold path, or an overflow
+                                // after the final pump, would otherwise leave it clean).
+                                gap_next = !deliver(snap, tx, sh);
                             }
                             Err(e) => return bump(sh, &format!("bad snapshot: {e}")),
                         },
@@ -411,10 +412,14 @@ fn serve(
 }
 
 /// Enqueues under the gate; `received` counts the frame only once its queue outcome is known.
-fn deliver(snap: Snapshot, tx: &SyncSender<Snapshot>, sh: &CtShared) {
+/// Returns false when the queue was full and the frame was dropped (still counted in
+/// `dropped`, so `ct_errors` keeps its meaning).
+fn deliver(snap: Snapshot, tx: &SyncSender<Snapshot>, sh: &CtShared) -> bool {
     let _cut = sh.gate();
-    if let Err(TrySendError::Full(_)) = tx.try_send(snap) {
+    let full = matches!(tx.try_send(snap), Err(TrySendError::Full(_)));
+    if full {
         sh.dropped.fetch_add(1, Ordering::Relaxed);
     }
     sh.received.fetch_add(1, Ordering::Relaxed);
+    !full
 }
