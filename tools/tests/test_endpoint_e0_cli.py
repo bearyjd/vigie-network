@@ -1,0 +1,186 @@
+"""E0 feasibility tool: read-only sqlite loading and the 48 h single-device report. Synthetic."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from e0_synth import (
+    COLLECTOR,
+    DAY,
+    HEALTH,
+    MAC,
+    T0,
+    TOOLS,
+    WINDOW,
+    e0,
+    event,
+    scope,
+    scope_dict,
+    write_inventory,
+    write_shard,
+)
+
+router = e0.router
+inputs = e0.inputs
+CLI = TOOLS / "endpoint_feasibility.py"
+DESTS = ("192.0.2.10", "198.51.100.20", "2001:db8::30", "203.0.113.40")
+
+
+def ok_row(bid: str, start: int, **over) -> tuple:
+    return (
+        over.get("collector", COLLECTOR),
+        bid,
+        start,
+        start + WINDOW,
+        over.get("kind", "observation"),
+        over.get("health", HEALTH),
+        over.get("truncated"),
+        over.get("dropped", 0),
+    )
+
+
+@pytest.mark.parametrize(
+    ("over", "start", "want"),
+    [
+        ({}, T0, ()),
+        ({"kind": "probe"}, T0, ("probe",)),
+        ({"kind": None}, T0, ("legacy_kind",)),
+        ({"health": None}, T0, ("health_missing",)),
+        ({"truncated": '{"ct_dropped_keys": 3}'}, T0, ("flow_degraded",)),
+        ({"truncated": '{"truncated_other": 1}'}, T0, ("flow_degraded",)),
+        ({"truncated": '{"source_flags": 8, "ct_unmapped_bytes": 9}'}, T0, ()),
+        ({"dropped": 2}, T0, ("flow_degraded",)),
+        ({}, T0 + 3570, ("cross_hour",)),
+    ],
+)
+def test_batch_reasons_mirror_pipeline_acceptance(over: dict, start: int, want: tuple) -> None:
+    row = ok_row("b", start, **over)
+    keys = ("collector_id", "batch_id", "window_start", "window_end", "observation_kind")
+    record = dict(zip(keys, row[:5], strict=True))
+    record.update(health=row[5], truncated=row[6], dropped_batches=row[7])
+    assert router.batch_reasons(record) == want
+
+
+def test_batch_reasons_legacy_and_empty_windows() -> None:
+    base = {"observation_kind": "observation", "health": HEALTH, "truncated": None}
+    legacy = {**base, "window_start": None, "window_end": None, "dropped_batches": 0}
+    assert router.batch_reasons(legacy) == ("legacy_window",)
+    empty = {**base, "window_start": T0, "window_end": T0, "dropped_batches": 0}
+    assert router.batch_reasons(empty) == ("empty_window",)
+
+
+def build_48h(tmp_path: Path) -> dict[str, Path]:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    batches, shards, events = [], {}, []
+    for i in range(2 * DAY // WINDOW):
+        start = T0 + i * WINDOW
+        bid = f"b{i:05d}"
+        batches.append(ok_row(bid, start))
+        day = "202311" + str(15 + (start + WINDOW) // DAY - T0 // DAY)
+        dst = DESTS[i % 4]
+        end = start + WINDOW
+        shards.setdefault(day, []).extend(
+            [
+                (COLLECTOR, end, MAC, dst, 443, "tcp", 400, 1500, 2, bid),
+                (COLLECTOR, end, MAC, None, None, "other", 10, 20, 1, bid),
+                (COLLECTOR, end, MAC, "192.168.8.1", 53, "udp", 5, 5, 1, bid),
+            ]
+        )
+        if i % 50:
+            events.append(event(start + 5, dst=dst.upper()))
+    batches.append((COLLECTOR, "legacy", None, None, None, None, None, 0))
+    batches.append(ok_row("hurt", T0 + DAY + 30, truncated='{"ct_errors": 1}'))
+    shards["20231116"] += [
+        (COLLECTOR, T0 + DAY + 90, MAC, "192.0.2.99", 443, "tcp", 1, 1, 1, "hurt"),
+        (COLLECTOR, T0 + DAY + 90, MAC, "192.0.2.98", 443, "tcp", 1, 1, 1, "legacy"),
+        (COLLECTOR, T0 + DAY + 90, MAC, "192.0.2.97", 443, "tcp", 1, 1, 1, "ghost"),
+    ]
+    write_inventory(tmp_path / "inventory.db", batches)
+    for day, rows in shards.items():
+        write_shard(raw, day, rows)
+    paths = {"inventory": tmp_path / "inventory.db", "raw": raw}
+    paths["events"] = tmp_path / "events.jsonl"
+    paths["events"].write_text("\n".join(json.dumps(e) for e in events + [events[3]]) + "\n")
+    paths["scope"] = tmp_path / "scope.json"
+    paths["scope"].write_text(json.dumps(scope_dict(export_start=T0)))
+    return paths
+
+
+def run_cli(paths: dict[str, Path], *extra: str) -> subprocess.CompletedProcess:
+    args = ["--scope", paths["scope"], "--events", paths["events"]]
+    args += ["--inventory", paths["inventory"], "--raw-dir", paths["raw"], *extra]
+    cmd = [sys.executable, "-I", str(CLI), *map(str, args)]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+
+
+def test_48h_single_device_report_end_to_end(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    before = {p: p.read_bytes() for p in paths["raw"].iterdir()}
+    proc = run_cli(paths)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["gate"]["verdict"] == "go"
+    share = out["other_share"]
+    assert share["mapped_bytes"] == 2880 * (1900 + 30 + 10) + 2 * 2
+    assert share["other_bytes"] == 2880 * 30
+    m = out["match"]
+    assert m["eligible_keys"] == 2880
+    assert m["excluded_keys"]["flow_degraded"] == 1 and m["excluded_keys"]["legacy_window"] == 1
+    gated, warm = m["gated"], m["warm_up"]
+    assert gated["direct"]["denominator"] + warm["direct"]["denominator"] == 2880
+    assert gated["direct"]["matched"] == gated["direct"]["denominator"] - 29
+    assert gated["combined"]["matched"] == gated["combined"]["denominator"]
+    assert out["events"]["duplicates"] == 1
+    assert out["flows"]["orphan_rows"] == 1
+    assert {p: p.read_bytes() for p in paths["raw"].iterdir()} == before
+
+
+def test_report_is_byte_identical_across_runs(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    first, second = run_cli(paths), run_cli(paths)
+    assert first.stdout == second.stdout and first.returncode == 0
+
+
+def test_no_go_exits_one_and_input_errors_exit_two(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    paths["events"].write_text("")
+    assert run_cli(paths).returncode == 1
+    paths["scope"].write_text('{"host_id": 1}')
+    proc = run_cli(paths)
+    assert proc.returncode == 2 and "error" in proc.stderr
+
+
+def test_loader_caps_batches_and_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = build_48h(tmp_path)
+    sc = scope()
+    monkeypatch.setattr(router, "MAX_BATCHES", 100)
+    with pytest.raises(inputs.InputError, match="batch"):
+        router.load_router(paths["inventory"], paths["raw"], sc)
+    monkeypatch.setattr(router, "MAX_BATCHES", 10_000)
+    monkeypatch.setattr(router, "MAX_FLOW_ROWS", 100)
+    with pytest.raises(inputs.InputError, match="row"):
+        router.load_router(paths["inventory"], paths["raw"], sc)
+
+
+def test_loader_rejects_bad_counters_and_reports_missing_shards(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0)])
+    write_shard(
+        raw, "20231115", [(COLLECTOR, T0 + 60, MAC, "192.0.2.1", 443, "tcp", 1, 1, 1, "b1")]
+    )
+    data = router.load_router(tmp_path / "inv.db", raw, scope())
+    assert data.missing_shards == ("raw-20231116.db", "raw-20231117.db")
+    write_shard(raw, "20231116", [(COLLECTOR, T0 + DAY, MAC, None, None, "other", -5, 1, 1, "b1")])
+    with pytest.raises(inputs.InputError, match="counter"):
+        router.load_router(tmp_path / "inv.db", raw, scope())
+
+
+def test_loader_errors_on_missing_inventory(tmp_path: Path) -> None:
+    with pytest.raises(inputs.InputError):
+        router.load_router(tmp_path / "absent.db", tmp_path, scope())
