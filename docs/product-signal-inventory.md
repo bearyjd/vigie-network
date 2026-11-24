@@ -21,13 +21,13 @@ Error messages are fixed text and never echo inventory values.
 
 ## Input (`vigie-product-signal-inventory`, version 1)
 
-The input is a strict JSON document. Unknown keys, duplicate keys, `NaN` and `Infinity` are rejected, and booleans are refused where numbers are expected. Limits: 8 MiB of input, 10,000 devices, 10,000 links, 64 MACs per device and 200,000 observations. Strings are at most 256 UTF-8 bytes and contain no control characters; a blank or whitespace-only string is treated as absent and is never evidence.
+The input is a strict JSON document. Unknown keys, duplicate keys, `NaN` and `Infinity` are rejected, and booleans are refused where numbers are expected. Limits: 8 MiB of input, 10,000 devices, 10,000 links, 64 MACs per device and 200,000 observations. Strings are at most 256 UTF-8 bytes and contain no control, format (such as zero-width or bidirectional) or surrogate characters; a blank or whitespace-only string is treated as absent and is never evidence.
 
 The document has these fields:
 
 - `now`: the export time, as a Unix timestamp.
 - `ttl_seconds`: the freshness window. Optional; the default is 86400, the same as characterization.
-- `devices`: a list of `{id, status, macs: [{mac, oui_vendor}]}`. `status` is `active`, `transient` or `retired`. `oui_vendor` is an optional lookup supplied by the owner; Vigie bundles no OUI dataset.
+- `devices`: a list of `{id, status, macs: [{mac, oui_vendor}]}`. `status` is `active`, `transient` or `retired`. `oui_vendor` is a required key whose value is an owner-supplied lookup or `null`; Vigie bundles no OUI dataset. A device `id` is 1 to 64 characters from `A-Za-z0-9_.:-` and must not look like a MAC address (six hex pairs separated by `:` or `-`) or an IPv4 or IPv6 address, so that ids never carry network identifiers; UUID-style ids are fine.
 - `links`: a list of `{from, into, revoked}`. Merges are active links, and an undo is a revoked link.
 - `observations`: a list of `{mac, kind, observed_at, ...}`. `kind` is `mdns`, `ssdp` or `dhcp`. Each kind accepts only the fields its source produces: `mdns` accepts `service`, `hostname`, `manufacturer` and `model`; `ssdp` accepts `ua`, `hostname`, `manufacturer` and `model`; `dhcp` accepts `hostname`, `opt55` and `opt60`. `manufacturer` and `model` are structured device-description fields.
 
@@ -59,7 +59,7 @@ Freshness uses the characterization window: `observed_at <= now < observed_at + 
 | `expired` | `product_claim_expired` | Product claims exist, but none is fresh. |
 | `generic` | `type_level_service_match`, `vendor_without_model`, `generic_hint` | Some fresh non-product evidence exists. A services-v1 characterization match is type-level only. A manufacturer without a model, a service, a UA, or DHCP option 55 or 60 is generic. |
 | `oui_only` | `oui_vendor_only`, `oui_vendors_differ` | Only OUI vendors on globally administered MACs. Differing OUIs in a merged group get their own reason. |
-| `unknown` | `random_mac_oui_ignored`, `expired_generic_only`, `no_signal` | Nothing usable. An OUI on a locally administered (random) MAC is not vendor evidence. |
+| `unknown` | `random_mac_oui_ignored`, `expired_generic_only`, `no_signal` | Nothing usable. An OUI on a locally administered (random) MAC is not vendor evidence. A fresh model without a manufacturer is not product evidence: the device is `unknown` with reason `no_signal`. |
 
 A product manufacturer that differs from the OUI vendor is normal, for example a radio-module vendor, and is not a conflict. Hostnames are never evidence. Human overrides (name, owner, type, group) are not inputs.
 

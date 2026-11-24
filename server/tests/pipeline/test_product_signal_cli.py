@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -78,3 +79,13 @@ def test_oversize_inventory_is_rejected_with_a_bounded_read(capsysbinary, tmp_pa
     assert code == 4
     assert b"too large" in err
     assert seen == [17]  # read stops at cap + 1 bytes
+
+
+def test_unhashable_link_endpoint_exits_4_with_fixed_message(capsysbinary, tmp_path):
+    doc = json.loads((FIXTURES / "inventory.json").read_text())
+    doc["links"] = [{"from": ["leak-me"], "into": {"k": "leak-me"}, "revoked": False}]
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(doc))
+    code, out, err = run(capsysbinary, "--inventory", str(bad))
+    assert (code, out) == (4, b"")
+    assert err == b"vigie-product-signal: invalid inventory: invalid link\n"

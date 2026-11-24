@@ -201,3 +201,36 @@ def test_error_messages_do_not_echo_input_values():
     with pytest.raises(InventoryError) as info:
         parse_inventory(doc)
     assert "secret" not in str(info.value)
+
+
+@pytest.mark.parametrize("bad", [["a"], {"a": 1}, 5, None])
+@pytest.mark.parametrize("end", ["from", "into"])
+def test_non_string_link_endpoints_are_rejected(end, bad):
+    link = {"from": "x1", "into": "x2", "revoked": False, end: bad}
+    with pytest.raises(InventoryError, match="^invalid link$"):
+        parse_inventory(minimal(devices=[device(1), device(2)], links=[link]))
+
+
+@pytest.mark.parametrize("ident", ["aa:bb:cc:dd:ee:ff", "AA-BB-CC-DD-EE-FF", "192.168.1.20",
+                                   "::1", "fe80::1", "2001:db8::7334"])  # fmt: skip
+def test_device_ids_that_look_like_macs_or_ips_are_rejected(ident):
+    with pytest.raises(InventoryError, match="^invalid device id$"):
+        parse_inventory(minimal(devices=[{**device(1), "id": ident}]))
+
+
+@pytest.mark.parametrize(
+    "ident", ["3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b", "x1", "host.local", "a:b"]
+)
+def test_uuid_style_and_plain_device_ids_are_accepted(ident):
+    assert parse_inventory(minimal(devices=[{**device(1), "id": ident}])).devices[0].id == ident
+
+
+def test_float_version_is_rejected():
+    rejects({**minimal(), "version": 1.0})
+
+
+@pytest.mark.parametrize("text", ["​", "Acme​", "‮Acme", "﻿Acme", "a\ud800b"])
+def test_invisible_format_and_surrogate_characters_are_rejected(text):
+    obs = {"mac": "00:00:5e:00:54:01", "kind": "mdns", "observed_at": 1, "manufacturer": text}
+    with pytest.raises(InventoryError, match="^invalid manufacturer$"):
+        parse_inventory(minimal(observations=[obs]))

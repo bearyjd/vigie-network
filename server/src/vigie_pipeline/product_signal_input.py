@@ -6,9 +6,11 @@ message that never echoes input values. Parsed data is immutable.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -28,6 +30,7 @@ MAX_TTL_SECONDS = 366 * 86400.0
 STATUSES = ("active", "transient", "retired")
 KINDS = ("mdns", "ssdp", "dhcp")
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
+_MAC_LIKE = re.compile(r"[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}", re.ASCII)
 _ENVELOPE = {"format", "version", "now", "ttl_seconds", "devices", "links", "observations"}
 _TEXT_FIELDS = ("service", "ua", "opt55", "opt60", "hostname", "manufacturer", "model")
 # Fields each kind may carry (mirrors what sources.py fills; manufacturer/model are the
@@ -37,6 +40,16 @@ _KIND_FIELDS = {
     "ssdp": frozenset({"ua", "hostname", "manufacturer", "model"}),
     "dhcp": frozenset({"hostname", "opt55", "opt60"}),
 }
+
+
+def _address_like(value: str) -> bool:
+    if _MAC_LIKE.fullmatch(value):
+        return True
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 class InventoryError(ValueError):
@@ -124,7 +137,8 @@ def _text(value: object, what: str) -> str | None:
         return None
     if not isinstance(value, str) or len(value.encode("utf-8", "replace")) > MAX_TEXT_BYTES:
         raise _fail(f"invalid {what}")
-    if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+    if any(ord(c) < 32 or 127 <= ord(c) <= 159 or unicodedata.category(c) in ("Cf", "Cs")
+           for c in value):  # fmt: skip
         raise _fail(f"invalid {what}")
     return value if value.strip() else None  # blank or whitespace-only is absent, not evidence
 
@@ -153,6 +167,8 @@ def _mac(value: object) -> str:
 def _device(value: object) -> Device:
     item = _mapping(value, {"id", "status", "macs"}, {"id", "status", "macs"}, "device")
     if not isinstance(item["id"], str) or not _ID.fullmatch(item["id"]):
+        raise _fail("invalid device id")
+    if _address_like(item["id"]):
         raise _fail("invalid device id")
     if item["status"] not in STATUSES:
         raise _fail("invalid device status")
@@ -185,6 +201,8 @@ def _links(value: object, ids: set[str]) -> dict[str, str]:
     for entry in _list(value, MAX_LINKS, "links"):
         link = _mapping(entry, {"from", "into", "revoked"}, {"from", "into", "revoked"}, "link")
         src, dst, revoked = link["from"], link["into"], link["revoked"]
+        if not isinstance(src, str) or not isinstance(dst, str):
+            raise _fail("invalid link")
         if src not in ids or dst not in ids or src == dst or not isinstance(revoked, bool):
             raise _fail("invalid link")
         if revoked:
@@ -209,7 +227,7 @@ def _links(value: object, ids: set[str]) -> dict[str, str]:
 def parse_inventory(doc: object) -> Inventory:
     """Validate a decoded document into immutable inventory data, or raise InventoryError."""
     env = _mapping(doc, _ENVELOPE, _ENVELOPE - {"ttl_seconds"}, "document")
-    if env["format"] != FORMAT or env["version"] != VERSION or isinstance(env["version"], bool):
+    if env["format"] != FORMAT or env["version"] != VERSION or type(env["version"]) is not int:
         raise _fail("unsupported format")
     now = env["now"]
     ttl = env.get("ttl_seconds", DEFAULT_TTL_SECONDS)
