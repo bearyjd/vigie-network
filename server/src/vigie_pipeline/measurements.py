@@ -52,6 +52,8 @@ HOUR_S = 3600
 # degradation, and may hide ct_errors/ct_dropped_keys/conntrack_lost, so it always degrades even
 # though the informational pair is folded into it first.
 ALWAYS_DEGRADING_TRUNCATED_KEYS = frozenset({"truncated_other"})
+# A collector transport gap (signed source_flags bit 4) and other conntrack loss.
+FLOW_DEGRADED = "flow_degraded"
 MAX_VALUE = (2**63 - 1) // 64  # at most64 canonical MACs can be summed safely
 
 
@@ -227,6 +229,35 @@ def _tolerated_overlap(start: int, end: int, neighbours: list) -> int | None:
     return covered
 
 
+def _queue_quality_repair(inv: sqlite3.Connection, collector: str, hour: int) -> None:
+    """Re-analyze every device of an hour that may already have trained a reference."""
+    inv.execute("INSERT OR IGNORE INTO monitoring_quality_work VALUES (?,?,'')", (collector, hour))
+
+
+def _degrade_spanned_hours(inv: sqlite3.Connection, collector: str, start: int, end: int) -> None:
+    """A cross-hour window that lost flow evidence refuses every hour it touches.
+
+    Its rows and seconds are never credited, but the loss may sit in any spanned hour. A missing
+    hour gets a zero-second row so the sticky reason survives later clean receipts; an existing
+    one keeps its seconds and is queued for repair. read_measurements bounds the span (3 shards).
+    """
+    for hour in range(start // HOUR_S * HOUR_S, (end - 1) // HOUR_S * HOUR_S + 1, HOUR_S):
+        old = inv.execute(
+            "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
+            (collector, hour),
+        ).fetchone()
+        prior = set(json.loads(old[0])) if old else set()
+        if FLOW_DEGRADED in prior:
+            continue
+        inv.execute(
+            "INSERT INTO coverage_hourly VALUES (?,?,0,0,?) ON CONFLICT(collector_id,hour) "
+            "DO UPDATE SET reasons=excluded.reasons",
+            (collector, hour, json.dumps(sorted(prior | {FLOW_DEGRADED}))),
+        )
+        if old is not None:
+            _queue_quality_repair(inv, collector, hour)
+
+
 def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
     m = measured
     if inv.execute(
@@ -287,6 +318,8 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
         "INSERT INTO measurement_batches VALUES (?,?,?,?,?,?,?)",
         (m.collector, m.batch_id, m.start, m.end, m.received, hour, json.dumps(reasons)),
     )
+    if start is not None and end is not None and {"cross_hour", FLOW_DEGRADED} <= set(reasons):
+        _degrade_spanned_hours(inv, m.collector, start, end)
     if (
         hour is None
         or start is None
@@ -320,7 +353,11 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
     old = inv.execute(
         "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?", (m.collector, hour)
     ).fetchone()
-    combined = sorted(set(reasons) | set(json.loads(old[0]) if old else []))
+    prior_reasons = set(json.loads(old[0])) if old else set()
+    combined = sorted(set(reasons) | prior_reasons)
+    if old is not None and FLOW_DEGRADED in reasons and FLOW_DEGRADED not in prior_reasons:
+        # A late receipt dirties only its own devices (none when rowless): fan out to the hour.
+        _queue_quality_repair(inv, m.collector, hour)
     inv.execute(
         "INSERT INTO coverage_hourly VALUES (?,?,?,?,?) ON CONFLICT(collector_id,hour) "
         "DO UPDATE SET observed_seconds=MIN(?,observed_seconds+excluded.observed_seconds), "
