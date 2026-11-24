@@ -329,3 +329,59 @@ def test_hot_rollback_journal_is_an_input_error(tmp_path: Path) -> None:
     (tmp_path / "inv.db-journal").write_bytes(b"hot")
     with pytest.raises(inputs.InputError, match="copy"):
         router.load_router(tmp_path / "inv.db", tmp_path, scope())
+
+
+def test_symlinked_shard_with_a_hot_wal_beside_its_target_is_refused(tmp_path: Path) -> None:
+    """Review repro: the WAL sits beside the link target, where immutable=1 never looks."""
+    paths = build_48h(tmp_path, wal=True)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    shard = paths["raw"] / "raw-20231116.db"
+    shard.rename(target / shard.name)
+    shard.symlink_to(target / shard.name)
+    live = sqlite3.connect(target / shard.name)
+    try:
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        row = (COLLECTOR, T0 + DAY + 60, MAC, None, None, "other", 2 * 10**9, 0, 1, "b01440")
+        live.execute("INSERT INTO raw_flow VALUES (?,?,?,?,?,?,?,?,?,?)", row)
+        live.commit()
+        assert (target / f"{shard.name}-wal").stat().st_size > 0
+        proc = run_cli(paths)
+    finally:
+        live.close()
+    assert proc.returncode == 2 and "link" in proc.stderr, proc.stdout[:200]
+
+
+def test_symlinked_inventory_is_refused(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    link = tmp_path / "inv-link.db"
+    link.symlink_to(paths["inventory"])
+    paths["inventory"] = link
+    proc = run_cli(paths)
+    assert proc.returncode == 2 and "link" in proc.stderr
+
+
+def _touch_mtime(path: Path) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+
+
+def _add_wal(path: Path) -> None:
+    path.with_name(path.name + "-wal").write_bytes(b"")
+
+
+@pytest.mark.parametrize("change", [_touch_mtime, _add_wal])
+def test_database_changed_while_being_read_is_an_input_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change
+) -> None:
+    paths = build_48h(tmp_path)
+    real = router._open_ro
+
+    def racing(path: Path):
+        db = real(path)
+        change(path)
+        return db
+
+    monkeypatch.setattr(router, "_open_ro", racing)
+    with pytest.raises(inputs.InputError, match="changed while being read"):
+        router.load_router(paths["inventory"], paths["raw"], scope())

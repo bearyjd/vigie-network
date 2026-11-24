@@ -344,9 +344,11 @@ def test_export_end_explanation_only_when_last_event_precedes_period_end() -> No
     end = sc.period_end
     covered = run([b], rows, [event(LATE), event(end, dst="192.0.2.99")], sc=sc)
     assert "export_ends_before_period_end" not in codes(covered)
-    short = run([b], rows, [event(LATE), event(end - 1, dst="192.0.2.99")], sc=sc)
+    hour = run([b], rows, [event(LATE), event(end - 3600, dst="192.0.2.99")], sc=sc)
+    assert "export_ends_before_period_end" not in codes(hour)  # within the 1 h slack
+    short = run([b], rows, [event(LATE), event(end - 3601, dst="192.0.2.99")], sc=sc)
     assert "export_ends_before_period_end" in codes(short)
-    assert short["events"]["last_accepted_t"] == end - 1
+    assert short["events"]["last_accepted_t"] == end - 3601
     assert short["gate"]["verdict"] == "go"  # an explanation, not a gate
 
 

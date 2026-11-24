@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .model import Scope
 
+EXPORT_END_SLACK_S = 3600
+
 TEXTS = {
     "key_level_match": "Matching is per (device, dst IP, proto, port, window) key, not per "
     "connection: router `flows` is a max of live flows and the router has no source port.",
@@ -35,9 +37,9 @@ TEXTS = {
     "duplicate_flow_rows": "Exact duplicate raw_flow rows were collapsed before counting bytes.",
     "raw_shard_missing": "One or more raw shard days were missing. A missing day inside the "
     "period gives no result; only the day after a midnight-aligned period end is exempt.",
-    "export_ends_before_period_end": "The last accepted endpoint event is before the period "
-    "end, so the export may not cover the end of the period and late keys can stay unmatched. "
-    "This is an explanation, not a gate.",
+    "export_ends_before_period_end": "The last accepted endpoint event is more than 1 h before "
+    "the period end, so the export may not cover the end of the period and late keys can stay "
+    "unmatched. This is an explanation, not a gate.",
     "clean_window_scope": "A window counts as clean from its own batch row only. The pipeline's "
     "raw_missing check, its collector-wide ct_lan_unmapped_bytes share and overlapping windows "
     "are not re-derived here; missing shard days are reported instead.",
@@ -52,7 +54,7 @@ def explanations(sc: Scope, out: dict) -> list[dict[str, str]]:
         "key_level_match": True,
         "clean_window_scope": True,
         "export_ends_before_period_end": events["last_accepted_t"] is None
-        or events["last_accepted_t"] < sc.period_end,
+        or events["last_accepted_t"] < sc.period_end - EXPORT_END_SLACK_S,
         "degraded_coverage": any(r != "legacy_window" for r in reasons),
         "legacy_windows": "legacy_window" in reasons,
         "warm_up": match["warm_up"]["combined"]["denominator"] > 0,

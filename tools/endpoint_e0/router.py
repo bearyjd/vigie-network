@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -31,6 +32,7 @@ ALWAYS_DEGRADING_TRUNCATED_KEYS = frozenset({"truncated_other"})
 LAN_UNMAPPED_BYTES_KEY = "ct_lan_unmapped_bytes"
 HOUR_S = 3600
 _CHUNK = 500  # bound on SQL host parameters per batch lookup
+_SIDECARS = ("-wal", "-journal")
 _BATCH_COLS = (
     "collector_id,batch_id,window_start,window_end,observation_kind,health,truncated,"
     "dropped_batches"
@@ -84,11 +86,24 @@ def batch_reasons(row) -> tuple[str, ...]:
     return tuple(reasons)
 
 
+def _state(path: Path) -> tuple:
+    """Main-file identity plus sidecar presence and size, to detect a change during a read."""
+    st = path.stat()
+    sidecars = []
+    for suffix in _SIDECARS:
+        sidecar = path.with_name(path.name + suffix)
+        sidecars.append(sidecar.stat().st_size if sidecar.exists() else None)
+    return (st.st_ino, st.st_size, st.st_mtime_ns, *sidecars)
+
+
 def _open_ro(path: Path) -> sqlite3.Connection:
     """Open without touching the directory: `immutable=1` creates no -shm/-wal sidecars (WAL
     shards in a read-only directory would otherwise fail), but it also skips WAL and hot-journal
-    recovery, so a database with pending sidecar content is refused rather than read short."""
-    for suffix in ("-wal", "-journal"):
+    recovery, so a database with pending sidecar content is refused rather than read short. A
+    symlink is refused too: its sidecars sit beside the target, where this check never looks."""
+    if path.is_symlink():
+        raise InputError(f"{path.name} is a symlink: copy the file, do not link it")
+    for suffix in _SIDECARS:
         sidecar = path.with_name(path.name + suffix)
         if sidecar.is_file() and sidecar.stat().st_size > 0:
             raise InputError(
@@ -99,6 +114,18 @@ def _open_ro(path: Path) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA query_only=ON")
     return db
+
+
+@contextmanager
+def _reading(path: Path) -> Iterator[sqlite3.Connection]:
+    """A read-only connection; fails if the file or its sidecars changed while it was read."""
+    before = _state(path)
+    with closing(_open_ro(path)) as db:
+        yield db
+    if _state(path) != before:
+        raise InputError(
+            f"{path.name}: database changed while being read; run on a checkpointed copy"
+        )
 
 
 def _batch(row) -> Batch:
@@ -117,7 +144,7 @@ def _load_batches(path: Path, wanted: set[tuple[str, str]]) -> dict[tuple[str, s
     for cid, bid in sorted(wanted):
         by_collector.setdefault(cid, []).append(bid)
     out = {}
-    with closing(_open_ro(path)) as db:
+    with _reading(path) as db:
         for cid, bids in by_collector.items():
             for i in range(0, len(bids), _CHUNK):
                 chunk = bids[i : i + _CHUNK]
@@ -179,7 +206,7 @@ def _load_flows(raw_dir: Path, sc: Scope) -> tuple[tuple[Flow, ...], tuple[str, 
         if not path.is_file():
             missing.append(name)
             continue
-        with closing(_open_ro(path)) as db:
+        with _reading(path) as db:
             rows = db.execute(
                 f"SELECT {_FLOW_COLS} FROM raw_flow WHERE ts > ? AND ts <= ? "  # noqa: S608
                 f"AND device_mac IN ({marks}) ORDER BY rowid LIMIT ?",
