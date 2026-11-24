@@ -38,7 +38,7 @@ server() { (cd server && UV_PROJECT_ENVIRONMENT="$SERVER_ENV" uv run --frozen "$
 trafficgen() { (cd tools/trafficgen && UV_PROJECT_ENVIRONMENT="$TRAFFIC_ENV" uv run --frozen "$@"); }
 stage_server() {
     server pytest -q &&
-        server pytest -q --no-cov -p no:cacheprovider ../deploy/tests/test_probe_render.py \
+        server pytest -q --no-cov -p no:cacheprovider --timeout=20 ../deploy/tests/test_probe_render.py \
             ../deploy/tests/test_probe_runner.py ../deploy/tests/test_probe_adapters.py \
             ../deploy/tests/test_probe_runner_config_misuse.py &&
         server ruff check . &&
