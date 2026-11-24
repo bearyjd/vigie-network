@@ -172,7 +172,8 @@ The remaining reader, scheduling, reputation and known-issue proposals retain th
 Phases, each shippable and reviewed on its own:
 1. **Identity quality first.** CVE-style matching needs vendor/product (ideally version). Measure how many
    inventory devices have a usable vendor, product or service signal (DHCP fingerprint, mDNS/service
-   characterization, OUI for non-randomized MACs) and show the unknowns honestly. Passive router-side data rarely
+   characterization, OUI for non-randomized MACs) and show the unknowns honestly. The offline
+   [product-signal coverage inventory](product-signal-inventory.md) reports this ratio as evidence only. Passive router-side data rarely
    gives firmware versions, so most matches will be type-level.
 2. **Local DNS reputation match.** Match the router-local parsed DNS queries (already collected per device) against
    an imported, versioned blocklist/reputation list. Output: an explainable incident (`detector=dns_reputation`) with
