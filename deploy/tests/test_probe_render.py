@@ -35,17 +35,18 @@ BASE = {
     "api_port": 18444,
     "collector_key_id": "k1",
 }
-# sha256 of each rendered file, captured from origin/main (73bd7f6) before any probe code existed.
+# sha256 of each rendered file, captured from origin/main (73bd7f6) before any probe code existed;
+# the pipeline container, plan and tod hashes were refreshed for the two monitoring_dns lines (#129).
 GOLDEN_FILES = {
     "vigie_test-api.container": "38fbe297b076d0e1bf7187cc19f67e22d6871a5e99e905e9be1892b6d07624e4",
     "vigie_test-ingest.container": "4481942e2cfd96c7c1bcf87251c50ff33ec34b7500c4aa58d6f7669d21afa621",
     "vigie_test-inv.volume": "4477fed973818287a2b46fc5625f36b8e505150c6578f513674269eb5f0369c6",
     "vigie_test-overrides.volume": "890fbb0b09ccc1f9f1b82cff9d1555d7de91352b6be950a63fbf6ef123a39869",
-    "vigie_test-pipeline.container": "34e2a09daaf5873e7a6a24b1e67e48decedd95f3c78e7ce9f3f150854c7b6714",
+    "vigie_test-pipeline.container": "b4739e07e83dbd03eadbaaa9707f6064c4256885376a5ca5bd1b9fd86460e2e2",
     "vigie_test-raw.volume": "de1a5531cf37fc4eba4febbccfdee127ccd99d19ba0107c92f40a0098a54dd16",
 }
-GOLDEN_PLAN = "f606c217ff4cb60f7c708fde5884d6751fa6939e0cc46d1555500fcb145a320b"
-GOLDEN_TOD_PIPELINE = "08e380149bba4f704f50a0b892f8e011c7338b6b23bba94fae68ea571f3bb564"
+GOLDEN_PLAN = "041f784d7ad0f52084ada3a446be1a381a7242661945a46eac3b64178072a5bb"
+GOLDEN_TOD_PIPELINE = "e172f38016965950c677fa6d9b0fb4297fbcbaafa0a526583c1de511e3e00f2b"
 PROBE = {"probes_enabled": True, "probe_allow": ["10.0.0.7", "10.0.0.9", "fd12::7"]}
 
 
