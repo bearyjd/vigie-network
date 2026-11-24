@@ -106,6 +106,8 @@ def _mac_span(item: object) -> MacSpan:
     for key, value in bounds.items():
         if value is not None and not _is_int(value, 0, MAX_TS):
             raise InputError(f"scope mac {key} must be an epoch integer")
+    if None not in bounds.values() and bounds["from"] > bounds["until"]:  # type: ignore[operator]
+        raise InputError("scope mac from must not be after until")
     return MacSpan(mac.lower(), bounds["from"], bounds["until"])
 
 
@@ -117,10 +119,11 @@ def _bounded_list(raw: dict, key: str, allow_empty: bool) -> list:
 
 
 def _networks(raw: dict) -> tuple:
+    prefixes = _bounded_list(raw, "lan_prefixes", False)
     try:
-        return tuple(
-            ipaddress.ip_network(p, strict=False) for p in _bounded_list(raw, "lan_prefixes", False)
-        )
+        if not all(isinstance(p, str) for p in prefixes):  # ip_network(5) is 0.0.0.5/32
+            raise TypeError
+        return tuple(ipaddress.ip_network(p, strict=False) for p in prefixes)
     except (TypeError, ValueError):
         raise InputError("scope lan_prefixes must be CIDR strings") from None
 
@@ -195,8 +198,6 @@ def _check_values(obj: dict) -> tuple[int, str, str, str] | None:
 
 def _classify(line: bytes, sc: Scope) -> tuple[str, object]:
     """('ok', (dedup_key, Event)) or (reason, None)."""
-    if len(line) > MAX_LINE_BYTES:
-        return "frame_bad", None
     try:
         obj = strict_loads(line.decode("utf-8"))
     except _DupKey:
@@ -235,12 +236,13 @@ def parse_events(raw_lines: Iterable[bytes], sc: Scope) -> EventLog:
     read = duplicates = 0
     for raw in raw_lines:
         line = raw.strip()
-        if not line:
+        oversize = len(raw.removesuffix(b"\n")) > MAX_LINE_BYTES  # the frame, before stripping
+        if not line and not oversize:
             continue
         read += 1
         if read > MAX_EVENTS:
             raise InputError(f"event log exceeds {MAX_EVENTS} events")
-        reason, payload = _classify(line, sc)
+        reason, payload = ("frame_bad", None) if oversize else _classify(line, sc)
         if reason != "ok":
             rejected[reason] += 1
             continue

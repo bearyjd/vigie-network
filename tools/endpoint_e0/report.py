@@ -1,9 +1,10 @@
 """E0 report: `other` byte share, key match ratio (direct and 24 h carryover) and the gate.
 
-Gate (PRP-003 section 10): `other` bytes < 10% of mapped bytes and matched keys >= 90%,
-in integer arithmetic, both after the 24 h warm-up and within it. A zero denominator never
-passes. Output holds counts and class labels only: no process path, hostname, user id or rule
-leaves this module.
+Gate (PRP-003 section 10): `other` bytes < 10% of mapped bytes and matched keys >= 90%, in
+integer arithmetic. This tool adds rules stricter than the PRP gate, which has none of them:
+keys within the 24 h warm-up must also reach 90%, and a zero denominator or a missing in-period
+raw shard gives no result, never a pass. Output holds counts and class labels only: no process
+path, hostname, user id or rule leaves this module.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from datetime import UTC, datetime
 
 from . import explain, netutil
 from .model import Batch, EventLog, Flow, RouterData, Scope
+from .router import in_period_shard_names
 
 SCHEMA = "vigie-e0-feasibility/1"
 DIRECT_TOLERANCE_S = 120
@@ -162,6 +164,7 @@ def _events(log: EventLog, mapped_bytes: int) -> dict:
         "distinct_src_ips": len({ev.src_ip for ev in log.events}),
         "per_day": dict(sorted(per_day.items())),
         "bytes_per_event": mapped_bytes // log.accepted if log.accepted else None,
+        "last_accepted_t": log.events[-1].t if log.events else None,
     }
 
 
@@ -182,8 +185,15 @@ def _ratio_reason(bucket: dict, name: str) -> str | None:
     return f"{name}match_ratio_below_90pct" if keys and matched * 10 < 9 * keys else None
 
 
-def _gate(share: dict, match: dict) -> dict:
+NO_RESULT_REASONS = frozenset(
+    {"zero_mapped_bytes", "zero_gated_keys", "raw_shard_missing_in_period"}
+)
+
+
+def _gate(sc: Scope, share: dict, match: dict, missing_shards: tuple[str, ...]) -> dict:
     reasons = []
+    if set(missing_shards) & set(in_period_shard_names(sc)):
+        reasons.append("raw_shard_missing_in_period")
     other, mapped = share["other_bytes"], share["mapped_bytes"]
     if mapped == 0:
         reasons.append("zero_mapped_bytes")
@@ -195,7 +205,7 @@ def _gate(share: dict, match: dict) -> dict:
         reason = _ratio_reason(match[name], prefix)
         if reason:
             reasons.append(reason)
-    if any(r.startswith("zero_") for r in reasons):
+    if NO_RESULT_REASONS.intersection(reasons):
         verdict = "no_result"
     else:
         verdict = "no_go" if reasons else "go"
@@ -227,7 +237,7 @@ def build_report(sc: Scope, router: RouterData, log: EventLog) -> dict:
         "events": _events(log, share["mapped_bytes"]),
         "batches": _batches(router),
         "attribution": {"mac_spans": len(sc.macs), "distinct_macs": len({m.mac for m in sc.macs})},
-        "gate": _gate(share, match),
+        "gate": _gate(sc, share, match, router.missing_shards),
     }
     return {**out, "explanations": explain.explanations(sc, out)}
 

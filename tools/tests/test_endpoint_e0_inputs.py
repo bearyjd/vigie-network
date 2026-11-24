@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from e0_synth import HOST, T0, e0, event, lines, scope, scope_dict
+from e0_synth import HOST, MAC, T0, e0, event, lines, scope, scope_dict
 
 report = e0.report
 router = e0.router
@@ -82,6 +82,10 @@ def test_scope_parses_and_is_immutable() -> None:
         {"router_ips": None},
         {"router_ips": "192.168.8.1"},
         {"router_ips": ["192.168.8.1"] * 65},
+        {"lan_prefixes": [5]},  # ip_network(5) would be 0.0.0.5/32
+        {"lan_prefixes": [True]},
+        {"lan_prefixes": ["192.168.8.0/24", 5]},
+        {"macs": [{"mac": "02:00:00:00:00:01", "from": T0 + 10, "until": T0}]},
     ],
 )
 def test_scope_rejects_invalid_values(over: dict) -> None:
@@ -219,6 +223,26 @@ def test_bounded_reader_frames_oversize_lines_and_keeps_the_next_line(tmp_path) 
     log = inputs.read_events(path, scope())
     assert log.accepted == 2 and log.read == 4
     assert log.rejected == {"frame_bad": 2}
+
+
+@pytest.mark.parametrize("pad", [b" " * 20 + b"trailing", b" " * 20])
+def test_valid_json_padded_past_the_cap_is_frame_bad(tmp_path, pad: bytes) -> None:
+    path = tmp_path / "events.jsonl"
+    exact = padded(inputs.MAX_LINE_BYTES)
+    path.write_bytes(exact + pad + b"\n" + json.dumps(event(T0, src_port=40002)).encode())
+    log = inputs.read_events(path, scope())
+    assert log.accepted == 1 and log.read == 2
+    assert log.rejected == {"frame_bad": 1}
+
+
+def test_whitespace_padded_oversize_line_is_counted_not_skipped() -> None:
+    log = inputs.parse_events([b" " * (inputs.MAX_LINE_BYTES + 1)], scope())
+    assert log.read == 1 and log.rejected == {"frame_bad": 1}
+
+
+def test_scope_mac_span_with_equal_bounds_is_allowed() -> None:
+    sc = inputs.parse_scope(json.dumps(scope_dict(macs=[{"mac": MAC, "from": T0, "until": T0}])))
+    assert sc.macs[0].since == sc.macs[0].until == T0
 
 
 def test_event_count_cap_allows_exactly_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:

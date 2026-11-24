@@ -7,6 +7,10 @@ export_start, optional skew_s), the inventory database (`batches`) and the raw s
 Prints a sorted-key JSON report with the `other` byte share, the key match ratio (direct
 +-120 s and 24 h carryover, explicit denominators), explanations and the go/no-go gate.
 
+A missing raw shard day inside the period gives no_result. An export whose last event precedes
+period_end is explained, not gated. Databases are opened immutable (no sidecars are created); one
+with a non-empty -wal or -journal file is refused: run on a checkpointed copy.
+
 Exit codes: 0 go, 1 no_go or no_result, 2 input/usage error. Run as `python3 -I`.
 """
 

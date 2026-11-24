@@ -97,9 +97,11 @@ def flow(bid: str, ts: int, dst: str | None = "192.0.2.10", port: int | None = 4
     )
 
 
-def write_inventory(path: Path, rows: list[tuple]) -> None:
+def write_inventory(path: Path, rows: list[tuple], wal: bool = False) -> None:
     """rows: (collector, batch, window_start, window_end, kind, health, truncated, dropped)."""
     db = sqlite3.connect(path)
+    if wal:
+        db.execute("PRAGMA journal_mode=WAL")
     db.execute(
         "CREATE TABLE batches (collector_id TEXT NOT NULL, batch_id TEXT NOT NULL, "
         "received_at TEXT NOT NULL, truncated TEXT, dropped_batches INTEGER NOT NULL DEFAULT 0, "
@@ -115,9 +117,11 @@ def write_inventory(path: Path, rows: list[tuple]) -> None:
     db.close()
 
 
-def write_shard(raw_dir: Path, day: str, rows: list[tuple]) -> None:
+def write_shard(raw_dir: Path, day: str, rows: list[tuple], wal: bool = False) -> None:
     """rows: (collector_id, ts, mac, dst_ip, dst_port, proto, up, down, flows, batch_id)."""
     db = sqlite3.connect(raw_dir / f"raw-{day}.db")
+    if wal:
+        db.execute("PRAGMA journal_mode=WAL")  # like vigie_ingest; a clean close drops sidecars
     db.execute(
         "CREATE TABLE IF NOT EXISTS raw_flow (collector_id TEXT NOT NULL, ts INTEGER NOT NULL, "
         "device_mac TEXT NOT NULL, dst_ip TEXT, dst_port INTEGER, proto TEXT NOT NULL, "

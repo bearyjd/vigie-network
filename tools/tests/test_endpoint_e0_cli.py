@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -75,7 +76,7 @@ def test_batch_reasons_legacy_and_empty_windows() -> None:
     assert router.batch_reasons(empty) == ("empty_window",)
 
 
-def build_48h(tmp_path: Path) -> dict[str, Path]:
+def build_48h(tmp_path: Path, wal: bool = False) -> dict[str, Path]:
     raw = tmp_path / "raw"
     raw.mkdir()
     batches, shards, events = [], {}, []
@@ -102,9 +103,9 @@ def build_48h(tmp_path: Path) -> dict[str, Path]:
         (COLLECTOR, T0 + DAY + 90, MAC, "192.0.2.98", 443, "tcp", 1, 1, 1, "legacy"),
         (COLLECTOR, T0 + DAY + 90, MAC, "192.0.2.97", 443, "tcp", 1, 1, 1, "ghost"),
     ]
-    write_inventory(tmp_path / "inventory.db", batches)
+    write_inventory(tmp_path / "inventory.db", batches, wal=wal)
     for day, rows in shards.items():
-        write_shard(raw, day, rows)
+        write_shard(raw, day, rows, wal=wal)
     paths = {"inventory": tmp_path / "inventory.db", "raw": raw}
     paths["events"] = tmp_path / "events.jsonl"
     paths["events"].write_text("\n".join(json.dumps(e) for e in events + [events[3]]) + "\n")
@@ -255,3 +256,76 @@ def test_sqlite_connections_are_read_only_twice_over(tmp_path: Path) -> None:
             db.execute("CREATE TABLE t (a)")
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("day", ["20231115", "20231116"])
+def test_missing_in_period_shard_gives_no_result(tmp_path: Path, day: str) -> None:
+    paths = build_48h(tmp_path)
+    (paths["raw"] / f"raw-{day}.db").unlink()
+    proc = run_cli(paths)
+    assert proc.returncode == 1, proc.stderr
+    gate = json.loads(proc.stdout)["gate"]
+    assert gate["verdict"] == "no_result"
+    assert "raw_shard_missing_in_period" in gate["reasons"]
+
+
+def test_absent_boundary_shard_after_midnight_end_still_goes(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    (paths["raw"] / "raw-20231117.db").unlink()  # the day after a midnight-aligned period_end
+    proc = run_cli(paths)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["gate"] == {**out["gate"], "verdict": "go", "reasons": []}
+    assert out["flows"]["missing_shards"] == ["raw-20231117.db"]
+
+
+def test_nonexistent_raw_dir_is_an_input_error(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    paths["raw"] = tmp_path / "absent"
+    proc = run_cli(paths)
+    assert proc.returncode == 2 and "raw" in proc.stderr
+
+
+def test_wal_mode_inputs_leave_the_directories_unchanged(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path, wal=True)
+    before = sorted(os.listdir(paths["raw"])), sorted(os.listdir(tmp_path))
+    proc = run_cli(paths)
+    assert proc.returncode == 0, proc.stderr
+    assert (sorted(os.listdir(paths["raw"])), sorted(os.listdir(tmp_path))) == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_wal_mode_inputs_in_read_only_directories(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path, wal=True)
+    dirs = (paths["raw"], tmp_path)
+    try:
+        for d in dirs:
+            d.chmod(0o555)
+        proc = run_cli(paths)
+    finally:
+        for d in dirs:
+            d.chmod(0o755)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_uncheckpointed_wal_is_an_input_error_not_a_silent_short_read(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path, wal=True)
+    live = sqlite3.connect(paths["raw"] / "raw-20231116.db")
+    try:
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        live.execute("DELETE FROM raw_flow WHERE rowid > 100")
+        live.commit()
+        assert (paths["raw"] / "raw-20231116.db-wal").stat().st_size > 0
+        before = sorted(os.listdir(paths["raw"]))
+        proc = run_cli(paths)
+        assert sorted(os.listdir(paths["raw"])) == before
+    finally:
+        live.close()
+    assert proc.returncode == 2 and "copy" in proc.stderr
+
+
+def test_hot_rollback_journal_is_an_input_error(tmp_path: Path) -> None:
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0)])
+    (tmp_path / "inv.db-journal").write_bytes(b"hot")
+    with pytest.raises(inputs.InputError, match="copy"):
+        router.load_router(tmp_path / "inv.db", tmp_path, scope())

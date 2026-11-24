@@ -319,7 +319,12 @@ def test_explanations_cover_rejects_duplicates_nat_flows_shards_and_defaults() -
         "raw_shard_missing",
     } <= set(codes(out))
     clean = run([b], [flow("b1", LATE + 60)], [event(LATE)])
-    assert codes(clean) == ["key_level_match", "skew_assumed_zero"]
+    assert codes(clean) == [
+        "clean_window_scope",
+        "export_ends_before_period_end",
+        "key_level_match",
+        "skew_assumed_zero",
+    ]
     assert "zero_denominator" in codes(run([], [], []))
 
 
@@ -330,3 +335,45 @@ def test_out_of_span_row_alone_flags_attribution_change() -> None:
     out = run([b1, b2], rows, [event(LATE)], sc=sc)
     assert out["flows"]["out_of_span_rows"] == 1
     assert "attribution_changed" in codes(out)
+
+
+def test_export_end_explanation_only_when_last_event_precedes_period_end() -> None:
+    sc = scope(export_start=T0)
+    b = win("b1", LATE)
+    rows = [flow("b1", LATE + 60)]
+    end = sc.period_end
+    covered = run([b], rows, [event(LATE), event(end, dst="192.0.2.99")], sc=sc)
+    assert "export_ends_before_period_end" not in codes(covered)
+    short = run([b], rows, [event(LATE), event(end - 1, dst="192.0.2.99")], sc=sc)
+    assert "export_ends_before_period_end" in codes(short)
+    assert short["events"]["last_accepted_t"] == end - 1
+    assert short["gate"]["verdict"] == "go"  # an explanation, not a gate
+
+
+def test_clean_window_scope_explains_what_clean_does_not_check() -> None:
+    text = report.explain.TEXTS["clean_window_scope"]
+    assert "raw_missing" in text and "ct_lan_unmapped_bytes" in text and "overlap" in text
+    assert "clean_window_scope" in codes(run([], [], []))
+
+
+def _repro(missing: tuple[str, ...], sc=None):
+    """The review repro: 48 h, 100 directly matched windows on day 2 only."""
+    batches = [win(f"b{i}", LATE + i * 60) for i in range(100)]
+    rows = [flow(f"b{i}", LATE + i * 60 + 60, dst=f"192.0.2.{i + 1}") for i in range(100)]
+    events = [event(LATE + i * 60 + 5, dst=f"192.0.2.{i + 1}") for i in range(100)]
+    return run(batches, rows, events, sc=sc, missing_shards=missing)
+
+
+def test_missing_in_period_shard_never_passes_the_gate() -> None:
+    out = _repro(("raw-20231115.db", "raw-20231117.db"))
+    assert out["match"]["gated"]["direct"] == {"matched": 100, "denominator": 100}
+    assert out["gate"]["verdict"] == "no_result"
+    assert out["gate"]["reasons"] == ["raw_shard_missing_in_period"]
+    assert "zero_denominator" not in codes(out)
+
+
+def test_only_the_midnight_boundary_shard_is_exempt() -> None:
+    assert _repro(("raw-20231117.db",))["gate"]["verdict"] == "go"
+    late_end = scope(export_start=T0, period_end=T0 + 2 * DAY + 30)
+    out = _repro(("raw-20231117.db",), sc=late_end)
+    assert out["gate"]["verdict"] == "no_result"

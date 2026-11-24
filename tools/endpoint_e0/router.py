@@ -85,7 +85,17 @@ def batch_reasons(row) -> tuple[str, ...]:
 
 
 def _open_ro(path: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2)
+    """Open without touching the directory: `immutable=1` creates no -shm/-wal sidecars (WAL
+    shards in a read-only directory would otherwise fail), but it also skips WAL and hot-journal
+    recovery, so a database with pending sidecar content is refused rather than read short."""
+    for suffix in ("-wal", "-journal"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.is_file() and sidecar.stat().st_size > 0:
+            raise InputError(
+                f"{path.name} has a non-empty {suffix} file (live or unclean database): "
+                "checkpoint it or run on a copy"
+            )
+    db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro&immutable=1", uri=True, timeout=2)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA query_only=ON")
     return db
@@ -125,6 +135,13 @@ def shard_names(sc: Scope) -> tuple[str, ...]:
     first, last = (sc.period_start + 1) // 86400, sc.period_end // 86400
     days = (datetime.fromtimestamp(d * 86400, UTC) for d in range(first, last + 1))
     return tuple(f"raw-{d:%Y%m%d}.db" for d in days)
+
+
+def in_period_shard_names(sc: Scope) -> tuple[str, ...]:
+    """shard_names without the day after a midnight-aligned period_end, which holds at most the
+    rows of a window ending exactly at period_end; its absence does not void the period."""
+    names = shard_names(sc)
+    return names[:-1] if sc.period_end % 86400 == 0 else names
 
 
 def _flow(row) -> Flow:
@@ -178,6 +195,8 @@ def load_router(inventory: Path, raw_dir: Path, sc: Scope) -> RouterData:
     try:
         if not inventory.is_file():
             raise InputError("inventory database not found")
+        if not raw_dir.is_dir():
+            raise InputError("raw shard directory not found")
         flows, missing = _load_flows(raw_dir, sc)
         wanted = {(f.collector_id, f.batch_id) for f in flows if f.batch_id}
         batches = _load_batches(inventory, wanted)
