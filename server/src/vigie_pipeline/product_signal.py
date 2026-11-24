@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
 from fractions import Fraction
 from typing import Any
 
@@ -64,19 +63,18 @@ def _tokens(obs: Obs) -> list[str]:
     return out
 
 
-def _type_level(macs: Iterable[str], obs: list[Obs], inv: Inventory) -> bool:
+def _type_level(obs: list[Obs], inv: Inventory) -> bool:
     """Reuse services-v1 per MAC: a matched rule is a type hint, never product evidence."""
-    for mac in macs:
-        services = [
-            Observation(mac, o.observed_at, "mdns", o.service)
-            for o in obs
-            if o.mac == mac and o.kind == "mdns" and o.service
-        ]
-        if services and classify(services, inv.now, ttl_seconds=inv.ttl_seconds).reason == (
-            "matched_rule"
-        ):
-            return True
-    return False
+    services: dict[str, list[Observation]] = {}
+    for o in obs:  # one pass: O(observations), not O(macs x observations)
+        if o.kind == "mdns" and o.service:
+            services.setdefault(o.mac, []).append(
+                Observation(o.mac, o.observed_at, "mdns", o.service)
+            )
+    return any(
+        classify(per_mac, inv.now, ttl_seconds=inv.ttl_seconds).reason == "matched_rule"
+        for per_mac in services.values()
+    )
 
 
 def _classify(members: list[Device], obs: list[Obs], inv: Inventory) -> dict[str, Any]:
@@ -101,7 +99,7 @@ def _classify(members: list[Device], obs: list[Obs], inv: Inventory) -> dict[str
     elif expired_claim:
         verdict = ("expired", "product_claim_expired")
     elif generic:
-        if _type_level([m.mac for m in macs], obs, inv):
+        if _type_level(obs, inv):
             verdict = ("generic", "type_level_service_match")
         elif any(t.endswith("_vendor") for t in generic):
             verdict = ("generic", "vendor_without_model")

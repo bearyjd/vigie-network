@@ -21,7 +21,7 @@ Error messages are fixed text and never echo inventory values.
 
 ## Input (`vigie-product-signal-inventory`, version 1)
 
-The input is a strict JSON document. Unknown keys, duplicate keys, `NaN` and `Infinity` are rejected, and booleans are refused where numbers are expected. Limits: 8 MiB of input, 10,000 devices, 10,000 links, 64 MACs per device and 200,000 observations. Strings are at most 256 UTF-8 bytes and contain no control characters.
+The input is a strict JSON document. Unknown keys, duplicate keys, `NaN` and `Infinity` are rejected, and booleans are refused where numbers are expected. Limits: 8 MiB of input, 10,000 devices, 10,000 links, 64 MACs per device and 200,000 observations. Strings are at most 256 UTF-8 bytes and contain no control characters; a blank or whitespace-only string is treated as absent and is never evidence.
 
 The document has these fields:
 

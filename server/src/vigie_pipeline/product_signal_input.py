@@ -126,7 +126,7 @@ def _text(value: object, what: str) -> str | None:
         raise _fail(f"invalid {what}")
     if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
         raise _fail(f"invalid {what}")
-    return value
+    return value if value.strip() else None  # blank or whitespace-only is absent, not evidence
 
 
 def _mapping(value: object, keys: set[str], required: set[str], what: str) -> dict[str, Any]:
