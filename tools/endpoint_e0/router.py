@@ -8,7 +8,9 @@ window_end (server/src/vigie_ingest/store.py rows_by_day), so the window comes f
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
@@ -88,21 +90,24 @@ def batch_reasons(row) -> tuple[str, ...]:
 
 def _state(path: Path) -> tuple:
     """Main-file identity plus sidecar presence and size, to detect a change during a read."""
-    st = path.stat()
+    st = os.lstat(path)
     sidecars = []
     for suffix in _SIDECARS:
         sidecar = path.with_name(path.name + suffix)
         sidecars.append(sidecar.stat().st_size if sidecar.exists() else None)
-    return (st.st_ino, st.st_size, st.st_mtime_ns, *sidecars)
+    return (st.st_ino, st.st_nlink, st.st_size, st.st_mtime_ns, *sidecars)
 
 
 def _open_ro(path: Path) -> sqlite3.Connection:
     """Open without touching the directory: `immutable=1` creates no -shm/-wal sidecars (WAL
     shards in a read-only directory would otherwise fail), but it also skips WAL and hot-journal
-    recovery, so a database with pending sidecar content is refused rather than read short. A
-    symlink is refused too: its sidecars sit beside the target, where this check never looks."""
-    if path.is_symlink():
-        raise InputError(f"{path.name} is a symlink: copy the file, do not link it")
+    recovery, so a database with pending sidecar content is refused rather than read short.
+    Symlinks and hardlinks are refused too: their sidecars can sit beside another name, where
+    this check never looks. Beyond that, the tool is only safe on a checkpointed private copy
+    that nothing else writes to."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or st.st_nlink != 1:
+        raise InputError(f"{path.name} is a symlink or hardlink: copy the file, do not link it")
     for suffix in _SIDECARS:
         sidecar = path.with_name(path.name + suffix)
         if sidecar.is_file() and sidecar.stat().st_size > 0:
@@ -229,4 +234,6 @@ def load_router(inventory: Path, raw_dir: Path, sc: Scope) -> RouterData:
         batches = _load_batches(inventory, wanted)
     except sqlite3.Error as exc:
         raise InputError(f"sqlite read failed: {exc}") from None
+    except OSError as exc:  # a file vanished or became unreadable after the existence checks
+        raise InputError(f"cannot read a database file: {exc.strerror}") from None
     return RouterData(batches=batches, flows=flows, missing_shards=missing)

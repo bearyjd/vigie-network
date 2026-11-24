@@ -9,8 +9,9 @@ Prints a sorted-key JSON report with the `other` byte share, the key match ratio
 
 A missing raw shard day inside the period gives no_result. An export whose last event precedes
 period_end is explained, not gated. Databases are opened immutable (no sidecars are created); one
-with a non-empty -wal or -journal file, a symlinked one, or one that changes while read is
-refused: run on a checkpointed copy.
+with a non-empty -wal or -journal file, a symlinked or hardlinked one, or one that changes while
+read is refused. Beyond those defences the tool is only safe on a checkpointed private copy that
+nothing else writes to.
 
 Exit codes: 0 go, 1 no_go or no_result, 2 input/usage error. Run as `python3 -I`.
 """

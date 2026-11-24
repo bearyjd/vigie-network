@@ -385,3 +385,45 @@ def test_database_changed_while_being_read_is_an_input_error(
     monkeypatch.setattr(router, "_open_ro", racing)
     with pytest.raises(inputs.InputError, match="changed while being read"):
         router.load_router(paths["inventory"], paths["raw"], scope())
+
+
+def test_hardlinked_shard_with_a_hot_wal_beside_its_other_name_is_refused(tmp_path: Path) -> None:
+    """Review repro: os.link'd shard; the WAL sits beside the other name, never checked."""
+    paths = build_48h(tmp_path, wal=True)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    shard = paths["raw"] / "raw-20231116.db"
+    shard.rename(other / shard.name)
+    os.link(other / shard.name, shard)
+    live = sqlite3.connect(other / shard.name)
+    try:
+        live.execute("PRAGMA wal_autocheckpoint=0")
+        row = (COLLECTOR, T0 + DAY + 60, MAC, None, None, "other", 2 * 10**9, 0, 1, "b01440")
+        live.execute("INSERT INTO raw_flow VALUES (?,?,?,?,?,?,?,?,?,?)", row)
+        live.commit()
+        assert (other / f"{shard.name}-wal").stat().st_size > 0
+        proc = run_cli(paths)
+    finally:
+        live.close()
+    assert proc.returncode == 2 and "do not link it" in proc.stderr, proc.stdout[:200]
+
+
+def test_hardlinked_inventory_is_refused(tmp_path: Path) -> None:
+    paths = build_48h(tmp_path)
+    os.link(paths["inventory"], tmp_path / "inv-twin.db")
+    proc = run_cli(paths)
+    assert proc.returncode == 2 and "do not link it" in proc.stderr
+
+
+def test_database_vanishing_after_the_existence_check_is_an_input_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = build_48h(tmp_path)
+
+    def gone(*_args, **_kw):
+        raise FileNotFoundError(2, "No such file or directory", str(paths["raw"]))
+
+    monkeypatch.setattr(router.os, "lstat", gone)
+    with pytest.raises(inputs.InputError) as err:
+        router.load_router(paths["inventory"], paths["raw"], scope())
+    assert str(tmp_path) not in str(err.value)
