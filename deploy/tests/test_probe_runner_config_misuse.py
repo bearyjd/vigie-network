@@ -64,7 +64,7 @@ REJECTED = {
     "link_local_resolver": lambda p: config(p, {**DNS, "resolver": "169.254.1.1"}),
     "hostname_resolver": lambda p: config(p, {**DNS, "resolver": "router.home.lan"}),
     "hostname_tcp": lambda p: config(p, {**lan(1), "address": "router.home.lan"}),
-    "scoped_resolver": lambda p: config(p, {**DNS, "resolver": "fe80::1%eth0"}),
+    "scoped_resolver": lambda p: config(p, {**DNS, "resolver": "fd12::7%eth0"}),
     "second_dns_upstream": lambda p: config(
         p,
         {**DNS, "id": "up1", "kind": "dns_upstream"},
@@ -101,8 +101,9 @@ def test_a_symlinked_config_exits_with_the_config_error_and_does_nothing(tmp_pat
     assert_untouched(tmp_path, calls)
 
 
+# Delete or invert when the mode check lands (docs/monitoring.md:1129 says the config is private).
 @pytest.mark.parametrize("mode", [0o644, 0o666, 0o640])
-def test_config_file_mode_is_not_enforced_documented_current_behaviour(tmp_path, mode):
+def test_known_gap_config_mode_not_enforced(tmp_path, mode):
     """FINDING: the runner never checks the config's mode or owner (only render's skeleton and
     the docs say private). A group/world-readable or writable config is loaded and probed.
     Pinned so that adding the check is a visible, deliberate change."""

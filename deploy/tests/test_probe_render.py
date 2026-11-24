@@ -295,17 +295,14 @@ def test_a_one_target_probe_allow_renders_exactly_one_address_on_one_directive()
 
 def test_rerendering_without_the_probe_keys_after_enabling_restores_main_byte_for_byte():
     """Rollback: the same config minus probes_enabled/probe_allow is the probe-free output again,
-    as rendered text and as the written bundle (no probe file, same plan). GOLDEN_FILES for the
-    pipeline container, GOLDEN_PLAN and GOLDEN_TOD_PIPELINE predate the monitoring_dns lines (#129)
-    and no longer match even the plain render, so those are compared with the plain render here."""
+    as rendered text and as the written bundle (no probe file, same plan)."""
     enabled = {**BASE, **PROBE}
     assert set(render.render(enabled)) != set(GOLDEN_FILES)
     rolled_back = {k: v for k, v in enabled.items() if k not in ("probes_enabled", "probe_allow")}
     plain = render.render(BASE)
     assert render.render(rolled_back) == plain
     assert all("probe" not in n.lower() and "probe" not in t.lower() for n, t in plain.items())
-    untouched = {n: h for n, h in GOLDEN_FILES.items() if n != "vigie_test-pipeline.container"}
-    assert {n: sha(plain[n]) for n in untouched} == untouched
+    assert digests(plain) == GOLDEN_FILES
     with tempfile.TemporaryDirectory() as tmp:
         for name, config in (("back", rolled_back), ("plain", BASE)):
             render.write_bundle(config, Path(tmp) / name)

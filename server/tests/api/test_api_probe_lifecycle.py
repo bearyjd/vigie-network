@@ -112,15 +112,23 @@ def test_outage_recovery_stale_and_collector_loss_end_to_end(lab: tuple[Env, lis
     assert recovered["verdict"] == "normal" and recovered["targets"][0]["state"] == "ok"
     assert kinds() == ["probe_outage", "probe_recovered"]
 
-    # the runner stops: past VIGIE_PROBE_STALE_S nothing may still read ok
+    # the runner stops: past VIGIE_PROBE_STALE_S nothing may still read ok, even before the
+    # pipeline folds again (the API enforces valid_until itself)
     clock[0] += settings.stale_s + 60
+    early = env.get("/probes").json()["data"]
+    assert early["stale"] is True and early["verdict"] == "unknown"
+    assert [t["state"] for t in early["targets"]] == ["unknown"]
     fold_probes(env.inv, settings, lambda: clock[0])
     stale = env.get("/probes").json()["data"]
     assert stale["stale"] is True and stale["verdict"] == "unknown" and stale["targets"] == []
     assert kinds() == ["probe_outage", "probe_recovered", "probe_stale"]
 
-    # runner back and ok, but no observation batch for more than 900 s: Vigie is blind
-    clock[0] += 900
+    # runner back and ok; the collector window is 900 s: normal at +840 s, blind at +960 s
+    collector_batch()
+    clock[0] += 840 - STEP_S
+    inside = tick(up=True, collector=False)
+    assert inside["stale"] is False and inside["verdict"] == "normal"
+    clock[0] += 120 - STEP_S
     blind = tick(up=True, collector=False)
     assert blind["stale"] is False and blind["targets"][0]["state"] == "ok"
     assert blind["verdict"] == "vigie_blind"
