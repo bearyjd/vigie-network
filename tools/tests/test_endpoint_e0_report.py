@@ -224,10 +224,12 @@ def test_guard_silent_at_export_start_fails_the_gate_through_the_warm_up_bucket(
     assert out["gate"]["reasons"] == ["warm_up_match_ratio_below_90pct"]
 
 
-def test_warm_up_bucket_at_ninety_percent_passes() -> None:
+def test_warm_up_ratio_threshold_is_ninety_percent() -> None:
     sc = scope(export_start=T0, period_end=T0 + 3 * DAY)
-    out = hourly(30, 0, sc=sc)  # hours 0..23 warm-up, all matched
+    out = hourly(30, 2, sc=sc)  # hours 0..23 warm-up, 22 of 24 matched
+    assert out["match"]["warm_up"]["combined"] == {"matched": 22, "denominator": 24}
     assert out["gate"]["verdict"] == "go"
+    assert hourly(30, 3, sc=sc)["gate"]["reasons"] == ["warm_up_match_ratio_below_90pct"]
 
 
 def test_scope_without_export_start_is_rejected_not_inferred_from_events() -> None:
