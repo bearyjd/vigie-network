@@ -184,3 +184,29 @@ def test_loader_rejects_bad_counters_and_reports_missing_shards(tmp_path: Path) 
 def test_loader_errors_on_missing_inventory(tmp_path: Path) -> None:
     with pytest.raises(inputs.InputError):
         router.load_router(tmp_path / "absent.db", tmp_path, scope())
+
+
+def test_loader_reads_only_scoped_macs_so_foreign_rows_do_not_trip_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0)])
+    foreign = [(COLLECTOR, T0 + 60, "02:00:00:00:0f:01", "192.0.2.1", 443, "tcp", 1, 1, 1, "b1")]
+    mine = [(COLLECTOR, T0 + 60, MAC, "192.0.2.1", 443, "tcp", 1, 1, 1, "b1")]
+    write_shard(raw, "20231115", foreign * 50 + mine)
+    monkeypatch.setattr(router, "MAX_FLOW_ROWS", 10)
+    data = router.load_router(tmp_path / "inv.db", raw, scope())
+    assert [f.mac for f in data.flows] == [MAC]
+
+
+def test_loader_fetches_only_batches_referenced_by_loaded_rows(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    legacy = [(COLLECTOR, f"old{i}", None, None, None, None, None, 0) for i in range(30)]
+    write_inventory(tmp_path / "inv.db", [ok_row("b1", T0), ok_row("b2", T0 + 60), *legacy])
+    write_shard(
+        raw, "20231115", [(COLLECTOR, T0 + 60, MAC, "192.0.2.1", 443, "tcp", 1, 1, 1, "b1")]
+    )
+    data = router.load_router(tmp_path / "inv.db", raw, scope())
+    assert set(data.batches) == {(COLLECTOR, "b1")}

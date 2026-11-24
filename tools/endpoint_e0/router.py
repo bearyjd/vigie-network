@@ -1,6 +1,7 @@
 """Read-only, bounded loading of accepted batch bounds (inventory) and raw_flow rows (shards).
 
-Raw rows join to batches by (collector_id, batch_id) only; `raw_flow.ts` is the batch's
+Only the scoped MACs' rows are read, and only the batches those rows reference. Raw rows join
+to batches by (collector_id, batch_id) only; `raw_flow.ts` is the batch's
 window_end (server/src/vigie_ingest/store.py rows_by_day), so the window comes from the batch.
 """
 
@@ -29,6 +30,7 @@ INFORMATIONAL_TRUNCATED_KEYS = frozenset(
 ALWAYS_DEGRADING_TRUNCATED_KEYS = frozenset({"truncated_other"})
 LAN_UNMAPPED_BYTES_KEY = "ct_lan_unmapped_bytes"
 HOUR_S = 3600
+_CHUNK = 500  # bound on SQL host parameters per batch lookup
 _BATCH_COLS = (
     "collector_id,batch_id,window_start,window_end,observation_kind,health,truncated,"
     "dropped_batches"
@@ -89,26 +91,33 @@ def _open_ro(path: Path) -> sqlite3.Connection:
     return db
 
 
-def _load_batches(path: Path, sc: Scope) -> dict[tuple[str, str], Batch]:
-    if not path.is_file():
-        raise InputError("inventory database not found")
-    with closing(_open_ro(path)) as db:
-        rows = db.execute(
-            f"SELECT {_BATCH_COLS} FROM batches WHERE window_start IS NULL OR window_end IS NULL "  # noqa: S608
-            "OR (window_end > ? AND window_end <= ?) ORDER BY collector_id, batch_id LIMIT ?",
-            (sc.period_start, sc.period_end, MAX_BATCHES + 1),
-        ).fetchall()
-    if len(rows) > MAX_BATCHES:
-        raise InputError(f"more than {MAX_BATCHES} batches in the period")
+def _batch(row) -> Batch:
+    for key in ("window_start", "window_end"):
+        if row[key] is not None and not isinstance(row[key], int):
+            raise InputError("batch window bound is not an integer")
+    cid, bid = str(row["collector_id"]), str(row["batch_id"])
+    return Batch(cid, bid, row["window_start"], row["window_end"], batch_reasons(row))
+
+
+def _load_batches(path: Path, wanted: set[tuple[str, str]]) -> dict[tuple[str, str], Batch]:
+    """Fetch only the batches the loaded rows reference, by (collector_id, batch_id)."""
+    if len(wanted) > MAX_BATCHES:
+        raise InputError(f"more than {MAX_BATCHES} batches referenced in the period")
+    by_collector: dict[str, list[str]] = {}
+    for cid, bid in sorted(wanted):
+        by_collector.setdefault(cid, []).append(bid)
     out = {}
-    for row in rows:
-        for key in ("window_start", "window_end"):
-            if row[key] is not None and not isinstance(row[key], int):
-                raise InputError("batch window bound is not an integer")
-        cid, bid = str(row["collector_id"]), str(row["batch_id"])
-        out[(cid, bid)] = Batch(
-            cid, bid, row["window_start"], row["window_end"], batch_reasons(row)
-        )
+    with closing(_open_ro(path)) as db:
+        for cid, bids in by_collector.items():
+            for i in range(0, len(bids), _CHUNK):
+                chunk = bids[i : i + _CHUNK]
+                marks = ",".join("?" * len(chunk))
+                rows = db.execute(
+                    f"SELECT {_BATCH_COLS} FROM batches WHERE collector_id=? "  # noqa: S608
+                    f"AND batch_id IN ({marks})",
+                    (cid, *chunk),
+                ).fetchall()
+                out.update({(b.collector_id, b.batch_id): b for b in map(_batch, rows)})
     return out
 
 
@@ -146,6 +155,8 @@ def _flow(row) -> Flow:
 def _load_flows(raw_dir: Path, sc: Scope) -> tuple[tuple[Flow, ...], tuple[str, ...]]:
     flows: list[Flow] = []
     missing = []
+    macs = sorted({span.mac for span in sc.macs})  # ingest stores canonical lower-case MACs
+    marks = ",".join("?" * len(macs))
     for name in shard_names(sc):
         path = raw_dir / name
         if not path.is_file():
@@ -153,9 +164,9 @@ def _load_flows(raw_dir: Path, sc: Scope) -> tuple[tuple[Flow, ...], tuple[str, 
             continue
         with closing(_open_ro(path)) as db:
             rows = db.execute(
-                f"SELECT {_FLOW_COLS} FROM raw_flow WHERE ts > ? AND ts <= ? ORDER BY rowid "  # noqa: S608
-                "LIMIT ?",
-                (sc.period_start, sc.period_end, MAX_FLOW_ROWS - len(flows) + 1),
+                f"SELECT {_FLOW_COLS} FROM raw_flow WHERE ts > ? AND ts <= ? "  # noqa: S608
+                f"AND device_mac IN ({marks}) ORDER BY rowid LIMIT ?",
+                (sc.period_start, sc.period_end, *macs, MAX_FLOW_ROWS - len(flows) + 1),
             ).fetchall()
         flows.extend(_flow(row) for row in rows)
         if len(flows) > MAX_FLOW_ROWS:
@@ -165,8 +176,11 @@ def _load_flows(raw_dir: Path, sc: Scope) -> tuple[tuple[Flow, ...], tuple[str, 
 
 def load_router(inventory: Path, raw_dir: Path, sc: Scope) -> RouterData:
     try:
-        batches = _load_batches(inventory, sc)
+        if not inventory.is_file():
+            raise InputError("inventory database not found")
         flows, missing = _load_flows(raw_dir, sc)
+        wanted = {(f.collector_id, f.batch_id) for f in flows if f.batch_id}
+        batches = _load_batches(inventory, wanted)
     except sqlite3.Error as exc:
         raise InputError(f"sqlite read failed: {exc}") from None
     return RouterData(batches=batches, flows=flows, missing_shards=missing)
