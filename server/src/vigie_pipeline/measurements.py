@@ -301,19 +301,20 @@ def apply_measurements(inv: sqlite3.Connection, measured: Measurements) -> None:
             already_covered = shared
     if "overlapping_window" in reasons and "probe" not in reasons:
         prior = inv.execute(
-            "SELECT reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
+            "SELECT qualified_seconds,reasons FROM coverage_hourly WHERE collector_id=? AND hour=?",
             (m.collector, hour),
         ).fetchone()
         if prior is not None:
-            degraded = sorted(set(json.loads(prior[0])) | {"overlapping_window"})
-            inv.execute(
-                "UPDATE coverage_hourly SET qualified_seconds=0,reasons=? "
-                "WHERE collector_id=? AND hour=?",
-                (json.dumps(degraded), m.collector, hour),
-            )
-            inv.execute(
-                "INSERT OR IGNORE INTO monitoring_quality_work VALUES (?,?,'')", (m.collector, hour)
-            )
+            # The batch's own reasons too, so a nested degraded receipt is order-independent.
+            before = set(json.loads(prior[1]))
+            degraded = before | set(reasons)
+            if degraded != before or prior[0] != 0:  # repair only on a real transition
+                inv.execute(
+                    "UPDATE coverage_hourly SET qualified_seconds=0,reasons=? "
+                    "WHERE collector_id=? AND hour=?",
+                    (json.dumps(sorted(degraded)), m.collector, hour),
+                )
+                _queue_quality_repair(inv, m.collector, hour)
     inv.execute(
         "INSERT INTO measurement_batches VALUES (?,?,?,?,?,?,?)",
         (m.collector, m.batch_id, m.start, m.end, m.received, hour, json.dumps(reasons)),

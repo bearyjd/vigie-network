@@ -70,8 +70,6 @@ def test_a_late_degraded_receipt_repairs_a_mature_reference(tmp_path, start, end
         apply_measurements(inv, late)
         assert coverage(inv, HOUR)[2] == ["flow_degraded"]
         assert queued(inv) == sorted({(HOUR,), ((end - 1) // 3600 * 3600,)})
-        apply_measurements(inv, late)  # duplicate delivery
-        assert coverage(inv, HOUR)[2] == ["flow_degraded"]
         analyze_monitoring(inv, ov, BaselineConfig(), CURRENT + 3620)
         assert profile_state(inv) == "rebuilding_quality"
         # One collector-hour drains per pass; replayed passes stay put once the queue is empty.
@@ -79,6 +77,9 @@ def test_a_late_degraded_receipt_repairs_a_mature_reference(tmp_path, start, end
             analyze_monitoring(inv, ov, BaselineConfig(), CURRENT + 3630 + tick)
         assert queued(inv) == []
         assert profile_state(inv) == "rebuilding_quality"
+        apply_measurements(inv, late)  # duplicate delivery, with no work item to hide behind
+        assert queued(inv) == []
+        assert coverage(inv, HOUR)[2] == ["flow_degraded"]
     finally:
         inv.close()
         ov.close()

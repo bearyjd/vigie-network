@@ -141,7 +141,9 @@ def evidence_gap(inv: sqlite3.Connection | None, lo: int, done: int) -> str | No
     if inv is None or not _has_table(inv, "coverage_hourly"):
         return "no coverage evidence in the window"
     row = inv.execute(
-        "SELECT 1 FROM coverage_hourly WHERE hour>=? AND hour<? LIMIT 1", (lo // 3600 * 3600, done)
+        # A zero-second row only carries a degradation reason (a cross-hour gap), not evidence.
+        "SELECT 1 FROM coverage_hourly WHERE hour>=? AND hour<? AND observed_seconds>0 LIMIT 1",
+        (lo // 3600 * 3600, done),
     )
     if row.fetchone() is None:
         return "no coverage evidence in the window"
@@ -161,7 +163,9 @@ def liveness(inv: sqlite3.Connection | None) -> tuple[int | None, int | None]:
         engine = inv.execute("SELECT MAX(updated_hour) FROM monitoring_profiles").fetchone()[0]
     if _has_table(inv, "coverage_hourly"):
         assert inv is not None  # noqa: S101 (narrowing for mypy)
-        ingest = inv.execute("SELECT MAX(hour) FROM coverage_hourly").fetchone()[0]
+        ingest = inv.execute(
+            "SELECT MAX(hour) FROM coverage_hourly WHERE observed_seconds>0"
+        ).fetchone()[0]
     return engine, ingest
 
 
