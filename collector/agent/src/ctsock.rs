@@ -228,9 +228,10 @@ pub struct CtShared {
     pub attempts: AtomicU64,
     /// Snapshots received over the connection's lifetime.
     pub received: AtomicU64,
-    /// Helper data may be missing although the counters can look clean: a connection ended, a
-    /// connect failed, a reconnect followed an earlier attempt, a snapshot was dropped from the
-    /// queue, or the sequence broke on one connection. Set by the reader, taken once per window
+    /// Helper data may be missing although the counters can look clean: a connect failed, a
+    /// reconnect followed an earlier connection or attempt, a snapshot was dropped from the
+    /// queue, or the sequence broke on one connection (a socket still down at the flush is
+    /// `connected` = false instead). Set by the reader, taken once per window
     /// by the main loop (independently of the snapshot queue). Never counted in `errors`.
     pub interrupted: AtomicBool,
 }
@@ -298,11 +299,8 @@ fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBo
                 sh.connected.store(true, Ordering::Relaxed);
                 let before = sh.received.load(Ordering::Relaxed);
                 serve(stream, cfg, tx, sh, stop);
-                // Latched before `connected` drops, so a flush that sees the socket down
-                // cannot also miss the latch and leave it for a later window alone.
-                if !stop.load(Ordering::Relaxed) {
-                    sh.interrupted.store(true, Ordering::Relaxed);
-                }
+                // No latch here: a flush while down sees `connected` false, and the reconnect
+                // that ends the gap latches above.
                 sh.connected.store(false, Ordering::Relaxed);
                 if sh.received.load(Ordering::Relaxed) > before {
                     attempt = 0;
