@@ -6,6 +6,7 @@ pub mod builder;
 pub mod config;
 pub mod ctfold;
 pub mod ctparse;
+pub mod ctseq;
 pub mod ctsock;
 pub mod dhcp_assembler;
 pub mod dnsmasq;

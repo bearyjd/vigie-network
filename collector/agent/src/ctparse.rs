@@ -81,6 +81,9 @@ pub struct Snapshot {
     pub recounted_flows: u64,
     pub dropped_new_keys: u64,
     pub records: Vec<Record>,
+    /// Never parsed: set by the reader when this frame follows a reconnect or breaks the
+    /// sequence, so the flag lands in the same window as the frame's bytes.
+    pub transport_gap: bool,
 }
 
 pub fn parse_snapshot(line: &[u8]) -> Result<Snapshot, ParseError> {

@@ -105,8 +105,8 @@ impl Helper {
         });
     }
 
-    /// Pumps and flushes one window; returns its `truncated` map.
-    fn flush(&mut self) -> serde_json::Value {
+    /// Pumps and flushes one window; returns its `truncated` map and A's uploaded bytes.
+    fn flush(&mut self) -> (serde_json::Value, u64) {
         self.mono += 60;
         let mut w = Window::default();
         self.sources.pump(&mut w, &self.table, self.mono);
@@ -124,20 +124,40 @@ impl Helper {
         let b = build_with_drops(&meta, sections, &Health::default(), BATCH_CAP, &drops);
         let j: serde_json::Value =
             serde_json::from_slice(&b.encoded.body(1_760_000_061, 0)).unwrap();
-        j["truncated"].clone()
+        let up = j["conntrack"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r["mac"] == A)
+                    .map(|r| r["bytes_up"].as_u64().unwrap())
+                    .sum()
+            })
+            .unwrap_or(0);
+        (j["truncated"].clone(), up)
+    }
+
+    /// Flushes and checks the window holds exactly `frames` frames' bytes and the given verdict.
+    fn window(&mut self, frames: u64, degraded: bool, why: &str) -> serde_json::Value {
+        let (t, up) = self.flush();
+        assert_eq!(
+            up,
+            FRAME_UP * frames,
+            "{why}: window membership of rows: {t}"
+        );
+        if degraded {
+            assert_ne!(flags(&t) & flag::CT_SOCKET_DOWN, 0, "{why}: {t}");
+        } else {
+            assert!(t.get("source_flags").is_none(), "{why}: {t}");
+        }
+        t
     }
 }
 
+/// `bytes_up` of one frame (see `frame`).
+const FRAME_UP: u64 = 70;
+
 fn flags(t: &serde_json::Value) -> u64 {
     t.get("source_flags").and_then(|v| v.as_u64()).unwrap_or(0)
-}
-
-fn assert_degraded(t: &serde_json::Value, why: &str) {
-    assert_ne!(flags(t) & flag::CT_SOCKET_DOWN, 0, "{why}: {t}");
-}
-
-fn assert_clean(t: &serde_json::Value, why: &str) {
-    assert!(t.get("source_flags").is_none(), "{why}: {t}");
 }
 
 #[test]
@@ -148,14 +168,13 @@ fn a_reconnect_with_a_reprimed_sequence_before_the_flush_still_marks_the_window(
     h.hang_up(c1);
     let mut c2 = h.accept();
     h.send(&mut c2, &[Some(1)]);
-    let t = h.flush();
-    assert_degraded(&t, "interrupted window looks healthy at flush time");
+    let t = h.window(2, true, "interrupted window looks healthy at flush time");
     assert!(
         t.get("ct_errors").is_none(),
         "a clean EOF stays out of the error counter: {t}"
     );
     h.send(&mut c2, &[Some(2)]);
-    assert_clean(&h.flush(), "the next genuinely clean window clears it");
+    h.window(1, false, "the next genuinely clean window clears it");
 }
 
 #[test]
@@ -164,16 +183,16 @@ fn a_reconnect_in_the_next_window_marks_that_window_too() {
     let mut c1 = h.accept();
     h.send(&mut c1, &[Some(1)]);
     h.hang_up(c1);
-    assert_degraded(&h.flush(), "down at flush time");
+    h.window(1, true, "down at flush time");
     assert!(
         !h.shared.connected.load(Ordering::Relaxed),
         "precondition: the reconnect falls in the next window"
     );
     let mut c2 = h.accept();
     h.send(&mut c2, &[Some(1)]);
-    assert_degraded(&h.flush(), "started down, recovered before the flush");
+    h.window(1, true, "started down, recovered before the flush");
     h.send(&mut c2, &[Some(2)]);
-    assert_clean(&h.flush(), "ordinary recovery");
+    h.window(1, false, "ordinary recovery");
 }
 
 #[test]
@@ -181,9 +200,9 @@ fn the_first_connect_is_not_an_interruption() {
     let mut h = helper("first");
     let mut c = h.accept();
     h.send(&mut c, &[Some(500)]);
-    assert_clean(&h.flush(), "a running helper's first frame is a baseline");
+    h.window(1, false, "a running helper's first frame is a baseline");
     h.send(&mut c, &[Some(501)]);
-    assert_clean(&h.flush(), "and its successor is continuous");
+    h.window(1, false, "and its successor is continuous");
 }
 
 #[test]
@@ -192,67 +211,93 @@ fn a_snapshot_lost_from_a_full_queue_marks_the_window() {
     let mut c = h.accept();
     let seqs: Vec<Option<u64>> = (1..=QUEUE as u64 + 1).map(Some).collect();
     h.send(&mut c, &seqs);
-    let t = h.flush();
-    assert_degraded(&t, "queue loss");
+    let t = h.window(QUEUE as u64, true, "queue loss");
     assert_eq!(t["ct_errors"], 1, "the drop counter keeps its meaning: {t}");
     h.send(&mut c, &[Some(QUEUE as u64 + 2)]);
-    assert_clean(&h.flush(), "cleared after the lossy window");
+    h.window(1, false, "cleared after the lossy window");
 }
 
-/// Each case runs on one connection: a baseline frame window, then the anomaly, then a clean
-/// successor window.
-fn sequence_case(tag: &str, first: &[Option<u64>], second: &[Option<u64>], degraded: bool) {
+/// One connection: a baseline window, the window with `second` (degraded or not), then a
+/// window with `next` alone, which must be clean. Every window holds exactly its own frames.
+fn sequence_case(
+    tag: &str,
+    first: &[Option<u64>],
+    second: &[Option<u64>],
+    degraded: bool,
+    next: Option<u64>,
+) {
     let mut h = helper(tag);
     let mut c = h.accept();
     h.send(&mut c, first);
-    assert_clean(&h.flush(), &format!("{tag}: baseline"));
+    h.window(first.len() as u64, false, &format!("{tag}: baseline"));
     h.send(&mut c, second);
-    let t = h.flush();
-    if degraded {
-        assert_degraded(&t, tag);
-    } else {
-        assert_clean(&t, tag);
-    }
-    let next = second.iter().rev().find_map(|s| *s).map(|s| s + 1);
+    h.window(second.len() as u64, degraded, tag);
     h.send(&mut c, &[next]);
-    assert_clean(
-        &h.flush(),
+    h.window(
+        1,
+        false,
         &format!("{tag}: the next continuous window is clean"),
     );
 }
 
+/// A helper-side loss (its queue was busy) is only revealed by the next frame: the window that
+/// receives that frame is marked, not the earlier one, which was already flushed.
 #[test]
-fn a_sequence_gap_on_one_connection_marks_the_window() {
-    sequence_case("gap", &[Some(1)], &[Some(3)], true);
+fn a_sequence_gap_marks_the_window_of_the_frame_that_reveals_it() {
+    sequence_case("gap", &[Some(1)], &[Some(3)], true, Some(4));
 }
 
 #[test]
 fn a_duplicate_snapshot_marks_the_window() {
-    sequence_case("dup", &[Some(1)], &[Some(1)], true);
+    sequence_case("dup", &[Some(1)], &[Some(1)], true, Some(2));
 }
 
 #[test]
-fn a_reordered_snapshot_marks_the_window() {
-    sequence_case("reorder", &[Some(5)], &[Some(4)], true);
+fn a_reordered_snapshot_marks_its_window_without_rewinding_the_sequence() {
+    sequence_case("reorder", &[Some(100)], &[Some(99)], true, Some(101));
 }
 
 #[test]
-fn a_reset_on_one_connection_marks_the_window() {
-    sequence_case("reset", &[Some(50)], &[Some(1)], true);
+fn a_replay_of_the_high_water_frame_after_a_reorder_is_a_duplicate() {
+    let mut h = helper("rereplay");
+    let mut c = h.accept();
+    h.send(&mut c, &[Some(100)]);
+    h.window(1, false, "baseline");
+    h.send(&mut c, &[Some(99)]);
+    h.window(1, true, "reorder");
+    h.send(&mut c, &[Some(100)]);
+    h.window(
+        1,
+        true,
+        "the high-water frame again is a duplicate, not continuous",
+    );
+    h.send(&mut c, &[Some(101)]);
+    h.window(1, false, "continuous again");
 }
 
 #[test]
-fn a_wrapped_sequence_is_judged_conservatively_like_a_reset() {
-    sequence_case("wrap", &[Some(u64::MAX)], &[Some(1)], true);
+fn a_reset_on_one_connection_marks_the_window_and_rebaselines() {
+    sequence_case("reset", &[Some(50_000)], &[Some(1)], true, Some(2));
+}
+
+#[test]
+fn a_wrapped_sequence_is_judged_like_a_reset() {
+    sequence_case("wrap", &[Some(u64::MAX)], &[Some(1)], true, Some(2));
 }
 
 #[test]
 fn consecutive_sequences_stay_clean() {
-    sequence_case("steady", &[Some(1), Some(2)], &[Some(3), Some(4)], false);
+    sequence_case(
+        "steady",
+        &[Some(1), Some(2)],
+        &[Some(3), Some(4)],
+        false,
+        Some(5),
+    );
 }
 
 #[test]
 fn frames_without_sequence_metadata_are_never_judged() {
-    sequence_case("noseq", &[None, None], &[None, None], false);
-    sequence_case("mixed", &[Some(7)], &[None, Some(8)], false);
+    sequence_case("noseq", &[None, None], &[None, None], false, None);
+    sequence_case("mixed", &[Some(7)], &[None, Some(8)], false, Some(9));
 }
