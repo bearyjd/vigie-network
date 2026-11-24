@@ -19,6 +19,7 @@ use vigie_agent::window::Window;
 use vigie_agent::wiring::{flag, Sources};
 
 const A: &str = "aa:bb:cc:00:00:01";
+const RETRY_MS: u64 = 400;
 
 struct Helper {
     listener: UnixListener,
@@ -36,15 +37,16 @@ fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
-/// A listening fake helper and a reader that retries quickly.
+/// A listening fake helper and a reader that retries after `RETRY_MS`: long enough that a test
+/// sees the socket down and flushes before the reader reconnects into the listen backlog.
 fn helper(tag: &str) -> Helper {
     let p = tmpdir(tag).join("c.sock");
     let listener = UnixListener::bind(&p).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     let me = std::fs::metadata("/proc/self").unwrap().uid();
     let cfg = CtConfig {
-        backoff_base_ms: 10,
-        backoff_cap_ms: 50,
+        backoff_base_ms: RETRY_MS,
+        backoff_cap_ms: RETRY_MS,
         ..CtConfig::new(p, vec![0, me])
     };
     let ct = CtReader::spawn(cfg).unwrap();
@@ -163,6 +165,10 @@ fn a_reconnect_in_the_next_window_marks_that_window_too() {
     h.send(&mut c1, &[Some(1)]);
     h.hang_up(c1);
     assert_degraded(&h.flush(), "down at flush time");
+    assert!(
+        !h.shared.connected.load(Ordering::Relaxed),
+        "precondition: the reconnect falls in the next window"
+    );
     let mut c2 = h.accept();
     h.send(&mut c2, &[Some(1)]);
     assert_degraded(&h.flush(), "started down, recovered before the flush");

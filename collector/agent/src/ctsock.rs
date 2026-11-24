@@ -387,7 +387,7 @@ fn serve(
 /// Whether `seq` continues `last` on one connection. The first numbered frame of a connection is
 /// its baseline (a restarted helper re-primes at 1); `seq` 0 is an old helper's frame without
 /// sequence metadata and is never judged. A gap, duplicate, reorder, reset or wrap breaks it.
-pub fn seq_continues(last: Option<u64>, seq: u64) -> bool {
+fn seq_continues(last: Option<u64>, seq: u64) -> bool {
     seq == 0 || last.is_none_or(|l| l.checked_add(1) == Some(seq))
 }
 
