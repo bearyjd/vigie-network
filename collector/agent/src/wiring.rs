@@ -34,7 +34,9 @@ pub mod flag {
     pub const CT_TABLE_PRESSURE: u64 = 1;
     /// The helper saw conntrack lines without byte counters (`nf_conntrack_acct` is off).
     pub const CT_ACCT_OFF: u64 = 2;
-    /// The helper socket is down, refused, or has been silent for `CT_STALE_S`.
+    /// The helper socket is down, refused, or has been silent for `CT_STALE_S`; or the window
+    /// had a transport gap even if the helper recovered since: a failed or repeated connect
+    /// (`CtShared::interrupted`), a queue drop, or a frame marked `Snapshot::transport_gap`.
     pub const CT_SOCKET_DOWN: u64 = 4;
     /// A multicast socket could not be bound or joined.
     pub const MULTICAST_BIND_FAILED: u64 = 8;
@@ -242,12 +244,12 @@ impl Sources {
                 if snap.acct_off {
                     self.window_flags |= flag::CT_ACCT_OFF;
                 }
+                if snap.transport_gap {
+                    self.window_flags |= flag::CT_SOCKET_DOWN;
+                }
                 self.ct_recounted = self.ct_recounted.saturating_add(snap.recounted_flows);
                 self.ct_dropped_keys = self.ct_dropped_keys.saturating_add(snap.dropped_new_keys);
             }
-            let sh = ct.shared();
-            let lost = sh.errors.swap(0, Ordering::Relaxed) + sh.dropped.swap(0, Ordering::Relaxed);
-            self.ct_errors = self.ct_errors.saturating_add(lost);
         }
         let map = fresh.as_ref().map_or(ip_to_mac, |(_, m)| m);
         if let Some(mc) = &self.mc {
@@ -273,14 +275,24 @@ impl Sources {
         fresh.map(|(all, _)| all)
     }
 
-    fn ct_down(&self, mono_s: u64) -> bool {
-        match &self.ct {
-            Some(ct) => {
-                !ct.shared().connected.load(Ordering::Relaxed)
-                    || mono_s.saturating_sub(self.ct_last_mono) > CT_STALE_S
-            }
-            None => self.start_failed & flag::CT_SOCKET_DOWN != 0,
-        }
+    /// Takes the reader's transport state for this window in one step under its gate, so a
+    /// reconnect, failed connect or drop lands wholly in this window or wholly in the next.
+    /// Returns whether the window had the socket down or a gap; counts errors and drops.
+    fn take_ct_cut(&mut self, mono_s: u64) -> bool {
+        let Some(ct) = &self.ct else {
+            return self.start_failed & flag::CT_SOCKET_DOWN != 0;
+        };
+        let sh = ct.shared();
+        let (lost, gap) = {
+            let _cut = sh.gate();
+            let dropped = sh.dropped.swap(0, Ordering::Relaxed);
+            let errors = sh.errors.swap(0, Ordering::Relaxed);
+            let interrupted = sh.interrupted.swap(false, Ordering::Relaxed);
+            let down = !sh.connected.load(Ordering::Relaxed);
+            (errors + dropped, interrupted || dropped > 0 || down)
+        };
+        self.ct_errors = self.ct_errors.saturating_add(lost);
+        gap || mono_s.saturating_sub(self.ct_last_mono) > CT_STALE_S
     }
 
     fn mc_failed(&self) -> bool {
@@ -299,7 +311,7 @@ impl Sources {
             w.add_conntrack(r);
         }
         let mut bits = std::mem::take(&mut self.window_flags);
-        if self.ct_down(mono_s) {
+        if self.take_ct_cut(mono_s) {
             bits |= flag::CT_SOCKET_DOWN;
         }
         if self.mc_failed() {

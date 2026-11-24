@@ -19,11 +19,12 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::ctparse::{parse_snapshot, Snapshot, MAX_LINE};
+use crate::ctseq::SeqTrack;
 
 pub const DEFAULT_SOCKET: &str = "/tmp/vigie/conntrack.sock";
 /// Snapshots queued between the reader thread and the main loop.
@@ -216,7 +217,8 @@ impl CtConfig {
     }
 }
 
-/// State shared with the main loop. All plain atomics: the main loop never waits on the reader.
+/// State shared with the main loop. Atomics, plus `gate`: the main loop takes it only briefly at
+/// the window cut, and the reader holds it only for a few stores or one non-blocking enqueue.
 #[derive(Debug, Default)]
 pub struct CtShared {
     pub connected: AtomicBool,
@@ -228,6 +230,21 @@ pub struct CtShared {
     pub attempts: AtomicU64,
     /// Snapshots received over the connection's lifetime.
     pub received: AtomicU64,
+    /// Helper data may be missing although the window can look clean: a connect followed an
+    /// earlier connection or attempt (while failing, `connected` is false). A socket still down at the flush is
+    /// `connected` = false; a drop is `dropped`; a broken sequence is on the frame
+    /// (`Snapshot::transport_gap`). Never counted in `errors`.
+    pub interrupted: AtomicBool,
+    /// Held by the reader while it changes `interrupted`, `connected`, `dropped` or enqueues,
+    /// and by the window cut while it takes them, so each event lands wholly in one window.
+    gate: Mutex<()>,
+}
+
+impl CtShared {
+    /// The reader/window-cut lock (see `gate`). A poisoned lock still serializes.
+    pub fn gate(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub struct CtReader {
@@ -281,13 +298,24 @@ fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) {
 
 fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBool) {
     let mut attempt = 0u32;
+    let mut first = true;
     while !stop.load(Ordering::Relaxed) {
         let got = connect(cfg);
         match got {
             Ok(stream) => {
-                sh.connected.store(true, Ordering::Relaxed);
+                {
+                    let _cut = sh.gate();
+                    // Only a successful first attempt starts without a gap behind it.
+                    if !first {
+                        sh.interrupted.store(true, Ordering::Relaxed);
+                    }
+                    sh.connected.store(true, Ordering::Relaxed);
+                }
                 let before = sh.received.load(Ordering::Relaxed);
-                serve(stream, cfg, tx, sh, stop);
+                serve(stream, cfg, (tx, sh, stop), !first);
+                // No latch here: a cut while down sees `connected` false, and the reconnect
+                // that ends the gap latches above.
+                let _cut = sh.gate();
                 sh.connected.store(false, Ordering::Relaxed);
                 if sh.received.load(Ordering::Relaxed) > before {
                     attempt = 0;
@@ -295,10 +323,12 @@ fn run(cfg: &CtConfig, tx: &SyncSender<Snapshot>, sh: &CtShared, stop: &AtomicBo
             }
             Err(e) => {
                 eprintln!("conntrack socket {}: {e}", cfg.path.display());
+                let _cut = sh.gate();
                 sh.errors.fetch_add(1, Ordering::Relaxed);
                 sh.attempts.fetch_add(1, Ordering::Relaxed);
             }
         }
+        first = false;
         let wait = backoff_ms(attempt, cfg.backoff_base_ms, cfg.backoff_cap_ms);
         attempt = attempt.saturating_add(1);
         sleep_unless_stopped(Duration::from_millis(wait), stop);
@@ -318,16 +348,19 @@ fn bump(sh: &CtShared, what: &str) {
 }
 
 /// Reads until the peer misbehaves or goes away. Returns on any error (already counted).
+/// After a reconnect or a queue drop the next delivered frame is marked: the gap behind it may
+/// sit in its counters.
 fn serve(
     mut s: UnixStream,
     cfg: &CtConfig,
-    tx: &SyncSender<Snapshot>,
-    sh: &CtShared,
-    stop: &AtomicBool,
+    (tx, sh, stop): (&SyncSender<Snapshot>, &CtShared, &AtomicBool),
+    reconnected: bool,
 ) {
     let mut lines = LineBuf::default();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut line_started: Option<Instant> = None;
+    let mut seq = SeqTrack::default();
+    let mut gap_next = reconnected;
     while !stop.load(Ordering::Relaxed) {
         match s.read(&mut buf) {
             Ok(0) => {
@@ -341,7 +374,22 @@ fn serve(
                     match ev {
                         LineEvent::Oversized => return bump(sh, "oversized line; dropping peer"),
                         LineEvent::Line(l) => match parse_snapshot(&l) {
-                            Ok(snap) => deliver(snap, tx, sh),
+                            Ok(snap) => {
+                                let (next, broken) = seq.judge(snap.seq);
+                                if broken {
+                                    eprintln!("conntrack socket: sequence {} breaks", snap.seq);
+                                }
+                                seq = next;
+                                let transport_gap = broken || std::mem::take(&mut gap_next);
+                                let snap = Snapshot {
+                                    transport_gap,
+                                    ..snap
+                                };
+                                // A dropped frame's loss rides on the next delivered one,
+                                // whichever window drains it (the Hold path, or an overflow
+                                // after the final pump, would otherwise leave it clean).
+                                gap_next = !deliver(snap, tx, sh);
+                            }
                             Err(e) => return bump(sh, &format!("bad snapshot: {e}")),
                         },
                     }
@@ -363,13 +411,15 @@ fn serve(
     }
 }
 
-fn deliver(snap: Snapshot, tx: &SyncSender<Snapshot>, sh: &CtShared) {
-    sh.received.fetch_add(1, Ordering::Relaxed);
-    match tx.try_send(snap) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            sh.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TrySendError::Disconnected(_)) => {}
+/// Enqueues under the gate; `received` counts the frame only once its queue outcome is known.
+/// Returns false when the queue was full and the frame was dropped (still counted in
+/// `dropped`, so `ct_errors` keeps its meaning).
+fn deliver(snap: Snapshot, tx: &SyncSender<Snapshot>, sh: &CtShared) -> bool {
+    let _cut = sh.gate();
+    let full = matches!(tx.try_send(snap), Err(TrySendError::Full(_)));
+    if full {
+        sh.dropped.fetch_add(1, Ordering::Relaxed);
     }
+    sh.received.fetch_add(1, Ordering::Relaxed);
+    !full
 }

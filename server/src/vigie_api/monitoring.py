@@ -246,9 +246,10 @@ def coverage(inv, collector, start, stop, now):
     for hour in range(start, stop, 3600):
         row = found.get(hour)
         reasons = json.loads(row["reasons"]) if row else ["missing"]
+        # A zero-second row only carries a cross-hour degradation reason: nothing was observed.
         state = (
             "missing"
-            if row is None
+            if row is None or row["observed_seconds"] == 0
             else "eligible"
             if row["qualified_seconds"] >= 3420 and not reasons
             else "partial"
