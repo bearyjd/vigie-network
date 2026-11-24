@@ -194,3 +194,34 @@ def test_a_signed_bit_4_rowless_receipt_degrades_the_hour_through_ingest(tmp_pat
         assert inv.execute("SELECT bytes_up FROM measurements_hourly").fetchone()[0] == 10
     finally:
         inv.close()
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (
+            measured("late1", HOUR + 60, HOUR + 120, DEGRADED),
+            measured("late2", HOUR + 180, HOUR + 240, DEGRADED),
+        ),
+        (
+            measured("span1", HOUR + 3570, HOUR + 3630, ("cross_hour", "flow_degraded")),
+            measured("span2", HOUR + 3580, HOUR + 3640, ("cross_hour", "flow_degraded")),
+        ),
+    ],
+    ids=["in_hour", "cross_hour"],
+)
+def test_a_second_degraded_receipt_for_an_already_degraded_hour_queues_nothing(
+    tmp_path, first, second
+):
+    inv, ov = mature(tmp_path)
+    try:
+        apply_measurements(inv, first)
+        for tick in range(4):
+            analyze_monitoring(inv, ov, BaselineConfig(), CURRENT + 3620 + tick)
+        assert queued(inv) == []
+        apply_measurements(inv, second)  # a distinct batch: no measurement_batches early return
+        assert queued(inv) == []
+        assert coverage(inv, HOUR)[2] == ["flow_degraded"]
+    finally:
+        inv.close()
+        ov.close()
