@@ -279,3 +279,36 @@ def test_docs_describe_the_final_bounds():
     section = docs[docs.index("## Probes") : docs.index("## Retention and verification limits")]
     for needle in ("valid_until", "unknown-target-id", "disabled", "probe_event_capped", "7 days"):
         assert needle in section, needle
+
+
+# ---------------------------------------------------------------- one target, rollback
+def test_a_one_target_probe_allow_renders_exactly_one_address_on_one_directive():
+    service = render.render({**BASE, "probes_enabled": True, "probe_allow": ["10.0.0.7"]})[
+        "vigie_test-probe.service"
+    ]
+    assert service.count("IPAddressAllow=") == 1
+    assert "IPAddressAllow=10.0.0.7\n" in service
+    assert service.count("10.0.0.7") == 1
+    assert service.count("IPAddressDeny=any\n") == 1
+
+
+def test_rerendering_without_the_probe_keys_after_enabling_restores_main_byte_for_byte():
+    """Rollback: the same config minus probes_enabled/probe_allow is the probe-free output again,
+    as rendered text and as the written bundle (no probe file, same plan). GOLDEN_FILES for the
+    pipeline container, GOLDEN_PLAN and GOLDEN_TOD_PIPELINE predate the monitoring_dns lines (#129)
+    and no longer match even the plain render, so those are compared with the plain render here."""
+    enabled = {**BASE, **PROBE}
+    assert set(render.render(enabled)) != set(GOLDEN_FILES)
+    rolled_back = {k: v for k, v in enabled.items() if k not in ("probes_enabled", "probe_allow")}
+    plain = render.render(BASE)
+    assert render.render(rolled_back) == plain
+    assert all("probe" not in n.lower() and "probe" not in t.lower() for n, t in plain.items())
+    untouched = {n: h for n, h in GOLDEN_FILES.items() if n != "vigie_test-pipeline.container"}
+    assert {n: sha(plain[n]) for n in untouched} == untouched
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, config in (("back", rolled_back), ("plain", BASE)):
+            render.write_bundle(config, Path(tmp) / name)
+        back, base = Path(tmp) / "back", Path(tmp) / "plain"
+        assert {p.name for p in back.iterdir()} == set(GOLDEN_FILES) | {"plan.json"}
+        for path in sorted(back.iterdir()):
+            assert path.read_bytes() == (base / path.name).read_bytes(), path.name
