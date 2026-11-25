@@ -265,3 +265,12 @@ def test_a_storage_error_is_the_uniform_500_like_other_routes(env: Env) -> None:
     env.inv.execute("DROP TABLE pipeline_meta")
     r = env.get("/probes")
     assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
+
+
+def test_stored_targets_are_dropped_when_the_pipeline_marks_the_status_stale(env: Env) -> None:
+    """The pipeline stores [] for a stale fold, but the reader must not rely on that: a stale
+    status that still carries targets (even "ok" ones) serves none and an unknown verdict."""
+    fresh_collector(env)
+    store(env, target(), target("lan-web", "tcp_lan"), stale=True, reason="stale")
+    d = data(env)
+    assert (d["stale"], d["verdict"], d["targets"]) == (True, "unknown", [])
