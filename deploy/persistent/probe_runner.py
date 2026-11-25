@@ -254,20 +254,20 @@ def parse_config(raw: object) -> ProbeConfig:
 
 
 def _read_regular(path: str, n: int, what: str, *, missing_ok=False, private=False) -> bytes | None:
-    """Read at most n+1 bytes of a regular file (O_NONBLOCK|O_NOFOLLOW: no FIFO hang, no
-    symlink). private: owned by the effective uid, no group/other bits (podman unshare: both 0)."""
+    """Read <= n+1 bytes of a regular file, no FIFO hang or symlink; private: ours, 0600 or less."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as exc:
         if missing_ok and exc.errno == errno.ENOENT:
             return None
         raise ProbeError(f"cannot open the {what}") from None
+    info = os.fstat(fd)  # the fd, not the path: no race between check and read
+    if not stat.S_ISREG(info.st_mode) or (
+        private and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & ~0o600)
+    ):
+        os.close(fd)
+        raise ProbeError(f"the {what} must be a regular file (a private config: 0600)")
     with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise ProbeError(f"the {what} must be a regular file")
-        if private and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
-            raise ProbeError(f"the {what} must be private (owner only, mode 0600)")
         try:
             return stream.read(n + 1)
         except OSError:

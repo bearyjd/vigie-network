@@ -101,8 +101,12 @@ def test_a_symlinked_config_exits_with_the_config_error_and_does_nothing(tmp_pat
     assert_untouched(tmp_path, calls)
 
 
-@pytest.mark.parametrize("mode", [0o644, 0o640, 0o666, 0o660])
-def test_a_config_with_group_or_other_bits_is_refused_and_does_nothing(tmp_path, mode):
+SINGLE_BITS = [0o600 | bit for bit in (0o040, 0o020, 0o010, 0o004, 0o002, 0o001)]
+EXTRA_BITS = [0o4600, 0o2600, 0o1600, 0o700, 0o500, 0o4400]
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o666, 0o660, *SINGLE_BITS, *EXTRA_BITS])
+def test_a_config_with_any_bit_beyond_owner_read_write_is_refused_and_does_nothing(tmp_path, mode):
     code, calls = run_main(tmp_path, config(tmp_path), mode=mode)
     assert code == pr.EXIT_CONFIG
     assert_untouched(tmp_path, calls)
@@ -127,3 +131,34 @@ def test_the_refusal_message_echoes_no_path_or_content(tmp_path, caplog):
     run_main(tmp_path, config(tmp_path), mode=0o644)
     text = caplog.text
     assert "private" in text and str(tmp_path) not in text and "probe-state" not in text
+
+
+def test_a_directory_config_exits_with_the_config_error_and_does_nothing(tmp_path, caplog):
+    path = tmp_path / "dir.json"
+    path.mkdir()
+    calls = []
+    code = pr.main([str(path)], dns=lambda *a: calls.append(a), connect=lambda *a: calls.append(a))
+    assert code == pr.EXIT_CONFIG
+    assert_untouched(tmp_path, calls)
+    assert "Traceback" not in caplog.text and str(tmp_path) not in caplog.text
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_the_check_reads_the_opened_fd_not_the_path(tmp_path, monkeypatch, mode):
+    """A path-based stat can be raced between open and check; fstat cannot."""
+    real_stat, real_lstat = os.stat, os.lstat
+    config_path = str(tmp_path / "probe.json")
+
+    def guard(real):
+        def inner(path, *a, **kw):
+            if os.fspath(path) == config_path:
+                raise AssertionError("config checked by path")
+            return real(path, *a, **kw)
+
+        return inner
+
+    monkeypatch.setattr(os, "stat", guard(real_stat))
+    monkeypatch.setattr(os, "lstat", guard(real_lstat))
+    (tmp_path / "state").mkdir()
+    code, calls = run_main(tmp_path, config(tmp_path), mode=mode)
+    assert code == (pr.EXIT_OK if mode == 0o600 else pr.EXIT_CONFIG)
