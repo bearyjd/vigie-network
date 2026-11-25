@@ -154,25 +154,33 @@ budget per network: sent open notifications of the upload detectors that day, un
 current decision is `expected`) and undecided ones, against at most one unwanted open per network
 per UTC day. Non-upload opens such as `new_device` are listed but not budgeted, as in the report.
 It prints only incident, device, lineage and collector ids: no MAC, IP, hostname, device name,
-incident evidence or delivery error. An id that is not a plain token is printed as `invalid-id`;
-collector ids of that kind stay separate networks, `invalid-id-1`, `invalid-id-2` and so on.
+incident evidence or delivery error. An id that is not a plain token is printed as `invalid-id#`;
+collector ids of that kind stay separate networks, `invalid-id#1`, `invalid-id#2` and so on (`#`
+never appears in a real id, so a masked label cannot collide with a real collector).
 Revoked collectors without data that day are left out of the network table and counted in one line,
 `N revoked collectors hidden` (`revoked_hidden` in JSON); one with data that day stays listed.
 
 **Receipt.** `appended_locally` means the pipeline wrote the notification to its delivery file.
 Nothing in the databases proves that it reached a phone, so every sent item is `receipt
-unverified`. The budget count is therefore an upper bound on received unwanted opens. Record
-actual receipt yourself in `owner_received`.
+unverified`. The budget counts opens RECORDED as sent on that UTC day, which is not the same as
+received: if the pipeline stops after the append but before it records `sent`, the owner may
+already have the notification while its row is still `pending` or `sending` (it then counts on the
+day it is recorded). Such a row is listed as `delivery pending` and makes its network unknown.
+An open is attributed to the network of the owner's decision when there is one (as the pilot
+report does), else to the incident's collector. Record actual receipt yourself in
+`owner_received`.
 
 **Unknown.** `unknown` means the evidence is incomplete or unreviewed, never "nothing happened".
 The digest lists every unknown day, network and item with its reasons. A day is unknown when it is
-not yet over by one hour as of `--now`, when delivery was not enabled for the whole day (no
-delivery watermark, or one later than the day start), when it lies beyond delivery, incident or
+not yet over by `LIVE_LAG_S` (7200 s) as of `--now`, when delivery was not enabled for the
+whole day (no delivery watermark, or one later than the day start), when it lies beyond delivery, incident or
 coverage retention, when there is no coverage or engine evidence or the engine or ingest stopped
 before the day ended, when the copy holds data newer than `--now`, when the output was truncated,
 when an item has no network or when no overrides copy was given. A network is unknown when it has fewer than 24 qualified hours, when a budgeted
-open is undecided or when a delivery row is missing. An item is unknown when it is unreviewed,
-pending, has no open delivery row, has no incident row, or was sent with receipt unverified.
+open is undecided, or when an upload item's delivery evidence is incomplete (`no open delivery row`,
+`delivery pending`, `unrecognised delivery state` or `incident row missing`). An item is unknown
+when it is unreviewed, has one of those delivery reasons, or was sent with receipt unverified. A
+`snoozed` decision counts as reviewed, as in pilot_report.
 A network-day verdict is `over` as soon as two unwanted opens are proven, even with unknowns.
 `within` needs complete, reviewed evidence. Everything else is `unknown`. A quiet day (no open
 sent) is `within` only under the same condition, with delivery enabled for the whole day: unlike

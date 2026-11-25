@@ -47,7 +47,7 @@ from vigie_ingest.db import iso_utc
 SCHEMA = "vigie-pilot-digest/1"
 MAX_ITEMS = 2000
 MAX_NETWORKS = 64
-MASKED = "invalid-id"
+MASKED = "invalid-id#"  # "#" is outside _SAFE_ID: no real id can equal a masked label
 _SAFE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._:-]{0,127}")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _INV_TABLES = ("coverage_hourly", "monitoring_incidents", "incident_deliveries")
@@ -63,7 +63,7 @@ DELIVERY = {
 NOTES = (
     "appended_locally means the pipeline wrote the notification to its local delivery file; "
     "actual receipt is never proven by the databases (receipt unverified)",
-    "the budget counts sent open notifications of upload detectors by UTC day of sending; "
+    "the budget counts open notifications of upload detectors RECORDED as sent that UTC day; "
     "unwanted = the owner's current decision is expected",
     "unknown means the evidence is incomplete or unreviewed; it is never read as healthy",
 )
@@ -139,7 +139,8 @@ def make_item(  # noqa: PLR0913
     sent_in_day = appended and dlv is not None and window[0] <= dlv[1] < window[1]
     return {
         "incident_id": safe_id(iid),
-        "network": collector or decision_network,  # raw: named by network_names()
+        # the decision's collector first, as pilot_report.unwanted_section attributes it
+        "network": decision_network or collector,  # raw: named by network_names()
         "device_id": safe_id(device),
         "lineage": safe_id(lineage),
         "detector": safe_id(detector),
@@ -180,8 +181,13 @@ def collect_items(
     return made, truncated
 
 
-_EVIDENCE_REASONS = frozenset(
-    {"incident row missing", "no open delivery row", "unrecognised delivery state"}
+_EVIDENCE_REASONS = frozenset(  # a pending/sending row may already have reached the owner
+    {
+        "incident row missing",
+        "no open delivery row",
+        "unrecognised delivery state",
+        "delivery pending",
+    }
 )
 
 
@@ -204,7 +210,7 @@ def budget(network: str, items: list[Item], inherited: list[str]) -> dict:
     sent_other = sum(i["sent_in_day"] and not i["budgeted_detector"] for i in mine)
     return {
         "budget": TARGET_UNWANTED_PER_NETWORK_DAY,
-        "counted_by": "local append; receipt unverified (an upper bound on received opens)",
+        "counted_by": "opens recorded as sent that UTC day (local append); receipt unverified",
         "opens_sent": len(counted),
         "opens_not_budgeted": sent_other,
         "unwanted": unwanted,
@@ -255,10 +261,11 @@ def _collectors(inv: sqlite3.Connection) -> tuple[set, set, bool]:
 
 def network_names(raw: set) -> dict:
     """Display name per raw collector id: itself when it is a plain token, otherwise a distinct
-    `invalid-id-N` in a stable order, so unsafe ids never merge into one budget."""
+    `invalid-id#N` in a stable order (never a valid id), so unsafe ids never merge into one budget
+    and never collide with a real collector."""
     out = {r: r for r in raw if safe_id(r) != MASKED}
     unsafe = sorted(set(raw) - set(out), key=lambda r: (type(r).__name__, repr(r)))
-    return {**out, **{r: f"{MASKED}-{n}" for n, r in enumerate(unsafe, 1)}}
+    return {**out, **{r: f"{MASKED}{n}" for n, r in enumerate(unsafe, 1)}}
 
 
 def build_digest(

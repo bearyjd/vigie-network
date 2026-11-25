@@ -132,7 +132,7 @@ def test_masked_networks_stay_separate(live: Live, capsys) -> None:
         _sent(live, f"u{cid[1]}1", "expected", cid=cid)
         _sent(live, f"u{cid[1]}2", "acknowledged", cid=cid)
     d = digest(live, capsys)
-    assert set(d["networks"]) == {"invalid-id-1", "invalid-id-2"}
+    assert set(d["networks"]) == {"invalid-id#1", "invalid-id#2"}
     assert {n["budget"]["unwanted"] for n in d["networks"].values()} == {1}
     assert all(n["budget"]["verdict"] != "over" for n in d["networks"].values())
 
