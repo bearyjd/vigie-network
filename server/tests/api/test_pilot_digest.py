@@ -9,7 +9,21 @@ import os
 import sqlite3
 
 import pytest
-from digest_helpers import DAY, HI, HOSTNAME, IP, LO, MAC, NOW, Live, digest, items, live, run  # noqa: F401
+from digest_helpers import (  # noqa: F401
+    DAY,
+    HI,
+    HOSTNAME,
+    IP,
+    LO,
+    MAC,
+    NOW,
+    Live,
+    _sent,
+    digest,
+    items,
+    live,
+    run,
+)
 
 from vigie_api import pilot_digest, pilot_report
 from vigie_ingest.db import iso_utc
@@ -79,14 +93,6 @@ def test_unlabeled_counts_missing_and_cleared_decisions(live: Live, capsys) -> N
     assert got["b"]["unknown_reasons"] == ["unreviewed"]
     assert got["d"]["decision"] is None
     assert {u["id"] for u in d["unknown"] if u["kind"] == "item"} == {"b", "d"}
-
-
-def _sent(live: Live, iid: str, status: str | None, cid: str = "c1", det: str = "large_upload",
-          at: int = LO + 7200) -> None:  # fmt: skip
-    live.incident(iid, cid=cid, detector=det, at=at)
-    live.open_row(iid, "sent", at=at + 100)
-    if status is not None:
-        live.decide(iid, status, cid=cid)
 
 
 def test_budget_exactly_one_unwanted_is_within(live: Live, capsys) -> None:
@@ -258,9 +264,13 @@ def test_run_leaves_the_copy_untouched(live: Live, capsys) -> None:
 
 @pytest.mark.parametrize(
     ("extra", "day", "now"),
-    [([], "2026-13-01", NOW), ([], "20261120", NOW), ([], DAY, "yesterday"),
-     ([], DAY, iso_utc(LO))],
-)  # fmt: skip
+    [
+        ([], "2026-13-01", NOW),
+        ([], "20261120", NOW),
+        ([], DAY, "yesterday"),
+        ([], DAY, iso_utc(LO)),
+    ],
+)
 def test_bad_arguments_exit_2(live: Live, capsys, extra, day, now) -> None:
     code, out, _ = run(live.snapshot(), capsys, *extra, day=day, now=now)
     assert (code, out) == (2, "")

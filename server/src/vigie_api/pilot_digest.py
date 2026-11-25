@@ -18,7 +18,6 @@ makes every verdict unknown.
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 from collections import Counter
@@ -26,15 +25,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from vigie_api.pilot_digest_coverage import coverage, coverage_entry
 from vigie_api.pilot_report import (
     _NON_UPLOAD_DETECTORS,
     DELIVERY_RETENTION_S,
     LIVE_LAG_S,
-    QUALIFIED_SECONDS,
     TARGET_UNWANTED_PER_NETWORK_DAY,
     _has_table,
     _lookup,
-    _reasons_clear,
     beyond_coverage_retention,
     beyond_incident_retention,
     delivery_watermark,
@@ -47,13 +45,10 @@ from vigie_api.ro_snapshot import InputRefused, reading
 from vigie_ingest.db import iso_utc
 
 SCHEMA = "vigie-pilot-digest/1"
-HOURS = 24
 MAX_ITEMS = 2000
 MAX_NETWORKS = 64
-MAX_REASON_CODES = 16
 MASKED = "invalid-id"
 _SAFE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._:-]{0,127}")
-_REASON = re.compile(r"[a-z0-9_]{1,32}")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _INV_TABLES = ("coverage_hourly", "monitoring_incidents", "incident_deliveries")
 DELIVERY = {
@@ -86,57 +81,6 @@ def _safe_time(value: object) -> str | None:
     if value is None:
         return None
     return value if isinstance(value, str) and _ISO.fullmatch(value) else "invalid-time"
-
-
-def _hour_reasons(qualified: int, text: object) -> list[str]:
-    """Reason codes for one non-qualified hour; free text never leaves as such."""
-    try:
-        parsed = json.loads(text) if isinstance(text, str) else None
-    except ValueError:
-        parsed = None
-    if not isinstance(parsed, list):
-        return ["other"]
-    codes = sorted({c if isinstance(c, str) and _REASON.fullmatch(c) else "other" for c in parsed})
-    if codes:
-        return codes
-    return ["short_observation"] if qualified < QUALIFIED_SECONDS else ["other"]
-
-
-def coverage(inv: sqlite3.Connection, lo: int, hi: int) -> tuple[dict[str, dict], bool]:
-    """Per collector: qualified hours of the day and counted reasons for the others."""
-    rows = inv.execute(
-        "SELECT collector_id,hour,qualified_seconds,reasons FROM coverage_hourly "
-        "WHERE hour>=? AND hour<? ORDER BY collector_id,hour LIMIT ?",
-        (lo, hi, HOURS * MAX_NETWORKS + 1),
-    ).fetchall()
-    seen: dict[str, set[int]] = {}
-    good: Counter[str] = Counter()
-    why: dict[str, Counter[str]] = {}
-    for row in rows[: HOURS * MAX_NETWORKS]:
-        cid = safe_id(row["collector_id"]) or MASKED
-        seen.setdefault(cid, set()).add(row["hour"])
-        why.setdefault(cid, Counter())
-        if row["qualified_seconds"] >= QUALIFIED_SECONDS and _reasons_clear(row["reasons"]):
-            good[cid] += 1
-        else:
-            why[cid].update(_hour_reasons(row["qualified_seconds"], row["reasons"]))
-    out = {cid: _coverage_entry(good[cid], len(hours), why[cid]) for cid, hours in seen.items()}
-    return out, len(rows) > HOURS * MAX_NETWORKS
-
-
-def _coverage_entry(qualified: int, rows: int, why: Counter[str]) -> dict:
-    reasons = Counter(why)
-    if rows < HOURS:
-        reasons["no_row"] += HOURS - rows
-    kept = dict(sorted(reasons.items())[:MAX_REASON_CODES])
-    if len(reasons) > MAX_REASON_CODES:
-        kept["other"] = kept.get("other", 0) + sum(sorted(reasons.values())[MAX_REASON_CODES:])
-    return {
-        "qualified_hours": qualified,
-        "hours": HOURS,
-        "complete": qualified == HOURS,
-        "reasons": kept,
-    }
 
 
 def _item_ids(inv: sqlite3.Connection, lo: int, hi: int) -> tuple[list[str], bool]:
@@ -195,7 +139,7 @@ def make_item(  # noqa: PLR0913
     sent_in_day = appended and dlv is not None and window[0] <= dlv[1] < window[1]
     return {
         "incident_id": safe_id(iid),
-        "network": safe_id(collector or decision_network),
+        "network": collector or decision_network,  # raw: named by network_names()
         "device_id": safe_id(device),
         "lineage": safe_id(lineage),
         "detector": safe_id(detector),
@@ -224,13 +168,12 @@ _DECISION_SQL = (
 
 
 def collect_items(
-    inv: sqlite3.Connection, ov: sqlite3.Connection | None, lo: int, hi: int
+    inv: sqlite3.Connection, ov: sqlite3.Connection | None, lo: int, hi: int, mark: int | None
 ) -> tuple[list[Item], bool]:
     ids, truncated = _item_ids(inv, lo, hi)
     incidents = _lookup(inv, _INCIDENT_SQL, ids)
     opens = _lookup(inv, _OPEN_SQL, ids)
     decisions = _lookup(ov, _DECISION_SQL, ids) if ov is not None else {}
-    mark = delivery_watermark(inv)
     made = [
         make_item(i, incidents.get(i), opens.get(i), decisions.get(i), (lo, hi), mark) for i in ids
     ]
@@ -271,11 +214,15 @@ def budget(network: str, items: list[Item], inherited: list[str]) -> dict:
     }
 
 
-def day_reasons(inv: sqlite3.Connection, lo: int, hi: int, now: int, retention: int) -> list[str]:
+def day_reasons(  # noqa: PLR0913
+    inv: sqlite3.Connection, lo: int, hi: int, now: int, retention: int, mark: int | None
+) -> list[str]:
     """Why no network-day verdict of this day can be trusted, whatever its own evidence."""
     why = []
     if now < hi + LIVE_LAG_S:
         why.append("day not complete as of --now")
+    if mark is None or mark > lo:  # an incident before the watermark is never announced
+        why.append("delivery not enabled for the whole day")
     if lo < now - retention:
         why.append("beyond delivery retention")
     if beyond_incident_retention(lo, now):
@@ -285,20 +232,33 @@ def day_reasons(inv: sqlite3.Connection, lo: int, hi: int, now: int, retention: 
     gap = evidence_gap(inv, lo, hi)
     if gap:
         why.append(gap)
-    stale = stale_reason(*liveness(inv), hi)  # stopped before the day ended: zeros are not real
+    engine, ingest = liveness(inv)
+    stale = stale_reason(engine, ingest, hi)  # stopped before the day ended: zeros are not real
     if stale:
         why.append(stale)
+    if max(engine or 0, ingest or 0) > now:  # --now is not when the copy was taken
+        why.append("copy holds data newer than --now")
     return why
 
 
-def _networks(inv: sqlite3.Connection, cover: dict, items: list[Item]) -> tuple[list[str], bool]:
-    """Registered collectors (a silent one shows 0/24), plus any network seen in the day."""
-    found = set(cover) | {i["network"] for i in items if i["network"]}
-    if _has_table(inv, "collectors"):
-        rows = inv.execute("SELECT id FROM collectors ORDER BY id LIMIT ?", (MAX_NETWORKS + 1,))
-        found |= {r[0] for r in rows}
-    names = sorted({safe_id(n) or MASKED for n in found})
-    return names[:MAX_NETWORKS], len(names) > MAX_NETWORKS
+def _collectors(inv: sqlite3.Connection) -> tuple[set, set, bool]:
+    """(active ids, revoked ids, truncated) of the collectors table, raw."""
+    if not _has_table(inv, "collectors"):
+        return set(), set(), False
+    rows = inv.execute(
+        "SELECT id,revoked FROM collectors ORDER BY id LIMIT ?", (4 * MAX_NETWORKS + 1,)
+    ).fetchall()
+    kept = rows[: 4 * MAX_NETWORKS]
+    active = {r[0] for r in kept if not r[1]}
+    return active, {r[0] for r in kept} - active, len(rows) > len(kept)
+
+
+def network_names(raw: set) -> dict:
+    """Display name per raw collector id: itself when it is a plain token, otherwise a distinct
+    `invalid-id-N` in a stable order, so unsafe ids never merge into one budget."""
+    out = {r: r for r in raw if safe_id(r) != MASKED}
+    unsafe = sorted(set(raw) - set(out), key=lambda r: (type(r).__name__, repr(r)))
+    return {**out, **{r: f"{MASKED}-{n}" for n, r in enumerate(unsafe, 1)}}
 
 
 def build_digest(
@@ -313,19 +273,24 @@ def build_digest(
             ov is not None and not _has_table(ov, "incident_decisions")
         ):
             raise InputRefused("database is not a supported Vigie inventory or overrides")
-        cover, cover_cut = coverage(inv, lo, hi)
-        items, items_cut = collect_items(inv, ov, lo, hi)
-        names, names_cut = _networks(inv, cover, items)
-        reasons = day_reasons(inv, lo, hi, now, retention)
+        mark = delivery_watermark(inv)
+        cover, cover_cut = coverage(inv, lo, hi, MAX_NETWORKS)
+        raw_items, items_cut = collect_items(inv, ov, lo, hi, mark)
+        active, revoked, coll_cut = _collectors(inv)
+        reasons = day_reasons(inv, lo, hi, now, retention, mark)
+    seen = set(cover) | {i["network"] for i in raw_items if i["network"] is not None}
+    names = network_names(seen | active)
+    items = [{**i, "network": names.get(i["network"])} for i in raw_items]
+    shown = sorted(names.items(), key=lambda kv: kv[1])
     if ov is None:
         reasons.append("no overrides database: decisions unavailable")
-    if cover_cut or items_cut or names_cut:
+    if cover_cut or items_cut or coll_cut or len(shown) > MAX_NETWORKS:
         reasons.append("truncated")
     if any(i["network"] is None for i in items):
         reasons.append("item without a network")
     networks = {}
-    for name in names:
-        entry = cover.get(name) or _coverage_entry(0, 0, Counter())
+    for raw, name in shown[:MAX_NETWORKS]:
+        entry = cover.get(raw) or coverage_entry(0, 0, Counter())
         own = [] if entry["complete"] else ["observation incomplete"]
         networks[name] = {"coverage": entry, "budget": budget(name, items, reasons + own)}
     unknown = [{"kind": "day", "id": iso_utc(lo)[:10], "reasons": reasons}] if reasons else []
@@ -347,6 +312,7 @@ def build_digest(
         "day_complete": now >= hi + LIVE_LAG_S,
         "assumed_delivery_retention_s": retention,
         "truncated": "truncated" in reasons,
+        "revoked_hidden": len(revoked - seen),
         "notes": list(NOTES),
         "networks": networks,
         "items": items,

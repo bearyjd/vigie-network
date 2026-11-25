@@ -134,3 +134,11 @@ def digest(live: Live, capsys, **kw) -> dict:
 
 def items(d: dict) -> dict[str, dict]:
     return {i["incident_id"]: i for i in d["items"]}
+
+
+def _sent(live: Live, iid: str, status: str | None, cid: str = "c1", det: str = "large_upload",
+          at: int = LO + 7200) -> None:  # fmt: skip
+    live.incident(iid, cid=cid, detector=det, at=at)
+    live.open_row(iid, "sent", at=at + 100)
+    if status is not None:
+        live.decide(iid, status, cid=cid)

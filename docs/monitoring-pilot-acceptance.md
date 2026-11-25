@@ -132,8 +132,11 @@ reuses the pilot report's definitions and is read-only, offline and deterministi
 `--now`, so the same copy and arguments always print the same output. Run it on a copy that
 `vigie-backup verify` accepted (see "Backups" in [deploy](deploy.md)), never on the live files. It
 opens each file `immutable=1`, creates no sidecar and refuses a symlink, a hardlink or a non-empty
-`-wal`/`-journal` (exit 2: checkpoint or use a verified backup copy). Run it as a one-shot
-container against the backup directory:
+`-wal`/`-journal`, a file that is not regular (a FIFO or directory) or one that changes or is
+replaced while it is read (exit 2: checkpoint or use a verified backup copy). Malformed rows exit 3.
+Pass as `--now` the time the copy was taken (the UTC time in the backup's `manifest.json`), not the
+current time: a copy holding coverage or engine hours later than `--now` makes the day unknown.
+Run it as a one-shot container against the backup directory:
 
 ```sh
 podman run --rm --user 10001:10001 --memory 512m --network none -v <backup-dir>:/in:ro \
@@ -151,7 +154,10 @@ budget per network: sent open notifications of the upload detectors that day, un
 current decision is `expected`) and undecided ones, against at most one unwanted open per network
 per UTC day. Non-upload opens such as `new_device` are listed but not budgeted, as in the report.
 It prints only incident, device, lineage and collector ids: no MAC, IP, hostname, device name,
-incident evidence or delivery error. An id that is not a plain token is printed as `invalid-id`.
+incident evidence or delivery error. An id that is not a plain token is printed as `invalid-id`;
+collector ids of that kind stay separate networks, `invalid-id-1`, `invalid-id-2` and so on.
+Revoked collectors without data that day are left out of the network table and counted in one line,
+`N revoked collectors hidden` (`revoked_hidden` in JSON); one with data that day stays listed.
 
 **Receipt.** `appended_locally` means the pipeline wrote the notification to its delivery file.
 Nothing in the databases proves that it reached a phone, so every sent item is `receipt
@@ -160,13 +166,18 @@ actual receipt yourself in `owner_received`.
 
 **Unknown.** `unknown` means the evidence is incomplete or unreviewed, never "nothing happened".
 The digest lists every unknown day, network and item with its reasons. A day is unknown when it is
-not yet over by one hour as of `--now`, when it lies beyond delivery, incident or coverage retention,
-when there is no coverage or engine evidence, when the output was truncated or when no overrides
-copy was given. A network is unknown when it has fewer than 24 qualified hours, when a budgeted
+not yet over by one hour as of `--now`, when delivery was not enabled for the whole day (no
+delivery watermark, or one later than the day start), when it lies beyond delivery, incident or
+coverage retention, when there is no coverage or engine evidence or the engine or ingest stopped
+before the day ended, when the copy holds data newer than `--now`, when the output was truncated,
+when an item has no network or when no overrides copy was given. A network is unknown when it has fewer than 24 qualified hours, when a budgeted
 open is undecided or when a delivery row is missing. An item is unknown when it is unreviewed,
 pending, has no open delivery row, has no incident row, or was sent with receipt unverified.
 A network-day verdict is `over` as soon as two unwanted opens are proven, even with unknowns.
-`within` needs complete, reviewed evidence. Everything else is `unknown`.
+`within` needs complete, reviewed evidence. Everything else is `unknown`. A quiet day (no open
+sent) is `within` only under the same condition, with delivery enabled for the whole day: unlike
+the report's seven-day verdict, which calls a window without notifications vacuous, one complete
+day with no unwanted open meets the daily budget.
 
 **Labels.** `--labels-template` prints one row per item with `owner_label` and `owner_received`
 left empty. The labels are yours: the tool never fills or infers them, and it does not read a

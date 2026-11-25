@@ -121,6 +121,7 @@ def render_text(d: dict) -> str:
             f"unwanted {bud['unwanted']}, undecided {bud['undecided']} -> "
             f"{bud['verdict'].upper()}",
         ]
+    lines.append(f"{d['revoked_hidden']} revoked collectors hidden")
     lines.append(f"items: {len(d['items'])}")
     for i in d["items"]:
         lines.append(
@@ -144,7 +145,7 @@ def main(argv: list[str]) -> int:
     except InputRefused as exc:
         print(f"vigie-api: pilot digest: {exc}", file=sys.stderr)
         return 2
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError, TypeError, ValueError, OverflowError):  # malformed rows
         print("vigie-api: pilot digest failed: database unreadable", file=sys.stderr)
         return 3
     if args.labels_template == "json":
