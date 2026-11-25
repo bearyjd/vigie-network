@@ -101,12 +101,29 @@ def test_a_symlinked_config_exits_with_the_config_error_and_does_nothing(tmp_pat
     assert_untouched(tmp_path, calls)
 
 
-# Delete or invert when the mode check lands (docs/monitoring.md:1129 says the config is private).
-@pytest.mark.parametrize("mode", [0o644, 0o666, 0o640])
-def test_known_gap_config_mode_not_enforced(tmp_path, mode):
-    """FINDING: the runner never checks the config's mode or owner (only render's skeleton and
-    the docs say private). A group/world-readable or writable config is loaded and probed.
-    Pinned so that adding the check is a visible, deliberate change."""
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o666, 0o660])
+def test_a_config_with_group_or_other_bits_is_refused_and_does_nothing(tmp_path, mode):
+    code, calls = run_main(tmp_path, config(tmp_path), mode=mode)
+    assert code == pr.EXIT_CONFIG
+    assert_untouched(tmp_path, calls)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_a_private_config_is_accepted(tmp_path, mode):
     (tmp_path / "state").mkdir()
     code, calls = run_main(tmp_path, config(tmp_path), mode=mode)
     assert code == pr.EXIT_OK and len(calls) == 1
+
+
+def test_a_config_owned_by_another_uid_is_refused_and_does_nothing(tmp_path, monkeypatch):
+    # chown to another user needs root, so shift the effective uid instead: same comparison.
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(tmp_path).st_uid + 1)
+    code, calls = run_main(tmp_path, config(tmp_path))
+    assert code == pr.EXIT_CONFIG
+    assert_untouched(tmp_path, calls)
+
+
+def test_the_refusal_message_echoes_no_path_or_content(tmp_path, caplog):
+    run_main(tmp_path, config(tmp_path), mode=0o644)
+    text = caplog.text
+    assert "private" in text and str(tmp_path) not in text and "probe-state" not in text

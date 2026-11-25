@@ -253,29 +253,29 @@ def parse_config(raw: object) -> ProbeConfig:
     return ProbeConfig(enabled, state_file, targets, readable)
 
 
-def _read_regular(path: str, limit: int, what: str, *, missing_ok: bool = False) -> bytes | None:
-    """Read at most limit+1 bytes of a regular file. O_NONBLOCK|O_NOFOLLOW so a FIFO without a
-    writer cannot hang the open and a symlink is refused; the fd must be a regular file."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+def _read_regular(path: str, n: int, what: str, *, missing_ok=False, private=False) -> bytes | None:
+    """Read at most n+1 bytes of a regular file (O_NONBLOCK|O_NOFOLLOW: no FIFO hang, no
+    symlink). private: owned by the effective uid, no group/other bits (podman unshare: both 0)."""
     try:
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        if missing_ok:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        if missing_ok and exc.errno == errno.ENOENT:
             return None
         raise ProbeError(f"cannot open the {what}") from None
-    except OSError:
-        raise ProbeError(f"cannot open the {what}") from None
     with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
             raise ProbeError(f"the {what} must be a regular file")
+        if private and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise ProbeError(f"the {what} must be private (owner only, mode 0600)")
         try:
-            return stream.read(limit + 1)
+            return stream.read(n + 1)
         except OSError:
             raise ProbeError(f"cannot read the {what}") from None
 
 
 def load_config(path: str) -> ProbeConfig:
-    data = _read_regular(path, MAX_CONFIG_BYTES, "probe config")
+    data = _read_regular(path, MAX_CONFIG_BYTES, "probe config", private=True)
     assert data is not None  # noqa: S101  (missing_ok is False)
     if len(data) > MAX_CONFIG_BYTES:
         raise ProbeError("probe config is too large")

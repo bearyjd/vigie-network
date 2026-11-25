@@ -227,6 +227,7 @@ def _cfg_file(tmp_path, **over):
     }
     path = tmp_path / "probe.json"
     path.write_text(json.dumps({**raw, **over}))
+    path.chmod(0o600)
     return path
 
 
