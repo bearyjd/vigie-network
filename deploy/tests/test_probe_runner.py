@@ -463,6 +463,7 @@ def test_config_errors_are_fixed_and_never_echo_values():
 def test_load_config_size_cap_and_roundtrip(tmp_path):
     path = tmp_path / "c.json"
     path.write_text(json.dumps(raw_config()))
+    path.chmod(0o600)
     assert pr.load_config(str(path)).enabled
     path.write_text(" " * 20000 + json.dumps(raw_config()))
     with pytest.raises(pr.ProbeError):
