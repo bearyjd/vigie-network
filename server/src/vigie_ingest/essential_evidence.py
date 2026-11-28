@@ -4,11 +4,23 @@ from __future__ import annotations
 
 import sqlite3
 
+from vigie_ingest.lan_unmapped import (
+    LAN_UNMAPPED_BYTES_KEY,
+    LAN_UNMAPPED_FLOWS_KEY,
+    MAX_VALUE,
+    lan_unmapped_reason,
+)
 from vigie_ingest.models import Batch
 
 HOUR_S = 3600
 MASK_BYTES = HOUR_S // 8
-INFORMATIONAL_KEYS = ("ct_unmapped_bytes", "ct_unmapped_flows", "mcast_unmapped", "mcast_dropped")
+INFORMATIONAL_KEYS = (
+    "ct_unmapped_bytes",
+    "ct_unmapped_flows",
+    LAN_UNMAPPED_FLOWS_KEY,
+    "mcast_unmapped",
+    "mcast_dropped",
+)
 
 
 def recording_since(conn: sqlite3.Connection) -> int | None:
@@ -26,6 +38,20 @@ def _valid_mac(mac: str) -> bool:
     return mac != "00:00:00:00:00:00" and not int(mac[:2], 16) & 1
 
 
+def _lan_unmapped_ok(batch: Batch) -> bool:
+    """Coverage's ct_lan_unmapped_bytes rule, on the per-MAC totals coverage sums from raw_flow."""
+    if LAN_UNMAPPED_BYTES_KEY not in batch.truncated:
+        return True
+    totals: dict[str, list[int]] = {}
+    overflowed = False
+    for row in batch.conntrack:
+        values = totals.setdefault(row.mac, [0, 0, 0])
+        for i, value in enumerate((row.bytes_up, row.bytes_down, row.flows)):
+            values[i] += value  # past MAX_VALUE coverage caps and fails closed: so do we
+            overflowed = overflowed or values[i] > MAX_VALUE
+    return lan_unmapped_reason(batch.truncated[LAN_UNMAPPED_BYTES_KEY], totals, overflowed) is None
+
+
 def _clean(batch: Batch) -> bool:
     return (
         {"truncated", "dropped_batches", "dns", "conntrack"} <= batch.model_fields_set
@@ -37,8 +63,9 @@ def _clean(batch: Batch) -> bool:
         and not any(
             (value & ~8 if key == "source_flags" else value)
             for key, value in batch.truncated.items()
-            if key not in INFORMATIONAL_KEYS
+            if key not in INFORMATIONAL_KEYS and key != LAN_UNMAPPED_BYTES_KEY
         )
+        and _lan_unmapped_ok(batch)
         and all(_valid_mac(r.mac) for r in batch.dns)
         and all(_valid_mac(r.mac) for r in batch.conntrack)
     )

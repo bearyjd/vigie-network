@@ -18,8 +18,10 @@ COLLECTOR_SRC = Path(__file__).resolve().parents[3] / "collector" / "agent" / "s
 DROP_KEYS = [
     "dns_dropped", "dns_pending_evicted", "dns_client_throttled", "dhcp_block_evicted",
     "tail_truncated", "tail_open_failed", "tail_bytes_skipped", "dns_quota_dropped",
-    "ct_lan_unmapped_flows", "ct_lan_unmapped_bytes", "ct_errors", "some_future_key",
+    "ct_errors", "some_future_key",
 ]  # fmt: skip
+# ct_lan_unmapped_flows is informational and ct_lan_unmapped_bytes follows coverage's threshold
+# (owner decision): both are covered by test_essential_lan_unmapped.py, not by this list.
 
 
 def raw_batch(env, start, end, truncated, *, n=None, collector="c1", received=None) -> None:
@@ -80,7 +82,9 @@ def collector_truncated_keys() -> set[str]:
 def test_the_key_list_is_pinned_against_the_collector():
     keys = collector_truncated_keys()
     assert {"dns_dropped", "dhcp_block_evicted", "tail_truncated", "leases"} <= keys
-    assert set(INFORMATIONAL_KEYS) <= keys | {"ct_unmapped_bytes", "ct_unmapped_flows"}
+    # the conntrack counters are emitted as a tuple list these patterns do not match
+    ct_keys = {"ct_unmapped_bytes", "ct_unmapped_flows", "ct_lan_unmapped_flows"}
+    assert set(INFORMATIONAL_KEYS) <= keys | ct_keys
 
 
 @pytest.mark.parametrize("key", sorted(collector_truncated_keys()))
