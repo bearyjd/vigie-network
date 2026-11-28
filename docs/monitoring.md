@@ -1421,8 +1421,18 @@ unjudged. Lease and neighbour snapshots do not update the anchor.
 
 *Q* = the number of completed hours of that collector after the anchor with both ordinary qualified
 coverage and durable essential-device observation evidence. The accepted batch windows must
-positively cover at least 3,420 seconds. An overlapping report of lost rows or unattributed LAN
-traffic disqualifies the hour. Unknown history, short or degraded coverage, and gaps pause the count.
+positively cover at least 3,420 seconds. An overlapping report of lost rows disqualifies the hour.
+Unattributed LAN traffic is judged by the same rule as coverage (one shared implementation,
+`vigie_ingest.lan_unmapped`): `ct_lan_unmapped_flows` is informational, and a batch's
+`ct_lan_unmapped_bytes` disqualifies the hour only when it is above the 256 KiB floor AND above 5
+percent of that batch's mapped conntrack bytes (per-MAC up + down) plus the unattributed bytes; a
+malformed value or per-MAC totals past the counter cap disqualify it as well. Residual risk: an
+essential device whose traffic the collector could not attribute to its MAC is counted only in
+`ct_lan_unmapped_bytes`; below the threshold the hour still counts, so that device can look absent
+(and be reported) while it is in fact on the LAN. Hours that the
+earlier presence rule already vetoed (any non-zero `ct_lan_unmapped_*`) stay vetoed: evidence is
+never rewritten, so a deployment counts only hours recorded after it.
+Unknown history, short or degraded coverage, and gaps pause the count.
 The incident opens when `Q * 3600 >= absent_after_s`. The maximum threshold remains 168 eligible
 hours. The observation evidence follows the 90-day monitoring retention period and survives the
 earlier expiry of raw shards and batch receipt records.

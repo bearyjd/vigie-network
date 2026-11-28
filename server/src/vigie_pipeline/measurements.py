@@ -9,6 +9,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 from vigie_ingest.db import shard_name, utc_day
+from vigie_ingest.lan_unmapped import (  # noqa: F401  (re-exported policy names)
+    LAN_UNMAPPED_BYTES_KEY,
+    LAN_UNMAPPED_FLOWS_KEY,
+    LAN_UNMAPPED_MAX_SHARE_PCT,
+    LAN_UNMAPPED_MIN_BYTES,
+    LAN_UNMAPPED_REASON,
+    MAX_VALUE,
+    lan_unmapped_reason,
+)
 from vigie_ingest.models import FUTURE_WINDOW_SLACK
 from vigie_pipeline.sources import ShardReadError, normalize_mac
 
@@ -17,21 +26,9 @@ from vigie_pipeline.sources import ShardReadError, normalize_mac
 # ct_unmapped_* now means only expected exclusions (global remainder, the router's own addresses);
 # ct_lan_unmapped_flows counts LAN-prefix sources without a MAC and is informational as well.
 INFORMATIONAL_TRUNCATED_KEYS = frozenset(
-    {"ct_unmapped_bytes", "ct_unmapped_flows", "ct_lan_unmapped_flows"}
+    {"ct_unmapped_bytes", "ct_unmapped_flows", LAN_UNMAPPED_FLOWS_KEY}
 )
-# ct_lan_unmapped_bytes (LAN-prefix sources with no MAC: a genuine attribution failure) is governed
-# by a threshold instead of presence. It is handled separately and must not hit the generic rule.
-LAN_UNMAPPED_BYTES_KEY = "ct_lan_unmapped_bytes"
-# Distinct reason for the threshold trip (attribution trouble), not a collector fault.
-LAN_UNMAPPED_REASON = "lan_unmapped_share"
-# The hour is disqualified (`lan_unmapped_share`) only when BOTH hold; at or below either bound
-# it qualifies. Both numbers are PER WINDOW and the share is collector-wide: see docs/monitoring.md.
-# Floor per window: a quiet hour must not be disqualified by a few KB of unattributed traffic.
-LAN_UNMAPPED_MIN_BYTES = 262144  # 256 KiB
-# Share of all conntrack bytes (mapped + LAN-unmapped). A read-only router snapshot showed
-# unmapped-but-LAN traffic at ~0.02% of bytes, so 5% leaves a ~250x margin. Policy number, to be
-# tuned on real data.
-LAN_UNMAPPED_MAX_SHARE_PCT = 5
+# ct_lan_unmapped_bytes and its threshold live in vigie_ingest.lan_unmapped, shared with ingest.
 # Independent whole-second truncation of the collector's wall and monotonic clocks can overlap
 # consecutive 60 s windows by 1 s. Replays are already rejected by batch_id.
 OVERLAP_TOLERANCE_S = 2
@@ -54,7 +51,6 @@ HOUR_S = 3600
 ALWAYS_DEGRADING_TRUNCATED_KEYS = frozenset({"truncated_other"})
 # A collector transport gap (signed source_flags bit 4) and other conntrack loss.
 FLOW_DEGRADED = "flow_degraded"
-MAX_VALUE = (2**63 - 1) // 64  # at most64 canonical MACs can be summed safely
 
 
 @dataclass(frozen=True)
@@ -66,23 +62,6 @@ class Measurements:
     received: str
     reasons: tuple[str, ...]
     counters: dict[str, tuple[int, int, int, int]]
-
-
-def _lan_unmapped_reason(value: object, counters: dict, overflowed: bool) -> str | None:
-    """Reason ct_lan_unmapped_bytes degrades the hour, or None. Fails closed on any doubt.
-
-    A malformed value or uncomputable totals is a data fault (`flow_degraded`); only the policy
-    threshold itself reports the distinct `lan_unmapped_share`, so operators can tell
-    attribution trouble from a collector fault.
-    """
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or overflowed:
-        return "flow_degraded"
-    if value <= LAN_UNMAPPED_MIN_BYTES:
-        return None
-    mapped = sum(v[0] + v[1] for v in counters.values())
-    if value * 100 > LAN_UNMAPPED_MAX_SHARE_PCT * (mapped + value):
-        return LAN_UNMAPPED_REASON
-    return None
 
 
 def read_measurements(
@@ -179,7 +158,7 @@ def read_measurements(
             if mac is not None:
                 counters.setdefault(mac, [0, 0, 0, 0])[3] += 1
         if LAN_UNMAPPED_BYTES_KEY in truncated:
-            lan_reason = _lan_unmapped_reason(
+            lan_reason = lan_unmapped_reason(
                 truncated[LAN_UNMAPPED_BYTES_KEY], counters, "counter_overflow" in reasons
             )
             if lan_reason is not None:
